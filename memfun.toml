@@ -1,0 +1,13 @@
+[project]
+name = "memfun"
+
+[llm]
+provider = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[backend]
+tier = "sqlite"
+sqlite_path = ".memfun/memfun.db"
+
+[sandbox]
+backend = "local"

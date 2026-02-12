@@ -1,0 +1,50 @@
+[project]
+name = "memfun"
+version = "0.1.1"
+description = "OSS autonomous coding agent: pluggable runtime + DSPy RLM + MCP + Agent Skills"
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{name = "Memfun Contributors"}]
+keywords = ["ai", "agent", "coding", "dspy", "rlm", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/indoor47/memfun"
+Repository = "https://github.com/indoor47/memfun"
+Issues = "https://github.com/indoor47/memfun/issues"
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "ruff>=0.8",
+    "pyright>=1.1",
+    "aiosqlite>=0.20",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 99
+exclude = ["Makefile"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH", "RUF"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "packages/*/tests"]

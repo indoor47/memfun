@@ -1,0 +1,38 @@
+[project]
+name = "memfun-optimizer"
+version = "0.1.1"
+description = "Self-optimization: trace analysis, agent synthesis, MIPROv2"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{name = "Memfun Contributors"}]
+keywords = ["ai", "agent", "coding", "dspy", "rlm", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "memfun-core",
+    "memfun-runtime",
+    "memfun-agent",
+    "dspy>=2.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/memfun/memfun"
+Repository = "https://github.com/memfun/memfun"
+Issues = "https://github.com/memfun/memfun/issues"
+Documentation = "https://memfun.dev/docs"
+
+[tool.uv.sources]
+memfun-core = { workspace = true }
+memfun-runtime = { workspace = true }
+memfun-agent = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memfun_optimizer"]

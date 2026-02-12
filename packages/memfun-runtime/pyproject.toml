@@ -1,0 +1,38 @@
+[project]
+name = "memfun-runtime"
+version = "0.1.1"
+description = "Pluggable runtime: Protocol interfaces, backends (T0-T3), BaseAgent, RuntimeContext"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{name = "Memfun Contributors"}]
+keywords = ["ai", "agent", "coding", "dspy", "rlm", "mcp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = ["memfun-core"]
+
+[project.optional-dependencies]
+sqlite = ["aiosqlite>=0.20"]
+redis = ["redis[hiredis]>=5.0"]
+nats = ["nats-py>=2.7"]
+docker = ["aiodocker>=0.22"]
+modal = ["modal>=0.66"]
+
+[project.urls]
+Homepage = "https://github.com/memfun/memfun"
+Repository = "https://github.com/memfun/memfun"
+Issues = "https://github.com/memfun/memfun/issues"
+Documentation = "https://memfun.dev/docs"
+
+[tool.uv.sources]
+memfun-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memfun_runtime"]
