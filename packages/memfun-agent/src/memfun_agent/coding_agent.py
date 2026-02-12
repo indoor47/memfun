@@ -189,6 +189,23 @@ class RLMCodingAgent(BaseAgent):
         try:
             # LLM-based triage: decide how to handle this query
             category = await self._triage_query(query, context)
+
+            # Guard: very short queries with conversation history
+            # are almost certainly follow-ups, not standalone questions
+            has_history = (
+                "=== LAST COMPLETED TASK ===" in context
+            )
+            if (
+                category == "direct"
+                and has_history
+                and len(query.strip()) < 20
+            ):
+                logger.info(
+                    "Overriding triage 'direct' -> 'project'"
+                    " (short follow-up with history)"
+                )
+                category = "project"
+
             logger.info("Query triage: %s", category)
 
             if category == "direct":
@@ -422,8 +439,20 @@ class RLMCodingAgent(BaseAgent):
     ) -> str:
         """Use the LLM to classify the query handling strategy.
 
-        Returns one of: 'direct', 'project', 'task'.
+        Returns one of: 'direct', 'project', 'task', 'web'.
         """
+        # Extract recent conversation from context
+        recent_conv = ""
+        if "=== LAST COMPLETED TASK ===" in context:
+            start = context.index(
+                "=== LAST COMPLETED TASK ==="
+            )
+            # Find the next section or end
+            end = context.find("=== ", start + 10)
+            if end == -1:
+                end = len(context)
+            recent_conv = context[start:end].strip()[:1500]
+
         # Build a brief project summary (not the full context)
         ctx_lines = context.split("\n")[:5]
         project_summary = " | ".join(
@@ -436,6 +465,8 @@ class RLMCodingAgent(BaseAgent):
             result = await asyncio.to_thread(
                 self._triage,
                 query=query,
+                recent_conversation=recent_conv
+                or "(no prior conversation)",
                 project_summary=project_summary
                 or "(no project context)",
             )

@@ -409,7 +409,7 @@ class ChatSession:
                 )
                 if content:
                     recent_summary += (
-                        f"\nResult: {content[:400]}"
+                        f"\nAgent response: {content[:2000]}"
                     )
                 context_parts.append(recent_summary)
 

@@ -200,6 +200,12 @@ class QueryTriage(dspy.Signature):
     The LLM decides whether the query needs project context, web search,
     or can be answered directly from general knowledge.
 
+    IMPORTANT: Short follow-up messages like "2", "yes", "the second one",
+    "do it", "go ahead" are CONTINUATIONS of the previous conversation.
+    They should be classified as 'project' or 'task' (matching the previous
+    turn's category), NEVER as 'direct'. Check recent_conversation to
+    understand what the user is referring to.
+
     Use 'web' when the query asks about current information, external
     APIs, documentation, prices, news, weather, or anything that
     requires up-to-date internet data. Also use 'web' when the user
@@ -209,15 +215,28 @@ class QueryTriage(dspy.Signature):
     query: str = dspy.InputField(
         desc="The user's question or request"
     )
+    recent_conversation: str = dspy.InputField(
+        desc=(
+            "Recent conversation history (last 1-2 turns). "
+            "CRITICAL: If the query is short (e.g. '2', 'yes', "
+            "'option 1'), this context tells you what the user "
+            "is referring to. A short query following a detailed "
+            "agent response with numbered options is a follow-up, "
+            "NOT a general knowledge question."
+        )
+    )
     project_summary: str = dspy.InputField(
         desc="Brief summary of available project context"
     )
     category: str = dspy.OutputField(
         desc=(
-            "One of: 'direct' (general knowledge, simple questions), "
+            "One of: 'direct' (general knowledge, simple questions "
+            "with NO prior conversation context), "
             "'web' (needs web search or URL fetching for current info), "
-            "'project' (needs codebase exploration), "
-            "'task' (multi-step coding task needing planning)"
+            "'project' (needs codebase exploration, or is a follow-up "
+            "to a previous project discussion), "
+            "'task' (multi-step coding task needing planning, or is a "
+            "follow-up to a previous task)"
         )
     )
     reasoning: str = dspy.OutputField(
