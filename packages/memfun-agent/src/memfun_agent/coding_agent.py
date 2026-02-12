@@ -574,6 +574,25 @@ class RLMCodingAgent(BaseAgent):
                     f"\n{memory_section}"
                 )
 
+        # For short follow-up messages, inject the previous
+        # turn's response directly so the LLM understands
+        # what "this", "that", "it" refer to.
+        if (
+            len(query.strip()) < 150
+            and "=== LAST COMPLETED TASK ===" in context
+        ):
+            start = context.index(
+                "=== LAST COMPLETED TASK ==="
+            )
+            end = context.find("\n=== ", start + 10)
+            if end == -1:
+                end = len(context)
+            prev_turn = context[start:end].strip()
+            if prev_turn:
+                parts.append(
+                    f"\n{prev_turn[:3000]}"
+                )
+
         # Add investigation rules for project queries
         parts.append(
             "\n=== INVESTIGATION RULES ==="
