@@ -189,9 +189,11 @@ class RLMExploration(dspy.Signature):
     )
     next_code: str = dspy.OutputField(
         desc=(
-            "Python code to execute. Use write_file(), "
+            "Pure Python code to execute — NO markdown fences, "
+            "NO ```python blocks, NO explanatory text. "
+            "Just raw Python. Use write_file(), "
             "run_cmd(), edit_file(). Always verify work. "
-            "Set state['FINAL'] = summary when done."
+            "Set state['FINAL'] = detailed_answer when done."
         )
     )
 

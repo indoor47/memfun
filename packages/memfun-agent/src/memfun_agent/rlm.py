@@ -77,29 +77,53 @@ def build_context_metadata(
     lines.append("")
     lines.append("Available helper functions in the REPL:")
     lines.append(
-        "  write_file(path, content) - Write a file (creates dirs)"
-    )
-    lines.append("  read_file(path) - Read file contents")
-    lines.append(
-        "  run_cmd(cmd) - Run a shell command, returns stdout"
+        "  write_file(path: str, content: str) -> str"
+        "  # Write a file, returns abs path"
     )
     lines.append(
-        "  edit_file(path, old, new) - Replace text in a file"
-    )
-    lines.append("  list_files(path='.') - List files recursively")
-    lines.append(
-        "  llm_query(question, context) - Ask sub-LM a question"
+        "  read_file(path: str) -> str"
+        "  # Read file contents as string"
     )
     lines.append(
-        "  web_search(query, max_results=5) - Search the web "
-        "(DuckDuckGo), returns list of {title, url, snippet}"
+        "  run_cmd(cmd: str) -> str"
+        "  # Run shell command, returns stdout string"
     )
     lines.append(
-        "  web_fetch(url, max_length=50000) - Fetch a URL, "
-        "returns content as markdown text"
+        "  edit_file(path: str, old: str, new: str) -> bool"
+        "  # Replace text in file"
+    )
+    lines.append(
+        "  list_files(path: str = '.') -> list[str]"
+        "  # Returns LIST of file paths"
+    )
+    lines.append(
+        "  llm_query(question: str, context: str) -> str"
+        "  # Ask sub-LM, returns answer string"
+    )
+    lines.append(
+        "  web_search(query: str, max_results: int = 5)"
+        " -> list[dict]"
+        "  # Search web, returns [{title, url, snippet}]"
+    )
+    lines.append(
+        "  web_fetch(url: str, max_length: int = 50000)"
+        " -> str"
+        "  # Fetch URL content as string"
     )
     lines.append("")
-    lines.append("RULES:")
+    lines.append("CRITICAL RULES:")
+    lines.append(
+        "- Output ONLY pure Python code. NO markdown, "
+        "NO ```python fences, NO explanatory text."
+    )
+    lines.append(
+        "- list_files() returns a list[str]. "
+        "Iterate with for-loop, do NOT call .split() on it."
+    )
+    lines.append(
+        "- read_file() returns a str. "
+        "Use .split('\\n') to get lines."
+    )
     lines.append(
         "- Always use write_file() instead of raw open()."
     )
@@ -112,9 +136,6 @@ def build_context_metadata(
     )
     lines.append(
         "- Use web_fetch() to read full content from a URL."
-    )
-    lines.append(
-        "- These helpers track operations and handle errors."
     )
     lines.append(
         "- You are fully autonomous: install deps, create "
@@ -436,7 +457,8 @@ class RLMModule(dspy.Module):
                 )
 
                 reasoning = getattr(prediction, "reasoning", "")
-                next_code = getattr(prediction, "next_code", "")
+                raw_code = getattr(prediction, "next_code", "")
+                next_code = _clean_generated_code(raw_code)
                 final_reasoning = reasoning
 
                 # Try to extract token usage from DSPy LM
@@ -578,12 +600,24 @@ class RLMModule(dspy.Module):
                                 )
 
                 # Append to history for next iteration
-                code_history += (
-                    f"\n--- Iteration {iteration} ---\n"
-                    f"Code:\n{next_code}\n"
-                    f"Output ({len(output)} chars):\n"
-                    f"{output[:1000]}\n"
-                )
+                if not exec_result.success:
+                    code_history += (
+                        f"\n--- Iteration {iteration} "
+                        f"(FAILED) ---\n"
+                        f"Code:\n{next_code}\n"
+                        f"ERROR:\n{output[:1500]}\n"
+                        f"FIX: Write pure Python only. "
+                        f"No markdown. Check return types "
+                        f"(list_files returns list, "
+                        f"read_file returns str).\n"
+                    )
+                else:
+                    code_history += (
+                        f"\n--- Iteration {iteration} ---\n"
+                        f"Code:\n{next_code}\n"
+                        f"Output ({len(output)} chars):\n"
+                        f"{output[:1000]}\n"
+                    )
 
                 # Add running state summary so LLM knows
                 # what's been accomplished
@@ -1255,6 +1289,59 @@ def _make_web_fetch(
             return ""
 
     return web_fetch
+
+
+def _clean_generated_code(code: str) -> str:
+    """Strip markdown fences and common LLM artifacts from generated code.
+
+    LLMs frequently wrap code in ```python ... ``` blocks.
+    This must be removed before exec().
+    """
+    import re
+
+    stripped = code.strip()
+
+    # Remove markdown code fences: ```python ... ```
+    # Handle ```python, ```py, ``` variants
+    if stripped.startswith("```"):
+        # Find the end of the opening fence line
+        first_newline = stripped.find("\n")
+        if first_newline == -1:
+            return ""
+        # Remove opening fence
+        stripped = stripped[first_newline + 1:]
+        # Remove closing fence
+        if stripped.rstrip().endswith("```"):
+            stripped = stripped.rstrip()
+            stripped = stripped[: stripped.rfind("```")]
+
+    # Also handle case where code has multiple fenced blocks
+    # (LLM sometimes outputs explanatory text + code blocks)
+    if "```python" in stripped or "```py" in stripped:
+        blocks: list[str] = []
+        in_block = False
+        current: list[str] = []
+        for line in stripped.split("\n"):
+            if re.match(r"^```(?:python|py)?\s*$", line.strip()):
+                if in_block:
+                    # Closing fence
+                    blocks.append("\n".join(current))
+                    current = []
+                    in_block = False
+                else:
+                    # Opening fence
+                    in_block = True
+                continue
+            if in_block:
+                current.append(line)
+        # If we found code blocks, use them
+        if blocks:
+            stripped = "\n\n".join(blocks)
+        elif current:
+            # Unclosed block
+            stripped = "\n".join(current)
+
+    return stripped.strip()
 
 
 @dataclass(frozen=True, slots=True)
