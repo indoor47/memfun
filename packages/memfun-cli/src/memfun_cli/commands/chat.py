@@ -1416,7 +1416,6 @@ async def _async_chat_loop() -> None:
                         " prefer."
                     )
                     try:
-                        import asyncio
                         stored = await (
                             session._learning_manager
                             .extract_and_store(
