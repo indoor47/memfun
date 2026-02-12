@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.2 (2026-02-12)
+
+### Fixed
+
+- Triage no longer misclassifies short follow-ups ("2", "yes", "option 1") as
+  standalone questions. QueryTriage now receives recent conversation history.
+- Short queries (<20 chars) with conversation history automatically route to
+  the project/RLM path instead of direct answer.
+- Last assistant response context increased from 400 to 2000 chars so numbered
+  option lists are not truncated before reaching the triage or agent.
+
 ## 0.1.1 (2026-02-12)
 
 ### Added
