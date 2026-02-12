@@ -1050,6 +1050,15 @@ def _print_plan_final(session: ChatSession) -> None:
 # ── Main chat loop ─────────────────────────────────────────────────
 
 
+def _get_version() -> str:
+    """Get the memfun-cli package version."""
+    try:
+        from importlib.metadata import version
+        return version("memfun-cli")
+    except Exception:
+        return "0.1.2"
+
+
 def _load_credentials() -> None:
     """Load API keys from credentials files into environment.
 
@@ -1152,7 +1161,7 @@ async def _async_chat_loop() -> None:
     # Compact welcome banner
     console.print()
     console.print(
-        f"  [bold cyan]memfun[/bold cyan] v0.1.0 [dim]│[/dim] {session.model_name} "
+        f"  [bold cyan]memfun[/bold cyan] v{_get_version()} [dim]│[/dim] {session.model_name} "
         f"[dim]│[/dim] {Path.cwd().name}/ [dim]│[/dim] {session.history_stats}"
     )
     console.print("  [dim]Type a message or /help. Ctrl+C to cancel. Ctrl+D to exit.[/dim]")
