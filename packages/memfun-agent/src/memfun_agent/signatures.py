@@ -155,8 +155,13 @@ class RLMExploration(dspy.Signature):
 
     Rules:
     - Use write_file() not open(). Use run_cmd() not subprocess.
-    - Set state['FINAL'] = summary when ALL work is complete.
-    - The summary must list all files created and actions taken.
+    - Set state['FINAL'] = answer when ALL work is complete.
+    - For questions/analysis: state['FINAL'] must contain the FULL
+      detailed answer with specific findings, data, and evidence
+      from the files you read. NEVER set FINAL to just a summary
+      like "Analyzed files" — include the actual information found.
+    - For coding tasks: state['FINAL'] must list all files created
+      and actions taken.
     - Do not stop early. Finish every step of the task.
     """
 

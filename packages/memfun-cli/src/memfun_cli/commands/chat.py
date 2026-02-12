@@ -281,6 +281,7 @@ class ChatSession:
         self._history: list[dict[str, Any]] = []
         self._cwd_context: str = ""
         self._last_step: TraceStep | None = None
+        self._completed_steps: list[TraceStep] = []
         self._plan: list[str] = []
         self._plan_status: dict[int, str] = {}
         self._plan_detail: dict[int, str] = {}
@@ -321,6 +322,9 @@ class ChatSession:
 
     def _on_step_callback(self, step: TraceStep) -> None:
         """Called by RLM after each iteration — stored for live display."""
+        # Archive previous step as completed
+        if self._last_step is not None:
+            self._completed_steps.append(self._last_step)
         self._last_step = step
 
     def _on_plan_callback(self, steps: list[str]) -> None:
@@ -467,6 +471,7 @@ class ChatSession:
         )
 
         self._last_step = None
+        self._completed_steps = []
         self._plan = []
         self._plan_status = {}
         self._plan_detail = {}
@@ -587,6 +592,10 @@ class ChatSession:
     @property
     def last_step(self) -> TraceStep | None:
         return self._last_step
+
+    @property
+    def completed_steps(self) -> list[TraceStep]:
+        return self._completed_steps
 
     @property
     def plan(self) -> list[str]:
@@ -1031,6 +1040,92 @@ def _print_completed_steps(
             )
             out.print()
             printed.add(i)
+
+
+def _print_completed_iterations(
+    session: ChatSession,
+    printed_count: list[int],
+    target_console: Console | None = None,
+) -> None:
+    """Print newly completed RLM iterations permanently.
+
+    Called in the main loop so completed iteration outputs stream
+    above the Live spinner. *printed_count* is a single-element
+    list tracking how many iterations have been printed so far.
+
+    Args:
+        session: The current ChatSession.
+        printed_count: Single-element list [n] — number already printed.
+        target_console: Console for printing above Live area.
+    """
+    out = target_console or console
+    steps = session.completed_steps
+    already = printed_count[0]
+
+    for step in steps[already:]:
+        # Header with iteration number and duration
+        dur_ms = step.duration_ms
+        dur_str = ""
+        if dur_ms > 0:
+            dur_str = (
+                f"  [dim]({dur_ms / 1000:.1f}s)[/dim]"
+            )
+        out.print(
+            f"  [dim]Iteration {step.iteration}[/dim]"
+            f"{dur_str}"
+        )
+
+        # Show reasoning snippet (first 2 sentences)
+        if step.reasoning:
+            sentences = step.reasoning.split(". ")[:2]
+            for s in sentences:
+                s = s.strip()
+                if s:
+                    out.print(f"    [dim]│[/dim] {s}")
+
+        # Show key operations from code
+        if step.code:
+            shown = 0
+            for code_line in step.code.split("\n"):
+                if shown >= 4:
+                    break
+                stripped = code_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                ops = (
+                    "write_file(", "read_file(",
+                    "edit_file(", "run_cmd(",
+                    "web_search(", "web_fetch(",
+                    "list_files(", "llm_query(",
+                )
+                if any(op in stripped for op in ops):
+                    out.print(
+                        f"    [dim]│ >[/dim]"
+                        f" [cyan]{stripped[:80]}[/cyan]"
+                    )
+                    shown += 1
+
+        # Show output snippet (errors are highlighted)
+        if step.output:
+            output_preview = step.output.strip()[:200]
+            if "error" in output_preview.lower() or \
+               "Traceback" in output_preview:
+                # Show error output in red
+                for oline in output_preview.split("\n")[:3]:
+                    oline = oline.strip()
+                    if oline:
+                        out.print(
+                            f"    [dim]│[/dim]"
+                            f" [red]{oline}[/red]"
+                        )
+            elif output_preview and len(output_preview) > 5:
+                first_line = output_preview.split("\n")[0][:80]
+                out.print(
+                    f"    [dim]│ → {first_line}[/dim]"
+                )
+
+        out.print()  # spacing between iterations
+        printed_count[0] += 1
 
 
 def _print_plan_final(session: ChatSession) -> None:
@@ -1514,6 +1609,7 @@ async def _async_chat_loop() -> None:
             cancelled = False
             typed_ahead = ""  # buffer keystrokes for next prompt
             printed_steps: set[int] = set()
+            printed_iters: list[int] = [0]
 
             # Set up terminal for Escape key detection
             fd = sys.stdin.fileno()
@@ -1550,6 +1646,13 @@ async def _async_chat_loop() -> None:
                         _print_completed_steps(
                             session,
                             printed_steps,
+                            live.console,
+                        )
+
+                        # Stream completed RLM iterations
+                        _print_completed_iterations(
+                            session,
+                            printed_iters,
                             live.console,
                         )
 
