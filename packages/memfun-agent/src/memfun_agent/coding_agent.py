@@ -558,6 +558,38 @@ class RLMCodingAgent(BaseAgent):
                 f"\nTarget audience: {payload['audience']}"
             )
 
+        # Extract memory/learnings from context and inject
+        # directly so the LLM sees them upfront (not buried
+        # in the context variable that needs exploration)
+        context = payload.get("context", "")
+        if "=== AGENT MEMORY" in context:
+            # Extract memory section
+            mem_start = context.index("=== AGENT MEMORY")
+            mem_end = context.find("\n=== ", mem_start + 10)
+            if mem_end == -1:
+                mem_end = len(context)
+            memory_section = context[mem_start:mem_end].strip()
+            if memory_section:
+                parts.append(
+                    f"\n{memory_section}"
+                )
+
+        # Add investigation rules for project queries
+        parts.append(
+            "\n=== INVESTIGATION RULES ==="
+            "\n- ALWAYS read the main source files with "
+            "read_file() — do NOT just list filenames"
+            "\n- Search conversation_history with MULTIPLE "
+            "keywords (e.g., search_history('weather'), "
+            "search_history('api'), search_history('meteo'))"
+            "\n- Cross-reference: check what the CODE says "
+            "vs what the HISTORY says — they may differ"
+            "\n- list_files(with_times=True) shows recency "
+            "— newer files reflect current state"
+            "\n- Do NOT set state['FINAL'] until you have "
+            "read actual file contents AND searched history"
+        )
+
         return "\n".join(parts)
 
     def _build_trace(

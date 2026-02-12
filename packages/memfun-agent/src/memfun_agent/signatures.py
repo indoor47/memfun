@@ -163,6 +163,10 @@ class RLMExploration(dspy.Signature):
     - For coding tasks: state['FINAL'] must list all files created
       and actions taken.
     - Do not stop early. Finish every step of the task.
+    - BEFORE setting FINAL for any question: you MUST have called
+      read_file() on the main source files (not just list_files).
+      If conversation_history exists, search it with multiple
+      keywords. Cross-check code vs history — they may differ.
     """
 
     context_metadata: str = dspy.InputField(
