@@ -296,9 +296,13 @@ class RLMCodingAgent(BaseAgent):
             task_type, query, payload
         )
 
+        # Extract conversation history from payload
+        history = payload.get("conversation_history")
+
         rlm_result: RLMResult = await self._rlm.aforward(
             query=full_query,
             context=context,
+            conversation_history=history,
         )
 
         return {

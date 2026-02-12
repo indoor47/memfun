@@ -48,6 +48,9 @@ _MAX_HISTORY_CHARS = 16_000
 def build_context_metadata(
     context: str | bytes,
     preview_length: int = _PREVIEW_LENGTH,
+    *,
+    has_history: bool = False,
+    history_len: int = 0,
 ) -> str:
     """Build a compact metadata string for the LLM about the context.
 
@@ -93,8 +96,9 @@ def build_context_metadata(
         "  # Replace text in file"
     )
     lines.append(
-        "  list_files(path: str = '.') -> list[str]"
-        "  # Returns LIST of file paths"
+        "  list_files(path: str = '.', with_times: bool = False)"
+        " -> list[str]"
+        "  # Returns LIST of file paths (with_times adds dates)"
     )
     lines.append(
         "  llm_query(question: str, context: str) -> str"
@@ -110,6 +114,27 @@ def build_context_metadata(
         " -> str"
         "  # Fetch URL content as string"
     )
+    if has_history:
+        lines.append("")
+        lines.append(
+            f"CONVERSATION HISTORY: {history_len} entries "
+            f"available as `conversation_history` variable "
+            f"(list of dicts, chronological order)."
+        )
+        lines.append(
+            "  Each entry has: role ('user'/'assistant'), "
+            "content (str), and optionally: "
+            "files_created (list), ops (list), method (str)"
+        )
+        lines.append(
+            "  search_history(keyword: str) -> list[dict]"
+            "  # Search history for entries containing keyword"
+        )
+        lines.append(
+            "  IMPORTANT: Always check conversation_history "
+            "for context about WHY things were done, past "
+            "decisions, and user preferences."
+        )
     lines.append("")
     lines.append("CRITICAL RULES:")
     lines.append(
@@ -341,9 +366,19 @@ class RLMModule(dspy.Module):
         self,
         query: str,
         context: str | bytes,
+        *,
+        conversation_history: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> RLMResult:
-        """Async forward: run the RLM exploration loop."""
+        """Async forward: run the RLM exploration loop.
+
+        Args:
+            query: The user's question or task.
+            context: Large context string (project state, etc.).
+            conversation_history: Optional list of conversation
+                entries (dicts with role, content, files_created, etc.)
+                to inject as a searchable variable in the REPL.
+        """
         start = time.perf_counter()
         trajectory: list[TraceStep] = []
         total_prompt_tokens = 0
@@ -353,11 +388,17 @@ class RLMModule(dspy.Module):
 
         # Build context metadata for the LLM
         ctx_meta = build_context_metadata(
-            context, self.config.preview_length
+            context,
+            self.config.preview_length,
+            has_history=bool(conversation_history),
+            history_len=len(conversation_history or []),
         )
 
         # Set up REPL environment
-        repl = self._create_repl(context)
+        repl = self._create_repl(
+            context,
+            conversation_history=conversation_history,
+        )
         code_history = ""
 
         answer = ""
@@ -838,7 +879,10 @@ class RLMModule(dspy.Module):
     # ── Internal helpers ───────────────────────────────────
 
     def _create_repl(
-        self, context: str | bytes
+        self,
+        context: str | bytes,
+        *,
+        conversation_history: list[dict[str, Any]] | None = None,
     ) -> LocalREPL:
         """Create and initialize a REPL with the context and tools."""
         repl = LocalREPL()
@@ -846,6 +890,13 @@ class RLMModule(dspy.Module):
         # Inject the context as a variable
         repl.namespace["context"] = context
         repl.namespace["state"] = {}
+
+        # Inject conversation history as a searchable variable
+        history = conversation_history or []
+        repl.namespace["conversation_history"] = history
+        repl.namespace["search_history"] = (
+            _make_search_history(history)
+        )
 
         # Inject llm_query for sub-LM calls
         repl.namespace["llm_query"] = self._make_llm_query()
@@ -1116,8 +1167,20 @@ def _make_list_files() -> Callable[[str], list[str]]:
     """Create a ``list_files`` helper."""
     import os as _os
 
-    def list_files(path: str = ".") -> list[str]:
-        """List all files recursively under *path*."""
+    def list_files(
+        path: str = ".", with_times: bool = False
+    ) -> list[str]:
+        """List all files recursively under *path*.
+
+        Args:
+            path: Directory to search.
+            with_times: If True, returns 'path (modified: YYYY-MM-DD)'.
+
+        Returns:
+            Sorted list of file paths.
+        """
+        import datetime
+
         files: list[str] = []
         for root, dirs, filenames in _os.walk(path):
             dirs[:] = [
@@ -1127,10 +1190,78 @@ def _make_list_files() -> Callable[[str], list[str]]:
                 and d != "__pycache__"
             ]
             for fname in filenames:
-                files.append(_os.path.join(root, fname))
+                fpath = _os.path.join(root, fname)
+                if with_times:
+                    try:
+                        mtime = _os.path.getmtime(fpath)
+                        dt = datetime.datetime.fromtimestamp(
+                            mtime
+                        ).strftime("%Y-%m-%d %H:%M")
+                        fpath = f"{fpath} (modified: {dt})"
+                    except OSError:
+                        pass
+                files.append(fpath)
         return sorted(files)
 
     return list_files
+
+
+def _make_search_history(
+    history: list[dict[str, Any]],
+) -> Callable[[str], list[dict[str, Any]]]:
+    """Create a ``search_history`` helper for conversation history."""
+
+    def search_history(
+        keyword: str,
+    ) -> list[dict[str, Any]]:
+        """Search conversation history for entries containing keyword.
+
+        Args:
+            keyword: Text to search for (case-insensitive).
+
+        Returns:
+            List of matching history entries (dicts with role,
+            content, and turn_number).
+        """
+        keyword_lower = keyword.lower()
+        results = []
+        for i, entry in enumerate(history):
+            content = str(entry.get("content", ""))
+            # Search in content, files_created, ops
+            searchable = content.lower()
+            files = entry.get("files_created", [])
+            if files:
+                searchable += " " + " ".join(files).lower()
+            ops = entry.get("ops", [])
+            if ops:
+                for op in ops:
+                    if isinstance(op, dict):
+                        searchable += " " + str(
+                            op.get("target", "")
+                        ).lower()
+
+            if keyword_lower in searchable:
+                result = {
+                    "turn_number": i // 2 + 1,
+                    "role": entry.get("role", "unknown"),
+                    "content": content[:500],
+                }
+                if files:
+                    result["files_created"] = files
+                results.append(result)
+
+        if results:
+            print(
+                f"Found {len(results)} history entries "
+                f"matching '{keyword}'"
+            )
+        else:
+            print(
+                f"No history entries matching '{keyword}'"
+            )
+        return results
+
+    return search_history
 
 
 def _make_web_search(

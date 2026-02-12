@@ -454,8 +454,10 @@ class ChatSession:
             context_parts.append(
                 f"conversation_history variable has "
                 f"{len(self._history)} entries with full "
-                f"details. Use list_files() and read_file() "
-                f"to review any previously created files."
+                f"details (injected in REPL namespace). "
+                f"Use search_history('keyword') to find "
+                f"past discussions. Use list_files() and "
+                f"read_file() to review created files."
             )
 
         context = "\n\n".join(context_parts)
@@ -467,6 +469,7 @@ class ChatSession:
                 "type": "ask",
                 "query": user_input,
                 "context": context,
+                "conversation_history": self._history,
             },
         )
 
