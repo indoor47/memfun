@@ -113,20 +113,27 @@ knowledge, unique in open-source coding agents.
 
 ## Features
 
+- **Context-First Solving** -- Gathers project context via I/O, then solves in
+  a single LLM call (2 calls total vs 20+ iterative loops). Falls back to RLM
+  for complex tasks. Auto-detects linters and fixes errors in up to 2 cycles.
 - **RLM Architecture** -- DSPy Recursive Language Models handle codebases 100x
   beyond native context windows via sandboxed REPL with recursive sub-LLM calls
+- **Multi-Agent Workflow** -- Triage classifies tasks, TaskDecomposer breaks
+  complex ones into a dependency DAG, and WorkflowEngine fans out to 9
+  specialist agents in parallel with review and revision loops
 - **Persistent Learning** -- Agent automatically extracts and remembers your
   preferences, project patterns, and technical details across sessions
 - **Pluggable Backends** -- Four tiers (In-Process, SQLite, Redis, NATS JetStream)
   with identical protocol interfaces; swap at config time
-- **Multi-Agent Orchestration** -- AGENT.md definitions, delegation system, and
-  built-in agents (architect, orchestrator, reviewer, planner)
+- **9 Specialist Agents** -- FileAgent, CoderAgent, TestAgent, ReviewAgent,
+  WebSearchAgent, WebFetchAgent, PlannerAgent, DebugAgent, SecurityAgent --
+  each with focused system prompts and iteration caps
 - **Agent Skills** -- 8 built-in portable skills following the agentskills.io
   open standard; synthesize new skills from execution traces
 - **MCP Tool Integration** -- FastMCP 3.0 tool server with filesystem, search,
   git, web fetch, and web search; agents and skills exposed as MCP tools
 - **Interactive Chat** -- Rich terminal UI with progress display, timer/token
-  tracking, slash commands, web search, and conversation history
+  tracking, per-agent transparency, slash commands, web search, and history
 - **Self-Optimization** -- Trace collection, MIPROv2 optimization, agent synthesis,
   and skill effectiveness tracking
 - **Security by Design** -- Parameterized SQL, SSRF prevention, sandbox isolation,
@@ -203,6 +210,8 @@ memfun > now add a /health endpoint
 | `/forget <target>` | Forget a memory entry (by number or text) |
 | `/context` | Rescan project files |
 | `/traces` | List recent execution traces |
+| `/agents` | List running multi-agent workflow agents |
+| `/workflow` | Show current workflow DAG and status |
 | `/model` | Show or switch LLM model |
 | `/clear` | Clear conversation history |
 | `/exit` | Exit (or Ctrl+D) |
@@ -247,7 +256,7 @@ memfun agent list               # List agent definitions
 |---------|-------------|
 | **memfun-core** | Shared types, config (`memfun.toml`), logging, errors |
 | **memfun-runtime** | Pluggable runtime: 8 protocol interfaces, 4 backend tiers, BaseAgent |
-| **memfun-agent** | RLM coding agent, DSPy signatures, MCP Tool Bridge, trace collection |
+| **memfun-agent** | RLM coding agent, context-first solver, 9 specialist agents, workflow engine, DSPy signatures, traces |
 | **memfun-skills** | Agent Skills: discovery, loading, execution, synthesis, marketplace |
 | **memfun-tools** | MCP tool server (FastMCP 3.0): code, git, filesystem, web tools |
 | **memfun-optimizer** | Self-optimization: trace analysis, agent synthesis, MIPROv2, persistent memory |
@@ -365,6 +374,22 @@ standard.
 
 ## Built-in Agents
 
+### Specialist Agents (used by WorkflowEngine)
+
+| Agent | Role | Max Iter |
+|-------|------|----------|
+| `file-agent` | Reads and analyzes files (never creates code) | 8 |
+| `coder-agent` | Implements features, writes code | 15 |
+| `test-agent` | Writes and runs tests | 10 |
+| `review-agent` | Reviews code quality and consistency | 8 |
+| `web-search-agent` | Searches the web for information | 8 |
+| `web-fetch-agent` | Fetches and extracts web page content | 8 |
+| `planner-agent` | Plans implementation approach | 6 |
+| `debug-agent` | Diagnoses and traces bugs | 12 |
+| `security-agent` | Security analysis and vulnerability review | 8 |
+
+### AGENT.md Definitions (higher-level coordination)
+
 | Agent | Role |
 |-------|------|
 | `architect` | Plans system design and technical approach |
@@ -382,7 +407,7 @@ git clone https://github.com/indoor47/memfun.git
 cd memfun
 uv sync
 
-# Run tests (304 pass, 88 skip for Redis/NATS without servers)
+# Run tests (464 pass, 88 skip for Redis/NATS without servers)
 uv run pytest
 
 # Lint
