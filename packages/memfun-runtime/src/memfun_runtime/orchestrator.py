@@ -32,7 +32,7 @@ class RetryPolicy(Enum):
 class OrchestratorConfig:
     """Tuning knobs for :class:`AgentOrchestrator`."""
 
-    default_timeout_seconds: float = 30.0
+    default_timeout_seconds: float = 120.0
     retry_policy: RetryPolicy = RetryPolicy.NONE
     max_retries: int = 3
     retry_delay_seconds: float = 1.0

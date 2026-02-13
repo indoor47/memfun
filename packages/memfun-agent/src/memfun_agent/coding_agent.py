@@ -8,6 +8,7 @@ optimization via MIPROv2/GEPA.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,10 @@ import dspy
 from memfun_core.logging import get_logger
 from memfun_runtime.agent import BaseAgent, agent
 
+from memfun_agent.context_first import (
+    ContextFirstConfig,
+    ContextFirstSolver,
+)
 from memfun_agent.rlm import RLMConfig, RLMModule, RLMResult
 from memfun_agent.signatures import (
     BugFix,
@@ -76,13 +81,16 @@ class RLMCodingAgent(BaseAgent):
         self._tool_bridge: MCPToolBridge | None = None
         self._trace_collector: TraceCollector | None = None
         self._rlm: RLMModule | None = None
+        self._context_solver: ContextFirstSolver | None = None
         self.on_step: Any | None = None
         self.on_plan: Any | None = None
         self.on_step_status: Any | None = None
+        self.on_context_first_status: Any | None = None
 
         # DSPy predictors for simple (non-RLM) tasks
         self._analyzers: dict[str, dspy.Module] = {}
         self._triage = dspy.Predict(QueryTriage)
+        self._query_resolver: Any | None = None
 
     # ── Lifecycle ──────────────────────────────────────────
 
@@ -131,6 +139,19 @@ class RLMCodingAgent(BaseAgent):
             on_step_status=self.on_step_status,
         )
 
+        # Set up Context-First Solver (tries before RLM)
+        try:
+            self._context_solver = ContextFirstSolver(
+                project_root=os.getcwd(),
+                config=ContextFirstConfig(),
+                on_status=self.on_context_first_status,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Context-First Solver init failed: %s", exc
+            )
+            self._context_solver = None
+
         # Set up direct predictors for simple tasks
         self._analyzers = {
             "analyze": dspy.ChainOfThought(CodeAnalysis),
@@ -138,6 +159,14 @@ class RLMCodingAgent(BaseAgent):
             "review": dspy.ChainOfThought(CodeReview),
             "explain": dspy.ChainOfThought(CodeExplanation),
         }
+
+        # Query resolver for deictic references
+        try:
+            from memfun_agent.query_resolver import QueryResolver
+
+            self._query_resolver = QueryResolver()
+        except Exception:
+            logger.debug("QueryResolver unavailable", exc_info=True)
 
         logger.info(
             "RLMCodingAgent started (max_iter=%d, tools=%d)",
@@ -187,8 +216,25 @@ class RLMCodingAgent(BaseAgent):
             )
 
         try:
-            # LLM-based triage: decide how to handle this query
-            category = await self._triage_query(query, context)
+            # Resolve deictic references ("fix this", "2", etc.)
+            history = payload.get("conversation_history")
+            if history and self._query_resolver:
+                try:
+                    query, _ = await self._query_resolver.aresolve(
+                        query, history,
+                    )
+                except Exception:
+                    logger.debug("Query resolution failed", exc_info=True)
+
+            # Accept pre-triaged category from chat.py; only
+            # triage if absent (backward-compatible).
+            category = payload.get("triage_category", "")
+            if not category or category not in (
+                "direct", "project", "task", "web",
+            ):
+                category = await self._triage_query(
+                    query, context
+                )
 
             # Guard: very short queries with conversation history
             # are almost certainly follow-ups, not standalone questions
@@ -288,7 +334,7 @@ class RLMCodingAgent(BaseAgent):
         context: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        """Handle a task using the full RLM exploration loop."""
+        """Handle a task using context-first solver, falling back to RLM."""
         assert self._rlm is not None
 
         # Build a richer query incorporating the task type
@@ -299,6 +345,30 @@ class RLMCodingAgent(BaseAgent):
         # Extract conversation history from payload
         history = payload.get("conversation_history")
 
+        # Try context-first approach (fewer LLM calls).
+        if self._context_solver is not None:
+            try:
+                cf_result = await self._context_solver.asolve(
+                    query=full_query,
+                    context=context,
+                    conversation_history=history,
+                )
+                if cf_result.success:
+                    result_dict = cf_result.to_result_dict()
+                    result_dict["task_type"] = task_type
+                    return result_dict
+                logger.info(
+                    "Context-first unsuccessful, "
+                    "falling back to RLM"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Context-first solver failed: %s, "
+                    "falling back to RLM",
+                    exc,
+                )
+
+        # Existing RLM path (fallback).
         rlm_result: RLMResult = await self._rlm.aforward(
             query=full_query,
             context=context,

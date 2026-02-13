@@ -706,6 +706,40 @@ class RLMModule(dspy.Module):
                         f"[State: {'; '.join(status_parts)}]\n"
                     )
 
+                # ── Iteration budget + stall detection ──────
+                remaining = self.config.max_iterations - iteration
+                code_history += (
+                    f"[Budget: {remaining} iterations remaining"
+                    f" out of {self.config.max_iterations}]\n"
+                )
+
+                if remaining <= 2:
+                    code_history += (
+                        "⚠ FINAL ITERATIONS: You MUST set "
+                        "state['FINAL'] now. Summarize what you "
+                        "did, list all files created/modified, "
+                        "and set FINAL immediately.\n"
+                    )
+                elif remaining <= self.config.max_iterations // 2:
+                    # Check for stall: if we've done reads but
+                    # no writes/edits/commands in last 3 iters
+                    state = repl.namespace.get("state", {})
+                    ops_so_far = state.get("_ops", [])
+                    action_ops = [
+                        o for o in ops_so_far
+                        if o[0] in ("write", "edit", "cmd")
+                    ]
+                    if not action_ops:
+                        code_history += (
+                            "⚠ STALL DETECTED: You've been "
+                            "reading files but haven't written "
+                            "or edited anything yet. You have "
+                            "enough context. STOP READING and "
+                            "START ACTING: use write_file() or "
+                            "edit_file() to implement your fix "
+                            "NOW. Do not read more files.\n"
+                        )
+
                 if self.config.verbose:
                     logger.info(
                         "RLM iteration %d: %s",

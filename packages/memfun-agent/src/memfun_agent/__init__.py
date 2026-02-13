@@ -3,17 +3,35 @@
 Public API:
 - ``RLMCodingAgent`` -- The main coding agent (BaseAgent subclass).
 - ``RLMModule`` / ``RLMConfig`` / ``RLMResult`` -- Core RLM module.
+- ``ContextFirstSolver`` / ``ContextFirstConfig`` -- Context-first solving.
 - ``MCPToolBridge`` / ``create_tool_bridge`` -- MCP tool integration.
 - ``TraceCollector`` / ``ExecutionTrace`` -- Trace collection.
 - DSPy signatures: ``CodeAnalysis``, ``BugFix``, ``CodeReview``,
-  ``CodeExplanation``, ``RLMExploration``.
+  ``CodeExplanation``, ``RLMExploration``, ``QueryResolution``,
+  ``TaskDecomposition``, ``ContextPlanning``, ``SingleShotSolving``.
 - Agent definitions (AGENT.md): ``AgentDefinition``, ``AgentLoader``,
   ``AgentValidator``, ``AgentRegistryBridge``, ``DefinedAgent``,
   ``parse_agent_md``.
+- Multi-agent: ``QueryResolver``, ``TaskDecomposer``, ``SubTask``,
+  ``DecompositionResult``, ``SharedSpec``, ``SharedSpecStore``,
+  ``WorkflowEngine``, ``WorkflowResult``, ``WorkflowState``.
+- Specialist agents: ``FileAgent``, ``CoderAgent``, ``TestAgent``,
+  ``ReviewAgent``, ``WebSearchAgent``, ``WebFetchAgent``,
+  ``PlannerAgent``, ``DebugAgent``, ``SecurityAgent``.
 """
 from __future__ import annotations
 
 from memfun_agent.coding_agent import RLMCodingAgent
+from memfun_agent.context_first import (
+    ContextFirstConfig,
+    ContextFirstResult,
+    ContextFirstSolver,
+)
+from memfun_agent.decomposer import (
+    DecompositionResult,
+    SubTask,
+    TaskDecomposer,
+)
 from memfun_agent.definitions import (
     AgentDefinition,
     AgentLoader,
@@ -24,6 +42,7 @@ from memfun_agent.definitions import (
     agent_to_metadata,
     parse_agent_md,
 )
+from memfun_agent.query_resolver import QueryResolver
 from memfun_agent.rlm import (
     LocalREPL,
     RLMConfig,
@@ -31,13 +50,30 @@ from memfun_agent.rlm import (
     RLMResult,
     build_context_metadata,
 )
+from memfun_agent.shared_spec import SharedSpec, SharedSpecStore
 from memfun_agent.signatures import (
     BugFix,
     CodeAnalysis,
     CodeExplanation,
     CodeReview,
+    ContextPlanning,
     LearningExtraction,
+    QueryResolution,
     RLMExploration,
+    SingleShotSolving,
+    TaskDecomposition,
+    VerificationFix,
+)
+from memfun_agent.specialists import (
+    CoderAgent,
+    DebugAgent,
+    FileAgent,
+    PlannerAgent,
+    ReviewAgent,
+    SecurityAgent,
+    TestAgent,
+    WebFetchAgent,
+    WebSearchAgent,
 )
 from memfun_agent.tool_bridge import (
     MCPToolBridge,
@@ -50,38 +86,62 @@ from memfun_agent.traces import (
     TraceCollector,
     TraceStep,
 )
+from memfun_agent.workflow import (
+    WorkflowEngine,
+    WorkflowResult,
+    WorkflowState,
+)
 
 __all__ = [
-    # Agent definitions (AGENT.md)
     "AgentDefinition",
     "AgentLoader",
     "AgentManifest",
     "AgentRegistryBridge",
     "AgentValidator",
-    # Signatures
     "BugFix",
     "CodeAnalysis",
     "CodeExplanation",
     "CodeReview",
-    # Defined agent
+    "CoderAgent",
+    "ContextFirstConfig",
+    "ContextFirstResult",
+    "ContextFirstSolver",
+    "ContextPlanning",
+    "DebugAgent",
+    "DecompositionResult",
     "DefinedAgent",
-    # Traces
     "ExecutionTrace",
+    "FileAgent",
     "LearningExtraction",
-    # RLM core
     "LocalREPL",
-    # Tool bridge
     "MCPToolBridge",
-    # Agent
+    "PlannerAgent",
+    "QueryResolution",
+    "QueryResolver",
     "RLMCodingAgent",
     "RLMConfig",
     "RLMExploration",
     "RLMModule",
     "RLMResult",
+    "ReviewAgent",
+    "SecurityAgent",
+    "SharedSpec",
+    "SharedSpecStore",
+    "SingleShotSolving",
+    "SubTask",
+    "TaskDecomposer",
+    "TaskDecomposition",
+    "TestAgent",
     "TokenUsage",
     "ToolResult",
     "TraceCollector",
     "TraceStep",
+    "VerificationFix",
+    "WebFetchAgent",
+    "WebSearchAgent",
+    "WorkflowEngine",
+    "WorkflowResult",
+    "WorkflowState",
     "agent_to_metadata",
     "build_context_metadata",
     "create_tool_bridge",

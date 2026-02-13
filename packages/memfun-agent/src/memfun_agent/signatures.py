@@ -208,8 +208,16 @@ class RLMExploration(dspy.Signature):
 class QueryTriage(dspy.Signature):
     """Classify a user query to determine the best handling strategy.
 
-    The LLM decides whether the query needs project context, web search,
-    or can be answered directly from general knowledge.
+    Classification guide:
+    - 'direct': Pure knowledge questions with no project context.
+      "What is a mutex?", "Explain async/await".
+    - 'web': Needs current internet data. "What's the latest React version?"
+    - 'project': READ-ONLY codebase exploration. "How does auth work here?",
+      "Explain the database schema", "What files handle routing?"
+    - 'task': ANY request that creates, modifies, or generates code.
+      "Add tests", "Fix the login bug", "Build a REST API", "Refactor models".
+      When in doubt between 'project' and 'task', prefer 'task' — the
+      system will fall back to single-agent if the task is simple.
 
     IMPORTANT: Short follow-up messages like "2", "yes", "the second one",
     "do it", "go ahead" are CONTINUATIONS of the previous conversation.
@@ -241,13 +249,14 @@ class QueryTriage(dspy.Signature):
     )
     category: str = dspy.OutputField(
         desc=(
-            "One of: 'direct' (general knowledge, simple questions "
-            "with NO prior conversation context), "
-            "'web' (needs web search or URL fetching for current info), "
-            "'project' (needs codebase exploration, or is a follow-up "
-            "to a previous project discussion), "
-            "'task' (multi-step coding task needing planning, or is a "
-            "follow-up to a previous task)"
+            "One of: 'direct' (general knowledge, no project needed), "
+            "'web' (needs internet search/fetch), "
+            "'project' (READ-ONLY: explore, analyze, explain existing "
+            "code without changing it), "
+            "'task' (WRITE/CHANGE: create files, fix bugs, refactor, "
+            "add features, implement, build, test, deploy — any request "
+            "that will modify or create code. When in doubt between "
+            "'project' and 'task', prefer 'task'.)"
         )
     )
     reasoning: str = dspy.OutputField(
@@ -290,6 +299,119 @@ class TaskPlanning(dspy.Signature):
             "Approach reasoning: what's the highest-quality "
             "way to accomplish this? What should the agent "
             "handle vs. what truly needs the user?"
+        )
+    )
+
+
+# ── Query Resolution ──────────────────────────────────────
+
+
+class QueryResolution(dspy.Signature):
+    """Resolve deictic references and expand short queries into full descriptions.
+
+    Given a potentially ambiguous user query and recent conversation history,
+    produce an unambiguous, fully-specified task description.  If the query
+    is already clear and self-contained, return it unchanged.
+
+    Examples of resolution:
+    - "fix this" + history about a bug  -> "Fix the TypeError in auth.py..."
+    - "2" + history with numbered options -> "Implement option 2: use Redis..."
+    - "do it" + history proposing refactor -> "Refactor the UserService class..."
+    - "yes, but use FastAPI" + history -> "Build the REST API using FastAPI..."
+    """
+
+    query: str = dspy.InputField(
+        desc="The user's raw query (may be short, ambiguous, or reference prior context)"
+    )
+    conversation_context: str = dspy.InputField(
+        desc=(
+            "Last 1-2 turns of conversation: the user's previous message "
+            "and the agent's previous response (including any numbered "
+            "options, file lists, proposed plans, or code suggestions)"
+        )
+    )
+    resolved_query: str = dspy.OutputField(
+        desc=(
+            "The fully resolved, unambiguous task description. If the "
+            "original query was already clear, return it verbatim. "
+            "Otherwise, expand all references ('this', 'that', 'it', "
+            "numbered options) into explicit descriptions using the "
+            "conversation context."
+        )
+    )
+    was_resolved: bool = dspy.OutputField(
+        desc="True if the query was modified/expanded, False if returned verbatim"
+    )
+
+
+# ── Task Decomposition ───────────────────────────────────────
+
+
+class TaskDecomposition(dspy.Signature):
+    """Decompose a complex coding task into a DAG of parallelisable sub-tasks.
+
+    Given a fully-resolved task description and project context, produce
+    a structured decomposition with:
+    - Sub-tasks that can be independently assigned to specialist agents
+    - Input/output contracts (what files/data each sub-task reads/writes)
+    - A shared specification (interfaces, naming conventions, patterns)
+    - A dependency graph and parallelism groups
+
+    IMPORTANT: Not every task should be decomposed.  If the task is
+    simple enough for a single agent (< 5 RLM iterations), return a
+    single sub-task.  Only decompose when there are genuinely
+    independent work streams.
+    """
+
+    task_description: str = dspy.InputField(
+        desc="The fully resolved task description"
+    )
+    project_context: str = dspy.InputField(
+        desc=(
+            "Project structure, existing files, conventions, "
+            "and any relevant code snippets"
+        )
+    )
+    sub_tasks: list[str] = dspy.OutputField(
+        desc=(
+            "JSON array of sub-task objects. Each object has: "
+            "'id' (str, e.g. 'T1'), "
+            "'description' (str, clear actionable description), "
+            "'agent_type' (str, one of: 'file', 'coder', 'test', 'review', "
+            "'web_search', 'web_fetch', 'planner', 'debug', 'security'), "
+            "'inputs' (list[str], files/data this task reads), "
+            "'outputs' (list[str], files/data this task produces), "
+            "'depends_on' (list[str], IDs of tasks that must complete first), "
+            "'max_iterations' (int, suggested RLM iterations 3-15). "
+            "Agent type guide: "
+            "'file' = read/analyze files (no writes), "
+            "'coder' = write production code, "
+            "'test' = write and run tests, "
+            "'review' = general code review and QA, "
+            "'web_search' = search the web for information/docs/APIs, "
+            "'web_fetch' = fetch and extract content from specific URLs, "
+            "'planner' = decompose sub-problems and create plans (no code), "
+            "'debug' = diagnose errors, read logs, trace issues, "
+            "'security' = security-focused vulnerability detection. "
+            "Example: [{'id':'T1','description':'Analyze existing API routes',"
+            "'agent_type':'file','inputs':['src/routes/'],'outputs':['analysis'],"
+            "'depends_on':[],'max_iterations':5}]"
+        )
+    )
+    shared_spec: str = dspy.OutputField(
+        desc=(
+            "A shared specification that all agents must follow: "
+            "naming conventions, interface contracts, file structure "
+            "conventions, import patterns, error handling approach. "
+            "This ensures all agents produce compatible output."
+        )
+    )
+    parallelism_groups: list[str] = dspy.OutputField(
+        desc=(
+            "JSON array of arrays. Each inner array is a group of task IDs "
+            "that can execute in parallel. Example: "
+            "[['T1','T2'],['T3'],['T4','T5']] "
+            "means T1+T2 run in parallel, then T3, then T4+T5 in parallel."
         )
     )
 
@@ -356,5 +478,136 @@ class LearningExtraction(dspy.Signature):
             "outdated and should be REPLACED. Copy the "
             "exact content text of the old learning. "
             "Empty list if no conflicts found."
+        )
+    )
+
+
+# ── Context-First Solving ──────────────────────────────────
+
+
+class ContextPlanning(dspy.Signature):
+    """Decide what context an autonomous coding agent needs to solve a task.
+
+    Given a user's query and a manifest of project files (paths + sizes),
+    determine which files should be read to provide sufficient context for
+    solving the task in a single pass.  Prioritise the most relevant files
+    first so that, if a budget limit is reached, the most important context
+    is always included.
+    """
+
+    query: str = dspy.InputField(
+        desc="The user's task or question"
+    )
+    file_manifest: str = dspy.InputField(
+        desc=(
+            "Newline-separated list of project files with byte sizes, "
+            "e.g. 'src/app.py (1234 bytes)'.  Covers all source files "
+            "in the project."
+        )
+    )
+    project_summary: str = dspy.InputField(
+        desc="Brief description of the project structure and purpose"
+    )
+
+    files_to_read: list[str] = dspy.OutputField(
+        desc=(
+            "File paths to read, ordered by relevance (most important "
+            "first).  Include every file likely needed to understand "
+            "and solve the task.  Use exact paths from the manifest."
+        )
+    )
+    search_patterns: list[str] = dspy.OutputField(
+        desc=(
+            "Optional grep/regex patterns to search across the codebase "
+            "for additional context (e.g. function names, error strings). "
+            "Return empty list if the files_to_read are sufficient."
+        )
+    )
+    reasoning: str = dspy.OutputField(
+        desc="Brief explanation of why these files are needed"
+    )
+
+
+class SingleShotSolving(dspy.Signature):
+    """Solve a coding task given complete source context in a single pass.
+
+    You receive the full source code of all relevant files concatenated
+    together, plus the user's task.  Produce a complete solution including:
+    1. Step-by-step reasoning about the problem
+    2. A human-readable summary of what you did
+    3. A JSON array of file operations to execute
+
+    IMPORTANT: The operations array must be valid JSON.  Each operation
+    is an object with an 'op' field and operation-specific fields.
+    """
+
+    query: str = dspy.InputField(
+        desc="The user's task or question"
+    )
+    full_context: str = dspy.InputField(
+        desc=(
+            "All relevant source code, concatenated with file headers "
+            "like '=== FILE: path/to/file.py ==='"
+        )
+    )
+
+    reasoning: str = dspy.OutputField(
+        desc=(
+            "Step-by-step analysis: what is the problem, what is the "
+            "root cause, what changes are needed and why"
+        )
+    )
+    answer: str = dspy.OutputField(
+        desc=(
+            "Human-readable summary of what was done (for the user). "
+            "Include file names and key changes."
+        )
+    )
+    operations: str = dspy.OutputField(
+        desc=(
+            'JSON array of operations to execute. Supported ops: '
+            '{"op":"write_file","path":"...","content":"..."} — '
+            'create or overwrite a file; '
+            '{"op":"edit_file","path":"...","old":"...","new":"..."} — '
+            'replace first occurrence of old text with new text; '
+            '{"op":"run_cmd","cmd":"..."} — run a shell command. '
+            'Return [] if no file changes are needed (answer-only query).'
+        )
+    )
+
+
+class VerificationFix(dspy.Signature):
+    """Fix code that failed linting or verification checks.
+
+    After the initial solution was applied, verification commands (linters,
+    type checkers, test runners) reported errors.  Given the current file
+    contents and the error output, produce ONLY the operations needed to
+    fix those specific errors.  Do not rewrite entire files — use
+    edit_file operations to make targeted fixes.
+    """
+
+    query: str = dspy.InputField(
+        desc="The original user task (for context)"
+    )
+    full_context: str = dspy.InputField(
+        desc=(
+            "Current source code of all affected files, "
+            "concatenated with file headers"
+        )
+    )
+    verification_errors: str = dspy.InputField(
+        desc=(
+            "Combined stdout+stderr from the failed verification "
+            "commands (lint errors, type errors, test failures)"
+        )
+    )
+
+    reasoning: str = dspy.OutputField(
+        desc="Analysis of each error and how to fix it"
+    )
+    operations: str = dspy.OutputField(
+        desc=(
+            'JSON array of fix operations. Prefer edit_file for '
+            'targeted fixes. Same format as SingleShotSolving operations.'
         )
     )

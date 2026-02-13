@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.4 (2026-02-13)
+
+### Added
+
+- **Context-First Solver**: Replaces the wasteful RLM iteration loop with a
+  2-call pipeline: gather context (pure I/O) then solve in one shot (1 LLM call).
+  Falls back to RLM on failure.  Projects under 200 KB get all files read
+  with zero planning calls.
+- **Verification/lint loop**: After file operations, auto-detects project
+  linters (ruff, eslint, go vet, cargo check) and feeds errors back to the
+  LLM for up to 2 fix cycles.
+- **5 new specialist agents**: WebSearchAgent, WebFetchAgent, PlannerAgent,
+  DebugAgent, SecurityAgent (9 total).
+- **Shared context gathering**: WorkflowEngine gathers project context
+  ONCE before fan-out, so specialists don't waste iterations rediscovering
+  files independently.
+- **Per-agent display transparency**: Multi-agent results show per-agent
+  breakdown (iterations, ops, duration) in the chat UI.
+- **Token tracking**: Context-first solver captures DSPy token usage and
+  displays it in the result metadata.
+
+### Fixed
+
+- **Double-triage bug**: Chat CLI now triages ONCE and passes the result
+  to the coding agent via payload, eliminating redundant LLM calls.
+- **Triage classification**: QueryTriage signature rewritten to aggressively
+  classify code-change requests as "task" (triggering multi-agent workflow)
+  vs read-only "project" exploration.
+- **Version banner**: Fixed version display in chat CLI banner.
+
+## 0.1.3 (2026-02-13)
+
+### Added
+
+- **Multi-agent coordination system (Phase 6)**: Task decomposition into
+  parallel sub-tasks with shared specifications, specialist agents
+  (FileAgent, CoderAgent, TestAgent, ReviewAgent), WorkflowEngine with
+  decompose -> fan-out -> review -> revise -> merge pipeline.
+- **QueryResolver**: Resolves deictic references ("fix this", "2", "do it")
+  using conversation history before triage dispatch.
+- **TaskDecomposer**: DSPy-powered DAG decomposition with cycle detection,
+  parallelism group inference, and single-task fallback.
+- **SharedSpec store**: Cross-agent shared specification for alignment,
+  file ownership tracking, and conflict detection.
+- **4 specialist agents**: FileAgent (read-only analysis), CoderAgent
+  (code generation), TestAgent (test writing), ReviewAgent (quality review).
+  All registered via `@agent` decorator.
+- **WorkflowEngine**: Orchestrates multi-agent workflows with parallel
+  execution via `asyncio.gather()`, review/revision loops (up to 2 rounds),
+  and graceful single-agent fallback.
+- **Chat CLI integration**: `/agents` and `/workflow` slash commands,
+  workflow-aware triage routing, `WorkflowResult` display.
+- **87 new tests**: Full coverage for query_resolver, decomposer,
+  shared_spec, specialists, and workflow modules.
+- **RLM action pressure**: Iteration budget signals and stall detection
+  to prevent the agent from endlessly re-reading files without acting.
+
+### Changed
+
+- Orchestrator default timeout bumped from 30s to 120s for RLM-based agents.
+- `memfun-agent` `__init__.py` exports all Phase 6 modules.
+
 ## 0.1.2 (2026-02-12)
 
 ### Fixed

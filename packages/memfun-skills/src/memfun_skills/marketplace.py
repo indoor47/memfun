@@ -235,7 +235,7 @@ class SkillPackager:
 
         # Parse key fields (simple YAML parsing)
         name = None
-        version = "0.1.2"  # default
+        version = "0.1.4"  # default
         description = None
 
         i = 0

@@ -224,6 +224,8 @@ _HELP_TEXT = """\
   /memory    View current memory contents
   /forget    Forget a memory entry
   /debug-learning  Test the learning extraction pipeline
+  /agents    List running multi-agent workflow agents
+  /workflow   Show current workflow DAG and status
 
 [dim]Esc or Ctrl+C cancels a running request.[/dim]
 """
@@ -254,7 +256,7 @@ _SLASH_COMPLETER = WordCompleter(
         "/help", "/exit", "/quit", "/clear",
         "/context", "/history", "/model", "/traces",
         "/remember", "/memory", "/forget",
-        "/debug-learning",
+        "/debug-learning", "/agents", "/workflow",
     ],
     sentence=True,
 )
@@ -287,6 +289,10 @@ class ChatSession:
         self._plan_detail: dict[int, str] = {}
         self._plan_step_start: dict[int, float] = {}
         self._plan_step_duration: dict[int, float] = {}
+        # Multi-agent workflow state
+        self._workflow_engine: Any | None = None
+        self._current_workflow: Any | None = None
+        self._sub_task_statuses: dict[str, Any] = {}
 
     async def start(self) -> None:
         """Load config, build runtime, create agent, scan cwd."""
@@ -311,6 +317,12 @@ class ChatSession:
         self._learning_manager = LearningManager(
             self._runtime.state_store
         )
+
+        # Register specialist agents for multi-agent workflows
+        try:
+            import memfun_agent.specialists  # noqa: F401
+        except Exception:
+            logger.debug("Specialist agents unavailable", exc_info=True)
 
         # Load persistent conversation history
         self._history = _load_history()
@@ -348,6 +360,51 @@ class ChatSession:
                 self._plan_step_duration[step_num] = (
                     time.monotonic() - start
                 )
+
+    # ── Multi-agent workflow support ──────────────────────
+
+    async def _init_workflow_engine(self) -> Any:
+        """Lazily initialise the WorkflowEngine."""
+        if self._workflow_engine is not None:
+            return self._workflow_engine
+
+        from memfun_agent.workflow import WorkflowEngine
+        from memfun_runtime.lifecycle import AgentManager
+        from memfun_runtime.orchestrator import (
+            AgentOrchestrator,
+            OrchestratorConfig,
+            RetryPolicy,
+        )
+
+        manager = AgentManager(self._runtime)
+        # Start rlm-coder for single-task fallback
+        if not manager.is_running("rlm-coder"):
+            await manager.start_agent("rlm-coder")
+
+        config = OrchestratorConfig(
+            default_timeout_seconds=600.0,
+            retry_policy=RetryPolicy.FIXED,
+            max_retries=1,
+        )
+        orchestrator = AgentOrchestrator(
+            self._runtime, manager, config=config,
+        )
+        self._workflow_engine = WorkflowEngine(
+            context=self._runtime,
+            orchestrator=orchestrator,
+            manager=manager,
+            on_workflow_status=self._on_workflow_status,
+            on_sub_task_status=self._on_sub_task_status,
+        )
+        return self._workflow_engine
+
+    def _on_workflow_status(self, state: Any) -> None:
+        """Track workflow status for live display."""
+        self._current_workflow = state
+
+    def _on_sub_task_status(self, task_id: str, status: Any) -> None:
+        """Track per-sub-task status for live display."""
+        self._sub_task_statuses[task_id] = status
 
     async def chat_turn(self, user_input: str) -> TaskResult:
         """Process one user message and return the agent's response."""
@@ -462,17 +519,7 @@ class ChatSession:
 
         context = "\n\n".join(context_parts)
 
-        task_msg = TaskMessage(
-            task_id=uuid.uuid4().hex,
-            agent_id=self._agent.agent_id,
-            payload={
-                "type": "ask",
-                "query": user_input,
-                "context": context,
-                "conversation_history": self._history,
-            },
-        )
-
+        # Reset per-turn tracking
         self._last_step = None
         self._completed_steps = []
         self._plan = []
@@ -480,7 +527,13 @@ class ChatSession:
         self._plan_detail = {}
         self._plan_step_start = {}
         self._plan_step_duration = {}
-        result = await self._agent.handle(task_msg)
+        self._current_workflow = None
+        self._sub_task_statuses = {}
+
+        # Try multi-agent path for "task" queries
+        result = await self._try_workflow_or_single(
+            user_input, context,
+        )
 
         # Append to persistent history with rich metadata
         data = result.result or {}
@@ -548,6 +601,109 @@ class ChatSession:
                 )
 
         return result
+
+    async def _try_workflow_or_single(
+        self,
+        user_input: str,
+        context: str,
+    ) -> TaskResult:
+        """Route to multi-agent workflow for 'task' queries, else single agent."""
+        assert self._agent is not None
+
+        # Triage ONCE — result is reused for both workflow and
+        # single-agent paths (eliminates redundant LLM call).
+        category = ""
+        if self._runtime is not None:
+            try:
+                category = await self._agent._triage_query(
+                    user_input, context,
+                )
+                logger.info("Triage: %s", category)
+            except Exception:
+                logger.debug(
+                    "Triage failed, using single agent",
+                    exc_info=True,
+                )
+
+        if category == "task":
+            try:
+                engine = await self._init_workflow_engine()
+                wf_result = await engine.execute_workflow(
+                    task_description=user_input,
+                    project_context=context,
+                    conversation_history=self._history,
+                )
+                # If decomposition produced multiple sub-tasks, return workflow result
+                if (
+                    wf_result.decomposition
+                    and not wf_result.decomposition.is_single_task
+                ):
+                    return self._workflow_to_task_result(wf_result)
+                # Single-task decomposition: its result is already a TaskResult
+                if wf_result.sub_task_results:
+                    first = next(iter(wf_result.sub_task_results.values()))
+                    return first
+            except Exception as exc:
+                logger.warning(
+                    "Multi-agent workflow failed, falling back: %s",
+                    exc,
+                )
+
+        # Single-agent path — pass triage result so the agent
+        # does not repeat the LLM triage call.
+        task_msg = TaskMessage(
+            task_id=uuid.uuid4().hex,
+            agent_id=self._agent.agent_id,
+            payload={
+                "type": "ask",
+                "query": user_input,
+                "context": context,
+                "conversation_history": self._history,
+                "triage_category": category,
+            },
+        )
+        return await self._agent.handle(task_msg)
+
+    @staticmethod
+    def _workflow_to_task_result(wf_result: Any) -> TaskResult:
+        """Convert a WorkflowResult into a TaskResult for display compatibility."""
+        from memfun_core.types import TaskResult as TaskRes
+
+        # Build per-agent breakdown for transparency.
+        agent_breakdown: list[dict[str, Any]] = []
+        for tid, sub_result in (
+            wf_result.sub_task_results or {}
+        ).items():
+            data = sub_result.result or {}
+            agent_breakdown.append({
+                "task_id": tid,
+                "agent": sub_result.agent_id,
+                "method": data.get("method", ""),
+                "iterations": data.get("iterations", 0),
+                "ops_count": len(data.get("ops", [])),
+                "files_count": len(
+                    data.get("files_created", [])
+                ),
+                "duration_ms": sub_result.duration_ms,
+                "success": sub_result.success,
+            })
+
+        return TaskRes(
+            task_id=wf_result.workflow_id,
+            agent_id="workflow-engine",
+            success=wf_result.success,
+            result={
+                "answer": wf_result.answer,
+                "method": "multi_agent",
+                "iterations": wf_result.review_rounds,
+                "ops": wf_result.ops,
+                "files_created": wf_result.files_created,
+                "review_summary": wf_result.review_summary,
+                "agent_breakdown": agent_breakdown,
+            },
+            error=wf_result.error,
+            duration_ms=wf_result.total_duration_ms,
+        )
 
     def clear_history(self) -> None:
         self._history.clear()
@@ -862,6 +1018,49 @@ def _display_answer(result: TaskResult) -> None:
             )
             console.print()
 
+    # Show multi-agent breakdown if available.
+    agent_breakdown = data.get("agent_breakdown", [])
+    if agent_breakdown:
+        console.print()
+        console.print("  [bold]Agents:[/bold]")
+        console.print()
+        for ab in agent_breakdown:
+            icon = (
+                "[green]✓[/green]"
+                if ab.get("success")
+                else "[red]✗[/red]"
+            )
+            dur = (
+                _format_elapsed(ab["duration_ms"] / 1000)
+                if ab.get("duration_ms")
+                else ""
+            )
+            parts = []
+            iters = ab.get("iterations", 0)
+            if iters:
+                parts.append(f"{iters} iter")
+            ops_n = ab.get("ops_count", 0)
+            if ops_n:
+                parts.append(
+                    f"{ops_n} op{'s' if ops_n != 1 else ''}"
+                )
+            if dur:
+                parts.append(dur)
+            detail = ", ".join(parts)
+            console.print(
+                f"    {icon} {ab.get('agent', '?')}"
+                f" [dim]({detail})[/dim]"
+            )
+        console.print()
+
+    # Show review summary if present.
+    review_summary = data.get("review_summary", "")
+    if review_summary:
+        console.print(
+            f"  [bold]Review:[/bold] {review_summary}"
+        )
+        console.print()
+
     # Show operations summary
     _display_ops_summary(ops, files_created)
     console.print()
@@ -1154,7 +1353,7 @@ def _get_version() -> str:
         from importlib.metadata import version
         return version("memfun-cli")
     except Exception:
-        return "0.1.2"
+        return "0.1.4"
 
 
 def _load_credentials() -> None:
@@ -1596,6 +1795,105 @@ async def _async_chat_loop() -> None:
                         console.print(
                             f"    [dim]No file:"
                             f" {ppath}[/dim]"
+                        )
+                    console.print()
+                    continue
+                if cmd == "/agents":
+                    if session._workflow_engine is None:
+                        console.print(
+                            "  [dim]No workflow engine"
+                            " initialized yet (start a"
+                            " complex task first).[/dim]"
+                        )
+                        continue
+                    try:
+                        mgr = session._workflow_engine._manager
+                        running = mgr.list_running()
+                        if not running:
+                            console.print(
+                                "  [dim]No agents running"
+                                "[/dim]"
+                            )
+                        else:
+                            console.print(
+                                f"\n  [bold]Running Agents"
+                                f" ({len(running)})"
+                                f"[/bold]\n"
+                            )
+                            for name in sorted(running):
+                                console.print(
+                                    f"  [green]\u2022[/green]"
+                                    f" {name}"
+                                )
+                            console.print()
+                    except Exception as exc:
+                        console.print(
+                            f"  [red]Error: {exc}[/red]"
+                        )
+                    continue
+                if cmd == "/workflow":
+                    wf = session._current_workflow
+                    if wf is None:
+                        console.print(
+                            "  [dim]No active workflow."
+                            " Start a complex task to"
+                            " trigger multi-agent"
+                            " decomposition.[/dim]"
+                        )
+                        continue
+                    console.print(
+                        f"\n  [bold]Workflow"
+                        f" {wf.workflow_id[:12]}..."
+                        f"[/bold]"
+                    )
+                    console.print(
+                        f"  Status: [cyan]"
+                        f"{wf.status.value}[/cyan]"
+                    )
+                    if wf.decomposition:
+                        d = wf.decomposition
+                        console.print(
+                            f"  Sub-tasks: {len(d.sub_tasks)}"
+                            f"  Groups: {len(d.parallelism_groups)}"
+                        )
+                        console.print(
+                            f"  Single-task: {d.is_single_task}"
+                        )
+                        console.print()
+                        for st in d.sub_tasks:
+                            sts = session._sub_task_statuses.get(
+                                st.id
+                            )
+                            status = sts.status if sts else "pending"
+                            icons = {
+                                "pending": "[dim]\u25cb[/dim]",
+                                "running": "[cyan]\u25cf[/cyan]",
+                                "completed": "[green]\u2713[/green]",
+                                "failed": "[red]\u2717[/red]",
+                                "revision": "[yellow]\u21bb[/yellow]",
+                            }
+                            icon = icons.get(
+                                status, "[dim]?[/dim]"
+                            )
+                            deps = ""
+                            if st.depends_on:
+                                deps = (
+                                    f" [dim](after "
+                                    f"{','.join(st.depends_on)})"
+                                    f"[/dim]"
+                                )
+                            desc = st.description[:60]
+                            console.print(
+                                f"  {icon} [{st.id}]"
+                                f" {desc}"
+                                f" [dim]({st.agent_type})[/dim]"
+                                f"{deps}"
+                            )
+                    if wf.review_rounds > 0:
+                        console.print(
+                            f"\n  Review rounds:"
+                            f" {wf.review_rounds}"
+                            f"/{wf.max_review_rounds}"
                         )
                     console.print()
                     continue
