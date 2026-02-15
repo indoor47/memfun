@@ -1171,20 +1171,41 @@ def _make_edit_file(
     """Create an ``edit_file`` helper bound to *ns*."""
     import os as _os
 
+    from memfun_agent.context_first import _fuzzy_find_and_replace
+
     def edit_file(
         path: str, old_text: str, new_text: str
     ) -> bool:
         """Replace first occurrence of *old_text* in file.
+
+        Uses fuzzy matching (whitespace normalization, then line-level
+        difflib) when exact matching fails.
 
         Returns ``True`` if the replacement was made.
         """
         path = _os.path.abspath(path)
         with open(path) as fh:
             content = fh.read()
-        if old_text not in content:
-            print(f"Text not found in {path}")
+
+        new_content, ratio, snippet, strategy = _fuzzy_find_and_replace(
+            content, old_text, new_text
+        )
+
+        if new_content is None:
+            print(
+                f"Text not found in {path} "
+                f"(best ratio={ratio:.2f}, strategy={strategy})"
+            )
+            if snippet:
+                print(f"  Closest match: {snippet[:200]}")
             return False
-        new_content = content.replace(old_text, new_text, 1)
+
+        if strategy != "exact":
+            print(
+                f"Fuzzy match in {path} "
+                f"(ratio={ratio:.2f}, strategy={strategy})"
+            )
+
         with open(path, "w") as fh:
             fh.write(new_content)
         ns["state"]["_ops"].append(
@@ -1321,7 +1342,7 @@ def _make_web_search(
         """
         max_results = min(max(1, max_results), 10)
         try:
-            from duckduckgo_search import DDGS
+            from ddgs import DDGS
 
             with DDGS() as ddgs:
                 raw = list(
@@ -1348,9 +1369,8 @@ def _make_web_search(
             return results
         except ImportError:
             print(
-                "[web_search] duckduckgo-search not "
-                "installed. Run: pip install "
-                "duckduckgo-search"
+                "[web_search] ddgs not installed. "
+                "Run: pip install ddgs"
             )
             return []
         except Exception as exc:

@@ -34,12 +34,12 @@ def _deep_merge(base: dict, override: dict) -> dict:
 @dataclass(frozen=True, slots=True)
 class LLMConfig:
     provider: str = "anthropic"
-    model: str = "claude-sonnet-4-5"
+    model: str = "claude-opus-4-6"
     sub_model: str | None = None
     api_key_env: str = "ANTHROPIC_API_KEY"
     base_url: str | None = None
     temperature: float = 0.0
-    max_tokens: int = 8192
+    max_tokens: int = 32768
 
 
 @dataclass(frozen=True, slots=True)

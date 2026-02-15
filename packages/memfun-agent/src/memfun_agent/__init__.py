@@ -30,9 +30,12 @@ from memfun_agent.code_map import (
 )
 from memfun_agent.coding_agent import RLMCodingAgent
 from memfun_agent.context_first import (
+    ConsistencyResult,
+    ConsistencyReviewer,
     ContextFirstConfig,
     ContextFirstResult,
     ContextFirstSolver,
+    EditDiagnostic,
 )
 from memfun_agent.decomposer import (
     DecompositionResult,
@@ -63,6 +66,7 @@ from memfun_agent.signatures import (
     CodeAnalysis,
     CodeExplanation,
     CodeReview,
+    ConsistencyReview,
     ContextPlanning,
     LearningExtraction,
     QueryResolution,
@@ -110,6 +114,9 @@ __all__ = [
     "CodeExplanation",
     "CodeReview",
     "CoderAgent",
+    "ConsistencyResult",
+    "ConsistencyReview",
+    "ConsistencyReviewer",
     "ContextFirstConfig",
     "ContextFirstResult",
     "ContextFirstSolver",
@@ -118,6 +125,7 @@ __all__ = [
     "DecompositionResult",
     "DefinedAgent",
     "Definition",
+    "EditDiagnostic",
     "ExecutionTrace",
     "FileAgent",
     "FileMap",

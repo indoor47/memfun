@@ -284,7 +284,8 @@ class RLMCodingAgent(BaseAgent):
                         enable_planning=False,
                     )
                 result_data = await self._handle_rlm(
-                    task_type, query, context, payload
+                    task_type, query, context, payload,
+                    category=category,
                 )
             else:
                 result_data = await self._handle_direct(
@@ -333,6 +334,8 @@ class RLMCodingAgent(BaseAgent):
         query: str,
         context: str,
         payload: dict[str, Any],
+        *,
+        category: str = "",
     ) -> dict[str, Any]:
         """Handle a task using context-first solver, falling back to RLM."""
         assert self._rlm is not None
@@ -345,15 +348,17 @@ class RLMCodingAgent(BaseAgent):
         # Extract conversation history from payload
         history = payload.get("conversation_history")
 
-        # Try context-first approach (fewer LLM calls) for all
-        # categories.  Escalation to multi-agent is handled by
-        # the caller (chat.py) if this fast path fails.
+        # Try context-first approach (fewer LLM calls).
+        # Web queries are handled via context-first's built-in
+        # web search (planner plans searches, gatherer executes them).
         if self._context_solver is not None:
             try:
                 cf_result = await self._context_solver.asolve(
                     query=full_query,
+                    raw_query=query,
                     context=context,
                     conversation_history=history,
+                    category=category,
                 )
                 if cf_result.success:
                     result_dict = cf_result.to_result_dict()

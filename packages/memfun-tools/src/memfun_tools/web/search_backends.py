@@ -40,7 +40,7 @@ class DuckDuckGoBackend:
 
     async def is_available(self) -> bool:
         try:
-            from duckduckgo_search import DDGS  # noqa: F401
+            from ddgs import DDGS  # noqa: F401
             return True
         except ImportError:
             return False
@@ -48,7 +48,7 @@ class DuckDuckGoBackend:
     async def search(self, query: str, max_results: int = 10) -> list[SearchResult]:
         import asyncio
 
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
 
         def _search() -> list[SearchResult]:
             with DDGS() as ddgs:
@@ -188,5 +188,5 @@ async def get_best_backend(preferred: str = "duckduckgo") -> SearchBackend:
 
     raise RuntimeError(
         "No search backend available. "
-        "Install duckduckgo-search: pip install duckduckgo-search"
+        "Install ddgs: pip install ddgs"
     )

@@ -539,6 +539,16 @@ class ContextPlanning(dspy.Signature):
             "Return empty list if the files_to_read are sufficient."
         )
     )
+    web_searches: str = dspy.OutputField(
+        desc=(
+            "JSON array of web search queries needed to answer the user's "
+            "question. Use this for questions about current events, "
+            "documentation, APIs, library usage, or anything that requires "
+            "up-to-date information. Return [] if the answer can be found "
+            "entirely in the project files. "
+            'Example: ["python requests library timeout", "FastAPI websocket docs"]'
+        )
+    )
     reasoning: str = dspy.OutputField(
         desc="Brief explanation of why these files are needed"
     )
@@ -555,6 +565,28 @@ class SingleShotSolving(dspy.Signature):
 
     IMPORTANT: The operations array must be valid JSON.  Each operation
     is an object with an 'op' field and operation-specific fields.
+
+    SCOPE RULES (HIGHEST PRIORITY):
+    - Read the user's query carefully.  Do ONLY what is asked.
+    - Do NOT add new features, new UI elements, new functionality, or
+      new sections that the user did not request.
+    - Do NOT restructure, redesign, or rearchitect existing code.
+    - If the user asks to resize or restyle, change ONLY sizes and styles.
+    - If the user asks to fix a bug, fix ONLY that bug.
+    - Conversation history may mention past features or plans — IGNORE
+      them.  Only the current query matters.
+    - When in doubt, do LESS.  It is far better to make too few changes
+      than too many.  The user can always ask for more.
+
+    EDIT RULES:
+    - For EXISTING files shown in the context: ALWAYS use edit_file with
+      targeted changes.  NEVER rewrite an entire existing file with
+      write_file — rewriting destroys functionality you may not reproduce.
+    - For NEW files that don't exist yet: Use write_file.
+    - Make the MINIMUM changes needed.  Do not reorganize, restyle, or
+      "improve" code beyond what the user specifically asked for.
+    - Each edit_file should change one logical thing.  Prefer multiple
+      small edit_file ops over one large write_file.
     """
 
     query: str = dspy.InputField(
@@ -569,25 +601,38 @@ class SingleShotSolving(dspy.Signature):
 
     reasoning: str = dspy.OutputField(
         desc=(
-            "Step-by-step analysis: what is the problem, what is the "
-            "root cause, what changes are needed and why"
+            "First, restate the user's request in one sentence to confirm "
+            "what they are asking for.  Then analyze step-by-step: what "
+            "specific changes are needed to fulfil ONLY that request.  "
+            "Do NOT plan changes for anything not explicitly requested."
         )
     )
     answer: str = dspy.OutputField(
         desc=(
-            "Human-readable summary of what was done (for the user). "
-            "Include file names and key changes."
+            "Concise summary of ONLY what you changed in this task. "
+            "List the specific modifications made (e.g. 'Reduced card "
+            "sizes and tightened spacing in style.css'). "
+            "Do NOT describe existing features, application state, or "
+            "functionality that was already present. Do NOT list new "
+            "features you added that were not requested. Focus strictly "
+            "on the delta — what is new or different after your changes."
         )
     )
     operations: str = dspy.OutputField(
         desc=(
-            'JSON array of operations to execute. Supported ops: '
-            '{"op":"write_file","path":"...","content":"..."} — '
-            'create or overwrite a file; '
-            '{"op":"edit_file","path":"...","old":"...","new":"..."} — '
-            'replace first occurrence of old text with new text; '
-            '{"op":"run_cmd","cmd":"..."} — run a shell command. '
-            'Return [] if no file changes are needed (answer-only query).'
+            'JSON array of operations. Supported ops:\n'
+            '{"op":"edit_file","path":"...","old":"exact text",'
+            '"new":"replacement"} '
+            '— targeted replacement in an EXISTING file. '
+            'ALWAYS prefer this.\n'
+            '{"op":"write_file","path":"...","content":"..."} '
+            '— create a NEW file only. '
+            'NEVER use on files shown in context.\n'
+            '{"op":"run_cmd","cmd":"..."} — run a shell command.\n'
+            'Return [] for answer-only queries.\n'
+            'RULE: Use edit_file for ALL modifications to existing '
+            'files. Use write_file ONLY to create files that do not '
+            'exist yet.'
         )
     )
 
@@ -623,7 +668,82 @@ class VerificationFix(dspy.Signature):
     )
     operations: str = dspy.OutputField(
         desc=(
-            'JSON array of fix operations. Prefer edit_file for '
-            'targeted fixes. Same format as SingleShotSolving operations.'
+            'JSON array of fix operations. Supported ops:\n'
+            '{"op":"edit_file","path":"...","old":"exact text",'
+            '"new":"replacement"} — ALWAYS use for existing files.\n'
+            '{"op":"write_file","path":"...","content":"..."} — '
+            'ONLY for creating new files.\n'
+            '{"op":"run_cmd","cmd":"..."} — run a shell command.\n'
+            'RULE: NEVER rewrite entire existing files. Use targeted '
+            'edit_file ops to fix specific errors.'
+        )
+    )
+
+
+class ConsistencyReview(dspy.Signature):
+    """Review whether executed code changes are complete and internally consistent.
+
+    After a coding task was solved and file operations were executed, check
+    whether the produced output actually fulfils the user's request.  Compare
+    what the user asked for against what the files now contain.
+
+    CRITICAL: The user_request is the source of truth.  If the solver
+    claimed to do things not in the user_request, those are SCOPE ISSUES
+    that should be flagged.  Only check that the user's actual request
+    was fulfilled correctly.
+
+    Focus on SEMANTIC issues that a linter cannot catch:
+    - Intended changes that were NOT actually applied (missing code)
+    - Changes that do NOT match what the user asked for (scope creep)
+    - Cross-file reference mismatches (JS onclick handlers referencing
+      HTML ids that don't exist, CSS classes not used in HTML, imports
+      of functions that were never defined)
+    - Orphaned code (functions defined but never called, event handlers
+      wired to wrong targets)
+    - Incomplete implementations (TODO/placeholder left in, function
+      stub without body, partial feature that stops mid-way)
+    - Features or changes that were ADDED but NOT REQUESTED by the user
+
+    If everything is correct and complete, set has_issues to False and
+    return an empty issues list.
+    """
+
+    user_request: str = dspy.InputField(
+        desc=(
+            "The original user task/question that was being solved. "
+            "This is the SOURCE OF TRUTH for what should have been done. "
+            "Any changes not related to this request are scope issues."
+        )
+    )
+    intended_changes: str = dspy.InputField(
+        desc=(
+            "What the solver claimed it would do (the answer/summary "
+            "from the solve step, plus the list of intended operations)"
+        )
+    )
+    actual_file_contents: str = dspy.InputField(
+        desc=(
+            "Current contents of all modified files after operations "
+            "were executed, concatenated with '=== FILE: path ===' headers"
+        )
+    )
+
+    has_issues: bool = dspy.OutputField(
+        desc=(
+            "True if any consistency issues were found, "
+            "False if everything looks correct"
+        )
+    )
+    issues: list[str] = dspy.OutputField(
+        desc=(
+            "List of specific consistency issues found.  Each issue "
+            "should be actionable: state the file, what is wrong, and "
+            "what should be there.  Return empty list if no issues."
+        )
+    )
+    reasoning: str = dspy.OutputField(
+        desc=(
+            "Brief analysis of how the actual output compares "
+            "to the intended changes"
         )
     )

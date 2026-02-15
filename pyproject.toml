@@ -1,6 +1,6 @@
 [project]
 name = "memfun"
-version = "0.1.6"
+version = "0.1.15"
 description = "OSS autonomous coding agent: pluggable runtime + DSPy RLM + MCP + Agent Skills"
 license = "Apache-2.0"
 readme = "README.md"

@@ -248,7 +248,7 @@ _HELP_TEXT = """\
 # Models available for switching via /model
 _AVAILABLE_MODELS: dict[str, list[tuple[str, str]]] = {
     "anthropic": [
-        ("claude-opus-4-6", "Opus 4.6 — most intelligent"),
+        ("claude-opus-4-6", "Opus 4.6 — most intelligent (default)"),
         ("claude-sonnet-4-5", "Sonnet 4.5 — fast + smart"),
         ("claude-haiku-4-5", "Haiku 4.5 — fastest"),
     ],
@@ -304,6 +304,9 @@ class ChatSession:
         self._plan_detail: dict[int, str] = {}
         self._plan_step_start: dict[int, float] = {}
         self._plan_step_duration: dict[int, float] = {}
+        # Context-first solver live status
+        self._context_first_status: str = ""
+        self._context_first_completed: list[str] = []
         # Multi-agent workflow state
         self._workflow_engine: Any | None = None
         self._current_workflow: Any | None = None
@@ -326,6 +329,9 @@ class ChatSession:
         self._agent.on_step = self._on_step_callback
         self._agent.on_plan = self._on_plan_callback
         self._agent.on_step_status = self._on_step_status_callback
+        self._agent.on_context_first_status = (
+            self._on_context_first_status_callback
+        )
         await self._agent.on_start()
 
         # Initialize persistent learning memory
@@ -376,6 +382,18 @@ class ChatSession:
                     time.monotonic() - start
                 )
 
+    # ── Context-first status callback ────────────────────
+
+    def _on_context_first_status_callback(self, msg: str) -> None:
+        """Called by ContextFirstSolver/OperationExecutor with live status."""
+        # Move previous status to the completed list so it gets
+        # printed permanently above the spinner.
+        if self._context_first_status:
+            self._context_first_completed.append(
+                self._context_first_status
+            )
+        self._context_first_status = msg
+
     # ── Multi-agent workflow support ──────────────────────
 
     async def _init_workflow_engine(self) -> Any:
@@ -424,6 +442,10 @@ class ChatSession:
     async def chat_turn(self, user_input: str) -> TaskResult:
         """Process one user message and return the agent's response."""
         assert self._agent is not None
+
+        # Reset context-first status from previous turn
+        self._context_first_status = ""
+        self._context_first_completed = []
 
         # Rescan CWD so context reflects files created by prior turns
         self._cwd_context = _scan_cwd_context(Path.cwd())
@@ -485,7 +507,7 @@ class ChatSession:
                 )
                 if content:
                     recent_summary += (
-                        f"\nAgent response: {content[:2000]}"
+                        f"\nAgent response: {content[:8000]}"
                     )
                 context_parts.append(recent_summary)
 
@@ -1326,8 +1348,10 @@ def _make_progress_renderable(
             return _make_workflow_progress(
                 session, wf_state, elapsed, frame,
             )
+        # Show context-first solver status if available
+        label = session._context_first_status or "Thinking..."
         lines.append(
-            f"  {frame} Thinking..."
+            f"  {frame} {label}"
             f"  [dim]({_format_elapsed(elapsed)})[/dim]"
         )
         lines.append("")
@@ -1486,6 +1510,45 @@ def _print_completed_steps(
             )
             out.print()
             printed.add(i)
+
+
+def _print_completed_cf_statuses(
+    session: ChatSession,
+    printed_count: list[int],
+    target_console: Console | None = None,
+) -> None:
+    """Print newly completed context-first status lines permanently.
+
+    Called in the main loop so completed statuses stream above the
+    Live spinner.  *printed_count* is a single-element list tracking
+    how many statuses have been printed so far.
+    """
+    out = target_console or console
+    completed = session._context_first_completed
+    already = printed_count[0]
+
+    if len(completed) <= already:
+        return
+
+    for msg in completed[already:]:
+        # Distinguish file operations from other statuses
+        if (
+            msg.startswith("Wrote ")
+            or msg.startswith("Edited ")
+            or msg.startswith("Ran: ")
+        ):
+            out.print(f"    [green]✓[/green] {msg}")
+        elif (
+            msg.startswith("Edit failed")
+            or msg.startswith("Command failed")
+        ):
+            out.print(f"    [red]✗[/red] {msg}")
+        elif msg.startswith("Reading "):
+            out.print(f"    [dim]↓[/dim] {msg}")
+        else:
+            out.print(f"    [dim]•[/dim] {msg}")
+
+    printed_count[0] = len(completed)
 
 
 def _print_completed_iterations(
@@ -2252,6 +2315,7 @@ async def _async_chat_loop() -> None:
             typed_ahead = ""  # buffer keystrokes for next prompt
             printed_steps: set[int] = set()
             printed_iters: list[int] = [0]
+            printed_cf: list[int] = [0]
             printed_wf_events: set[str] = set()
 
             # Set up terminal for Escape key detection
@@ -2289,6 +2353,13 @@ async def _async_chat_loop() -> None:
                         _print_completed_steps(
                             session,
                             printed_steps,
+                            live.console,
+                        )
+
+                        # Stream context-first solver statuses
+                        _print_completed_cf_statuses(
+                            session,
+                            printed_cf,
                             live.console,
                         )
 
@@ -2348,6 +2419,10 @@ async def _async_chat_loop() -> None:
 
             if result is not None:
                 _display_answer(result)
+
+            # Separator between turns for visual clarity
+            console.print()
+            console.rule(style="dim")
             console.print()
 
     finally:
