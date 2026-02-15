@@ -348,19 +348,33 @@ class QueryResolution(dspy.Signature):
 
 
 class TaskDecomposition(dspy.Signature):
-    """Decompose a complex coding task into a DAG of parallelisable sub-tasks.
+    """Decompose a coding task into sub-tasks ONLY when genuinely needed.
 
-    Given a fully-resolved task description and project context, produce
-    a structured decomposition with:
-    - Sub-tasks that can be independently assigned to specialist agents
-    - Input/output contracts (what files/data each sub-task reads/writes)
-    - A shared specification (interfaces, naming conventions, patterns)
-    - A dependency graph and parallelism groups
+    SIMPLE tasks (bug fixes, single-file edits, small changes):
+      Return exactly 1 sub-task with agent_type="coder".
+      Examples: "Fix the TypeError on line 162", "Add null check to fetchWeather",
+      "Change color from blue to red", "Fix the undefined variable bug"
 
-    IMPORTANT: Not every task should be decomposed.  If the task is
-    simple enough for a single agent (< 5 RLM iterations), return a
-    single sub-task.  Only decompose when there are genuinely
-    independent work streams.
+    COMPLEX tasks (multi-file features, redesigns, migrations):
+      Return 3+ sub-tasks with appropriate specialist agents.
+      Examples: "Redesign sidebar with animations", "Add JWT authentication",
+      "Migrate database from MySQL to PostgreSQL"
+
+    Let the task description guide you. Most bug fixes are simple.
+    When in doubt, use fewer sub-tasks — the system can escalate later.
+
+    Complex examples:
+      "Redesign the sidebar with animations" ->
+        T1 (file): Analyze current sidebar code and CSS structure
+        T2 (coder): Implement new sidebar layout and styling
+        T3 (coder): Add CSS/JS animations and transitions
+        T4 (review): Review for quality and consistency (depends T2,T3)
+
+      "Add authentication to the API" ->
+        T1 (file): Analyze current API routes and middleware
+        T2 (coder): Implement auth middleware and user model
+        T3 (test): Write and run auth tests (depends T2)
+        T4 (security): Security review of auth implementation
     """
 
     task_description: str = dspy.InputField(
@@ -374,7 +388,8 @@ class TaskDecomposition(dspy.Signature):
     )
     sub_tasks: list[str] = dspy.OutputField(
         desc=(
-            "JSON array of sub-task objects. Each object has: "
+            "JSON array of sub-task objects. Return 1 for simple tasks, "
+            "3+ for complex ones. Each object has: "
             "'id' (str, e.g. 'T1'), "
             "'description' (str, clear actionable description), "
             "'agent_type' (str, one of: 'file', 'coder', 'test', 'review', "
@@ -393,9 +408,9 @@ class TaskDecomposition(dspy.Signature):
             "'planner' = decompose sub-problems and create plans (no code), "
             "'debug' = diagnose errors, read logs, trace issues, "
             "'security' = security-focused vulnerability detection. "
-            "Example: [{'id':'T1','description':'Analyze existing API routes',"
-            "'agent_type':'file','inputs':['src/routes/'],'outputs':['analysis'],"
-            "'depends_on':[],'max_iterations':5}]"
+            "Example: [{'id':'T1','description':'Fix the undefined error in fetchWeather',"
+            "'agent_type':'coder','inputs':['src/weather.js'],'outputs':['src/weather.js'],"
+            "'depends_on':[],'max_iterations':8}]"
         )
     )
     shared_spec: str = dspy.OutputField(

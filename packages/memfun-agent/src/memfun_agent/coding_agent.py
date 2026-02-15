@@ -345,7 +345,9 @@ class RLMCodingAgent(BaseAgent):
         # Extract conversation history from payload
         history = payload.get("conversation_history")
 
-        # Try context-first approach (fewer LLM calls).
+        # Try context-first approach (fewer LLM calls) for all
+        # categories.  Escalation to multi-agent is handled by
+        # the caller (chat.py) if this fast path fails.
         if self._context_solver is not None:
             try:
                 cf_result = await self._context_solver.asolve(

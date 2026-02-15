@@ -607,7 +607,14 @@ class ChatSession:
         user_input: str,
         context: str,
     ) -> TaskResult:
-        """Route to multi-agent workflow for 'task' queries, else single agent."""
+        """Try fast, escalate on failure.
+
+        For "task" queries:
+          1. Try context-first fast path (1-2 LLM calls, ~30-60s)
+          2. If that fails/produces nothing → escalate to multi-agent
+        For non-task queries:
+          Single-agent path directly.
+        """
         assert self._agent is not None
 
         # Triage ONCE — result is reused for both workflow and
@@ -626,6 +633,23 @@ class ChatSession:
                 )
 
         if category == "task":
+            # PHASE 1: Try fast path (context-first, 1-2 LLM calls)
+            try:
+                fast_result = await self._try_fast_path(
+                    user_input, context, category,
+                )
+                if fast_result is not None and fast_result.success:
+                    return fast_result
+                logger.info(
+                    "Fast path returned no useful result, escalating"
+                )
+            except Exception:
+                logger.info(
+                    "Fast path failed, escalating to multi-agent",
+                    exc_info=True,
+                )
+
+            # PHASE 2: Escalate to multi-agent workflow
             try:
                 engine = await self._init_workflow_engine()
                 wf_result = await engine.execute_workflow(
@@ -633,16 +657,7 @@ class ChatSession:
                     project_context=context,
                     conversation_history=self._history,
                 )
-                # If decomposition produced multiple sub-tasks, return workflow result
-                if (
-                    wf_result.decomposition
-                    and not wf_result.decomposition.is_single_task
-                ):
-                    return self._workflow_to_task_result(wf_result)
-                # Single-task decomposition: its result is already a TaskResult
-                if wf_result.sub_task_results:
-                    first = next(iter(wf_result.sub_task_results.values()))
-                    return first
+                return self._workflow_to_task_result(wf_result)
             except Exception as exc:
                 logger.warning(
                     "Multi-agent workflow failed, falling back: %s",
@@ -664,6 +679,43 @@ class ChatSession:
         )
         return await self._agent.handle(task_msg)
 
+    async def _try_fast_path(
+        self,
+        user_input: str,
+        context: str,
+        category: str,
+    ) -> TaskResult | None:
+        """Attempt context-first resolution (fast, cheap).
+
+        Returns a TaskResult if context-first produces a useful answer,
+        or None if it fails or produces nothing actionable.
+        """
+        assert self._agent is not None
+
+        task_msg = TaskMessage(
+            task_id=uuid.uuid4().hex,
+            agent_id=self._agent.agent_id,
+            payload={
+                "type": "ask",
+                "query": user_input,
+                "context": context,
+                "conversation_history": self._history,
+                "triage_category": category,
+            },
+        )
+        result = await self._agent.handle(task_msg)
+
+        # Check if the result is actionable (has content or created files)
+        if not result.success:
+            return None
+        data = result.result or {}
+        answer = data.get("answer", "")
+        files = data.get("files_created", [])
+        ops = data.get("ops", [])
+        if answer or files or ops:
+            return result
+        return None
+
     @staticmethod
     def _workflow_to_task_result(wf_result: Any) -> TaskResult:
         """Convert a WorkflowResult into a TaskResult for display compatibility."""
@@ -671,16 +723,35 @@ class ChatSession:
 
         # Build per-agent breakdown for transparency.
         agent_breakdown: list[dict[str, Any]] = []
+        total_ops_count = 0
         for tid, sub_result in (
             wf_result.sub_task_results or {}
         ).items():
             data = sub_result.result or {}
+            ops = data.get("ops", [])
+            reads = sum(
+                1 for o in ops if o.get("type") == "read"
+            )
+            writes = sum(
+                1 for o in ops if o.get("type") == "write"
+            )
+            edits = sum(
+                1 for o in ops if o.get("type") == "edit"
+            )
+            cmds = sum(
+                1 for o in ops if o.get("type") == "cmd"
+            )
+            total_ops_count += len(ops)
             agent_breakdown.append({
                 "task_id": tid,
                 "agent": sub_result.agent_id,
                 "method": data.get("method", ""),
                 "iterations": data.get("iterations", 0),
-                "ops_count": len(data.get("ops", [])),
+                "ops_count": len(ops),
+                "reads": reads,
+                "writes": writes,
+                "edits": edits,
+                "cmds": cmds,
                 "files_count": len(
                     data.get("files_created", [])
                 ),
@@ -688,6 +759,7 @@ class ChatSession:
                 "success": sub_result.success,
             })
 
+        num_agents = len(agent_breakdown)
         return TaskRes(
             task_id=wf_result.workflow_id,
             agent_id="workflow-engine",
@@ -696,6 +768,8 @@ class ChatSession:
                 "answer": wf_result.answer,
                 "method": "multi_agent",
                 "iterations": wf_result.review_rounds,
+                "num_agents": num_agents,
+                "total_ops": total_ops_count,
                 "ops": wf_result.ops,
                 "files_created": wf_result.files_created,
                 "review_summary": wf_result.review_summary,
@@ -976,8 +1050,49 @@ def _display_answer(result: TaskResult) -> None:
     meta_parts: list[str] = []
     if method:
         meta_parts.append(method)
+
+    num_agents = data.get("num_agents", 0)
+    if num_agents:
+        meta_parts.append(
+            f"{num_agents} agent{'s' if num_agents != 1 else ''}"
+        )
+
+    total_ops_val = data.get("total_ops", 0)
+    if total_ops_val:
+        meta_parts.append(
+            f"{total_ops_val} op{'s' if total_ops_val != 1 else ''}"
+        )
+
     if iterations:
         meta_parts.append(f"{iterations} iter")
+
+    # Tool usage breakdown for single-agent results
+    if not num_agents and ops:
+        write_n = sum(
+            1 for o in ops if o.get("type") == "write"
+        )
+        edit_n = sum(
+            1 for o in ops if o.get("type") == "edit"
+        )
+        cmd_n = sum(
+            1 for o in ops if o.get("type") == "cmd"
+        )
+        tool_parts = []
+        if write_n:
+            tool_parts.append(
+                f"{write_n} write{'s' if write_n != 1 else ''}"
+            )
+        if edit_n:
+            tool_parts.append(
+                f"{edit_n} edit{'s' if edit_n != 1 else ''}"
+            )
+        if cmd_n:
+            tool_parts.append(
+                f"{cmd_n} cmd{'s' if cmd_n != 1 else ''}"
+            )
+        if tool_parts:
+            meta_parts.append(", ".join(tool_parts))
+
     if duration:
         meta_parts.append(duration)
     tok_str = _format_tokens(total_tokens)
@@ -1039,11 +1154,39 @@ def _display_answer(result: TaskResult) -> None:
             iters = ab.get("iterations", 0)
             if iters:
                 parts.append(f"{iters} iter")
-            ops_n = ab.get("ops_count", 0)
-            if ops_n:
+            # Detailed op breakdown
+            reads_n = ab.get("reads", 0)
+            writes_n = ab.get("writes", 0)
+            edits_n = ab.get("edits", 0)
+            cmds_n = ab.get("cmds", 0)
+            if reads_n:
                 parts.append(
-                    f"{ops_n} op{'s' if ops_n != 1 else ''}"
+                    f"{reads_n} read"
+                    f"{'s' if reads_n != 1 else ''}"
                 )
+            if writes_n:
+                parts.append(
+                    f"{writes_n} write"
+                    f"{'s' if writes_n != 1 else ''}"
+                )
+            if edits_n:
+                parts.append(
+                    f"{edits_n} edit"
+                    f"{'s' if edits_n != 1 else ''}"
+                )
+            if cmds_n:
+                parts.append(
+                    f"{cmds_n} cmd"
+                    f"{'s' if cmds_n != 1 else ''}"
+                )
+            # Fallback to total ops if no breakdown
+            if not any([reads_n, writes_n, edits_n, cmds_n]):
+                ops_n = ab.get("ops_count", 0)
+                if ops_n:
+                    parts.append(
+                        f"{ops_n} op"
+                        f"{'s' if ops_n != 1 else ''}"
+                    )
             if dur:
                 parts.append(dur)
             detail = ", ".join(parts)
@@ -1066,6 +1209,86 @@ def _display_answer(result: TaskResult) -> None:
     console.print()
 
 
+_WF_STATUS_LABELS = {
+    "decomposing": "Decomposing task into sub-tasks",
+    "running": "Running specialist agents",
+    "reviewing": "Reviewing results",
+    "revising": "Revising flagged issues",
+    "completed": "Workflow complete",
+    "failed": "Workflow failed",
+}
+
+
+def _make_workflow_progress(
+    session: ChatSession,
+    wf_state: Any,
+    elapsed: float,
+    frame: str,
+) -> Text:
+    """Build a live-updating display for multi-agent workflow."""
+    lines: list[str] = [""]
+
+    status_name = (
+        wf_state.status.value
+        if hasattr(wf_state.status, "value")
+        else str(wf_state.status)
+    )
+    label = _WF_STATUS_LABELS.get(status_name, status_name)
+
+    lines.append(
+        f"  {frame} {label}"
+        f"  [dim]({_format_elapsed(elapsed)})[/dim]"
+    )
+    lines.append("")
+
+    # Show sub-task statuses if available
+    sub_statuses = getattr(wf_state, "sub_task_statuses", {})
+    if sub_statuses:
+        for tid in sorted(sub_statuses):
+            ss = sub_statuses[tid]
+            st_status = ss.status if isinstance(ss.status, str) else str(ss.status)
+            agent = ss.agent_name or "agent"
+            desc = ss.sub_task.description[:60] if ss.sub_task else ""
+
+            if st_status == "completed":
+                dur_s = 0.0
+                if ss.completed_at and ss.started_at:
+                    dur_s = ss.completed_at - ss.started_at
+                dur_str = (
+                    f" [dim]({dur_s:.1f}s)[/dim]"
+                    if dur_s > 0
+                    else ""
+                )
+                lines.append(
+                    f"    [green]✓[/green] {tid}: {agent}"
+                    f"{dur_str}"
+                )
+            elif st_status == "running":
+                run_s = 0.0
+                if ss.started_at:
+                    run_s = time.time() - ss.started_at
+                lines.append(
+                    f"    {frame} {tid}: {agent}"
+                    f" [dim]({_format_elapsed(run_s)})[/dim]"
+                )
+                if desc:
+                    lines.append(
+                        f"        [dim]{desc}[/dim]"
+                    )
+            elif st_status == "failed":
+                lines.append(
+                    f"    [red]✗[/red] {tid}: {agent}"
+                )
+            else:
+                lines.append(
+                    f"    [dim]○[/dim] {tid}: {agent}"
+                    f" [dim]({st_status})[/dim]"
+                )
+        lines.append("")
+
+    return Text.from_markup("\n".join(lines))
+
+
 def _make_progress_renderable(
     session: ChatSession, elapsed: float
 ) -> Text:
@@ -1082,6 +1305,12 @@ def _make_progress_renderable(
     step = session.last_step
 
     if step is None:
+        # Check for workflow progress
+        wf_state = session._current_workflow
+        if wf_state is not None:
+            return _make_workflow_progress(
+                session, wf_state, elapsed, frame,
+            )
         lines.append(
             f"  {frame} Thinking..."
             f"  [dim]({_format_elapsed(elapsed)})[/dim]"
@@ -1330,6 +1559,84 @@ def _print_completed_iterations(
         printed_count[0] += 1
 
 
+def _print_completed_workflow_events(
+    session: ChatSession,
+    printed_tids: set[str],
+    target_console: Console | None = None,
+) -> None:
+    """Print newly completed workflow sub-tasks permanently.
+
+    Streams completed sub-task events above the Live spinner so
+    users see progress as each specialist agent finishes.
+    """
+    out = target_console or console
+
+    for tid, ss in sorted(session._sub_task_statuses.items()):
+        status_str = ss.status if isinstance(ss.status, str) else str(ss.status)
+        key = f"{tid}:{status_str}"
+        if key in printed_tids:
+            continue
+
+        agent = ss.agent_name or "agent"
+
+        if status_str == "running" and f"{tid}:running" not in printed_tids:
+            desc = ss.sub_task.description[:70] if ss.sub_task else ""
+            out.print(
+                f"  [cyan]▸[/cyan] {tid}: {agent}"
+                f" [dim]started[/dim]"
+            )
+            if desc:
+                out.print(f"    [dim]{desc}[/dim]")
+            out.print()
+            printed_tids.add(key)
+
+        elif status_str == "completed":
+            dur_s = 0.0
+            if ss.completed_at and ss.started_at:
+                dur_s = ss.completed_at - ss.started_at
+            dur_str = (
+                f" [dim]({dur_s:.1f}s)[/dim]"
+                if dur_s > 0
+                else ""
+            )
+            # Show result summary
+            data = ss.result.result if ss.result else {}
+            iters = data.get("iterations", 0) if data else 0
+            ops = data.get("ops", []) if data else []
+            files = data.get("files_created", []) if data else []
+            detail_parts = []
+            if iters:
+                detail_parts.append(f"{iters} iter")
+            if ops:
+                detail_parts.append(
+                    f"{len(ops)} op{'s' if len(ops) != 1 else ''}"
+                )
+            if files:
+                detail_parts.append(
+                    f"{len(files)} file{'s' if len(files) != 1 else ''}"
+                )
+            detail = (
+                f" ({', '.join(detail_parts)})"
+                if detail_parts
+                else ""
+            )
+            out.print(
+                f"  [green]✓[/green] {tid}: {agent}"
+                f"{detail}{dur_str}"
+            )
+            out.print()
+            printed_tids.add(key)
+
+        elif status_str == "failed":
+            err = ss.result.error if ss.result else "unknown"
+            out.print(
+                f"  [red]✗[/red] {tid}: {agent}"
+                f" [dim]({err})[/dim]"
+            )
+            out.print()
+            printed_tids.add(key)
+
+
 def _print_plan_final(session: ChatSession) -> None:
     """Print any remaining unprinted plan steps after completion."""
     if not session.plan:
@@ -1353,7 +1660,7 @@ def _get_version() -> str:
         from importlib.metadata import version
         return version("memfun-cli")
     except Exception:
-        return "0.1.4"
+        return "0.1.5"
 
 
 def _load_credentials() -> None:
@@ -1911,6 +2218,7 @@ async def _async_chat_loop() -> None:
             typed_ahead = ""  # buffer keystrokes for next prompt
             printed_steps: set[int] = set()
             printed_iters: list[int] = [0]
+            printed_wf_events: set[str] = set()
 
             # Set up terminal for Escape key detection
             fd = sys.stdin.fileno()
@@ -1954,6 +2262,13 @@ async def _async_chat_loop() -> None:
                         _print_completed_iterations(
                             session,
                             printed_iters,
+                            live.console,
+                        )
+
+                        # Stream workflow sub-task events
+                        _print_completed_workflow_events(
+                            session,
+                            printed_wf_events,
                             live.console,
                         )
 

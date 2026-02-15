@@ -483,6 +483,8 @@ class OperationExecutor:
         self.project_root = Path(project_root).resolve()
         self.ops: list[tuple[str, str, Any]] = []
         self.files_created: list[str] = []
+        self.attempted: int = 0  # total operations attempted
+        self.failed: int = 0  # operations that silently failed
 
     async def execute(
         self, operations: list[dict[str, Any]]
@@ -490,6 +492,8 @@ class OperationExecutor:
         """Execute all operations sequentially."""
         for op in operations:
             op_type = op.get("op", "")
+            if op_type in ("write_file", "edit_file"):
+                self.attempted += 1
             try:
                 if op_type == "write_file":
                     await self._write_file(op)
@@ -500,6 +504,7 @@ class OperationExecutor:
                 else:
                     logger.warning("Unknown operation: %s", op_type)
             except Exception as exc:
+                self.failed += 1
                 logger.warning(
                     "Operation %s failed: %s", op_type, exc
                 )
@@ -508,6 +513,7 @@ class OperationExecutor:
         path_str = op.get("path", "")
         content = op.get("content", "")
         if not path_str:
+            self.failed += 1
             return
 
         path = Path(os.path.abspath(path_str))
@@ -529,11 +535,13 @@ class OperationExecutor:
         path = Path(os.path.abspath(path_str))
         if not path.is_file():
             logger.warning("edit_file: %s does not exist", path)
+            self.failed += 1
             return
 
         content = await asyncio.to_thread(path.read_text, "utf-8")
         if old_text not in content:
             logger.warning("edit_file: old text not found in %s", path)
+            self.failed += 1
             return
 
         new_content = content.replace(old_text, new_text, 1)
@@ -894,12 +902,23 @@ class ContextFirstSolver:
         tokens_after = _get_dspy_token_usage()
         total_tokens = max(0, tokens_after - tokens_before)
 
+        # Determine success: if operations were attempted but ALL
+        # failed (e.g. every edit_file had "old text not found"),
+        # report failure so the caller can escalate.
+        success = True
+        if executor.attempted > 0 and executor.failed >= executor.attempted:
+            logger.warning(
+                "All %d file operations failed — marking as unsuccessful",
+                executor.attempted,
+            )
+            success = False
+
         return ContextFirstResult(
             answer=solve_result.answer,
             reasoning=solve_result.reasoning,
             ops=executor.ops,
             files_created=executor.files_created,
-            success=True,
+            success=success,
             method=method,
             total_tokens=total_tokens,
         )

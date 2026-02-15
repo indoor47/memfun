@@ -1,6 +1,6 @@
 [project]
 name = "memfun-runtime"
-version = "0.1.4"
+version = "0.1.5"
 description = "Pluggable runtime: Protocol interfaces, backends (T0-T3), BaseAgent, RuntimeContext"
 requires-python = ">=3.12"
 license = "Apache-2.0"

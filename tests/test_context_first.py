@@ -292,9 +292,11 @@ async def test_executor_edit_file_missing_text(tmp_path: Path):
         }
     ])
 
-    # File unchanged, no ops recorded.
+    # File unchanged, no ops recorded, failure tracked.
     assert target.read_text() == "something else"
     assert len(executor.ops) == 0
+    assert executor.attempted == 1
+    assert executor.failed == 1
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 [project]
 name = "memfun-optimizer"
-version = "0.1.4"
+version = "0.1.5"
 description = "Self-optimization: trace analysis, agent synthesis, MIPROv2"
 requires-python = ">=3.12"
 license = "Apache-2.0"

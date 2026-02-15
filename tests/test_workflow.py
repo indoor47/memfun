@@ -270,44 +270,71 @@ def test_workflow_status_values():
 
 
 @pytest.mark.asyncio
-async def test_execute_workflow_single_task_path():
-    """Single-task decomposition uses rlm-coder fallback."""
+async def test_execute_workflow_expanded_pipeline():
+    """Even a simple decomposition runs through the full multi-agent pipeline."""
     mock_context = MagicMock()
-    mock_context.state_store = AsyncMock()
+    mock_state_store = AsyncMock()
+    mock_state_store.get.return_value = None
+    mock_state_store.set = AsyncMock()
+    mock_context.state_store = mock_state_store
     mock_orchestrator = AsyncMock()
     mock_manager = MagicMock()
     mock_manager.is_running.return_value = True
 
     engine = WorkflowEngine(mock_context, mock_orchestrator, mock_manager)
 
-    # Mock decomposer to return single task
-    single_decomp = DecompositionResult(
-        sub_tasks=[SubTask(id="T1", description="Simple task", agent_type="coder")],
+    # Expanded pipeline: file -> coder -> review (3 groups)
+    expanded_decomp = DecompositionResult(
+        sub_tasks=[
+            SubTask(id="T1", description="Analyze code", agent_type="file"),
+            SubTask(
+                id="T2", description="Implement changes", agent_type="coder",
+                depends_on=["T1"],
+            ),
+            SubTask(
+                id="T3", description="Review implementation", agent_type="review",
+                depends_on=["T2"],
+            ),
+        ],
         shared_spec="",
-        parallelism_groups=[["T1"]],
-        is_single_task=True,
+        parallelism_groups=[["T1"], ["T2"], ["T3"]],
+        is_single_task=False,
     )
 
-    # Mock rlm-coder response
-    mock_task_result = TaskResult(
-        task_id="wf_single",
-        agent_id="rlm-coder",
-        success=True,
+    t1_result = TaskResult(
+        task_id="wf_T1", agent_id="file-agent", success=True,
+        result={"answer": "Analysis done", "files_created": [], "ops": []},
+    )
+    t2_result = TaskResult(
+        task_id="wf_T2", agent_id="coder-agent", success=True,
         result={
-            "answer": "Task completed",
+            "answer": "Code written",
             "files_created": ["output.py"],
             "ops": [],
         },
     )
-    mock_orchestrator.dispatch.return_value = mock_task_result
+    t3_result = TaskResult(
+        task_id="wf_T3", agent_id="review-agent", success=True,
+        result={"answer": "Looks good", "files_created": [], "ops": []},
+    )
+    review_result = TaskResult(
+        task_id="wf_review", agent_id="review-agent", success=True,
+        result={"answer": "approved: true\n\nAll good"},
+    )
 
-    with patch.object(engine._decomposer, "adecompose", return_value=single_decomp):
+    mock_orchestrator.fan_out.side_effect = [
+        [t1_result],
+        [t2_result],
+        [t3_result],
+    ]
+    mock_orchestrator.dispatch.return_value = review_result
+
+    with patch.object(engine._decomposer, "adecompose", return_value=expanded_decomp):
         result = await engine.execute_workflow("Simple task", "context", None)
 
     assert result.success is True
-    assert result.answer == "Task completed"
-    assert result.files_created == ["output.py"]
-    mock_orchestrator.dispatch.assert_called_once()
+    assert "output.py" in result.files_created
+    assert mock_orchestrator.fan_out.call_count == 3
 
 
 @pytest.mark.asyncio
@@ -375,6 +402,51 @@ async def test_execute_workflow_multi_task_path():
     assert len(result.sub_task_results) == 2
     assert result.files_created == ["src/main.py"]
     assert mock_orchestrator.fan_out.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_workflow_single_task_bypass():
+    """Single-task decomposition bypasses full pipeline (fast path)."""
+    mock_context = MagicMock()
+    mock_state_store = AsyncMock()
+    mock_state_store.get.return_value = None
+    mock_state_store.set = AsyncMock()
+    mock_context.state_store = mock_state_store
+    mock_orchestrator = AsyncMock()
+    mock_manager = MagicMock()
+    mock_manager.is_running.return_value = True
+
+    engine = WorkflowEngine(mock_context, mock_orchestrator, mock_manager)
+
+    # Single-task decomposition (simple bug fix)
+    single_decomp = DecompositionResult(
+        sub_tasks=[
+            SubTask(id="T1", description="Fix the bug", agent_type="coder"),
+        ],
+        shared_spec="",
+        parallelism_groups=[["T1"]],
+        is_single_task=True,
+    )
+
+    coder_result = TaskResult(
+        task_id="wf_single", agent_id="rlm-coder", success=True,
+        result={
+            "answer": "Fixed the bug",
+            "files_created": ["src/main.js"],
+            "ops": [{"type": "edit", "target": "src/main.js", "detail": ""}],
+        },
+    )
+
+    mock_orchestrator.dispatch.return_value = coder_result
+
+    with patch.object(engine._decomposer, "adecompose", return_value=single_decomp):
+        result = await engine.execute_workflow("Fix the bug", "context", None)
+
+    assert result.success is True
+    assert "Fixed the bug" in result.answer
+    # Should use dispatch (single task), NOT fan_out (multi-agent)
+    mock_orchestrator.dispatch.assert_called_once()
+    mock_orchestrator.fan_out.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -545,24 +617,48 @@ async def test_workflow_callbacks():
         on_sub_task_status=on_subtask,
     )
 
-    # Mock single task
+    # Multi-task decomposition
     decomp = DecompositionResult(
-        sub_tasks=[SubTask(id="T1", description="Task", agent_type="coder")],
+        sub_tasks=[
+            SubTask(id="T1", description="Analyze", agent_type="file"),
+            SubTask(
+                id="T2", description="Implement", agent_type="coder",
+                depends_on=["T1"],
+            ),
+        ],
         shared_spec="",
-        parallelism_groups=[["T1"]],
-        is_single_task=True,
+        parallelism_groups=[["T1"], ["T2"]],
+        is_single_task=False,
     )
 
-    mock_orchestrator.dispatch.return_value = TaskResult(
-        task_id="wf_single",
-        agent_id="rlm-coder",
-        success=True,
+    t1_result = TaskResult(
+        task_id="wf_T1", agent_id="file-agent", success=True,
         result={"answer": "Done", "files_created": [], "ops": []},
     )
+    t2_result = TaskResult(
+        task_id="wf_T2", agent_id="coder-agent", success=True,
+        result={"answer": "Done", "files_created": [], "ops": []},
+    )
+    review_result = TaskResult(
+        task_id="wf_review", agent_id="review-agent", success=True,
+        result={"answer": "approved: true\n\nLooks good"},
+    )
+
+    mock_state_store = AsyncMock()
+    mock_state_store.get.return_value = None
+    mock_state_store.set = AsyncMock()
+    mock_context.state_store = mock_state_store
+
+    mock_orchestrator.fan_out.side_effect = [
+        [t1_result],
+        [t2_result],
+    ]
+    mock_orchestrator.dispatch.return_value = review_result
 
     with patch.object(engine._decomposer, "adecompose", return_value=decomp):
         await engine.execute_workflow("Task", "context", None)
 
-    # Check callbacks were called
+    # Check callbacks were called for full pipeline
     assert WorkflowStatus.DECOMPOSING in workflow_statuses
+    assert WorkflowStatus.RUNNING in workflow_statuses
     assert WorkflowStatus.COMPLETED in workflow_statuses

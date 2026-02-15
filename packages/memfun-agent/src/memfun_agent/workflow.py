@@ -190,18 +190,22 @@ class WorkflowEngine:
         )
         state.decomposition = decomposition
 
-        # Single-task fast path.
-        if decomposition.is_single_task:
-            logger.info("Single-task decomposition; using rlm-coder fallback")
-            return await self._execute_single_task(
-                state, task_description, project_context, history, start,
-            )
-
         logger.info(
-            "Decomposed into %d sub-tasks (%d groups)",
+            "Decomposed into %d sub-tasks (%d groups, single=%s)",
             len(decomposition.sub_tasks),
             len(decomposition.parallelism_groups),
+            decomposition.is_single_task,
         )
+
+        # Fast path: single-task bypass — skip full pipeline.
+        if decomposition.is_single_task:
+            return await self._execute_single_task(
+                state,
+                task_description,
+                project_context,
+                history,
+                start,
+            )
 
         # Create shared spec.
         spec = SharedSpec(
@@ -237,9 +241,15 @@ class WorkflowEngine:
         state.status = WorkflowStatus.RUNNING
         self._emit_status(state)
 
+        base_context = state.shared_context or project_context
         for group in decomposition.parallelism_groups:
+            # Rebuild enriched context from base + all completed so far
+            # (avoids O(n²) re-appending of prior results).
+            enriched_context = self._enrich_with_prior_results(
+                base_context, state,
+            )
             await self._execute_group(
-                state, group, state.shared_context, history,
+                state, group, enriched_context, history,
             )
 
         # ── Phase 3: REVIEW ───────────────────────────────────
@@ -398,6 +408,19 @@ class WorkflowEngine:
             sub_status.status = "completed" if result.success else "failed"
             self._emit_sub_task(tid, sub_status)
 
+            data = result.result or {}
+            logger.info(
+                "Sub-task %s (%s): success=%s, answer_len=%d,"
+                " ops=%d, files=%d, error=%s",
+                tid,
+                sub_status.agent_name,
+                result.success,
+                len(data.get("answer", "")),
+                len(data.get("ops", [])),
+                len(data.get("files_created", [])),
+                result.error,
+            )
+
     async def _run_review(
         self,
         state: WorkflowState,
@@ -405,22 +428,35 @@ class WorkflowEngine:
         history: list[dict[str, Any]] | None,
     ) -> ReviewResult:
         """Run ReviewAgent on all completed outputs."""
-        # Build review context.
+        # Build review context from ALL sub-task results.
         review_parts: list[str] = []
         for tid, sub_status in state.sub_task_statuses.items():
-            if sub_status.result and sub_status.result.success:
-                data = sub_status.result.result or {}
-                answer = data.get("answer", "")[:2000]
-                files = ", ".join(data.get("files_created", []))
-                review_parts.append(
-                    f"=== Sub-task {tid} ({sub_status.agent_name}) ===\n"
-                    f"Description: {sub_status.sub_task.description}\n"
-                    f"Answer: {answer}\n"
-                    f"Files: {files}\n"
-                )
+            if sub_status.result is None:
+                continue
+            data = sub_status.result.result or {}
+            answer = data.get("answer", "")[:2000]
+            files = ", ".join(data.get("files_created", []))
+            status_label = (
+                "SUCCESS" if sub_status.result.success
+                else f"FAILED: {sub_status.result.error or 'unknown'}"
+            )
+            review_parts.append(
+                f"=== Sub-task {tid} ({sub_status.agent_name})"
+                f" [{status_label}] ===\n"
+                f"Description: {sub_status.sub_task.description}\n"
+                f"Answer: {answer}\n"
+                f"Files: {files}\n"
+            )
 
         if not review_parts:
-            return ReviewResult(approved=True, issues=[], summary="No outputs to review")
+            logger.warning(
+                "No sub-task results found for review"
+                " (all results are None)"
+            )
+            return ReviewResult(
+                approved=True, issues=[],
+                summary="No sub-task results available",
+            )
 
         review_query = (
             "Review the outputs of the following sub-tasks for consistency, "
@@ -606,6 +642,66 @@ class WorkflowEngine:
             )
             return project_context
 
+    # ── Result forwarding ─────────────────────────────────────
+
+    @staticmethod
+    def _enrich_with_prior_results(
+        base_context: str,
+        state: WorkflowState,
+    ) -> str:
+        """Append completed sub-task answers to the context.
+
+        This ensures subsequent dependency groups can see what prior
+        agents discovered or produced.
+        """
+        parts: list[str] = []
+        for tid in sorted(state.sub_task_statuses):
+            ss = state.sub_task_statuses[tid]
+            if ss.status not in ("completed", "failed"):
+                continue
+            if ss.result is None:
+                continue
+            data = ss.result.result or {}
+            answer = data.get("answer", "")
+            files = data.get("files_created", [])
+            ops = data.get("ops", [])
+            if not answer and not files:
+                continue
+            section = (
+                f"=== PRIOR AGENT RESULT: {tid}"
+                f" ({ss.agent_name}) ===\n"
+            )
+            if answer:
+                section += f"{answer[:3000]}\n"
+            if files:
+                section += (
+                    f"Files created: {', '.join(files)}\n"
+                )
+            if ops:
+                writes = [
+                    o for o in ops
+                    if isinstance(o, dict) and o.get("type") == "write"
+                ]
+                edits = [
+                    o for o in ops
+                    if isinstance(o, dict) and o.get("type") == "edit"
+                ]
+                if writes or edits:
+                    section += (
+                        f"Operations: {len(writes)} writes,"
+                        f" {len(edits)} edits\n"
+                    )
+            parts.append(section)
+
+        if not parts:
+            return base_context
+
+        prior_block = (
+            "\n\n=== COMPLETED AGENT RESULTS ===\n"
+            + "\n".join(parts)
+        )
+        return base_context + prior_block
+
     # ── Agent management ──────────────────────────────────────
 
     async def _ensure_agents_running(self, sub_tasks: list[SubTask]) -> None:
@@ -686,21 +782,33 @@ class WorkflowEngine:
         sub_results: dict[str, TaskResult] = {}
 
         for tid, sub_status in state.sub_task_statuses.items():
-            if sub_status.result:
-                sub_results[tid] = sub_status.result
-                data = sub_status.result.result or {}
+            if sub_status.result is None:
+                # Agent never ran or result was lost.
+                answer_parts.append(
+                    f"## {tid}: {sub_status.sub_task.description}\n"
+                    f"*No result (agent: {sub_status.agent_name})*"
+                )
+                continue
 
-                files = data.get("files_created", [])
-                all_files.extend(files)
+            sub_results[tid] = sub_status.result
+            data = sub_status.result.result or {}
 
-                ops = data.get("ops", [])
-                all_ops.extend(ops)
+            files = data.get("files_created", [])
+            all_files.extend(files)
 
-                answer = data.get("answer", "")
-                if answer:
-                    answer_parts.append(
-                        f"## {tid}: {sub_status.sub_task.description}\n{answer}"
-                    )
+            ops = data.get("ops", [])
+            all_ops.extend(ops)
+
+            answer = data.get("answer", "")
+            if answer:
+                answer_parts.append(
+                    f"## {tid}: {sub_status.sub_task.description}\n{answer}"
+                )
+            elif not sub_status.result.success:
+                answer_parts.append(
+                    f"## {tid}: {sub_status.sub_task.description}\n"
+                    f"*Failed: {sub_status.result.error or 'unknown error'}*"
+                )
 
         merged_answer = "\n\n".join(answer_parts)
         if review.summary:

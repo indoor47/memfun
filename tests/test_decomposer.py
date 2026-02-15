@@ -262,8 +262,8 @@ async def test_adecompose_with_mock():
 
 
 @pytest.mark.asyncio
-async def test_adecompose_single_task_detection():
-    """Single task result is flagged as single_task."""
+async def test_adecompose_single_task_kept_as_single():
+    """Single task from LLM is kept as-is (no forced expansion)."""
     decomposer = TaskDecomposer()
 
     mock_result = MagicMock()
@@ -278,6 +278,8 @@ async def test_adecompose_single_task_detection():
 
     assert len(result.sub_tasks) == 1
     assert result.is_single_task is True
+    assert result.sub_tasks[0].agent_type == "coder"
+    assert result.sub_tasks[0].description == "Simple task"
 
 
 @pytest.mark.asyncio
@@ -319,15 +321,15 @@ async def test_adecompose_cycle_detection_fallback():
     with patch.object(decomposer.decomposer, "__call__", return_value=mock_result):
         result = await decomposer.adecompose("task", "context")
 
-    # Should fall back to single task
+    # Should fall back to single coder task
     assert result.is_single_task is True
-    assert result.sub_tasks[0].id == "T1"
-    assert result.sub_tasks[0].description == "task"
+    assert len(result.sub_tasks) == 1
+    assert result.sub_tasks[0].agent_type == "coder"
 
 
 @pytest.mark.asyncio
-async def test_adecompose_empty_tasks_fallback():
-    """Empty sub_tasks from LLM triggers fallback."""
+async def test_adecompose_empty_tasks_single_fallback():
+    """Empty sub_tasks from LLM triggers single-task fallback."""
     decomposer = TaskDecomposer()
 
     mock_result = MagicMock()
@@ -341,10 +343,11 @@ async def test_adecompose_empty_tasks_fallback():
     assert result.is_single_task is True
     assert len(result.sub_tasks) == 1
     assert result.sub_tasks[0].description == "Original task"
+    assert result.sub_tasks[0].agent_type == "coder"
 
 
 @pytest.mark.asyncio
-async def test_adecompose_exception_fallback():
+async def test_adecompose_exception_single_fallback():
     """LLM exception triggers single-task fallback."""
     decomposer = TaskDecomposer()
 
@@ -352,7 +355,8 @@ async def test_adecompose_exception_fallback():
         result = await decomposer.adecompose("task", "context")
 
     assert result.is_single_task is True
-    assert result.sub_tasks[0].description == "task"
+    assert len(result.sub_tasks) == 1
+    assert result.sub_tasks[0].agent_type == "coder"
 
 
 @pytest.mark.asyncio
@@ -380,14 +384,13 @@ async def test_adecompose_context_truncation():
 
 
 def test_single_fallback_structure():
-    """Single-task fallback has correct structure."""
+    """Single-task fallback returns one coder task."""
     result = TaskDecomposer._single_fallback("Test description")
 
     assert result.is_single_task is True
     assert len(result.sub_tasks) == 1
     assert result.sub_tasks[0].id == "T1"
-    assert result.sub_tasks[0].description == "Test description"
     assert result.sub_tasks[0].agent_type == "coder"
-    assert result.sub_tasks[0].max_iterations == 25
+    assert result.sub_tasks[0].description == "Test description"
     assert result.shared_spec == ""
     assert result.parallelism_groups == [["T1"]]

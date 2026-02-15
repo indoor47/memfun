@@ -227,16 +227,9 @@ class TaskDecomposer(dspy.Module):
             raw_groups = getattr(result, "parallelism_groups", [])
             groups = _parse_groups(raw_groups)
 
+            # If LLM returned nothing, fall back to a single coder task.
             if not sub_tasks:
                 return self._single_fallback(task_description)
-
-            if len(sub_tasks) <= 1:
-                return DecompositionResult(
-                    sub_tasks=sub_tasks,
-                    shared_spec=shared_spec,
-                    parallelism_groups=groups or [[sub_tasks[0].id]],
-                    is_single_task=True,
-                )
 
             _validate_dag(sub_tasks)
 
@@ -248,7 +241,7 @@ class TaskDecomposer(dspy.Module):
                 sub_tasks=sub_tasks,
                 shared_spec=shared_spec,
                 parallelism_groups=groups,
-                is_single_task=False,
+                is_single_task=len(sub_tasks) <= 1,
             )
 
         except Exception as exc:
@@ -260,14 +253,16 @@ class TaskDecomposer(dspy.Module):
 
     @staticmethod
     def _single_fallback(description: str) -> DecompositionResult:
-        st = SubTask(
-            id="T1",
-            description=description,
-            agent_type="coder",
-            max_iterations=25,
-        )
+        sub_tasks = [
+            SubTask(
+                id="T1",
+                description=description,
+                agent_type="coder",
+                max_iterations=10,
+            ),
+        ]
         return DecompositionResult(
-            sub_tasks=[st],
+            sub_tasks=sub_tasks,
             shared_spec="",
             parallelism_groups=[["T1"]],
             is_single_task=True,
