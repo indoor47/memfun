@@ -269,6 +269,7 @@ class SolveResult:
     reasoning: str
     answer: str
     operations: list[dict[str, Any]]
+    truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -540,7 +541,7 @@ class ContextGatherer:
             self._status("Searching the web...")
             web_results: list[str] = []
             for query in web_searches[:5]:
-                self._status(f"Searching: {query}")
+                self._status(f"Search Web: {query}")
                 result = await self._web_search(query)
                 web_results.append(f"### Search: {query}\n{result}")
             if web_results:
@@ -652,10 +653,15 @@ class SingleShotSolver(dspy.Module):
 
         operations = _parse_operations(raw_ops)
 
+        # Detect truncation: if the raw operations string doesn't
+        # close the JSON array, the LLM response was likely cut off.
+        truncated = _detect_truncation(raw_ops, operations)
+
         return SolveResult(
             reasoning=reasoning,
             answer=answer,
             operations=operations,
+            truncated=truncated,
         )
 
 
@@ -701,6 +707,53 @@ def _parse_operations(raw: str) -> list[dict[str, Any]]:
     return ops
 
 
+def _detect_truncation(
+    raw_ops: str,
+    parsed_ops: list[dict[str, Any]],
+) -> bool:
+    """Detect whether the LLM response was likely truncated.
+
+    Signals:
+    - The raw operations string doesn't close the JSON array (no ``]``)
+    - Operations were expected (non-empty raw) but parsing yielded nothing
+    - The raw string ends mid-JSON (unclosed braces/brackets)
+    """
+    text = raw_ops.strip()
+    if not text or text == "[]":
+        return False
+
+    # Strip markdown code fences before checking endings.
+    # LLMs often wrap JSON in ```json ... ``` which makes the
+    # raw string end with ``` instead of ], causing false positives.
+    cleaned = text
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3].rstrip()
+
+    # If the raw text contains an opening bracket but no closing
+    # one, the JSON array was cut off.
+    if "[" in cleaned:
+        stripped = cleaned.rstrip()
+        if stripped and stripped[-1] not in ("]", "}", ")"):
+            logger.warning(
+                "Truncation detected: operations JSON not closed "
+                "(ends with %r)",
+                stripped[-20:],
+            )
+            return True
+
+    # If raw text looks substantial but parsed to nothing,
+    # likely a truncated JSON that couldn't be parsed.
+    if len(text) > 100 and not parsed_ops:
+        logger.warning(
+            "Truncation detected: %d chars of operations "
+            "but 0 parsed",
+            len(text),
+        )
+        return True
+
+    return False
+
+
 # ── Operation Executor ────────────────────────────────────────
 
 
@@ -715,9 +768,12 @@ class OperationExecutor:
         self,
         project_root: str | Path,
         on_status: Callable[[str], None] | None = None,
+        *,
+        edit_only: bool = False,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self._on_status = on_status
+        self._edit_only = edit_only
         self.ops: list[tuple[str, str, Any]] = []
         self.files_created: list[str] = []
         self.attempted: int = 0  # total operations attempted
@@ -764,6 +820,21 @@ class OperationExecutor:
             return
 
         path = Path(os.path.abspath(path_str))
+
+        # edit_only mode: block write_file for existing files entirely.
+        # Used by polish/fix steps that should only make targeted edits.
+        if self._edit_only and path.is_file():
+            logger.warning(
+                "edit_only: blocked write_file on existing %s "
+                "(%d chars) — use edit_file instead",
+                path, len(content),
+            )
+            self._status(
+                f"Blocked rewrite of {path.name} "
+                f"(edit_only mode)"
+            )
+            self.failed += 1
+            return
 
         # Guard: detect destructive overwrites of existing files.
         if path.is_file():
@@ -907,6 +978,35 @@ class OperationExecutor:
             )
         else:
             self._status(f"Ran: {cmd}")
+
+
+# ── Shared helpers (importable by specialists) ───────────────
+
+
+async def read_affected_files(
+    files: list[str],
+    project_root: Path | None = None,
+) -> str:
+    """Re-read files that were created/modified for fix context.
+
+    Returns a context string with ``=== FILE: path ===`` headers.
+    """
+    parts: list[str] = []
+    for fpath_str in files:
+        fpath = Path(fpath_str)
+        if not fpath.is_file():
+            continue
+        try:
+            content = await asyncio.to_thread(fpath.read_text, "utf-8")
+            rel = str(fpath.relative_to(project_root)) if project_root else fpath_str
+        except (OSError, ValueError):
+            rel = fpath_str
+            try:
+                content = await asyncio.to_thread(fpath.read_text, "utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+        parts.append(f"=== FILE: {rel} ===\n{content}")
+    return "\n\n".join(parts)
 
 
 # ── Verification ──────────────────────────────────────────────
@@ -1287,6 +1387,33 @@ class ContextFirstSolver:
             full_context=full_context,
         )
 
+        # 3a. Truncation detection — if the LLM response was cut off,
+        # the operations are incomplete.  Bail out so the caller can
+        # escalate to the multi-agent workflow.
+        if solve_result.truncated:
+            self._status(
+                "Response truncated — escalating to workflow..."
+            )
+            logger.warning(
+                "Solver output truncated, returning failure "
+                "for workflow escalation"
+            )
+            tokens_after = _get_dspy_token_usage()
+            return ContextFirstResult(
+                answer=solve_result.answer,
+                reasoning=(
+                    "Solver output was truncated (operations "
+                    "incomplete). Task too complex for single-shot."
+                ),
+                ops=[],
+                files_created=[],
+                success=False,
+                method="context_first_truncated",
+                total_tokens=max(
+                    0, tokens_after - tokens_before
+                ),
+            )
+
         # 4. Execute operations.
         executor = OperationExecutor(
             self.project_root, on_status=self._on_status
@@ -1419,32 +1546,26 @@ class ContextFirstSolver:
             self._status(
                 f"Applying {len(fix_ops)} fix operations..."
             )
-            await executor.execute(fix_ops)
+            # Use edit_only executor: lint fixes should be
+            # targeted edits, never full file rewrites.
+            fix_executor = OperationExecutor(
+                self.project_root,
+                on_status=self._on_status,
+                edit_only=True,
+            )
+            await fix_executor.execute(fix_ops)
+            executor.ops.extend(fix_executor.ops)
+            executor.files_created.extend(
+                fix_executor.files_created
+            )
+            executor.attempted += fix_executor.attempted
+            executor.failed += fix_executor.failed
 
     async def _read_affected_files(
         self, files: list[str]
     ) -> str:
         """Re-read files that were created/modified for fix context."""
-        parts: list[str] = []
-        for fpath_str in files:
-            fpath = Path(fpath_str)
-            if not fpath.is_file():
-                continue
-            try:
-                content = await asyncio.to_thread(
-                    fpath.read_text, "utf-8"
-                )
-                rel = str(fpath.relative_to(self.project_root))
-            except (OSError, ValueError):
-                rel = fpath_str
-                try:
-                    content = await asyncio.to_thread(
-                        fpath.read_text, "utf-8"
-                    )
-                except (OSError, UnicodeDecodeError):
-                    continue
-            parts.append(f"=== FILE: {rel} ===\n{content}")
-        return "\n\n".join(parts)
+        return await read_affected_files(files, self.project_root)
 
     async def _retry_failed_edits(
         self,
@@ -1635,7 +1756,21 @@ class ContextFirstSolver:
                 self._status(
                     f"Applying {len(polish_ops)} polish operations..."
                 )
-                await executor.execute(polish_ops)
+                # Use edit_only executor: polish must not rewrite
+                # entire files — only targeted edit_file ops.
+                polish_executor = OperationExecutor(
+                    self.project_root,
+                    on_status=self._on_status,
+                    edit_only=True,
+                )
+                await polish_executor.execute(polish_ops)
+                # Merge results back into the main executor.
+                executor.ops.extend(polish_executor.ops)
+                executor.files_created.extend(
+                    polish_executor.files_created
+                )
+                executor.attempted += polish_executor.attempted
+                executor.failed += polish_executor.failed
             else:
                 logger.info("Polish solver produced no operations")
 

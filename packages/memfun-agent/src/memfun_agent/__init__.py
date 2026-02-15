@@ -76,6 +76,7 @@ from memfun_agent.signatures import (
     VerificationFix,
 )
 from memfun_agent.specialists import (
+    AGENT_ACTIVITY,
     CoderAgent,
     DebugAgent,
     FileAgent,
@@ -104,6 +105,7 @@ from memfun_agent.workflow import (
 )
 
 __all__ = [
+    "AGENT_ACTIVITY",
     "AgentDefinition",
     "AgentLoader",
     "AgentManifest",

@@ -259,13 +259,15 @@ class RLMCodingAgent(BaseAgent):
                     query
                 )
             elif (
-                category in ("project", "task", "web")
+                category in (
+                    "project", "task", "web", "workflow",
+                )
                 and self._rlm is not None
             ):
-                # Enable planning for "task" category;
+                # Enable planning for "task"/"workflow" category;
                 # "web" uses RLM so the agent can call
                 # web_search/web_fetch helpers in the REPL.
-                if category in ("task", "web"):
+                if category in ("task", "web", "workflow"):
                     self._rlm.config = RLMConfig(
                         max_iterations=self._rlm.config.max_iterations,
                         max_output_chars=self._rlm.config.max_output_chars,
@@ -364,18 +366,49 @@ class RLMCodingAgent(BaseAgent):
                     result_dict = cf_result.to_result_dict()
                     result_dict["task_type"] = task_type
                     return result_dict
+
+                # Context-first failed — signal escalation to
+                # multi-agent workflow.  The single-agent RLM
+                # is strictly worse than multi-agent for complex
+                # tasks (gets stuck in read loops, no parallelism,
+                # no cross-agent review).
                 logger.info(
-                    "Context-first unsuccessful, "
-                    "falling back to RLM"
+                    "Context-first unsuccessful (%s) — "
+                    "signalling escalation to multi-agent",
+                    cf_result.method,
                 )
+                return {
+                    "answer": cf_result.answer,
+                    "task_type": task_type,
+                    "method": cf_result.method,
+                    "iterations": 0,
+                    "trajectory_length": 0,
+                    "final_reasoning": cf_result.reasoning,
+                    "total_tokens": cf_result.total_tokens,
+                    "ops": [],
+                    "files_created": [],
+                    "_escalate": True,
+                }
             except Exception as exc:
                 logger.warning(
                     "Context-first solver failed: %s, "
-                    "falling back to RLM",
+                    "signalling escalation to multi-agent",
                     exc,
                 )
+                return {
+                    "answer": "",
+                    "task_type": task_type,
+                    "method": "context_first_error",
+                    "iterations": 0,
+                    "trajectory_length": 0,
+                    "final_reasoning": str(exc),
+                    "total_tokens": 0,
+                    "ops": [],
+                    "files_created": [],
+                    "_escalate": True,
+                }
 
-        # Existing RLM path (fallback).
+        # No context solver available — use RLM as last resort.
         rlm_result: RLMResult = await self._rlm.aforward(
             query=full_query,
             context=context,
@@ -520,7 +553,8 @@ class RLMCodingAgent(BaseAgent):
     ) -> str:
         """Use the LLM to classify the query handling strategy.
 
-        Returns one of: 'direct', 'project', 'task', 'web'.
+        Returns one of: 'direct', 'project', 'task', 'web',
+        'workflow'.
         """
         # Extract recent conversation from context
         recent_conv = ""
@@ -534,13 +568,9 @@ class RLMCodingAgent(BaseAgent):
                 end = len(context)
             recent_conv = context[start:end].strip()[:1500]
 
-        # Build a brief project summary (not the full context)
-        ctx_lines = context.split("\n")[:5]
-        project_summary = " | ".join(
-            line.strip()
-            for line in ctx_lines
-            if line.strip()
-        )[:200]
+        # Build a rich project summary with code map + project type
+        # so triage can assess complexity and file count.
+        project_summary = self._build_triage_summary(context)
 
         try:
             result = await asyncio.to_thread(
@@ -556,7 +586,8 @@ class RLMCodingAgent(BaseAgent):
             ).strip().lower()
             # Normalize to valid categories
             if category not in (
-                "direct", "project", "task", "web"
+                "direct", "project", "task", "web",
+                "workflow",
             ):
                 category = "project"
             return category
@@ -566,6 +597,53 @@ class RLMCodingAgent(BaseAgent):
                 exc,
             )
             return "project"
+
+    @staticmethod
+    def _build_triage_summary(context: str) -> str:
+        """Extract structured project info from context for triage.
+
+        Pulls out the code map (file tree with classes/functions) and
+        project type info (README, pyproject, package.json) so the
+        triage LLM can assess complexity.
+        """
+        parts: list[str] = []
+
+        # Extract code map (built by _scan_cwd_context)
+        if "--- Code Map ---" in context:
+            start = context.index("--- Code Map ---")
+            end = context.find("\n---", start + 16)
+            if end == -1:
+                end = min(start + 4000, len(context))
+            parts.append(context[start:end].strip()[:3000])
+
+        # Extract project type info from config file headers
+        for marker in (
+            "--- README.md ---",
+            "--- pyproject.toml ---",
+            "--- package.json ---",
+            "--- Cargo.toml ---",
+        ):
+            if marker in context:
+                start = context.index(marker)
+                end = context.find("\n---", start + len(marker))
+                if end == -1:
+                    end = min(start + 500, len(context))
+                parts.append(
+                    context[start:end].strip()[:500]
+                )
+
+        if not parts:
+            # Fallback: first few lines (old behaviour)
+            ctx_lines = context.split("\n")[:5]
+            fallback = " | ".join(
+                line.strip()
+                for line in ctx_lines
+                if line.strip()
+            )[:200]
+            if fallback:
+                parts.append(fallback)
+
+        return "\n".join(parts)[:4000]
 
     async def _handle_direct_answer(
         self,

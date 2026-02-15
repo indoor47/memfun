@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.0 (2026-02-15)
+
+### Added
+
+- **Three-tier escalation hierarchy**: Context-first solver (2 LLM calls) →
+  multi-agent workflow (5-9 parallel specialists) → RLM exploration (iterative
+  REPL). All context-first failures now escalate to multi-agent workflow instead
+  of falling back to single-agent RLM loop.
+- **Specialist post-processing pipeline**: Every code-producing specialist agent
+  now runs the same quality pipeline as the context-first solver: auto-detect
+  linters → verify → fix → consistency review → polish.
+- **Edit-only mode for fix/polish**: OperationExecutor supports `edit_only=True`
+  which blocks `write_file` on existing files during fix and polish steps,
+  ensuring targeted edits rather than whole-file rewrites.
+- **Destructive write guard**: `write_file` on existing files is blocked if it
+  would lose >30% of content. Suggests `edit_file()` instead.
+- **Read caching (MD5)**: `read_file()` tracks content hashes per file. Re-reads
+  of unchanged files return a short summary instead of full content, preventing
+  context burn from re-read loops.
+- **Stall detection**: Warns the agent when no action ops exist at iteration
+  midpoint, when any file has been read 3+ times, and at final iterations.
+- **Specialist output pre-reading**: Before running, specialists pre-read output
+  files from prior workflow stages and inject them with "DO NOT REWRITE" headers.
+- **Truncation false-positive fix**: `_detect_truncation()` strips markdown code
+  fences before checking JSON endings, preventing false escalation.
+- **Web search in context-first**: Web-category queries now route through the
+  planner path to include DuckDuckGo web search results in context.
+- 2 new truncation detection tests (markdown code fence cases).
+
+### Changed
+
+- LLM `max_tokens` increased from 65,536 to 128,000 to reduce single-shot
+  truncation.
+- RLM per-output truncation limit removed entirely (was 10K chars). History
+  window increased to 120K chars.
+- CoderAgent, TestAgent, DebugAgent system prompts now instruct agents to prefer
+  `edit_file` over `write_file` for existing files.
+- README fully rewritten to reflect v0.2.0 architecture: three-tier escalation,
+  parallel multi-agent workflow, quality pipeline, code map, file safety, and
+  persistent memory.
+- CI workflow fixed: `uv sync --all-packages` so workspace member packages are
+  installed. Pyright typecheck set to `continue-on-error` (DSPy is untyped).
+- Test count: 597 passing, 88 skipped.
+
+### Fixed
+
+- Context-first failures no longer fall back to single-agent RLM loop. They
+  signal `_escalate: True` to the chat CLI, which routes to multi-agent workflow.
+- Consistency polish test updated to use `edit_file` ops (matches edit-only mode).
+- Scope creep guard in context-first solver: LLM-suggested web queries are
+  filtered to prevent unrelated searches.
+- DuckDuckGo migration: replaced deprecated `ddgs.text()` with current API.
+- Default LLM model changed to Opus for improved reasoning quality.
+
 ## 0.1.6 (2026-02-15)
 
 ### Added

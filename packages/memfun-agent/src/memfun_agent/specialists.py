@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from memfun_core.logging import get_logger
@@ -21,7 +22,17 @@ if TYPE_CHECKING:
     from memfun_core.types import TaskMessage, TaskResult
     from memfun_runtime.context import RuntimeContext
 
+    from memfun_agent.rlm import RLMResult
+
 logger = get_logger("agent.specialist")
+
+
+# ── Per-agent live activity (for UI spinners) ─────────────────
+
+# Maps sub_task_id → {iteration, max_iter, last_op, agent_name}.
+# Updated by on_step callbacks inside handle(); read by the CLI
+# spinner in _make_workflow_progress().
+AGENT_ACTIVITY: dict[str, dict[str, Any]] = {}
 
 
 # ── Agent-type to name mapping ────────────────────────────────
@@ -57,6 +68,7 @@ class _SpecialistBase(BaseAgent):
     def __init__(self, context: RuntimeContext) -> None:
         super().__init__(context)
         self._rlm: RLMModule | None = None
+        self._extra_tools: dict[str, Any] = {}
         self._spec_store: SharedSpecStore | None = None
 
         # Callbacks for progress tracking (set by WorkflowEngine).
@@ -68,12 +80,11 @@ class _SpecialistBase(BaseAgent):
         await super().on_start()
         self._spec_store = SharedSpecStore(self._context.state_store)
 
-        extra_tools: dict[str, Any] = {}
         try:
             from memfun_agent.tool_bridge import create_tool_bridge
 
             bridge = await create_tool_bridge()
-            extra_tools = bridge.get_repl_tools()
+            self._extra_tools = bridge.get_repl_tools()
         except Exception:
             logger.debug("MCP tool bridge unavailable for %s", self.agent_id)
 
@@ -83,7 +94,7 @@ class _SpecialistBase(BaseAgent):
                 verbose=True,
                 enable_planning=False,
             ),
-            extra_tools=extra_tools,
+            extra_tools=self._extra_tools,
             on_step=self.on_step,
             on_plan=self.on_plan,
             on_step_status=self.on_step_status,
@@ -125,6 +136,33 @@ class _SpecialistBase(BaseAgent):
                     exc_info=True,
                 )
 
+        # Pre-read OUTPUT files so the agent sees their current content
+        # before writing.  This prevents destructive overwrites where
+        # the agent rewrites a file from scratch, losing existing code.
+        outputs = payload.get("outputs", [])
+        if outputs:
+            try:
+                from memfun_agent.context_first import read_affected_files
+
+                project_root = Path(os.getcwd())
+                existing = await read_affected_files(
+                    outputs, project_root,
+                )
+                if existing.strip():
+                    context = (
+                        "=== EXISTING OUTPUT FILES (DO NOT REWRITE "
+                        "FROM SCRATCH — use edit_file to modify) "
+                        "===\n"
+                        + existing
+                        + "\n\n"
+                        + context
+                    )
+            except Exception:
+                logger.debug(
+                    "Pre-reading output files failed",
+                    exc_info=True,
+                )
+
         # Inject shared spec into query.
         spec_context = ""
         if workflow_id and self._spec_store:
@@ -136,12 +174,58 @@ class _SpecialistBase(BaseAgent):
         if spec_context:
             full_query += f"\n\n{spec_context}"
 
-        assert self._rlm is not None
-        rlm_result = await self._rlm.aforward(
-            query=full_query,
-            context=context,
-            conversation_history=history,
+        # Create a per-task RLM with a live-activity callback so the
+        # CLI spinner can show iteration progress per specialist.
+        sub_task_id = payload.get("sub_task_id", task.task_id)
+        max_iter = self._MAX_ITERATIONS
+
+        def _on_step(step: Any) -> None:
+            """Update AGENT_ACTIVITY with current iteration info."""
+            # Extract a short description of the last operation from
+            # the code the LLM produced (first meaningful line).
+            code_lines = (step.code or "").strip().splitlines()
+            last_op = ""
+            for line in code_lines:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    last_op = stripped
+                    break
+            AGENT_ACTIVITY[sub_task_id] = {
+                "iteration": step.iteration,
+                "max_iter": max_iter,
+                "last_op": last_op,
+                "agent_name": self.agent_id,
+            }
+
+        task_rlm = RLMModule(
+            config=RLMConfig(
+                max_iterations=max_iter,
+                verbose=True,
+                enable_planning=False,
+            ),
+            extra_tools=self._extra_tools,
+            on_step=_on_step,
+            on_plan=self.on_plan,
+            on_step_status=self.on_step_status,
         )
+
+        try:
+            rlm_result = await task_rlm.aforward(
+                query=full_query,
+                context=context,
+                conversation_history=history,
+            )
+        finally:
+            # Clean up activity entry when done.
+            AGENT_ACTIVITY.pop(sub_task_id, None)
+
+        # Post-process: verify + consistency review + polish.
+        if rlm_result.success and rlm_result.files_created:
+            rlm_result = await self._post_process(
+                query=query,
+                rlm_result=rlm_result,
+                sub_task_id=sub_task_id,
+            )
 
         # Report file creations back to shared spec.
         if workflow_id and self._spec_store and rlm_result.files_created:
@@ -170,6 +254,145 @@ class _SpecialistBase(BaseAgent):
             error=rlm_result.error,
             duration_ms=elapsed_ms,
         )
+
+
+    async def _post_process(
+        self,
+        query: str,
+        rlm_result: RLMResult,
+        sub_task_id: str,
+    ) -> RLMResult:
+        """Verify, consistency-check, and polish specialist output.
+
+        Runs the same quality pipeline as the context-first solver:
+        1. Auto-detect linters -> run -> fix if needed (0-1 LLM calls)
+        2. Consistency review against sub-task description (1 LLM call)
+        3. Polish if consistency issues found (0-1 LLM calls)
+
+        Returns an updated RLMResult with any extra ops/files appended.
+        """
+        from memfun_agent.context_first import (
+            ConsistencyReviewer,
+            FixSolver,
+            OperationExecutor,
+            Verifier,
+            _detect_verify_commands,
+            read_affected_files,
+        )
+
+        project_root = Path(os.getcwd())
+        extra_ops: list[tuple[str, str, Any]] = []
+        extra_files: list[str] = []
+
+        def _update_activity(label: str) -> None:
+            AGENT_ACTIVITY[sub_task_id] = {
+                "iteration": rlm_result.iterations,
+                "max_iter": self._MAX_ITERATIONS,
+                "last_op": label,
+                "agent_name": self.agent_id,
+            }
+
+        try:
+            # ── Phase 1: Verification (linters) ────────────────
+            verify_cmds = _detect_verify_commands(project_root)
+            if verify_cmds and rlm_result.files_created:
+                _update_activity("Verifying...")
+                verifier = Verifier(project_root)
+                vr = await verifier.averify(verify_cmds)
+
+                if not vr.passed:
+                    logger.info(
+                        "%s: verification failed, attempting fix: %s",
+                        self.agent_id, vr.errors[:200],
+                    )
+                    _update_activity("Fixing lint errors...")
+                    current = await read_affected_files(
+                        rlm_result.files_created, project_root,
+                    )
+                    if current:
+                        fix_solver = FixSolver()
+                        try:
+                            fix_ops = await fix_solver.afix(
+                                query=query,
+                                full_context=current,
+                                verification_errors=vr.errors,
+                            )
+                            if fix_ops:
+                                executor = OperationExecutor(
+                                    project_root, edit_only=True,
+                                )
+                                await executor.execute(fix_ops)
+                                extra_ops.extend(executor.ops)
+                                extra_files.extend(executor.files_created)
+                        except Exception as exc:
+                            logger.warning(
+                                "%s: fix solver failed: %s",
+                                self.agent_id, exc,
+                            )
+
+            # ── Phase 2: Consistency review + polish ───────────
+            all_files = list(set(rlm_result.files_created + extra_files))
+            if all_files:
+                _update_activity("Reviewing consistency...")
+                actual = await read_affected_files(all_files, project_root)
+                if actual:
+                    reviewer = ConsistencyReviewer()
+                    review = await reviewer.areview(
+                        user_request=query,
+                        intended_changes=(
+                            f"Agent answer:\n{rlm_result.answer[:2000]}"
+                        ),
+                        actual_file_contents=actual,
+                    )
+                    if review.has_issues and review.issues:
+                        logger.info(
+                            "%s: %d consistency issues, polishing",
+                            self.agent_id, len(review.issues),
+                        )
+                        _update_activity("Polishing...")
+                        issues_text = (
+                            "CONSISTENCY REVIEW ISSUES:\n"
+                            + "\n".join(
+                                f"- {i}" for i in review.issues
+                            )
+                            + f"\n\nReasoning: {review.reasoning}"
+                        )
+                        fix_solver = FixSolver()
+                        polish_ops = await fix_solver.afix(
+                            query=query,
+                            full_context=actual,
+                            verification_errors=issues_text,
+                        )
+                        if polish_ops:
+                            executor = OperationExecutor(
+                                project_root, edit_only=True,
+                            )
+                            await executor.execute(polish_ops)
+                            extra_ops.extend(executor.ops)
+                            extra_files.extend(executor.files_created)
+                    else:
+                        logger.info(
+                            "%s: consistency check passed",
+                            self.agent_id,
+                        )
+
+        except Exception as exc:
+            # Post-processing is best-effort — never block the pipeline.
+            logger.warning(
+                "%s: post-processing failed (non-fatal): %s",
+                self.agent_id, exc,
+            )
+        finally:
+            AGENT_ACTIVITY.pop(sub_task_id, None)
+
+        # Merge extras into result.
+        if extra_ops or extra_files:
+            rlm_result.ops = list(rlm_result.ops) + extra_ops
+            rlm_result.files_created = list(set(
+                rlm_result.files_created + extra_files
+            ))
+
+        return rlm_result
 
 
 # ── Concrete specialists ──────────────────────────────────────
@@ -211,8 +434,15 @@ class CoderAgent(_SpecialistBase):
         "production-quality code based on the task description and shared "
         "specification. Follow the naming conventions and interface contracts "
         "in the shared spec exactly.\n\n"
-        "Use write_file() for every file. Install dependencies with "
-        "run_cmd(). Verify your code compiles/imports correctly."
+        "CRITICAL FILE EDITING RULES:\n"
+        "- ALWAYS use read_file(path) FIRST to see the current content "
+        "of any file you will modify.\n"
+        "- For EXISTING files: use edit_file(path, old_text, new_text) "
+        "to make targeted changes. NEVER rewrite an entire existing file "
+        "with write_file() — this destroys existing code.\n"
+        "- For NEW files only: use write_file(path, content).\n"
+        "- Install dependencies with run_cmd().\n"
+        "- Verify your code compiles/imports correctly."
     )
 
 
@@ -230,6 +460,11 @@ class TestAgent(_SpecialistBase):
         "You are a TESTING specialist. Your job is to WRITE and RUN tests "
         "for code produced by other agents. Read the files created, "
         "understand their interfaces, and write comprehensive tests.\n\n"
+        "CRITICAL FILE EDITING RULES:\n"
+        "- ALWAYS use read_file(path) FIRST before modifying any file.\n"
+        "- For EXISTING test files: use edit_file(path, old_text, new_text) "
+        "to add or modify tests without destroying existing ones.\n"
+        "- For NEW test files: use write_file(path, content).\n\n"
         "Run the tests with pytest or the appropriate test runner. "
         "Report which tests pass and which fail. "
         "Set state['FINAL'] to the test results."
@@ -355,6 +590,8 @@ class DebugAgent(_SpecialistBase):
         "Use read_file() to examine source code and logs. Use run_cmd() "
         "to run failing tests or reproduce errors. Use grep to search "
         "for error patterns across the codebase.\n\n"
+        "If you apply fixes: use edit_file(path, old_text, new_text) for "
+        "targeted changes. NEVER rewrite entire files with write_file().\n\n"
         "Your analysis must include:\n"
         "1. The exact error and where it occurs\n"
         "2. The root cause (not just symptoms)\n"

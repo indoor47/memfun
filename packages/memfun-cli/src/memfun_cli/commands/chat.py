@@ -30,6 +30,8 @@ from memfun_core.config import MemfunConfig
 from memfun_core.logging import get_logger
 from memfun_core.types import TaskMessage
 from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -311,6 +313,9 @@ class ChatSession:
         self._workflow_engine: Any | None = None
         self._current_workflow: Any | None = None
         self._sub_task_statuses: dict[str, Any] = {}
+        # Execution mode: auto | workflow
+        self._mode: str = "auto"
+        self._modes: tuple[str, ...] = ("auto", "workflow")
 
     async def start(self) -> None:
         """Load config, build runtime, create agent, scan cwd."""
@@ -438,6 +443,12 @@ class ChatSession:
     def _on_sub_task_status(self, task_id: str, status: Any) -> None:
         """Track per-sub-task status for live display."""
         self._sub_task_statuses[task_id] = status
+
+    def cycle_mode(self) -> str:
+        """Cycle to the next execution mode. Returns the new mode."""
+        idx = self._modes.index(self._mode)
+        self._mode = self._modes[(idx + 1) % len(self._modes)]
+        return self._mode
 
     async def chat_turn(self, user_input: str) -> TaskResult:
         """Process one user message and return the agent's response."""
@@ -654,10 +665,14 @@ class ChatSession:
         """
         assert self._agent is not None
 
-        # Triage ONCE — result is reused for both workflow and
-        # single-agent paths (eliminates redundant LLM call).
-        category = ""
-        if self._runtime is not None:
+        # Mode override: skip triage when user forced a mode.
+        if self._mode == "workflow":
+            logger.info("Mode override: workflow")
+            category = "workflow"
+        elif self._runtime is not None:
+            # Triage ONCE — result is reused for both workflow and
+            # single-agent paths (eliminates redundant LLM call).
+            category = ""
             try:
                 category = await self._agent._triage_query(
                     user_input, context,
@@ -668,6 +683,30 @@ class ChatSession:
                     "Triage failed, using single agent",
                     exc_info=True,
                 )
+        else:
+            category = ""
+
+        if category == "workflow":
+            # Complex task — go directly to multi-agent workflow,
+            # skip the context-first attempt that would truncate.
+            try:
+                engine = await self._init_workflow_engine()
+                wf_result = await engine.execute_workflow(
+                    task_description=user_input,
+                    project_context=context,
+                    conversation_history=self._history,
+                )
+                # Auto-switch back to "auto" after workflow completes.
+                if self._mode == "workflow":
+                    self._mode = "auto"
+                return self._workflow_to_task_result(wf_result)
+            except Exception as exc:
+                logger.warning(
+                    "Workflow failed for 'workflow' category, "
+                    "falling back to single-agent: %s",
+                    exc,
+                )
+                # Fall through to single-agent path
 
         if category == "task":
             # PHASE 1: Try fast path (context-first, 1-2 LLM calls)
@@ -694,6 +733,9 @@ class ChatSession:
                     project_context=context,
                     conversation_history=self._history,
                 )
+                # Auto-switch back to "auto" after workflow completes.
+                if self._mode == "workflow":
+                    self._mode = "auto"
                 return self._workflow_to_task_result(wf_result)
             except Exception as exc:
                 logger.warning(
@@ -746,6 +788,15 @@ class ChatSession:
         if not result.success:
             return None
         data = result.result or {}
+
+        # Explicit escalation signal from context-first truncation:
+        # the task is too complex for single-agent, must go to workflow.
+        if data.get("_escalate"):
+            logger.info(
+                "Fast path requests escalation to workflow"
+            )
+            return None
+
         answer = data.get("answer", "")
         files = data.get("files_created", [])
         ops = data.get("ops", [])
@@ -1256,6 +1307,16 @@ _WF_STATUS_LABELS = {
 }
 
 
+def _get_agent_activity(sub_task_id: str) -> dict[str, Any] | None:
+    """Read live activity for a specialist agent (if available)."""
+    try:
+        from memfun_agent.specialists import AGENT_ACTIVITY
+
+        return AGENT_ACTIVITY.get(sub_task_id)
+    except Exception:
+        return None
+
+
 def _make_workflow_progress(
     session: ChatSession,
     wf_state: Any,
@@ -1304,11 +1365,30 @@ def _make_workflow_progress(
                 run_s = 0.0
                 if ss.started_at:
                     run_s = time.time() - ss.started_at
+
+                # Show live iteration progress if available.
+                activity = _get_agent_activity(tid)
+                iter_label = ""
+                if activity:
+                    it = activity.get("iteration", 0)
+                    mx = activity.get("max_iter", 0)
+                    if it and mx:
+                        iter_label = f" [cyan]iter {it}/{mx}[/cyan]"
+
                 lines.append(
-                    f"    {frame} {tid}: {agent}"
+                    f"    {frame} {tid}: {agent}{iter_label}"
                     f" [dim]({_format_elapsed(run_s)})[/dim]"
                 )
-                if desc:
+
+                # Show current operation (truncated).
+                if activity and activity.get("last_op"):
+                    op_text = activity["last_op"]
+                    if len(op_text) > 60:
+                        op_text = op_text[:57] + "..."
+                    lines.append(
+                        f"        [dim]{op_text}[/dim]"
+                    )
+                elif desc:
                     lines.append(
                         f"        [dim]{desc}[/dim]"
                     )
@@ -1742,20 +1822,25 @@ def _get_version() -> str:
 
 
 def _get_build() -> str:
-    """Get the git short hash as build identifier."""
+    """Get the git short hash as build identifier.
+
+    Uses CWD first (shows the project being worked on),
+    falls back to the memfun source tree.
+    """
     import subprocess
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            cwd=Path(__file__).resolve().parent,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
+    for cwd in (Path.cwd(), Path(__file__).resolve().parent):
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                cwd=cwd,
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            continue
     return "unknown"
 
 
@@ -1871,20 +1956,79 @@ async def _async_chat_loop() -> None:
     # Set up prompt_toolkit with file history and slash command completion
     history_path = Path.home() / ".memfun" / "chat_history"
     history_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Key bindings — shift+tab cycles execution mode,
+    # bracketed-paste collapses large pastes.
+    from prompt_toolkit.keys import Keys
+
+    kb = KeyBindings()
+    # Mutable container so closures + loop body can share it.
+    _paste_state: dict[str, str] = {"full_text": ""}
+
+    @kb.add("s-tab")
+    def _cycle_mode(event: Any) -> None:
+        new_mode = session.cycle_mode()
+        # Force toolbar refresh by invalidating the app
+        if event.app:
+            event.app.invalidate()
+        logger.info("Mode switched to: %s", new_mode)
+
+    @kb.add(Keys.BracketedPaste)
+    def _handle_paste(event: Any) -> None:
+        data: str = event.data
+        lines = data.splitlines()
+        buf = event.app.current_buffer
+
+        if len(lines) > 3:
+            # Store full text (prefix already typed + pasted).
+            prefix = buf.text
+            _paste_state["full_text"] = prefix + data
+            # Show compact badge in the input field.
+            badge = f"[pasted {len(lines)} lines · {len(data)} chars]"
+            buf.text = prefix + badge
+            buf.cursor_position = len(buf.text)
+        else:
+            # Small paste — insert normally.
+            _paste_state["full_text"] = ""
+            buf.insert_text(data)
+
+    mode_hints: dict[str, str] = {
+        "auto": " \u23f5\u23f5 auto mode  shift+tab to switch",
+        "workflow": " \u2699 workflow mode  multi-agent \u00b7 shift+tab to switch",
+    }
+
+    def _bottom_toolbar() -> HTML:
+        import shutil
+
+        cols = shutil.get_terminal_size().columns
+        dash = "\u2500" * cols
+        hint = mode_hints.get(session._mode, "")
+        return HTML(
+            f'<style fg="ansigray">{dash}\n{hint}</style>'
+        )
+
+    from prompt_toolkit.styles import Style as PTStyle
+
+    _toolbar_style = PTStyle.from_dict({
+        "bottom-toolbar": "ansigray bg:default noreverse",
+        "bottom-toolbar.text": "ansigray bg:default noreverse",
+    })
+
     prompt_session: PromptSession[str] = PromptSession(
         history=FileHistory(str(history_path)),
         completer=_SLASH_COMPLETER,
         complete_while_typing=True,
+        key_bindings=kb,
+        bottom_toolbar=_bottom_toolbar,
+        style=_toolbar_style,
     )
 
     typed_ahead = ""  # keystrokes buffered during processing
 
     try:
         while True:
-            # Get user input with dashed borders
-            term_width = console.width
-            dash_line = "─" * term_width
-            console.print(f"[dim]{dash_line}[/dim]")
+            _paste_state["full_text"] = ""
+            console.print(f"[dim]{'─' * console.width}[/dim]")
             try:
                 user_input = await prompt_session.prompt_async(
                     "> ",
@@ -1895,9 +2039,13 @@ async def _async_chat_loop() -> None:
                 break
             except KeyboardInterrupt:
                 typed_ahead = ""
+                _paste_state["full_text"] = ""
                 continue
-            finally:
-                console.print(f"[dim]{dash_line}[/dim]")
+
+            # If a large paste was collapsed, swap in the full text.
+            if _paste_state["full_text"]:
+                user_input = _paste_state["full_text"]
+                _paste_state["full_text"] = ""
 
             user_input = user_input.strip()
             if not user_input:
@@ -2456,4 +2604,5 @@ def chat_command() -> None:
 
         run_project_init()
 
-    asyncio.run(_async_chat_loop())
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(_async_chat_loop())

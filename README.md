@@ -1,172 +1,95 @@
 # Memfun
 
-**An autonomous coding agent with infinite memory and scalable multi-agent orchestration.**
+**An autonomous coding agent that solves tasks in parallel, learns from every conversation, and scales from laptop to cluster.**
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://python.org)
+[![CI](https://github.com/indoor47/memfun/actions/workflows/ci.yml/badge.svg)](https://github.com/indoor47/memfun/actions/workflows/ci.yml)
 
 ---
 
-## Why Memfun?
+## What Memfun Does
 
-Every coding agent today hits the same wall: **context windows are finite**. Feed a
-100k-line codebase to GPT-4, Claude, or any frontier model and the agent either
-truncates, hallucinates, or gives up. Multi-file refactors across large monorepos
-remain out of reach. Agents forget what you told them two conversations ago. And
-scaling from one agent to a coordinated team? Most frameworks don't even try.
-
-Memfun solves this with two foundational ideas:
-
-### 1. Infinite Memory via Recursive Language Models (RLM)
-
-Instead of cramming an entire codebase into a single prompt, Memfun uses the
-**Recursive Language Model** pattern from DSPy. The agent gets a sandboxed Python
-REPL where variable state lives *outside* the token window. It can read files,
-parse ASTs, run searches, store intermediate results in variables, and make
-recursive sub-LLM calls -- all without exceeding context limits.
-
-This means the agent's effective memory is **unbounded**. It can explore a million-
-line codebase by navigating it programmatically -- reading what it needs, storing
-what matters, and reasoning over the accumulated state. The token window becomes a
-*working register*, not a hard ceiling.
-
-The same mechanism powers persistent learning. After every conversation turn, the
-agent extracts reusable knowledge (your preferences, project patterns, technical
-details) and stores it in a searchable database with TF-IDF retrieval. Before each
-turn, relevant memories are retrieved and injected as highest-priority context. The
-agent genuinely learns from you over time -- it won't ask you what port to use
-twice.
+Give Memfun a task in natural language. It reads your codebase, plans an approach, writes code across multiple files, runs your linters, fixes errors, reviews its own output for consistency, and delivers the result -- all in one shot. For complex tasks, it splits work across parallel specialist agents (coder, tester, reviewer, debugger, security auditor) that work simultaneously and cross-check each other.
 
 ```
-Traditional Agent:           Memfun RLM Agent:
-┌─────────────────┐         ┌─────────────────┐
-│  Context Window  │         │  Context Window  │ <- working register
-│  (128k tokens)   │         │  (128k tokens)   │
-│                  │         ├─────────────────┤
-│  [entire codebase│         │  REPL Variables  │ <- unbounded state
-│   crammed in]    │         │  (files, ASTs,   │
-│                  │         │   search results,│
-│  [truncated...]  │         │   intermediate   │
-│                  │         │   computations)  │
-│                  │         ├─────────────────┤
-│                  │         │  Persistent DB   │ <- infinite memory
-│                  │         │  (learnings,     │
-│                  │         │   preferences,   │
-│                  │         │   project facts) │
-└─────────────────┘         └─────────────────┘
+memfun > add JWT authentication to the Flask API
+
+  Context-first: gathered 12 files (48 KB)
+
+  Operations:
+    write  src/auth/jwt.py           (JWT token creation, verification, refresh)
+    write  src/auth/middleware.py     (require_auth decorator)
+    edit   src/routes/api.py          (added @require_auth to protected routes)
+    write  tests/test_auth.py         (12 test cases)
+    run    ruff check src/            (passed)
+
+  Verified: 0 lint errors
+
+  32s  •  8.2k tokens
 ```
 
-### 2. Scalable Multi-Agent Orchestration
+### How It Solves Tasks
 
-A single agent isn't enough for complex software engineering. You need an architect
-to plan, a coder to implement, a reviewer to catch bugs, and a tester to validate.
-Memfun provides a **pluggable runtime** with four deployment tiers that let you
-scale from a single laptop to a distributed cluster without changing code:
+Memfun uses a **three-tier escalation** strategy, starting cheap and fast:
 
-| Tier | Backend | Use Case |
-|------|---------|----------|
-| T0 | In-Process (asyncio) | Unit tests, CI, instant startup |
-| T1 | SQLite | Single developer, local projects (default) |
-| T2 | Redis | Team environments, shared state |
-| T3 | NATS JetStream | Production: distributed, fault-tolerant, multi-node |
+**Tier 1: Context-First (2 LLM calls)** -- For most tasks. A planner selects which files to read (using a structural code map, not just filenames). A single-shot solver produces all file operations at once. An executor applies them, auto-detects your linter (ruff, eslint, go vet, cargo check), and fixes errors in up to 2 cycles. A consistency reviewer then checks the output against the original request and polishes if needed. Projects under 200 KB skip the planner entirely -- zero overhead.
 
-All four tiers implement the same 8 protocol interfaces (event bus, state store,
-task queue, agent registry, session manager, sandbox adapter, knowledge base,
-tool registry). Your agents, skills, and tools work identically across all tiers.
+**Tier 2: Multi-Agent Workflow (parallel specialists)** -- For complex tasks that need decomposition. A task decomposer breaks the work into a dependency DAG. Specialist agents run in parallel groups -- a coder implements features while a test agent writes tests and a security agent audits for vulnerabilities. Each specialist runs its own verify + review + polish pipeline. A cross-agent reviewer checks for conflicts between agents, and up to 2 revision rounds fix issues.
 
-Agents are defined as **AGENT.md** files -- human-readable markdown documents that
-specify capabilities, constraints, and delegation rules. The orchestrator
-coordinates agents dynamically, routing tasks to the right specialist.
+**Tier 3: RLM Exploration (iterative REPL)** -- Last resort for tasks requiring deep codebase exploration. The agent gets a sandboxed Python REPL where it can read files, run searches, execute commands, and make sub-LLM calls -- with variable state stored outside the token window so effective memory is unbounded.
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  Orchestrator                     │
-│    (routes tasks, manages agent lifecycle)        │
-├──────────┬──────────┬──────────┬────────────────┤
-│ Architect│  Coder   │ Reviewer │   Planner      │
-│ (plans   │ (RLM +   │ (code    │  (decomposes   │
-│  design) │  REPL)   │  review) │   tasks)       │
-├──────────┴──────────┴──────────┴────────────────┤
-│            Memfun Runtime (T0-T3)                │
-│  Event Bus │ State Store │ Task Queue │ Registry │
-└─────────────────────────────────────────────────┘
+Task arrives
+  |
+  v
+Context-First Solver (2 LLM calls, ~30s)
+  |
+  +--> Success? Done.
+  |
+  +--> Failed/truncated?
+         |
+         v
+       Multi-Agent Workflow (5-9 parallel agents, ~2min)
+         |
+         +--> Success? Done.
+         |
+         +--> No context solver?
+                |
+                v
+              RLM Exploration (iterative, ~5min)
 ```
 
-### What Makes This SOTA?
+### What Makes It Different
 
-Most coding agents are thin wrappers around a single LLM call. The ambitious ones
-add tool calling or RAG. Memfun goes further on every axis:
-
-| Capability | Typical Agents | Memfun |
-|-----------|---------------|--------|
-| **Context handling** | Truncate to fit window | RLM: navigate programmatically, unbounded |
-| **Memory** | None (stateless) or basic RAG | Persistent TF-IDF DB + auto-extraction after every turn |
-| **Multi-agent** | Sequential chains | True orchestration with event bus, delegation, agent registry |
-| **Scaling** | Single process | 4 tiers: in-process to distributed NATS cluster |
-| **Tool interface** | Custom per-agent | MCP standard (FastMCP 3.0), portable across tools |
-| **Self-improvement** | None | Trace analysis, MIPROv2 optimization, agent/skill synthesis |
-| **Skills** | Hard-coded capabilities | Agent Skills standard (agentskills.io), portable across 20+ AI tools |
-
-The combination of **RLM for infinite context** + **pluggable multi-agent runtime** +
-**persistent learning memory** + **self-optimization from traces** is, to our
-knowledge, unique in open-source coding agents.
-
-## Features
-
-- **Context-First Solving** -- Gathers project context via I/O, then solves in
-  a single LLM call (2 calls total vs 20+ iterative loops). Falls back to RLM
-  for complex tasks. Auto-detects linters and fixes errors in up to 2 cycles.
-- **RLM Architecture** -- DSPy Recursive Language Models handle codebases 100x
-  beyond native context windows via sandboxed REPL with recursive sub-LLM calls
-- **Multi-Agent Workflow** -- Triage classifies tasks, TaskDecomposer breaks
-  complex ones into a dependency DAG, and WorkflowEngine fans out to 9
-  specialist agents in parallel with review and revision loops
-- **Persistent Learning** -- Agent automatically extracts and remembers your
-  preferences, project patterns, and technical details across sessions
-- **Pluggable Backends** -- Four tiers (In-Process, SQLite, Redis, NATS JetStream)
-  with identical protocol interfaces; swap at config time
-- **9 Specialist Agents** -- FileAgent, CoderAgent, TestAgent, ReviewAgent,
-  WebSearchAgent, WebFetchAgent, PlannerAgent, DebugAgent, SecurityAgent --
-  each with focused system prompts and iteration caps
-- **Agent Skills** -- 8 built-in portable skills following the agentskills.io
-  open standard; synthesize new skills from execution traces
-- **MCP Tool Integration** -- FastMCP 3.0 tool server with filesystem, search,
-  git, web fetch, and web search; agents and skills exposed as MCP tools
-- **Interactive Chat** -- Rich terminal UI with progress display, timer/token
-  tracking, per-agent transparency, slash commands, web search, and history
-- **Self-Optimization** -- Trace collection, MIPROv2 optimization, agent synthesis,
-  and skill effectiveness tracking
-- **Security by Design** -- Parameterized SQL, SSRF prevention, sandbox isolation,
-  trust tiers, path traversal protection, and secret management
+| | Typical Agents | Memfun |
+|---|---|---|
+| **Solving** | Single LLM call or iterative loop | Context-first (2 calls) with automatic escalation to parallel multi-agent |
+| **Quality** | Raw LLM output | Every output verified by linters + consistency reviewed + polished |
+| **File edits** | Rewrites entire files | Targeted `edit_file` with fuzzy matching; destructive overwrites blocked |
+| **Parallelism** | Sequential | Up to 9 specialists working simultaneously |
+| **Memory** | Stateless | Persistent learning across sessions (TF-IDF + MEMORY.md) |
+| **Scaling** | Single process | 4 backend tiers: in-process to distributed NATS cluster |
 
 ## Quick Start
 
 ```bash
-# Install with uv (recommended)
-uv tool install memfun-cli
-
-# Or install from source
+# Install from source
 git clone https://github.com/indoor47/memfun.git
 cd memfun
 uv sync
 uv tool install packages/memfun-cli
 
-# Initialize (first-time setup: LLM provider + project config)
+# Initialize (LLM provider, API key, backend)
 memfun init
 
 # Start chatting
 memfun
 ```
 
-On first run, `memfun init` walks you through:
-1. **LLM provider** -- Anthropic (Claude), OpenAI, Ollama, or custom endpoint
-2. **API key** -- securely stored in `~/.memfun/credentials.json`
-3. **Project backend** -- SQLite (default), in-memory, Redis, or NATS
-4. **Sandbox** -- local (default), Docker, or Modal
+On first run, `memfun init` configures your LLM provider (Anthropic, OpenAI, Ollama, or custom endpoint), API key, backend tier (SQLite default), and sandbox.
 
-Then just run `memfun` to start an interactive chat session.
-
-### Interactive Chat
+## Interactive Chat
 
 ```
 $ memfun
@@ -178,26 +101,27 @@ $ memfun
  ██║ ╚═╝ ██║███████╗██║ ╚═╝ ██║██║     ╚██████╔╝██║ ╚████║
  ╚═╝     ╚═╝╚══════╝╚═╝     ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═══╝
 
-memfun > build me a REST API with user auth
+memfun > refactor the database module to use connection pooling
 
-  Plan:
-    ✓ 1. Analyze project structure  (thought for 3.2s)
-    ✓ 2. Create Flask app with JWT auth  (thought for 8.7s)
-    ✓ 3. Add user model and routes  (thought for 12.1s)
-    ✓ 4. Write tests  (thought for 6.4s)
+  Workflow: 3 agents in parallel
+    ✓ coder-agent    8 iterations, 4 ops  (42s)
+    ✓ test-agent     5 iterations, 2 ops  (28s)
+    ✓ review-agent   3 iterations, 0 ops  (12s)
 
-  Created app.py, models.py, routes/auth.py, tests/test_auth.py
+  Review: no issues found
 
-  1m 23s  •  14.2k tokens
+  Operations:
+    edit  src/db/connection.py    (replaced single connection with pool)
+    edit  src/db/queries.py       (use pool.acquire() context manager)
+    write tests/test_pool.py      (8 new test cases)
+    run   ruff check src/         (passed)
+    run   pytest tests/test_pool.py (passed)
 
-memfun > I prefer port 8080 for dev servers
+  1m 48s  •  22.1k tokens
 
-  Remembered (project, Preferences): I prefer port 8080 for dev servers
+memfun > I always want pool_size=10 for dev
 
-memfun > now add a /health endpoint
-
-  # Agent automatically uses port 8080 (learned from memory)
-  ...
+  Remembered: pool_size=10 for dev environments
 ```
 
 ### Slash Commands
@@ -205,16 +129,15 @@ memfun > now add a /health endpoint
 | Command | Description |
 |---------|-------------|
 | `/help` | Show available commands |
-| `/remember <text>` | Remember a preference or fact |
-| `/memory` | View current memory contents |
-| `/forget <target>` | Forget a memory entry (by number or text) |
+| `/remember <text>` | Store a preference or project fact |
+| `/memory` | View stored memories |
+| `/forget <target>` | Remove a memory entry |
 | `/context` | Rescan project files |
 | `/traces` | List recent execution traces |
-| `/agents` | List running multi-agent workflow agents |
+| `/agents` | Show running specialist agents |
 | `/workflow` | Show current workflow DAG and status |
 | `/model` | Show or switch LLM model |
 | `/clear` | Clear conversation history |
-| `/exit` | Exit (or Ctrl+D) |
 
 ### CLI Commands
 
@@ -231,90 +154,131 @@ memfun agent list               # List agent definitions
 
 ## Architecture
 
+### Solving Pipeline
+
 ```
-┌─────────────────────────────────────────────────────────┐
-│                      memfun-cli                          │
-│  Interactive chat, slash commands, setup wizard, CLI      │
-├────────┬──────────┬──────────┬──────────┬───────────────┤
-│memfun- │ memfun-  │ memfun-  │ memfun-  │   memfun-     │
-│agent   │ skills   │ tools    │optimizer │   runtime     │
-│        │          │          │          │               │
-│ RLM    │ Discover │ MCP      │ Trace    │ 8 Protocol    │
-│ coding │ Load     │ server   │ analysis │ interfaces    │
-│ agent  │ Execute  │ Code+Web │ Agent    │ 4 backend     │
-│ Traces │ Synth.   │ Gateway  │ synth.   │ tiers         │
-│        │          │          │ MIPROv2  │ BaseAgent     │
-├────────┴──────────┴──────────┴──────────┴───────────────┤
-│                      memfun-core                         │
-│         Config, types, errors, logging                    │
-└─────────────────────────────────────────────────────────┘
+                    ┌─────────────────────────────┐
+                    │        Query Triage          │
+                    │  (direct/project/task/web)   │
+                    └──────────┬──────────────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+              v                v                v
+        ┌──────────┐  ┌──────────────┐  ┌──────────────┐
+        │  Direct   │  │ Context-First│  │  Multi-Agent │
+        │  Answer   │  │   Solver     │  │  Workflow    │
+        │ (1 call)  │  │  (2 calls)   │  │(5-9 agents) │
+        └──────────┘  └──────┬───────┘  └──────┬───────┘
+                              │                 │
+                      ┌───────v─────────────────v───────┐
+                      │        Quality Pipeline          │
+                      │  Verify (linter) → Fix → Review  │
+                      │      → Polish (edit-only)        │
+                      └─────────────────────────────────┘
 ```
 
-### Packages
+### Multi-Agent Workflow
+
+```
+Task Decomposer (DAG)
+  │
+  ├─ Group 1 (parallel):  FileAgent + PlannerAgent
+  │
+  ├─ Group 2 (parallel):  CoderAgent + TestAgent + SecurityAgent
+  │     │
+  │     └─ Each runs: RLM loop → Verify → Consistency Review → Polish
+  │
+  ├─ Cross-Agent Review:  ReviewAgent checks all outputs
+  │
+  └─ Revision (up to 2 rounds): re-run failing agents with feedback
+```
+
+### 9 Specialist Agents
+
+| Agent | Role | Iterations |
+|-------|------|-----------|
+| **CoderAgent** | Writes production code, prefers `edit_file` over `write_file` | 15 |
+| **TestAgent** | Writes and runs tests | 10 |
+| **DebugAgent** | Diagnoses bugs, traces root causes | 12 |
+| **ReviewAgent** | Code quality, consistency, cross-agent conflicts | 8 |
+| **FileAgent** | Reads and analyzes files (never writes) | 8 |
+| **SecurityAgent** | Vulnerability analysis (injection, SSRF, secrets) | 8 |
+| **PlannerAgent** | Decomposes sub-problems, no code | 6 |
+| **WebSearchAgent** | Web search via DuckDuckGo | 8 |
+| **WebFetchAgent** | Fetches and extracts web page content | 8 |
+
+### Code Map
+
+Instead of feeding the planner a flat list of filenames, Memfun extracts a structural code map -- classes, functions, methods with their signatures -- using Python `ast` for `.py` files and regex for JS/TS, Go, Rust, and Java. The planner sees *what's in each file*, not just that it exists.
+
+```
+src/auth/jwt.py (2.1 KB)
+  class JWTManager
+    def __init__(self, secret: str, algorithm: str = "HS256")
+    def create_token(self, payload: dict, expires_in: int = 3600) -> str
+    def verify_token(self, token: str) -> dict | None
+  def require_auth(f: Callable) -> Callable
+src/db/models.py (1.4 KB)
+  class User
+    def check_password(self, password: str) -> bool
+  class Session
+```
+
+### Quality Pipeline
+
+Every code-producing path (context-first solver and each specialist agent) runs the same post-processing:
+
+1. **Auto-detect linters**: Finds ruff, eslint, go vet, cargo check based on project files
+2. **Verify**: Runs linters as subprocesses (0 LLM calls)
+3. **Fix**: If lint errors found, feeds them to a fix solver (1 LLM call)
+4. **Consistency review**: Semantic check comparing output against the original request (1 LLM call)
+5. **Polish**: If issues found, targeted edits in `edit_only` mode -- never rewrites whole files (0-1 LLM calls)
+
+### File Safety
+
+- **Destructive write guard**: `write_file` on existing files is blocked if it would lose >30% of content
+- **Edit-only mode**: Fix and polish steps can only use `edit_file`, never `write_file` on existing files
+- **Fuzzy edit matching**: 3 strategies (exact, whitespace-normalized, difflib sliding window) so edits land even when LLM output has minor whitespace differences
+- **Read caching**: MD5 hash per file prevents the agent from wasting iterations re-reading unchanged files
+- **Stall detection**: Warns the agent when it's stuck reading without acting, or re-reading the same files
+
+### Persistent Memory
+
+After every conversation turn, the agent extracts reusable knowledge (preferences, patterns, project details) and stores it in two layers:
+
+- **MEMORY.md**: Human-readable, editable file in `.memfun/MEMORY.md`. Always loaded as context.
+- **SQLite MemoryStore**: TF-IDF indexed database for efficient retrieval at scale.
+
+Before each turn, relevant memories are retrieved and injected as high-priority context. The agent genuinely learns -- it won't ask you what port to use twice.
+
+## Backend Tiers
+
+| Tier | Backend | Use Case |
+|------|---------|----------|
+| **T0** | In-Process (asyncio) | Unit tests, CI, instant startup |
+| **T1** | SQLite (WAL mode) | Single developer, local projects *(default)* |
+| **T2** | Redis | Team environments, shared state |
+| **T3** | NATS JetStream | Production: distributed, fault-tolerant, multi-node |
+
+All tiers implement the same 8 protocol interfaces (event bus, state store, task queue, agent registry, session manager, sandbox adapter, knowledge base, tool registry). Swap backends at config time -- no code changes.
+
+## Packages
 
 | Package | Description |
 |---------|-------------|
-| **memfun-core** | Shared types, config (`memfun.toml`), logging, errors |
-| **memfun-runtime** | Pluggable runtime: 8 protocol interfaces, 4 backend tiers, BaseAgent |
-| **memfun-agent** | RLM coding agent, context-first solver, 9 specialist agents, workflow engine, DSPy signatures, traces |
-| **memfun-skills** | Agent Skills: discovery, loading, execution, synthesis, marketplace |
-| **memfun-tools** | MCP tool server (FastMCP 3.0): code, git, filesystem, web tools |
-| **memfun-optimizer** | Self-optimization: trace analysis, agent synthesis, MIPROv2, persistent memory |
-| **memfun-cli** | CLI application: interactive chat, setup wizard, all commands |
-
-### How RLM Works
-
-The Recursive Language Model pattern separates the agent's *reasoning* from its
-*memory*. Instead of one massive prompt, the agent operates in iterations:
-
-```python
-# Simplified RLM loop (actual implementation in memfun-agent)
-for iteration in range(max_iterations):
-    # Agent sees: task + REPL state (variables, not raw files)
-    code = llm.generate_code(task, repl_state)
-
-    # Execute in sandboxed REPL -- results stored as variables
-    output = sandbox.execute(code)
-    # e.g., code: files = read_file("src/auth.py")
-    #       code: ast = parse_ast(files)
-    #       code: issues = search("TODO|FIXME", "src/")
-
-    # Agent can make sub-LLM calls for complex reasoning
-    # e.g., code: analysis = sub_llm("analyze this function", func_code)
-
-    # Check if task is complete
-    if task_complete(output):
-        return output
-```
-
-Each iteration, the agent can read files, run searches, parse code, call sub-LLMs,
-and accumulate state in REPL variables. The context window only needs to hold the
-current iteration's reasoning -- not the entire codebase. This is what enables
-Memfun to handle repositories that are orders of magnitude larger than any model's
-native context window.
-
-### How Persistent Memory Works
-
-After every conversation turn, the agent runs a learning extraction pipeline:
-
-1. **Extract**: DSPy `LearningExtraction` signature analyzes the conversation and
-   identifies reusable knowledge (preferences, patterns, technical details)
-2. **Store**: Learnings are persisted to a SQLite-backed MemoryStore with TF-IDF
-   indexing for efficient retrieval
-3. **Retrieve**: Before each turn, relevant memories are retrieved via TF-IDF
-   search and injected as highest-priority context
-4. **Visible layer**: Learnings also appear in `.memfun/MEMORY.md` -- a human-
-   readable, editable file you can manage with `/remember` and `/forget`
-
-The database-backed memory scales to thousands of entries. The agent doesn't just
-remember what you told it -- it learns patterns from how you work and applies them
-automatically.
+| **memfun-core** | Types, config (`memfun.toml`), logging, errors |
+| **memfun-runtime** | 8 protocol interfaces, 4 backend tiers, BaseAgent, `@agent` decorator |
+| **memfun-agent** | Context-first solver, 9 specialist agents, workflow engine, RLM, code map, DSPy signatures |
+| **memfun-skills** | Agent Skills runtime: discovery, loading, execution, synthesis |
+| **memfun-tools** | MCP tool server (FastMCP 3.0): filesystem, search, git, web tools |
+| **memfun-optimizer** | Trace analysis, agent synthesis, MIPROv2 optimization, persistent memory |
+| **memfun-cli** | Interactive chat, setup wizard, slash commands, all CLI commands |
 
 ## Configuration
 
-Memfun reads configuration from `memfun.toml` in the project root:
-
 ```toml
+# memfun.toml
 [project]
 name = "my-project"
 
@@ -323,7 +287,7 @@ provider = "anthropic"              # anthropic | openai | ollama | custom
 model = "claude-sonnet-4-5-20250514"
 api_key_env = "ANTHROPIC_API_KEY"
 temperature = 0.0
-max_tokens = 8192
+max_tokens = 128000
 
 [backend]
 tier = "sqlite"                     # in-process | sqlite | redis | nats
@@ -337,25 +301,9 @@ timeout_seconds = 30
 search_backend = "duckduckgo"       # duckduckgo | brave | tavily | searxng
 ```
 
-### Backend Tiers
-
-**T0 -- In-Process** (asyncio queues, zero dependencies)
-Best for: unit tests, CI pipelines, quick experiments.
-
-**T1 -- SQLite** (WAL-mode, single-file, default)
-Best for: individual developers, local projects. Zero infrastructure.
-
-**T2 -- Redis** (pub/sub, streams, shared state)
-Best for: team environments where multiple developers share agent state.
-
-**T3 -- NATS JetStream** (distributed, fault-tolerant, multi-node)
-Best for: production deployments. Horizontal scaling, persistence, clustering.
-NATS is a single binary with zero external dependencies -- no ZooKeeper, no Kafka,
-no Pulsar. Apache 2.0 licensed.
-
 ## Built-in Skills
 
-Memfun ships with 8 portable skills following the [Agent Skills](https://agentskills.io) standard:
+8 portable skills following the [Agent Skills](https://agentskills.io) standard:
 
 | Skill | Description |
 |-------|-------------|
@@ -368,46 +316,16 @@ Memfun ships with 8 portable skills following the [Agent Skills](https://agentsk
 | `refactor` | Refactor code for improved quality |
 | `ask` | General-purpose coding questions |
 
-Skills are defined as `SKILL.md` files and are portable across Claude Code, Codex
-CLI, Cursor, Gemini CLI, and 20+ other AI tools that support the Agent Skills
-standard.
-
-## Built-in Agents
-
-### Specialist Agents (used by WorkflowEngine)
-
-| Agent | Role | Max Iter |
-|-------|------|----------|
-| `file-agent` | Reads and analyzes files (never creates code) | 8 |
-| `coder-agent` | Implements features, writes code | 15 |
-| `test-agent` | Writes and runs tests | 10 |
-| `review-agent` | Reviews code quality and consistency | 8 |
-| `web-search-agent` | Searches the web for information | 8 |
-| `web-fetch-agent` | Fetches and extracts web page content | 8 |
-| `planner-agent` | Plans implementation approach | 6 |
-| `debug-agent` | Diagnoses and traces bugs | 12 |
-| `security-agent` | Security analysis and vulnerability review | 8 |
-
-### AGENT.md Definitions (higher-level coordination)
-
-| Agent | Role |
-|-------|------|
-| `architect` | Plans system design and technical approach |
-| `orchestrator` | Coordinates multi-agent workflows |
-| `reviewer` | Reviews code for correctness and quality |
-| `planner` | Decomposes complex tasks into steps |
-
-Define custom agents as `AGENT.md` files in `.memfun/agents/` or `agents/`.
+Skills are defined as `SKILL.md` files and are portable across Claude Code, Codex CLI, Cursor, Gemini CLI, and 20+ other AI tools.
 
 ## Development
 
 ```bash
-# Clone and setup
 git clone https://github.com/indoor47/memfun.git
 cd memfun
 uv sync
 
-# Run tests (464 pass, 88 skip for Redis/NATS without servers)
+# Run tests (597 pass, 88 skip for Redis/NATS without servers)
 uv run pytest
 
 # Lint
@@ -416,28 +334,27 @@ uv run ruff check .
 # Type check
 uv run pyright
 
-# Run the CLI in development (editable install)
+# Run in development
 uv run memfun
 ```
 
 ## Tech Stack
 
-- **Python 3.12+** with asyncio, `typing.Protocol`, dataclasses
-- **DSPy 2.6+** -- RLM module, MIPROv2 optimizer, structured signatures
-- **FastMCP 3.0** -- MCP server framework with composition and proxy
-- **aiosqlite** -- async SQLite for T1 backend
-- **redis** -- async Redis for T2 backend
-- **nats-py** -- NATS JetStream for T3 backend
-- **Typer + Rich** -- CLI framework with terminal UI
+- **Python 3.12+**, asyncio, `typing.Protocol`, dataclasses
+- **DSPy 2.6+** -- structured signatures, RLM module, MIPROv2 optimizer
+- **FastMCP 3.0** -- MCP server with composition and proxy
+- **aiosqlite** -- async SQLite (T1 backend)
+- **redis** -- async Redis (T2 backend)
+- **nats-py** -- NATS JetStream (T3 backend)
+- **Typer + Rich** -- CLI and terminal UI
 - **tree-sitter + ast-grep** -- AST parsing and code search
-- **DuckDuckGo Search** -- zero-config web search (no API key required)
+- **DuckDuckGo Search** -- zero-config web search
 - **Ruff** -- linting and formatting
 - **pytest + pytest-asyncio** -- testing
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code conventions,
-and the pull request process.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, conventions, and pull request process.
 
 ## Security
 
@@ -445,4 +362,4 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting and security practice
 
 ## License
 
-Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for the full text.
+Apache License 2.0. See [LICENSE](LICENSE).

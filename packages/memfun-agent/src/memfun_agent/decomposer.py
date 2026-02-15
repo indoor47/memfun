@@ -117,20 +117,39 @@ def _parse_sub_tasks(raw: Any) -> list[SubTask]:
 
 
 def _parse_groups(raw: Any) -> list[list[str]]:
-    """Defensively parse parallelism groups from LLM output."""
+    """Defensively parse parallelism groups from LLM output.
+
+    Handles various LLM output formats:
+    - Proper nested lists: ``[["T1", "T2"], ["T3"]]``
+    - JSON strings: ``'["T1", "T2"]'``
+    - Python list repr with single quotes: ``"['T1', 'T2']"``
+    - Comma-separated: ``"T1, T2"``
+    """
     items = _normalize_list(raw)
     groups: list[list[str]] = []
     for item in items:
         if isinstance(item, str):
+            text = item.strip()
+            # Try JSON first (double quotes).
             try:
-                parsed = json.loads(item)
+                parsed = json.loads(text)
                 if isinstance(parsed, list):
                     groups.append([str(x) for x in parsed])
                     continue
             except (json.JSONDecodeError, ValueError):
                 pass
+            # Try Python list repr (single quotes) by
+            # replacing ' with ".
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = json.loads(text.replace("'", '"'))
+                    if isinstance(parsed, list):
+                        groups.append([str(x) for x in parsed])
+                        continue
+                except (json.JSONDecodeError, ValueError):
+                    pass
             # Try comma-separated
-            ids = [x.strip() for x in re.split(r"[,\s]+", item) if x.strip()]
+            ids = [x.strip() for x in re.split(r"[,\s]+", text) if x.strip()]
             if ids:
                 groups.append(ids)
         elif isinstance(item, list):
@@ -233,7 +252,26 @@ class TaskDecomposer(dspy.Module):
 
             _validate_dag(sub_tasks)
 
-            # If LLM didn't produce groups, infer from deps.
+            # Validate group IDs match actual sub_task IDs.
+            # LLMs frequently produce mismatched IDs (e.g. "1"
+            # instead of "T1"), causing _execute_group to skip
+            # all tasks silently.
+            known_ids = {t.id for t in sub_tasks}
+            if groups:
+                all_group_ids = {
+                    tid for grp in groups for tid in grp
+                }
+                if not all_group_ids.issubset(known_ids):
+                    logger.warning(
+                        "Group IDs %s don't match sub_task IDs %s"
+                        " — rebuilding groups from dependencies",
+                        all_group_ids - known_ids,
+                        known_ids,
+                    )
+                    groups = []  # force rebuild below
+
+            # If LLM didn't produce groups (or they were
+            # invalid), infer from deps.
             if not groups:
                 groups = _infer_groups(sub_tasks)
 

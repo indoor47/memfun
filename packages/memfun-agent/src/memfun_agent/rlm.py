@@ -37,9 +37,9 @@ logger = get_logger("agent.rlm")
 # ── Constants ──────────────────────────────────────────────────
 
 _DEFAULT_MAX_ITERATIONS = 10
-_DEFAULT_MAX_OUTPUT_CHARS = 10_000
+_DEFAULT_MAX_OUTPUT_CHARS = 0  # 0 = no limit (rely on history window)
 _PREVIEW_LENGTH = 500
-_MAX_HISTORY_CHARS = 16_000
+_MAX_HISTORY_CHARS = 120_000
 
 
 # ── Context metadata helper ────────────────────────────────────
@@ -550,7 +550,10 @@ class RLMModule(dspy.Module):
                 # Build output string
                 output = exec_result.stdout
                 output_truncated = False
-                if len(output) > self.config.max_output_chars:
+                if (
+                    self.config.max_output_chars > 0
+                    and len(output) > self.config.max_output_chars
+                ):
                     output = (
                         output[: self.config.max_output_chars]
                         + f"\n... (truncated, total {len(exec_result.stdout)} chars)"
@@ -669,6 +672,14 @@ class RLMModule(dspy.Module):
                         o[1] for o in ops_so_far
                         if o[0] == "write"
                     ]
+                    edits = [
+                        o[1] for o in ops_so_far
+                        if o[0] == "edit"
+                    ]
+                    reads = [
+                        o[1] for o in ops_so_far
+                        if o[0] == "read"
+                    ]
                     cmds = [
                         o[1] for o in ops_so_far
                         if o[0] == "cmd"
@@ -682,10 +693,23 @@ class RLMModule(dspy.Module):
                         if o[0] == "web_fetch"
                     ]
                     status_parts = []
+                    if reads:
+                        # Show unique files read.
+                        unique_reads = list(dict.fromkeys(reads))
+                        status_parts.append(
+                            f"Files read: "
+                            f"{', '.join(unique_reads[-5:])}"
+                        )
                     if writes:
                         status_parts.append(
                             f"Files written: "
                             f"{', '.join(writes[-5:])}"
+                        )
+                    if edits:
+                        unique_edits = list(dict.fromkeys(edits))
+                        status_parts.append(
+                            f"Files edited: "
+                            f"{', '.join(unique_edits[-5:])}"
                         )
                     if cmds:
                         status_parts.append(
@@ -722,7 +746,7 @@ class RLMModule(dspy.Module):
                     )
                 elif remaining <= self.config.max_iterations // 2:
                     # Check for stall: if we've done reads but
-                    # no writes/edits/commands in last 3 iters
+                    # no writes/edits/commands
                     state = repl.namespace.get("state", {})
                     ops_so_far = state.get("_ops", [])
                     action_ops = [
@@ -739,6 +763,40 @@ class RLMModule(dspy.Module):
                             "edit_file() to implement your fix "
                             "NOW. Do not read more files.\n"
                         )
+                    else:
+                        # Check for re-read loop: if the agent
+                        # has action ops but keeps re-reading
+                        # the same files (common after edits)
+                        read_ops = [
+                            o[1] for o in ops_so_far
+                            if o[0] == "read"
+                        ]
+                        if len(read_ops) >= 4:
+                            from collections import Counter
+
+                            read_counts = Counter(read_ops)
+                            hot_files = [
+                                (f, c) for f, c in
+                                read_counts.most_common(3)
+                                if c >= 3
+                            ]
+                            if hot_files:
+                                names = ", ".join(
+                                    f"{f.rsplit('/', 1)[-1]}"
+                                    f" ({c}x)"
+                                    for f, c in hot_files
+                                )
+                                code_history += (
+                                    f"⚠ RE-READ LOOP: You've "
+                                    f"read {names} multiple "
+                                    f"times. The content hasn't "
+                                    f"changed. If your task is "
+                                    f"done, set state['FINAL'] "
+                                    f"with a summary of what you "
+                                    f"did. If not done, make "
+                                    f"your remaining edits NOW "
+                                    f"without re-reading.\n"
+                                )
 
                 if self.config.verbose:
                     logger.info(
@@ -1096,8 +1154,36 @@ def _make_write_file(
         """Write *content* to *path*. Creates parent dirs.
 
         Returns the absolute path written.
+
+        **Overwrite guard**: If the file already exists and the new
+        content would lose >30% of lines, the write is blocked and
+        a warning is printed suggesting ``edit_file()`` instead.
         """
         path = _os.path.abspath(path)
+
+        # Guard: detect destructive overwrites of existing files.
+        if _os.path.isfile(path):
+            try:
+                with open(path) as fh:
+                    existing = fh.read()
+            except (OSError, UnicodeDecodeError):
+                existing = ""
+
+            old_lines = len(existing.splitlines())
+            new_lines = len(content.splitlines())
+
+            if old_lines > 10 and new_lines < old_lines * 0.7:
+                loss_pct = (1 - new_lines / old_lines) * 100
+                print(
+                    f"BLOCKED: write_file would lose {loss_pct:.0f}% "
+                    f"of {path} ({old_lines} -> {new_lines} lines). "
+                    f"Use edit_file(path, old_text, new_text) to make "
+                    f"targeted changes instead of rewriting the whole "
+                    f"file. Or use read_file(path) first to see the "
+                    f"current content."
+                )
+                return path
+
         _os.makedirs(
             _os.path.dirname(path) or ".", exist_ok=True
         )
@@ -1116,17 +1202,59 @@ def _make_write_file(
 def _make_read_file(
     ns: dict[str, Any],
 ) -> Callable[[str], str]:
-    """Create a ``read_file`` helper bound to *ns*."""
+    """Create a ``read_file`` helper bound to *ns*.
+
+    Includes read caching: if the same file is read again and its
+    content hasn't changed, returns a short summary instead of the
+    full content.  This prevents the RLM from burning context by
+    re-reading unchanged files every iteration.
+    """
+    import hashlib
     import os as _os
 
+    # Track {abs_path: content_md5} for cache invalidation.
+    _read_cache: dict[str, str] = {}
+
     def read_file(path: str) -> str:
-        """Read and return file contents."""
+        """Read and return file contents.
+
+        If the file was already read and hasn't changed, returns a
+        short summary instead of the full content.  The original
+        content is still accessible as a Python variable from a
+        prior iteration.
+        """
         path = _os.path.abspath(path)
         with open(path) as fh:
             content = fh.read()
+
+        content_hash = hashlib.md5(
+            content.encode("utf-8", errors="replace")
+        ).hexdigest()
+
         ns["state"]["_ops"].append(
             ("read", path, len(content))
         )
+
+        # Check if content is identical to last read.
+        prev_hash = _read_cache.get(path)
+        _read_cache[path] = content_hash
+
+        if prev_hash == content_hash:
+            # File unchanged — return summary to save context.
+            lines = len(content.splitlines())
+            print(
+                f"Already read {path} ({len(content)} chars, "
+                f"{lines} lines) — content unchanged since last "
+                f"read. Use your existing knowledge of this file "
+                f"instead of re-reading it."
+            )
+            return (
+                f"[File already read and unchanged: {path} "
+                f"({len(content)} chars, {lines} lines). "
+                f"Content is identical to your previous read. "
+                f"Proceed with what you already know.]"
+            )
+
         print(f"Read {path} ({len(content)} chars)")
         return content
 

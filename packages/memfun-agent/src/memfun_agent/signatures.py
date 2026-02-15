@@ -214,10 +214,22 @@ class QueryTriage(dspy.Signature):
     - 'web': Needs current internet data. "What's the latest React version?"
     - 'project': READ-ONLY codebase exploration. "How does auth work here?",
       "Explain the database schema", "What files handle routing?"
-    - 'task': ANY request that creates, modifies, or generates code.
-      "Add tests", "Fix the login bug", "Build a REST API", "Refactor models".
-      When in doubt between 'project' and 'task', prefer 'task' — the
-      system will fall back to single-agent if the task is simple.
+    - 'task': Code changes — this is the DEFAULT for any coding request.
+      Handles single AND multi-concern requests: bug fixes, adding features,
+      restyling, refactoring, changing multiple things at once.
+      "Fix the login bug", "Change colors and fix the exit handler",
+      "Add localStorage + delete buttons", "Refactor the auth system".
+      Use 'task' for virtually ALL code modification requests.
+    - 'workflow': ONLY for extremely large requests that explicitly ask
+      for 5+ completely independent features AND the project has 30+
+      files requiring cross-team coordination. This is very rare.
+      Example: "Build an entire e-commerce platform with auth, payments,
+      inventory, shipping, reviews, and admin dashboard from scratch".
+
+    ALMOST ALWAYS use 'task'. The system will automatically escalate
+    to multi-agent workflow if a task turns out to be too complex.
+    Do NOT use 'workflow' just because the user mentions 2-3 concerns
+    in one message — that is still 'task'.
 
     IMPORTANT: Short follow-up messages like "2", "yes", "the second one",
     "do it", "go ahead" are CONTINUATIONS of the previous conversation.
@@ -245,7 +257,13 @@ class QueryTriage(dspy.Signature):
         )
     )
     project_summary: str = dspy.InputField(
-        desc="Brief summary of available project context"
+        desc=(
+            "Project structure: code map (files with classes, functions, "
+            "and method signatures), project type (from README, "
+            "pyproject.toml, package.json).  Use this to assess how "
+            "many files the request would touch and whether the changes "
+            "need cross-file coordination."
+        )
     )
     category: str = dspy.OutputField(
         desc=(
@@ -253,10 +271,11 @@ class QueryTriage(dspy.Signature):
             "'web' (needs internet search/fetch), "
             "'project' (READ-ONLY: explore, analyze, explain existing "
             "code without changing it), "
-            "'task' (WRITE/CHANGE: create files, fix bugs, refactor, "
-            "add features, implement, build, test, deploy — any request "
-            "that will modify or create code. When in doubt between "
-            "'project' and 'task', prefer 'task'.)"
+            "'task' (DEFAULT for ALL code changes — single or multiple "
+            "concerns, bug fixes, restyling, refactoring, adding features), "
+            "'workflow' (EXTREMELY RARE: only for 5+ independent features "
+            "on a 30+ file project needing cross-team coordination). "
+            "ALMOST ALWAYS use 'task'. When in doubt, use 'task'."
         )
     )
     reasoning: str = dspy.OutputField(

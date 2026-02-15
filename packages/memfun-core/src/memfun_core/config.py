@@ -39,7 +39,7 @@ class LLMConfig:
     api_key_env: str = "ANTHROPIC_API_KEY"
     base_url: str | None = None
     temperature: float = 0.0
-    max_tokens: int = 32768
+    max_tokens: int = 128_000
 
 
 @dataclass(frozen=True, slots=True)

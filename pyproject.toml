@@ -1,6 +1,6 @@
 [project]
 name = "memfun"
-version = "0.1.15"
+version = "0.2.0"
 description = "OSS autonomous coding agent: pluggable runtime + DSPy RLM + MCP + Agent Skills"
 license = "Apache-2.0"
 readme = "README.md"
@@ -9,7 +9,6 @@ authors = [{name = "Memfun Contributors"}]
 keywords = ["ai", "agent", "coding", "dspy", "rlm", "mcp"]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries",
 ]

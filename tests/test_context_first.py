@@ -999,10 +999,12 @@ async def test_solver_consistency_review_triggers_polish(tmp_path: Path):
     async def _mock_fix(query, full_context, verification_errors):
         nonlocal polish_called
         polish_called = True
+        # Polish runs in edit_only mode, so must use edit_file (not write_file).
         return [{
-            "op": "write_file",
+            "op": "edit_file",
             "path": str(tmp_path / "out.py"),
-            "content": "complete_implementation()",
+            "old": "incomplete",
+            "new": "complete_implementation()",
         }]
 
     with (
@@ -1534,8 +1536,6 @@ def test_plan_result_web_searches_default():
 @pytest.mark.asyncio
 async def test_context_planner_extracts_web_searches(tmp_path: Path):
     """Planner extracts web_searches from DSPy output."""
-    import asyncio
-
     from memfun_agent.context_first import ContextPlanner
 
     planner = ContextPlanner()

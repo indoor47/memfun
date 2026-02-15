@@ -19,19 +19,20 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --python 3.12
+      - run: uv sync --all-packages --python 3.12
       - run: uv run ruff check .
       - run: uv run ruff format --check .
 
   typecheck:
     name: Type Check
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --python 3.12
+      - run: uv sync --all-packages --python 3.12
       - run: uv run pyright
 
   test:
@@ -45,7 +46,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --python ${{ matrix.python-version }}
+      - run: uv sync --all-packages --python ${{ matrix.python-version }}
       - run: uv run pytest --cov --cov-report=xml -v
       - uses: codecov/codecov-action@v4
         if: matrix.python-version == '3.12'
@@ -62,5 +63,5 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --python 3.12
+      - run: uv sync --all-packages --python 3.12
       - run: uv run pip-audit

@@ -241,8 +241,31 @@ class WorkflowEngine:
         state.status = WorkflowStatus.RUNNING
         self._emit_status(state)
 
+        # Final safety: ensure group IDs match sub_task_statuses.
+        known_ids = set(state.sub_task_statuses.keys())
+        execution_groups = decomposition.parallelism_groups
+        all_group_ids = {
+            tid for grp in execution_groups for tid in grp
+        }
+        if not all_group_ids.issubset(known_ids):
+            logger.warning(
+                "Parallelism group IDs %s don't match known"
+                " sub-task IDs %s — rebuilding groups",
+                all_group_ids - known_ids,
+                known_ids,
+            )
+            from memfun_agent.decomposer import _infer_groups
+
+            execution_groups = _infer_groups(
+                decomposition.sub_tasks,
+            )
+            logger.info(
+                "Rebuilt %d execution groups from deps",
+                len(execution_groups),
+            )
+
         base_context = state.shared_context or project_context
-        for group in decomposition.parallelism_groups:
+        for group in execution_groups:
             # Rebuild enriched context from base + all completed so far
             # (avoids O(n²) re-appending of prior results).
             enriched_context = self._enrich_with_prior_results(
@@ -364,10 +387,17 @@ class WorkflowEngine:
         """Execute a parallelism group via orchestrator.fan_out()."""
         tasks: list[TaskMessage] = []
         agent_names: list[str] = []
+        matched_tids: list[str] = []
 
         for tid in group:
             sub_status = state.sub_task_statuses.get(tid)
             if sub_status is None:
+                logger.warning(
+                    "Group task ID %r not found in sub_task_statuses"
+                    " (known: %s)",
+                    tid,
+                    list(state.sub_task_statuses.keys()),
+                )
                 continue
 
             task_msg = TaskMessage(
@@ -387,19 +417,34 @@ class WorkflowEngine:
             )
             tasks.append(task_msg)
             agent_names.append(sub_status.agent_name)
+            matched_tids.append(tid)
 
             sub_status.status = "running"
             sub_status.started_at = time.time()
             self._emit_sub_task(tid, sub_status)
 
         if not tasks:
+            logger.warning(
+                "No tasks to execute in group %s — all IDs"
+                " unmatched. This likely means the decomposer"
+                " produced mismatched group/task IDs.",
+                group,
+            )
             return
 
+        logger.info(
+            "Executing group of %d tasks: %s",
+            len(tasks),
+            matched_tids,
+        )
         results = await self._orchestrator.fan_out(
             tasks, agent_names, timeout=600.0,
         )
 
-        for tid, result in zip(group, results, strict=False):
+        # Zip results back using matched_tids (not group)
+        # to ensure correct alignment when some group IDs
+        # were skipped.
+        for tid, result in zip(matched_tids, results, strict=False):
             sub_status = state.sub_task_statuses.get(tid)
             if sub_status is None:
                 continue
@@ -711,14 +756,28 @@ class WorkflowEngine:
         """Start needed specialist agents."""
         needed = {agent_name_for_type(st.agent_type) for st in sub_tasks}
         needed.add("review-agent")
+        started = []
+        failed = []
 
-        for name in needed:
-            if not self._manager.is_running(name):
-                try:
-                    await self._manager.start_agent(name)
-                    logger.info("Started agent %s", name)
-                except Exception as exc:
-                    logger.error("Failed to start %s: %s", name, exc)
+        for name in sorted(needed):
+            if self._manager.is_running(name):
+                started.append(name)
+                continue
+            try:
+                await self._manager.start_agent(name)
+                started.append(name)
+                logger.info("Started agent %s", name)
+            except Exception as exc:
+                failed.append(name)
+                logger.error("Failed to start %s: %s", name, exc)
+
+        logger.info(
+            "Agent readiness: %d started (%s), %d failed (%s)",
+            len(started),
+            ", ".join(started),
+            len(failed),
+            ", ".join(failed) or "none",
+        )
 
     # ── Review parsing ────────────────────────────────────────
 
@@ -784,9 +843,17 @@ class WorkflowEngine:
         answer_parts: list[str] = []
         sub_results: dict[str, TaskResult] = {}
 
+        none_count = 0
         for tid, sub_status in state.sub_task_statuses.items():
             if sub_status.result is None:
                 # Agent never ran or result was lost.
+                none_count += 1
+                logger.warning(
+                    "Sub-task %s (%s) has no result — agent"
+                    " never ran or result was lost",
+                    tid,
+                    sub_status.agent_name,
+                )
                 answer_parts.append(
                     f"## {tid}: {sub_status.sub_task.description}\n"
                     f"*No result (agent: {sub_status.agent_name})*"
@@ -812,6 +879,13 @@ class WorkflowEngine:
                     f"## {tid}: {sub_status.sub_task.description}\n"
                     f"*Failed: {sub_status.result.error or 'unknown error'}*"
                 )
+
+        if none_count:
+            logger.error(
+                "%d/%d sub-tasks produced no result",
+                none_count,
+                len(state.sub_task_statuses),
+            )
 
         merged_answer = "\n\n".join(answer_parts)
         if review.summary:
