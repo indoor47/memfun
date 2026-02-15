@@ -1704,7 +1704,7 @@ wheels = [
 
 [[package]]
 name = "memfun"
-version = "0.1.5"
+version = "0.1.6"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -1731,7 +1731,6 @@ dev = [
 
 [[package]]
 name = "memfun-agent"
-version = "0.1.5"
 source = { editable = "packages/memfun-agent" }
 dependencies = [
     { name = "dspy" },
@@ -1750,7 +1749,6 @@ requires-dist = [
 
 [[package]]
 name = "memfun-cli"
-version = "0.1.5"
 source = { editable = "packages/memfun-cli" }
 dependencies = [
     { name = "inquirerpy" },
@@ -1781,12 +1779,10 @@ requires-dist = [
 
 [[package]]
 name = "memfun-core"
-version = "0.1.5"
 source = { editable = "packages/memfun-core" }
 
 [[package]]
 name = "memfun-optimizer"
-version = "0.1.5"
 source = { editable = "packages/memfun-optimizer" }
 dependencies = [
     { name = "dspy" },
@@ -1805,7 +1801,6 @@ requires-dist = [
 
 [[package]]
 name = "memfun-runtime"
-version = "0.1.5"
 source = { editable = "packages/memfun-runtime" }
 dependencies = [
     { name = "memfun-core" },
@@ -1837,11 +1832,10 @@ requires-dist = [
     { name = "nats-py", marker = "extra == 'nats'", specifier = ">=2.7" },
     { name = "redis", extras = ["hiredis"], marker = "extra == 'redis'", specifier = ">=5.0" },
 ]
-provides-extras = ["sqlite", "redis", "nats", "docker", "modal"]
+provides-extras = ["docker", "modal", "nats", "redis", "sqlite"]
 
 [[package]]
 name = "memfun-skills"
-version = "0.1.5"
 source = { editable = "packages/memfun-skills" }
 dependencies = [
     { name = "memfun-core" },
@@ -1858,7 +1852,6 @@ requires-dist = [
 
 [[package]]
 name = "memfun-tools"
-version = "0.1.5"
 source = { editable = "packages/memfun-tools" }
 dependencies = [
     { name = "duckduckgo-search" },

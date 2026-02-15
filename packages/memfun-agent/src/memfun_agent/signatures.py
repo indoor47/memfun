@@ -515,9 +515,10 @@ class ContextPlanning(dspy.Signature):
     )
     file_manifest: str = dspy.InputField(
         desc=(
-            "Newline-separated list of project files with byte sizes, "
-            "e.g. 'src/app.py (1234 bytes)'.  Covers all source files "
-            "in the project."
+            "Newline-separated list of project files with code structure. "
+            "Each file shows its path, size, and top-level definitions "
+            "(classes, functions, methods with signatures).  Use these "
+            "definitions to identify which files are relevant to the task."
         )
     )
     project_summary: str = dspy.InputField(

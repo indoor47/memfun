@@ -188,6 +188,21 @@ def _scan_cwd_context(cwd: Path) -> str:
         if candidate.exists():
             parts.append(f"--- {name} ---\n{_read_file(candidate)}")
 
+    # Inject compact code map (classes/functions/methods) so the
+    # triage and direct-answer paths have structural awareness.
+    try:
+        from memfun_agent.code_map import build_code_map, code_map_to_string
+        from memfun_agent.context_first import build_file_manifest
+
+        manifest = build_file_manifest(cwd)
+        if manifest:
+            file_maps = build_code_map(cwd, manifest=manifest)
+            map_str = code_map_to_string(file_maps, max_tokens=800)
+            if map_str:
+                parts.append(f"--- Code Map ---\n{map_str}")
+    except Exception:
+        logger.debug("Code map generation failed", exc_info=True)
+
     source_files: list[Path] = []
     for child in sorted(cwd.rglob("*")):
         if child.is_file() and child.suffix in _SOURCE_EXTENSIONS:
@@ -197,7 +212,7 @@ def _scan_cwd_context(cwd: Path) -> str:
             if any(p in _SKIP_DIRS for p in rel.parts):
                 continue
             source_files.append(child)
-            if len(source_files) >= 10:
+            if len(source_files) >= 5:
                 break
 
     for sf in source_files:
@@ -1655,12 +1670,30 @@ def _print_plan_final(session: ChatSession) -> None:
 
 
 def _get_version() -> str:
-    """Get the memfun-cli package version."""
+    """Get the memfun version from source (live with editable installs)."""
     try:
-        from importlib.metadata import version
-        return version("memfun-cli")
+        from memfun_core._version import __version__
+        return __version__
     except Exception:
-        return "0.1.5"
+        return "dev"
+
+
+def _get_build() -> str:
+    """Get the git short hash as build identifier."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            cwd=Path(__file__).resolve().parent,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
 
 
 def _load_credentials() -> None:
@@ -1765,7 +1798,8 @@ async def _async_chat_loop() -> None:
     # Compact welcome banner
     console.print()
     console.print(
-        f"  [bold cyan]memfun[/bold cyan] v{_get_version()} [dim]│[/dim] {session.model_name} "
+        f"  [bold cyan]memfun[/bold cyan] v{_get_version()} [dim]({_get_build()})[/dim] "
+        f"[dim]│[/dim] {session.model_name} "
         f"[dim]│[/dim] {Path.cwd().name}/ [dim]│[/dim] {session.history_stats}"
     )
     console.print("  [dim]Type a message or /help. Ctrl+C to cancel. Ctrl+D to exit.[/dim]")

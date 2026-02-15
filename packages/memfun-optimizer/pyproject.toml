@@ -1,6 +1,6 @@
 [project]
 name = "memfun-optimizer"
-version = "0.1.5"
+dynamic = ["version"]
 description = "Self-optimization: trace analysis, agent synthesis, MIPROv2"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -33,6 +33,9 @@ memfun-agent = { workspace = true }
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "../memfun-core/src/memfun_core/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/memfun_optimizer"]

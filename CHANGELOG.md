@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.6 (2026-02-15)
+
+### Added
+
+- **Code map (repo structure index)**: Aider-style compact index of classes,
+  functions, and methods with signatures extracted from source files.  Uses
+  Python `ast` module for `.py` files, regex for JS/TS/Go/Rust/Java.
+  Auto-injected into ContextPlanner, WorkflowEngine, and chat triage context
+  so the LLM sees codebase structure without reading every file.
+- **35 new tests**: Full coverage for code map extraction (Python, JS/TS,
+  Go, Rust, Java), build_code_map, code_map_to_string formatting and
+  truncation.
+
+### Changed
+
+- ContextPlanner now receives code definitions (classes, functions, methods)
+  instead of just file paths and sizes, dramatically improving file selection
+  accuracy for large projects.
+- Chat triage context (`_scan_cwd_context`) now includes a compact code map
+  and reads 5 source files (down from 10) since the code map provides
+  structural overview.
+
 ## 0.1.4 (2026-02-13)
 
 ### Added

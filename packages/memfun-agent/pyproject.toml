@@ -1,6 +1,6 @@
 [project]
 name = "memfun-agent"
-version = "0.1.5"
+dynamic = ["version"]
 description = "RLM coding agent, MCP Tool Bridge, trace collection"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -33,6 +33,9 @@ memfun-tools = { workspace = true }
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "../memfun-core/src/memfun_core/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/memfun_agent"]

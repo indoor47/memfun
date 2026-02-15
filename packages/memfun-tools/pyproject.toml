@@ -1,6 +1,6 @@
 [project]
 name = "memfun-tools"
-version = "0.1.5"
+dynamic = ["version"]
 description = "MCP tool servers: code tools (filesystem, search, git) + web tools (fetch, search)"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -36,6 +36,9 @@ memfun-agent = { workspace = true }
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "../memfun-core/src/memfun_core/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/memfun_tools"]

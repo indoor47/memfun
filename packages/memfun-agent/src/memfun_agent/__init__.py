@@ -4,6 +4,7 @@ Public API:
 - ``RLMCodingAgent`` -- The main coding agent (BaseAgent subclass).
 - ``RLMModule`` / ``RLMConfig`` / ``RLMResult`` -- Core RLM module.
 - ``ContextFirstSolver`` / ``ContextFirstConfig`` -- Context-first solving.
+- ``build_code_map`` / ``code_map_to_string`` -- Code structure indexing.
 - ``MCPToolBridge`` / ``create_tool_bridge`` -- MCP tool integration.
 - ``TraceCollector`` / ``ExecutionTrace`` -- Trace collection.
 - DSPy signatures: ``CodeAnalysis``, ``BugFix``, ``CodeReview``,
@@ -21,6 +22,12 @@ Public API:
 """
 from __future__ import annotations
 
+from memfun_agent.code_map import (
+    Definition,
+    FileMap,
+    build_code_map,
+    code_map_to_string,
+)
 from memfun_agent.coding_agent import RLMCodingAgent
 from memfun_agent.context_first import (
     ContextFirstConfig,
@@ -110,8 +117,10 @@ __all__ = [
     "DebugAgent",
     "DecompositionResult",
     "DefinedAgent",
+    "Definition",
     "ExecutionTrace",
     "FileAgent",
+    "FileMap",
     "LearningExtraction",
     "LocalREPL",
     "MCPToolBridge",
@@ -143,7 +152,9 @@ __all__ = [
     "WorkflowResult",
     "WorkflowState",
     "agent_to_metadata",
+    "build_code_map",
     "build_context_metadata",
+    "code_map_to_string",
     "create_tool_bridge",
     "parse_agent_md",
 ]

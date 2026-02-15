@@ -815,7 +815,12 @@ class ContextFirstSolver:
             )
 
         total_size = sum(size for _, size in manifest)
-        manifest_str = manifest_to_string(manifest)
+
+        # Build code map (classes/functions/methods) instead of
+        # plain path+size manifest for better planner file selection.
+        from memfun_agent.code_map import build_code_map, code_map_to_string
+        file_maps = build_code_map(self.project_root, manifest=manifest)
+        manifest_str = code_map_to_string(file_maps, max_tokens=2000)
 
         # Inject conversation context as extra info for the solver.
         extra_context = ""

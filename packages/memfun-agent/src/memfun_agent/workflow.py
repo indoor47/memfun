@@ -575,12 +575,12 @@ class WorkflowEngine:
 
         Returns the enriched context string.
         """
+        from memfun_agent.code_map import build_code_map, code_map_to_string
         from memfun_agent.context_first import (
             ContextFirstConfig,
             ContextGatherer,
             ContextPlanner,
             build_file_manifest,
-            manifest_to_string,
         )
 
         project_root = os.getcwd()
@@ -628,7 +628,10 @@ class WorkflowEngine:
             planner = ContextPlanner()
             plan = await planner.aplan(
                 query=combined_query,
-                file_manifest=manifest_to_string(manifest),
+                file_manifest=code_map_to_string(
+                    build_code_map(project_root, manifest=manifest),
+                    max_tokens=2000,
+                ),
                 project_summary=project_context[:2000],
             )
             return await gatherer.agather(
