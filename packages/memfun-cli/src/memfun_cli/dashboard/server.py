@@ -26,6 +26,13 @@ from typing import Any
 
 from memfun_core.logging import get_logger
 
+try:
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import HTMLResponse
+except ImportError as _fastapi_err:
+    FastAPI = WebSocket = WebSocketDisconnect = HTMLResponse = None  # type: ignore[assignment, misc]
+    _fastapi_err_msg = str(_fastapi_err)
+
 logger = get_logger("dashboard")
 
 # Will be populated when the server starts
@@ -294,12 +301,9 @@ async def _handle_chat_message(ws: Any, text: str) -> None:
 
 def create_app():
     """Create the FastAPI app for the dashboard."""
-    try:
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-        from fastapi.responses import HTMLResponse
-    except ImportError:
+    if FastAPI is None:
         logger.error("Install fastapi: pip install fastapi uvicorn")
-        raise
+        raise ImportError(_fastapi_err_msg)
 
     app = FastAPI(title="Memfun Agent Dashboard")
 
