@@ -51,6 +51,51 @@ _chat_ws: Any | None = None
 MAX_EVENTS = 500
 
 
+async def _load_event_history() -> None:
+    """Load recent events from Redis Streams on startup."""
+    try:
+        from memfun_runtime.backends.redis._pool import create_pool
+        from memfun_runtime.distributed import DistributedEvent
+
+        client = await create_pool(_redis_url)
+        stream_key = f"memfun:stream:{EVENT_TOPIC}"
+
+        # XREVRANGE: newest first, grab last 200
+        entries = await client.xrevrange(stream_key, count=200)
+        if not entries:
+            logger.info("No historical events in Redis")
+            return
+
+        # Reverse to chronological order
+        for _redis_id, fields in reversed(entries):
+            try:
+                event = DistributedEvent.from_bytes(fields[b"payload"])
+                event_dict = {
+                    "event_type": event.event_type,
+                    "task_id": event.task_id,
+                    "agent_name": event.agent_name,
+                    "worker_id": event.worker_id,
+                    "success": event.success,
+                    "duration_ms": event.duration_ms,
+                    "detail": event.detail,
+                    "ts": event.ts,
+                }
+                _update_state(event_dict)
+                _events.append(event_dict)
+            except Exception:
+                continue
+
+        if len(_events) > MAX_EVENTS:
+            del _events[: len(_events) - MAX_EVENTS]
+
+        logger.info("Loaded %d historical events from Redis", len(_events))
+    except Exception:
+        logger.debug("Could not load event history", exc_info=True)
+
+
+EVENT_TOPIC = "memfun.distributed.events"
+
+
 async def _redis_listener() -> None:
     """Subscribe to the distributed events stream and broadcast."""
     from memfun_runtime.backends.redis.event_bus import RedisEventBus
@@ -311,6 +356,7 @@ def create_app():
 
     @app.on_event("startup")
     async def startup():
+        await _load_event_history()
         task = asyncio.create_task(_redis_listener())
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
