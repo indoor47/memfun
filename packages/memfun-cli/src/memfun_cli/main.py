@@ -105,7 +105,9 @@ def explain(
 def version() -> None:
     """Show the Memfun version."""
     from rich.console import Console
-    Console().print("memfun 0.1.0")
+
+    from memfun_core._version import __version__
+    Console().print(f"memfun {__version__}")
 
 
 def _handle_slash_command() -> bool:

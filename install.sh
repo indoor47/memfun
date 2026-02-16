@@ -16,6 +16,15 @@ echo "  ██║ ╚═╝ ██║███████╗██║ ╚═╝
 echo "  ╚═╝     ╚═╝╚══════╝╚═╝     ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═══╝"
 echo ""
 
+# ── 0. Check system prerequisites ────────────────────────
+for cmd in git curl; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Error: '$cmd' is required but not installed."
+        echo "Install it with your package manager (e.g., apt install $cmd)"
+        exit 1
+    fi
+done
+
 # ── 1. Install uv if missing ──────────────────────────────
 if ! command -v uv &>/dev/null; then
     echo "Installing uv..."
@@ -36,7 +45,14 @@ fi
 # ── 3. Install dependencies ───────────────────────────────
 echo "Installing dependencies..."
 cd "$INSTALL_DIR"
-uv sync --quiet
+uv sync --all-packages --quiet
+
+# Verify the entrypoint was created
+if [ ! -f "$INSTALL_DIR/.venv/bin/memfun" ]; then
+    echo "Error: 'memfun' binary was not created in the virtual environment."
+    echo "Try running: cd $INSTALL_DIR && uv sync --all-packages"
+    exit 1
+fi
 
 # ── 4. Create global 'memfun' command ─────────────────────
 WRAPPER="$BIN_DIR/memfun"
@@ -47,11 +63,24 @@ exec "$INSTALL_DIR/.venv/bin/memfun" "\$@"
 WRAP
     chmod +x "$WRAPPER"
 else
-    sudo tee "$WRAPPER" > /dev/null << WRAP
+    # Try sudo; fall back to ~/.local/bin if sudo fails
+    if sudo -n true 2>/dev/null; then
+        sudo tee "$WRAPPER" > /dev/null << WRAP
 #!/usr/bin/env bash
 exec "$INSTALL_DIR/.venv/bin/memfun" "\$@"
 WRAP
-    sudo chmod +x "$WRAPPER"
+        sudo chmod +x "$WRAPPER"
+    else
+        BIN_DIR="$HOME/.local/bin"
+        mkdir -p "$BIN_DIR"
+        WRAPPER="$BIN_DIR/memfun"
+        cat > "$WRAPPER" << WRAP
+#!/usr/bin/env bash
+exec "$INSTALL_DIR/.venv/bin/memfun" "\$@"
+WRAP
+        chmod +x "$WRAPPER"
+        echo "Note: Installed to $BIN_DIR/memfun (add to PATH if needed)"
+    fi
 fi
 
 echo ""

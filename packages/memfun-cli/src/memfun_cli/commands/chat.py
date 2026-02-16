@@ -1970,6 +1970,11 @@ def _configure_dspy(config: MemfunConfig) -> None:
             provider,
             config.llm.api_key_env,
         )
+        from rich.console import Console
+        Console().print(
+            f"\n  [yellow]Warning: No API key found for {provider}. "
+            f"Set {config.llm.api_key_env} or run 'memfun init'.[/yellow]\n"
+        )
         return
 
     # DSPy uses LiteLLM model names: provider/model
