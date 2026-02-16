@@ -1,0 +1,177 @@
+# Distributed multi-agent setup with Redis event bus + live dashboard.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.distributed.yml up --build --scale worker-coder=3
+#
+# Then open http://localhost:8080 for the live dashboard.
+
+services:
+  # ── Redis (event bus + state) ───────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Live Dashboard ──────────────────────────────────────────
+  dashboard:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: >
+      python -m memfun_cli.dashboard.server
+        --redis-url redis://redis:6379
+        --host 0.0.0.0
+        --port 8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      MEMFUN_REDIS_URL: "redis://redis:6379"
+      MEMFUN_LOG_LEVEL: "info"
+    restart: unless-stopped
+
+  # ── Orchestrator (publishes tasks) ──────────────────────────
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: >
+      python -m memfun_cli.chat
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      MEMFUN_REDIS_URL: "redis://redis:6379"
+      MEMFUN_BACKEND_TIER: "redis"
+      MEMFUN_LOG_LEVEL: "info"
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+  # ── Specialist Workers ──────────────────────────────────────
+  # Scale with: --scale worker-coder=3 --scale worker-test=2
+
+  worker-coder:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: >
+      python -m memfun_runtime.worker
+        --agent coder-agent
+        --redis-url redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      MEMFUN_REDIS_URL: "redis://redis:6379"
+      MEMFUN_LOG_LEVEL: "info"
+    restart: unless-stopped
+
+  worker-file:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: >
+      python -m memfun_runtime.worker
+        --agent file-agent
+        --redis-url redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      MEMFUN_REDIS_URL: "redis://redis:6379"
+      MEMFUN_LOG_LEVEL: "info"
+    restart: unless-stopped
+
+  worker-test:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: >
+      python -m memfun_runtime.worker
+        --agent test-agent
+        --redis-url redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      MEMFUN_REDIS_URL: "redis://redis:6379"
+      MEMFUN_LOG_LEVEL: "info"
+    restart: unless-stopped
+
+  worker-review:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: >
+      python -m memfun_runtime.worker
+        --agent review-agent
+        --redis-url redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      MEMFUN_REDIS_URL: "redis://redis:6379"
+      MEMFUN_LOG_LEVEL: "info"
+    restart: unless-stopped
+
+  worker-security:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: >
+      python -m memfun_runtime.worker
+        --agent security-agent
+        --redis-url redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      MEMFUN_REDIS_URL: "redis://redis:6379"
+      MEMFUN_LOG_LEVEL: "info"
+    restart: unless-stopped
+
+  worker-debug:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: >
+      python -m memfun_runtime.worker
+        --agent debug-agent
+        --redis-url redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      MEMFUN_REDIS_URL: "redis://redis:6379"
+      MEMFUN_LOG_LEVEL: "info"
+    restart: unless-stopped
+
+  worker-planner:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: >
+      python -m memfun_runtime.worker
+        --agent planner-agent
+        --redis-url redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      MEMFUN_REDIS_URL: "redis://redis:6379"
+      MEMFUN_LOG_LEVEL: "info"
+    restart: unless-stopped
+
+volumes:
+  redis-data:

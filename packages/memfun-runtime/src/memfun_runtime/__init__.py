@@ -4,6 +4,7 @@ from __future__ import annotations
 from memfun_runtime.agent import BaseAgent, agent, get_agent_registry
 from memfun_runtime.builder import RuntimeBuilder
 from memfun_runtime.context import RuntimeContext
+from memfun_runtime.distributed import DistributedOrchestrator
 from memfun_runtime.lifecycle import AgentManager
 from memfun_runtime.orchestrator import AgentOrchestrator
 from memfun_runtime.protocols import (
@@ -24,6 +25,7 @@ __all__ = [
     "AgentManager",
     "AgentOrchestrator",
     "BaseAgent",
+    "DistributedOrchestrator",
     "EventBusAdapter",
     "HealthMonitor",
     "OrchestratorAdapter",
