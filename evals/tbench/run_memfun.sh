@@ -19,6 +19,11 @@ OUTPUT_PATH="/root/tbench-runs"
 AGENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${AGENT_DIR}:${PYTHONPATH:-}"
 
+# Load API key from memfun credentials if not already set
+if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -f "$HOME/.memfun/credentials.json" ]; then
+    export ANTHROPIC_API_KEY=$(python3 -c "import json; print(json.load(open('$HOME/.memfun/credentials.json')).get('ANTHROPIC_API_KEY',''))")
+fi
+
 echo "=== Memfun Terminal-Bench Run ==="
 echo "Model:      ${MODEL}"
 echo "Run ID:     ${RUN_ID}"
