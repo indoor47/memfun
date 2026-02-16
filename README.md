@@ -347,17 +347,22 @@ coordination and HTTP event forwarding -- open 3 terminals, see all their work i
 ## Quick Start
 
 ```bash
-# Install from source
-git clone https://github.com/indoor47/memfun.git
-cd memfun
-uv sync
-uv tool install packages/memfun-cli
+# One-line install
+curl -fsSL https://raw.githubusercontent.com/indoor47/memfun/main/install.sh | bash
 
 # Initialize (LLM provider, API key, backend)
 memfun init
 
 # Start chatting
 memfun
+```
+
+Or install manually:
+
+```bash
+git clone https://github.com/indoor47/memfun.git
+cd memfun
+uv sync --all-packages
 ```
 
 `memfun init` walks you through:
@@ -403,7 +408,7 @@ name = "my-project"
 
 [llm]
 provider = "anthropic"                # anthropic | openai | ollama | custom
-model = "claude-sonnet-4-5-20250514"
+model = "claude-opus-4-6"
 api_key_env = "ANTHROPIC_API_KEY"
 temperature = 0.0
 max_tokens = 128000
@@ -462,11 +467,11 @@ Gemini CLI, and 20+ other AI tools.
 ```bash
 git clone https://github.com/indoor47/memfun.git
 cd memfun
-uv sync
+uv sync --all-packages
 
-uv run pytest                   # 597 pass, 88 skip
-uv run ruff check .             # 0 errors
-uv run pyright                  # type checking
+make test                       # 597 pass, 88 skip
+make lint                       # 0 errors
+make typecheck                  # Pyright strict mode
 uv run memfun                   # run in dev mode
 ```
 
