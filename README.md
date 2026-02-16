@@ -7,6 +7,8 @@
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License" /></a>
     <a href="https://python.org"><img src="https://img.shields.io/badge/python-3.12%2B-blue.svg" alt="Python" /></a>
     <a href="https://github.com/indoor47/memfun/actions/workflows/ci.yml"><img src="https://github.com/indoor47/memfun/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+    <img src="https://img.shields.io/badge/tests-597_pass-brightgreen.svg" alt="Tests" />
+    <img src="https://img.shields.io/badge/packages-7-orange.svg" alt="Packages" />
   </p>
 </p>
 
@@ -327,6 +329,19 @@ portable across any MCP-compatible AI tool:
 - **Web tools**: DuckDuckGo search, URL fetch with markdown conversion, SSRF prevention
 - **Agent tools**: agents and skills exposed as MCP tools for cross-system interoperability
 
+### Live Dashboard
+
+Every `memfun` session launches a real-time web dashboard at `http://localhost:8081`
+that shows what the agent is doing as it works:
+
+- **Active requests** with status, elapsed time, and token count
+- **Sub-task breakdown** for multi-agent workflows (which specialist is running, how many iterations)
+- **Event stream** with live WebSocket updates
+- **Session history** of all requests and results
+
+Multiple terminals in the same project share a single dashboard instance via lockfile
+coordination and HTTP event forwarding -- open 3 terminals, see all their work in one place.
+
 ---
 
 ## Quick Start
@@ -417,9 +432,10 @@ memfun/
 │   ├── memfun-tools/       MCP server (FastMCP 3.0): code, git, web tools
 │   ├── memfun-skills/      Agent Skills: discovery, loading, execution, synthesis
 │   ├── memfun-optimizer/   Trace analysis, agent synthesis, MIPROv2, memory
-│   └── memfun-cli/         Interactive chat, setup wizard, CLI commands
+│   └── memfun-cli/         Interactive chat, setup wizard, live dashboard, CLI
 ├── skills/                 8 built-in Agent Skills (SKILL.md format)
 ├── agents/                 Built-in agent definitions (AGENT.md format)
+├── evals/                  SWE-bench + Terminal-Bench evaluation harnesses
 └── tests/                  597 tests (88 skipped for Redis/NATS without servers)
 ```
 

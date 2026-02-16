@@ -5,6 +5,94 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.7 (2026-02-16)
+
+### Added
+
+- **Single dashboard per project**: Multiple terminals sharing the same project
+  now share one dashboard instance. Lockfile (`.memfun/dashboard.lock`) detects
+  the primary dashboard, secondary terminals forward events via `POST /api/event`.
+  Health check endpoint (`GET /api/health`) for liveness verification. Stale
+  lockfiles (dead PIDs) are automatically cleaned up.
+- **Terminal-Bench agent adapter**: `evals/tbench/memfun_agent.py` -- a BaseAgent
+  subclass using Memfun's ContextFirst approach (explore, plan, execute, verify)
+  for Terminal-Bench evaluation. Non-blocking command execution to avoid tmux
+  blocking issues with heredocs.
+- **Fix `memfun ask` DSPy configuration**: The one-shot CLI commands (`ask`,
+  `analyze`, `fix`, `review`) now load credentials from `~/.memfun/credentials.json`
+  and configure DSPy before running the agent. Previously they failed with
+  "No LM is loaded."
+
+## 0.2.6 (2026-02-16)
+
+### Added
+
+- **Dashboard state persistence**: Dashboard state (requests, tasks, events)
+  persists to `.memfun/dashboard.json` and restores on restart. Debounced
+  saves (every 10s) with force-flush on shutdown.
+
+### Fixed
+
+- Suppressed `websockets` and `uvicorn` deprecation warnings that cluttered
+  terminal output on dashboard startup.
+
+## 0.2.5 (2026-02-15)
+
+### Added
+
+- **Context-first dashboard events**: The context-first solver now emits live
+  events to the dashboard (planning, gathering, solving, verifying phases).
+- `worker_id` collision fix: specialist agents use their agent name instead of
+  a hardcoded value, so parallel agents appear correctly in the dashboard.
+
+### Fixed
+
+- FastAPI deprecation: replaced `on_event("startup"/"shutdown")` with lifespan
+  context manager.
+- Warning filters moved to `_async_chat_loop` top for reliable suppression
+  before uvicorn imports.
+
+## 0.2.4 (2026-02-15)
+
+### Added
+
+- **Live web dashboard**: Real-time monitoring at `http://localhost:8081` with
+  3-column layout (active requests, sub-tasks, events). Auto-starts with every
+  `memfun` chat session. Per-project dashboard with WebSocket live updates.
+- Redis backend: load historical events on dashboard startup.
+
+### Fixed
+
+- Install script wrapper fixed to use venv entry point directly.
+
+## 0.2.3 (2026-02-15)
+
+### Fixed
+
+- Silent dashboard event errors now surface properly.
+- Added `ChatSession.emit_event()` helper for consistent event publishing.
+
+## 0.2.2 (2026-02-15)
+
+### Added
+
+- **Live dashboard with xterm.js terminal**: Browser-based real-time dashboard
+  with session management, WebSocket event stream, and workflow visualization.
+- WorkflowEngine publishes live events to dashboard (task start, progress, complete).
+- `install.sh` one-liner for quick installation.
+- Init wizard: Redis/NATS URL prompts and config writing.
+
+## 0.2.1 (2026-02-15)
+
+### Added
+
+- Web terminal with xterm.js for browser-based agent chat.
+- Dashboard session management and chat terminal UI.
+
+### Fixed
+
+- WebSocket 403: moved FastAPI imports to module level.
+
 ## 0.2.0 (2026-02-15)
 
 ### Added
