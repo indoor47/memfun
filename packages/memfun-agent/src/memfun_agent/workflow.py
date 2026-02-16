@@ -992,7 +992,7 @@ class WorkflowEngine:
                 event_type=event_type,
                 task_id=task_id,
                 agent_name=agent_name,
-                worker_id="workflow-engine",
+                worker_id=agent_name or "workflow-engine",
                 success=success,
                 duration_ms=duration_ms,
                 detail=detail,
