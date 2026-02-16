@@ -51,7 +51,8 @@ def init_command(
         )
 
     # Step 2: Project init if needed
-    if not project_dir.exists():
+    project_config = project_dir / "config.toml"
+    if not project_config.exists():
         if non_interactive:
             run_project_init(
                 backend=backend or "sqlite",
