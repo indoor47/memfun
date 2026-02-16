@@ -1969,15 +1969,10 @@ async def _start_dashboard_background(
     """
     try:
         import socket
-        import warnings
 
         import uvicorn
 
         from memfun_cli.dashboard.server import create_app
-
-        # Suppress uvicorn/websockets deprecation warnings
-        warnings.filterwarnings("ignore", module="websockets")
-        warnings.filterwarnings("ignore", module="uvicorn")
 
         # Find available port
         port = None
@@ -2010,8 +2005,18 @@ async def _start_dashboard_background(
 
 async def _async_chat_loop() -> None:
     """The async chat loop — called from chat_command."""
+    import warnings
+
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
+
+    # Suppress uvicorn/websockets deprecation warnings (dashboard)
+    warnings.filterwarnings(
+        "ignore", category=DeprecationWarning, module=r"websockets\..*",
+    )
+    warnings.filterwarnings(
+        "ignore", category=DeprecationWarning, module=r"uvicorn\..*",
+    )
 
     # Credentials and auto-init are handled in chat_command()
     # (sync context) before asyncio.run() starts.
