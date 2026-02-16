@@ -2045,18 +2045,8 @@ async def _start_dashboard_background(
 
 async def _async_chat_loop() -> None:
     """The async chat loop — called from chat_command."""
-    import warnings
-
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory
-
-    # Suppress uvicorn/websockets deprecation warnings (dashboard)
-    warnings.filterwarnings(
-        "ignore", category=DeprecationWarning, module=r"websockets\..*",
-    )
-    warnings.filterwarnings(
-        "ignore", category=DeprecationWarning, module=r"uvicorn\..*",
-    )
 
     # Credentials and auto-init are handled in chat_command()
     # (sync context) before asyncio.run() starts.
@@ -2741,6 +2731,14 @@ def chat_command() -> None:
         from memfun_cli.commands.init import run_project_init
 
         run_project_init()
+
+    # Suppress uvicorn/websockets deprecation warnings before
+    # the event loop starts (dashboard runs uvicorn in-process).
+    import warnings
+
+    warnings.filterwarnings("ignore", message=".*websockets.legacy.*")
+    warnings.filterwarnings("ignore", message=".*WebSocketServerProtocol.*")
+    warnings.filterwarnings("ignore", message=".*ws_handler.*")
 
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(_async_chat_loop())
