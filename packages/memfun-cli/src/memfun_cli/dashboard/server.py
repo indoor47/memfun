@@ -30,13 +30,15 @@ logger = get_logger("dashboard")
 
 # Will be populated when the server starts
 _redis_url: str = "redis://localhost:6379"
+_workspace_root: Path = Path.home() / "projects"
 _connections: set[Any] = set()  # WebSocket connections
 _events: list[dict] = []  # Recent events buffer (max 500)
 _workers: dict[str, dict] = {}  # worker_id -> {agent_name, status, last_seen}
 _tasks: dict[str, dict] = {}  # task_id -> {agent_name, status, worker_id, ...}
 
-# Chat state
-_chat_session: Any | None = None
+# Session state: one ChatSession per project folder
+_sessions: dict[str, Any] = {}  # session_name -> ChatSession
+_active_session: str = ""  # currently selected session name
 _chat_ws: Any | None = None
 
 MAX_EVENTS = 500
@@ -137,7 +139,7 @@ def _get_state() -> dict:
     }
 
 
-# ── Chat session helpers ──────────────────────────────────────────
+# ── Session + chat helpers ────────────────────────────────────────
 
 
 def _load_credentials() -> None:
@@ -157,19 +159,64 @@ def _load_credentials() -> None:
                     ):
                         os.environ[key] = value
         except Exception:
-            logger.debug("Failed to load credentials from %s", creds_path)
+            logger.debug(
+                "Failed to load credentials from %s", creds_path,
+            )
 
 
-async def _init_chat_session() -> Any:
-    """Create and start a ChatSession (lazy, one-time)."""
+def _list_sessions() -> list[dict[str, str]]:
+    """List available sessions (project folders under workspace)."""
+    _workspace_root.mkdir(parents=True, exist_ok=True)
+    sessions: list[dict[str, str]] = []
+    for p in sorted(_workspace_root.iterdir()):
+        if p.is_dir() and not p.name.startswith("."):
+            sessions.append({
+                "name": p.name,
+                "path": str(p),
+                "has_memfun": (p / "memfun.toml").exists()
+                or (p / ".memfun").is_dir(),
+            })
+    return sessions
+
+
+def _create_session(name: str) -> dict[str, str]:
+    """Create a new session folder."""
+    safe = "".join(
+        c if c.isalnum() or c in "-_" else "-"
+        for c in name.strip()
+    )
+    if not safe:
+        safe = f"project-{int(time.time())}"
+    session_dir = _workspace_root / safe
+    session_dir.mkdir(parents=True, exist_ok=True)
+    return {"name": safe, "path": str(session_dir)}
+
+
+async def _get_or_create_chat_session(
+    session_name: str,
+) -> Any:
+    """Get (or lazily create) a ChatSession for a project."""
+    if session_name in _sessions:
+        return _sessions[session_name]
+
     from memfun_cli.commands.chat import ChatSession
 
     _load_credentials()
 
-    session = ChatSession()
-    await session.start()
+    session_path = _workspace_root / session_name
+    session_path.mkdir(parents=True, exist_ok=True)
 
-    # Wire the context-first status callback to push to WebSocket
+    # Switch working directory so the agent operates in this project
+    original_cwd = os.getcwd()
+    os.chdir(session_path)
+
+    try:
+        session = ChatSession()
+        await session.start()
+    finally:
+        os.chdir(original_cwd)
+
+    # Wire status callback to push updates to WebSocket
     original_cb = session._on_context_first_status_callback
 
     def _cf_status_hook(msg: str) -> None:
@@ -179,7 +226,8 @@ async def _init_chat_session() -> Any:
     if session._agent is not None:
         session._agent.on_context_first_status = _cf_status_hook
 
-    logger.info("Chat session initialized for dashboard")
+    _sessions[session_name] = session
+    logger.info("Chat session created for: %s", session_name)
     return session
 
 
@@ -197,16 +245,27 @@ def _push_chat_status(text: str) -> None:
 
 
 async def _handle_chat_message(ws: Any, text: str) -> None:
-    """Process a chat message and push result back."""
-    global _chat_session
+    """Process a chat message in the active session."""
+    session = _sessions.get(_active_session)
+    if session is None:
+        await ws.send_text(json.dumps({
+            "type": "error",
+            "text": "No active session. Select one first.",
+        }))
+        return
 
     await ws.send_text(json.dumps({
         "type": "status", "text": "Processing...",
     }))
 
+    # Run in the session's project directory
+    session_path = _workspace_root / _active_session
+    original_cwd = os.getcwd()
+    os.chdir(session_path)
+
     start = time.monotonic()
     try:
-        result = await _chat_session.chat_turn(text)
+        result = await session.chat_turn(text)
         elapsed = time.monotonic() - start
         data = result.result or {}
         answer = data.get(
@@ -226,6 +285,8 @@ async def _handle_chat_message(ws: Any, text: str) -> None:
             "type": "error",
             "text": str(exc),
         }))
+    finally:
+        os.chdir(original_cwd)
 
 
 # ── FastAPI app ───────────────────────────────────────────────────
@@ -267,35 +328,105 @@ def create_app():
 
     @app.websocket("/ws/chat")
     async def chat_endpoint(ws: WebSocket):
-        global _chat_session, _chat_ws
+        global _active_session, _chat_ws
         await ws.accept()
         _chat_ws = ws
 
-        # Lazy-init ChatSession on first connection
-        if _chat_session is None:
-            await ws.send_text(json.dumps({
-                "type": "status",
-                "text": "Starting agent...",
-            }))
-            try:
-                _chat_session = await _init_chat_session()
-            except Exception as exc:
+        # If there's an active session, init it
+        if _active_session:
+            if _active_session not in _sessions:
                 await ws.send_text(json.dumps({
-                    "type": "error",
-                    "text": f"Failed to start agent: {exc}",
+                    "type": "status",
+                    "text": f"Starting agent for {_active_session}...",
                 }))
-                _chat_ws = None
-                return
+                try:
+                    await _get_or_create_chat_session(
+                        _active_session,
+                    )
+                except Exception as exc:
+                    await ws.send_text(json.dumps({
+                        "type": "error",
+                        "text": f"Failed to start: {exc}",
+                    }))
+                    _chat_ws = None
+                    return
             await ws.send_text(json.dumps({
                 "type": "status",
                 "text": "Agent ready.",
             }))
 
-        # Send recent history
-        history = _chat_session._history[-20:]
+            # Send recent history for this session
+            session = _sessions.get(_active_session)
+            if session:
+                history = session._history[-20:]
+                await ws.send_text(json.dumps({
+                    "type": "history",
+                    "messages": [
+                        {
+                            "role": h.get("role", "user"),
+                            "content": str(
+                                h.get("content", "")
+                            )[:2000],
+                        }
+                        for h in history
+                    ],
+                }))
+        else:
+            await ws.send_text(json.dumps({
+                "type": "status",
+                "text": "Select a session to start.",
+            }))
+
+        try:
+            while True:
+                raw = await ws.receive_text()
+                data = json.loads(raw)
+                if data.get("type") == "message":
+                    user_text = str(
+                        data.get("text", ""),
+                    ).strip()
+                    if user_text:
+                        await _handle_chat_message(
+                            ws, user_text,
+                        )
+                elif data.get("type") == "switch_session":
+                    name = str(
+                        data.get("session", ""),
+                    ).strip()
+                    if name:
+                        await _switch_session(ws, name)
+        except WebSocketDisconnect:
+            _chat_ws = None
+
+    async def _switch_session(
+        ws: Any, session_name: str,
+    ) -> None:
+        """Switch the terminal to a different session."""
+        global _active_session
+        _active_session = session_name
         await ws.send_text(json.dumps({
-            "type": "history",
-            "messages": [
+            "type": "status",
+            "text": f"Switching to {session_name}...",
+        }))
+
+        if session_name not in _sessions:
+            try:
+                await _get_or_create_chat_session(
+                    session_name,
+                )
+            except Exception as exc:
+                await ws.send_text(json.dumps({
+                    "type": "error",
+                    "text": f"Failed: {exc}",
+                }))
+                return
+
+        session = _sessions[session_name]
+        history = session._history[-20:]
+        await ws.send_text(json.dumps({
+            "type": "session_switched",
+            "session": session_name,
+            "history": [
                 {
                     "role": h.get("role", "user"),
                     "content": str(
@@ -306,20 +437,24 @@ def create_app():
             ],
         }))
 
-        try:
-            while True:
-                raw = await ws.receive_text()
-                data = json.loads(raw)
-                if data.get("type") == "message":
-                    user_text = str(data.get("text", "")).strip()
-                    if user_text:
-                        await _handle_chat_message(ws, user_text)
-        except WebSocketDisconnect:
-            _chat_ws = None
-
     @app.get("/api/state")
     async def api_state():
         return _get_state()
+
+    @app.get("/api/sessions")
+    async def api_sessions():
+        return {
+            "sessions": _list_sessions(),
+            "active": _active_session,
+        }
+
+    @app.post("/api/sessions")
+    async def api_create_session(body: dict):
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return {"error": "Name required"}
+        info = _create_session(name)
+        return {"session": info}
 
     return app
 
@@ -358,6 +493,31 @@ _DASHBOARD_HTML = (
     background: var(--accent); color: var(--bg);
     padding: 2px 8px; border-radius: 12px;
     font-size: 11px; font-weight: 700;
+  }
+  .header .session-picker {
+    display: flex; align-items: center; gap: 8px;
+    margin-left: 16px;
+  }
+  .header .session-picker select {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 8px;
+    font-family: inherit; font-size: 12px;
+    cursor: pointer; outline: none;
+    max-width: 180px;
+  }
+  .header .session-picker select:focus {
+    border-color: var(--accent);
+  }
+  .header .session-picker button {
+    background: var(--accent); color: var(--bg);
+    border: none; border-radius: 6px;
+    padding: 4px 10px; font-family: inherit;
+    font-size: 11px; font-weight: 600;
+    cursor: pointer;
+  }
+  .header .session-picker button:hover {
+    opacity: 0.85;
   }
   .header .stats {
     margin-left: auto; display: flex; gap: 16px;
@@ -569,6 +729,12 @@ _DASHBOARD_HTML = (
 <div class="header">
   <h1>Memfun</h1>
   <div class="badge">LIVE</div>
+  <div class="session-picker">
+    <select id="session-select">
+      <option value="">-- select session --</option>
+    </select>
+    <button id="new-session-btn">+ New</button>
+  </div>
   <div class="stats">
     Workers: <span id="stat-workers">0</span>
     &nbsp;|&nbsp;
@@ -817,6 +983,24 @@ function connectChat() {
           tLine('t-answer', m.content);
         }
       });
+    } else if (msg.type === 'session_switched') {
+      clearStatus();
+      termOut.innerHTML = '';
+      tLine('t-welcome',
+        'Session: ' + msg.session);
+      (msg.history || []).slice(-10).forEach(m => {
+        if (m.role === 'user') {
+          tLine('t-user', '> ' + m.content);
+        } else {
+          tLine('t-answer', m.content);
+        }
+      });
+      agentDot.className = 'dot-green';
+      agentStatus.textContent = 'ready';
+      chatBusy = false;
+      termIn.disabled = false;
+      termIn.placeholder = 'Ask memfun anything...';
+      termIn.focus();
     }
   };
 
@@ -869,14 +1053,75 @@ function clearStatus() {
   if (statusEl) { statusEl.remove(); statusEl = null; }
 }
 
+// ── Session picker ────────────────────────────────────────
+const sessionSelect = document.getElementById('session-select');
+const newSessionBtn = document.getElementById('new-session-btn');
+
+async function loadSessions() {
+  try {
+    const resp = await fetch('/api/sessions');
+    const data = await resp.json();
+    const sessions = data.sessions || [];
+    const active = data.active || '';
+    // Keep the placeholder
+    sessionSelect.innerHTML =
+      '<option value="">-- select session --</option>';
+    sessions.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.name;
+      opt.textContent = s.name + (s.has_memfun ? ' *' : '');
+      if (s.name === active) opt.selected = true;
+      sessionSelect.appendChild(opt);
+    });
+  } catch (e) {
+    console.warn('Failed to load sessions', e);
+  }
+}
+
+sessionSelect.addEventListener('change', () => {
+  const name = sessionSelect.value;
+  if (!name) return;
+  if (chatWs && chatWs.readyState === WebSocket.OPEN) {
+    chatWs.send(JSON.stringify({
+      type: 'switch_session', session: name,
+    }));
+    termIn.disabled = true;
+    termIn.placeholder = 'Switching session...';
+    agentDot.className = 'dot-gray';
+    agentStatus.textContent = 'switching...';
+  }
+});
+
+newSessionBtn.addEventListener('click', async () => {
+  const name = prompt('New session name (project folder):');
+  if (!name || !name.trim()) return;
+  try {
+    const resp = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name.trim()}),
+    });
+    const data = await resp.json();
+    if (data.error) { alert(data.error); return; }
+    await loadSessions();
+    // Auto-switch to the new session
+    const sName = data.session.name;
+    sessionSelect.value = sName;
+    sessionSelect.dispatchEvent(new Event('change'));
+  } catch (e) {
+    alert('Failed to create session: ' + e.message);
+  }
+});
+
 // Welcome message
 tLine('t-welcome',
   'Memfun Agent Terminal');
 tLine('t-meta',
-  'Type a message and press Enter to chat with the agent.');
+  'Select a session above, then type a message.');
 tLine('t-answer', '');
 
 connectChat();
+loadSessions();
 
 // ── Drag handle for resizing ──────────────────────────────
 const handle = document.getElementById('drag-handle');
