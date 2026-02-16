@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING
 import litellm
 from terminal_bench.agents.base_agent import AgentResult, BaseAgent
 from terminal_bench.agents.failure_mode import FailureMode
-from terminal_bench.terminal.models import TerminalCommand
 
 if TYPE_CHECKING:
     from terminal_bench.terminal.tmux_session import TmuxSession
@@ -333,19 +332,20 @@ class MemfunAgent(BaseAgent):
         session: TmuxSession,
         command: str,
     ) -> str:
-        """Send a command to the tmux session and capture output."""
+        """Send a command to the tmux session and capture output.
+
+        Uses non-blocking send to avoid issues with heredocs and
+        long-running commands that break the tmux blocking mechanism.
+        """
         # Reset incremental tracking to get clean diff
         session.get_incremental_output()
 
-        # Send command with Enter key via TerminalCommand
-        session.send_command(
-            TerminalCommand(
-                command=command,
-                append_enter=True,
-                block=True,
-                min_timeout_sec=1.0,
-                max_timeout_sec=300.0,
-            )
+        # Send command non-blocking (block=True breaks heredocs because
+        # "; tmux wait -S done" is appended after EOF, breaking the delimiter)
+        session.send_keys(
+            [command, "Enter"],
+            block=False,
+            min_timeout_sec=8.0,  # wait at least 8s for output
         )
 
         # Get just the new output since the command was sent
