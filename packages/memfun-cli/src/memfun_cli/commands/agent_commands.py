@@ -103,6 +103,70 @@ def _read_path_context(path: Path) -> str:
     return "\n\n".join(parts)
 
 
+def _load_credentials() -> None:
+    """Load API keys from ~/.memfun/credentials.json into environment."""
+    import json
+    import os
+
+    for creds_path in [
+        Path.home() / ".memfun" / "credentials.json",
+        Path.cwd() / ".memfun" / "credentials.json",
+    ]:
+        if not creds_path.exists():
+            continue
+        try:
+            creds = json.loads(creds_path.read_text())
+            if isinstance(creds, dict):
+                for key, value in creds.items():
+                    if isinstance(key, str) and isinstance(value, str) and value:
+                        os.environ[key] = value
+        except Exception:
+            pass
+
+
+def _configure_dspy(config: MemfunConfig) -> None:
+    """Configure DSPy with the LLM from memfun config."""
+    import os
+
+    import dspy
+
+    provider = config.llm.provider
+    model = config.llm.model
+    api_key = os.environ.get(config.llm.api_key_env, "")
+
+    if not api_key and provider != "ollama":
+        console.print(
+            f"[yellow]Warning: No API key for {provider} "
+            f"(set {config.llm.api_key_env})[/yellow]"
+        )
+        return
+
+    if provider == "anthropic":
+        lm_model = f"anthropic/{model}"
+    elif provider == "openai":
+        lm_model = f"openai/{model}"
+    elif provider == "ollama":
+        lm_model = f"ollama_chat/{model}"
+        api_key = "ollama"
+    else:
+        lm_model = model
+
+    kwargs: dict[str, Any] = {
+        "temperature": config.llm.temperature,
+        "max_tokens": config.llm.max_tokens,
+    }
+    if api_key:
+        kwargs["api_key"] = api_key
+    if config.llm.base_url:
+        kwargs["api_base"] = config.llm.base_url
+
+    try:
+        lm = dspy.LM(lm_model, **kwargs)
+        dspy.configure(lm=lm)
+    except Exception as exc:
+        console.print(f"[yellow]Warning: Failed to configure DSPy: {exc}[/yellow]")
+
+
 async def run_agent_task(
     task_type: str,
     query: str,
@@ -112,17 +176,19 @@ async def run_agent_task(
     """Build the runtime, start the agent, dispatch a task, and return the result.
 
     This is the core helper shared by all agent CLI commands. It:
-    1. Loads ``MemfunConfig`` from ``memfun.toml`` (or defaults).
-    2. Builds a ``RuntimeContext`` via ``RuntimeBuilder``.
-    3. Instantiates ``RLMCodingAgent`` with that context.
-    4. Calls ``on_start()``, then ``handle()`` with a ``TaskMessage``.
-    5. Returns the ``TaskResult``.
-    6. Calls ``on_stop()`` in a ``finally`` block.
+    1. Loads credentials from ``~/.memfun/credentials.json``.
+    2. Loads ``MemfunConfig`` and configures DSPy.
+    3. Builds a ``RuntimeContext`` via ``RuntimeBuilder``.
+    4. Instantiates ``RLMCodingAgent`` with that context.
+    5. Calls ``on_start()``, then ``handle()`` with a ``TaskMessage``.
+    6. Returns the ``TaskResult``.
     """
     from memfun_agent.coding_agent import RLMCodingAgent
     from memfun_runtime.builder import RuntimeBuilder
 
+    _load_credentials()
     config = _load_config()
+    _configure_dspy(config)
     runtime_ctx = await RuntimeBuilder(config).build()
     agent = RLMCodingAgent(runtime_ctx)
 
