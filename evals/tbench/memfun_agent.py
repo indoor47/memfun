@@ -334,8 +334,8 @@ class MemfunAgent(BaseAgent):
     ) -> str:
         """Send a command to the tmux session and capture output.
 
-        Uses non-blocking send to avoid issues with heredocs and
-        long-running commands that break the tmux blocking mechanism.
+        Uses non-blocking send with output polling to handle both fast
+        and slow commands. Polls until output stabilizes or timeout.
         """
         # Reset incremental tracking to get clean diff
         session.get_incremental_output()
@@ -345,10 +345,27 @@ class MemfunAgent(BaseAgent):
         session.send_keys(
             [command, "Enter"],
             block=False,
-            min_timeout_sec=8.0,  # wait at least 8s for output
+            min_timeout_sec=3.0,  # initial wait
         )
 
-        # Get just the new output since the command was sent
+        # Poll for output stabilization (handles slow commands)
+        last_output = ""
+        stable_count = 0
+        max_wait = 60  # seconds max polling
+        start = time.time()
+
+        while time.time() - start < max_wait:
+            current = session.capture_pane(capture_entire=True)
+            if current == last_output:
+                stable_count += 1
+                if stable_count >= 2:  # stable for ~6s
+                    break
+            else:
+                stable_count = 0
+                last_output = current
+            time.sleep(3.0)
+
+        # Get the incremental output
         output = session.get_incremental_output()
         return output.strip()
 
