@@ -958,7 +958,7 @@ class WorkflowEngine:
         detail: str | None = None,
     ) -> None:
         """Best-effort publish event to dashboard stream."""
-        with contextlib.suppress(Exception):
+        try:
             from memfun_runtime.distributed import (
                 EVENT_TOPIC,
                 DistributedEvent,
@@ -975,4 +975,10 @@ class WorkflowEngine:
             )
             await self._context.event_bus.publish(
                 EVENT_TOPIC, event.to_bytes(),
+            )
+            logger.debug("Dashboard event: %s", event_type)
+        except Exception:
+            logger.warning(
+                "Failed to emit dashboard event %s", event_type,
+                exc_info=True,
             )

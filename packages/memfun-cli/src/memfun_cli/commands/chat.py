@@ -450,6 +450,40 @@ class ChatSession:
         self._mode = self._modes[(idx + 1) % len(self._modes)]
         return self._mode
 
+    async def _emit_dashboard_event(
+        self,
+        event_type: str,
+        *,
+        task_id: str | None = None,
+        agent_name: str | None = None,
+        success: bool | None = None,
+        duration_ms: float | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Best-effort publish event to dashboard Redis stream."""
+        if self._runtime is None:
+            return
+        try:
+            from memfun_runtime.distributed import (
+                EVENT_TOPIC,
+                DistributedEvent,
+            )
+
+            event = DistributedEvent(
+                event_type=event_type,
+                task_id=task_id,
+                agent_name=agent_name,
+                worker_id="chat-session",
+                success=success,
+                duration_ms=duration_ms,
+                detail=detail,
+            )
+            await self._runtime.event_bus.publish(
+                EVENT_TOPIC, event.to_bytes(),
+            )
+        except Exception:
+            logger.debug("Dashboard event publish failed", exc_info=True)
+
     async def chat_turn(self, user_input: str) -> TaskResult:
         """Process one user message and return the agent's response."""
         assert self._agent is not None
