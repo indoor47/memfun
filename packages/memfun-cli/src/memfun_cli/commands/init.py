@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import typer
@@ -265,17 +267,11 @@ def _interactive_project_init(
         ).execute()
 
     if backend == "redis":
-        redis_url = inquirer.text(
-            message="Redis URL:",
-            default="redis://localhost:6379",
-        ).execute()
+        redis_url = _setup_service("redis")
         os.environ["MEMFUN_REDIS_URL"] = redis_url
 
     if backend == "nats":
-        nats_url = inquirer.text(
-            message="NATS URL:",
-            default="nats://localhost:4222",
-        ).execute()
+        nats_url = _setup_service("nats")
         os.environ["MEMFUN_NATS_URL"] = nats_url
 
     if not sandbox:
@@ -291,6 +287,135 @@ def _interactive_project_init(
 
     run_project_init(backend=backend, sandbox=sandbox)
     console.print("[green]✓[/green] Project initialized")
+
+
+_DOCKER_CONFIGS: dict[str, dict[str, str | list[str]]] = {
+    "redis": {
+        "image": "redis:alpine",
+        "container": "memfun-redis",
+        "ports": ["6379:6379"],
+        "default_url": "redis://localhost:6379",
+        "extra_args": [],
+    },
+    "nats": {
+        "image": "nats:alpine",
+        "container": "memfun-nats",
+        "ports": ["4222:4222", "8222:8222"],
+        "default_url": "nats://localhost:4222",
+        "extra_args": ["-js"],  # enable JetStream
+    },
+}
+
+
+def _has_docker() -> bool:
+    """Check if Docker is available and running."""
+    if not shutil.which("docker"):
+        return False
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _docker_start(service: str) -> str:
+    """Start a service via Docker and return its URL."""
+    cfg = _DOCKER_CONFIGS[service]
+    container = str(cfg["container"])
+    image = str(cfg["image"])
+    default_url = str(cfg["default_url"])
+    ports = cfg["ports"]
+    extra = cfg["extra_args"]
+
+    # Check if container already exists
+    check = subprocess.run(
+        ["docker", "inspect", container],
+        capture_output=True,
+    )
+    if check.returncode == 0:
+        # Container exists — start it if stopped
+        subprocess.run(
+            ["docker", "start", container],
+            capture_output=True,
+        )
+        console.print(
+            f"  [green]✓[/green] {service.title()} container "
+            f"already exists, started"
+        )
+        return default_url
+
+    # Build docker run command
+    cmd = ["docker", "run", "-d", "--name", container]
+    assert isinstance(ports, list)
+    for p in ports:
+        cmd.extend(["-p", str(p)])
+    cmd.append(image)
+    assert isinstance(extra, list)
+    cmd.extend(str(a) for a in extra)
+
+    console.print(f"  [dim]Starting {service} via Docker...[/dim]")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        console.print(
+            f"  [red]✗[/red] Failed to start {service}: "
+            f"{result.stderr.strip()}"
+        )
+        console.print(
+            "  [yellow]Falling back to manual URL entry[/yellow]"
+        )
+        return inquirer.text(
+            message=f"{service.title()} URL:",
+            default=default_url,
+        ).execute()
+
+    console.print(
+        f"  [green]✓[/green] {service.title()} started "
+        f"at {default_url}"
+    )
+    return default_url
+
+
+def _setup_service(service: str) -> str:
+    """Prompt user to auto-start or connect to an existing service."""
+    cfg = _DOCKER_CONFIGS[service]
+    default_url = str(cfg["default_url"])
+    has_docker = _has_docker()
+
+    choices = []
+    if has_docker:
+        choices.append({
+            "name": f"Auto-start {service.title()} via Docker (recommended)",
+            "value": "auto",
+        })
+    choices.extend([
+        {
+            "name": f"Connect to existing {service.title()}",
+            "value": "custom",
+        },
+        {
+            "name": f"Use default ({default_url})",
+            "value": "default",
+        },
+    ])
+
+    mode = inquirer.select(
+        message=f"{service.title()} setup:",
+        choices=choices,
+        default="auto" if has_docker else "custom",
+    ).execute()
+
+    if mode == "auto":
+        return _docker_start(service)
+    if mode == "default":
+        return default_url
+    return inquirer.text(
+        message=f"{service.title()} URL:",
+        default=default_url,
+    ).execute()
 
 
 def _write_toml(path: Path, config: dict) -> None:
