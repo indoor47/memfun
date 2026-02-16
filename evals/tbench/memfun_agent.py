@@ -5,7 +5,7 @@ explore the environment, plan, execute step-by-step, and verify.
 
 Usage:
     tb run --agent-import-path memfun_agent:MemfunAgent \
-           --model anthropic/claude-opus-4-6-20250929 \
+           --model anthropic/claude-opus-4-6 \
            --dataset terminal-bench-core==0.1.1 \
            --output-path /root/tbench-runs \
            --run-id memfun-v1
@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 import litellm
 from terminal_bench.agents.base_agent import AgentResult, BaseAgent
 from terminal_bench.agents.failure_mode import FailureMode
+from terminal_bench.terminal.models import TerminalCommand
 
 if TYPE_CHECKING:
     from terminal_bench.terminal.tmux_session import TmuxSession
@@ -333,29 +334,23 @@ class MemfunAgent(BaseAgent):
         command: str,
     ) -> str:
         """Send a command to the tmux session and capture output."""
-        # Clear any pending output
-        session.capture_pane(capture_entire=True)
+        # Reset incremental tracking to get clean diff
+        session.get_incremental_output()
 
-        # Send the command
-        session.send_keys(
-            command,
-            block=True,
-            min_timeout_sec=1.0,
-            max_timeout_sec=300.0,
+        # Send command with Enter key via TerminalCommand
+        session.send_command(
+            TerminalCommand(
+                command=command,
+                append_enter=True,
+                block=True,
+                min_timeout_sec=1.0,
+                max_timeout_sec=300.0,
+            )
         )
 
-        # Capture the output
-        output = session.capture_pane(capture_entire=True)
-
-        # Strip the command echo from the output
-        lines = output.split("\n")
-        # Find where the command appears and skip it
-        for i, line in enumerate(lines):
-            if command[:60] in line:
-                lines = lines[i + 1 :]
-                break
-
-        return "\n".join(lines).strip()
+        # Get just the new output since the command was sent
+        output = session.get_incremental_output()
+        return output.strip()
 
     # ── Conversation management ───────────────────────────────
 

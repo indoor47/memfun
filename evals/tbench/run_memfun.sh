@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-MODEL="${1:-anthropic/claude-opus-4-6-20250929}"
+MODEL="${1:-anthropic/claude-opus-4-6}"
 RUN_ID="${2:-memfun-agent-opus}"
 N_CONCURRENT="${3:-2}"
 OUTPUT_PATH="/root/tbench-runs"
