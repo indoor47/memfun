@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import time
 import warnings
 from contextlib import asynccontextmanager
@@ -110,6 +111,77 @@ def _load_state() -> None:
         )
     except Exception:
         logger.debug("Failed to load dashboard state", exc_info=True)
+
+
+def _lockfile_path() -> Path | None:
+    """Path to the dashboard lockfile."""
+    if _project_root is None:
+        return None
+    return _project_root / ".memfun" / "dashboard.lock"
+
+
+def _write_lockfile(port: int) -> None:
+    """Write lockfile with port and PID."""
+    path = _lockfile_path()
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {"port": port, "pid": os.getpid()}
+        path.write_text(json.dumps(data), "utf-8")
+    except Exception:
+        logger.debug("Failed to write dashboard lockfile", exc_info=True)
+
+
+def _remove_lockfile() -> None:
+    """Remove lockfile on shutdown."""
+    path = _lockfile_path()
+    if path is None:
+        return
+    try:
+        if path.is_file():
+            path.unlink()
+    except Exception:
+        logger.debug("Failed to remove dashboard lockfile", exc_info=True)
+
+
+def read_lockfile(project_root: Path) -> dict | None:
+    """Read and validate the dashboard lockfile for a project.
+
+    Returns ``{"port": int, "pid": int}`` if the lockfile exists and the
+    owning process is still alive, otherwise ``None`` (stale lockfiles
+    are cleaned up automatically).
+    """
+    path = project_root / ".memfun" / "dashboard.lock"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text("utf-8"))
+        pid = data.get("pid", 0)
+        port = data.get("port", 0)
+        if not pid or not port:
+            return None
+        # Check if the owning process is still alive
+        os.kill(pid, 0)
+        return {"port": port, "pid": pid}
+    except ProcessLookupError:
+        # Stale lockfile — owning process is dead
+        logger.info("Removing stale dashboard lockfile (pid %s)", data.get("pid"))
+        with _suppress_os():
+            path.unlink()
+        return None
+    except Exception:
+        return None
+
+
+def _suppress_os():
+    """Contextmanager to suppress OSError."""
+    import contextlib
+
+    return contextlib.suppress(OSError)
+
+
+_dashboard_port: int = 0  # set by create_app lifespan
 
 
 async def _event_listener(bus: Any) -> None:
@@ -283,6 +355,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         _load_state()
+        if _dashboard_port:
+            _write_lockfile(_dashboard_port)
         if _event_bus is not None:
             task = asyncio.create_task(_event_listener(_event_bus))
         else:
@@ -291,6 +365,7 @@ def create_app(
         task.add_done_callback(_bg_tasks.discard)
         yield
         _save_state(force=True)  # final flush
+        _remove_lockfile()
         task.cancel()
 
     app = FastAPI(title="Memfun Agent Dashboard", lifespan=lifespan)
@@ -313,6 +388,29 @@ def create_app(
     @app.get("/api/state")
     async def api_state() -> dict:
         return _get_state()
+
+    @app.get("/api/health")
+    async def api_health() -> dict:
+        return {"status": "ok", "project": _project_name}
+
+    @app.post("/api/event")
+    async def api_ingest_event(body: dict) -> dict:
+        """Ingest an event from an external memfun process."""
+        global _connections
+        _update_state(body)
+        _events.append(body)
+        if len(_events) > MAX_EVENTS:
+            _events.pop(0)
+        # Broadcast to WebSocket clients
+        message = json.dumps({"type": "event", "data": body})
+        dead: set[Any] = set()
+        for ws in _connections:
+            try:
+                await ws.send_text(message)
+            except Exception:
+                dead.add(ws)
+        _connections -= dead
+        return {"ok": True}
 
     return app
 

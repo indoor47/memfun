@@ -2002,19 +2002,44 @@ def _configure_dspy(config: MemfunConfig) -> None:
 
 async def _start_dashboard_background(
     runtime: Any,
-) -> int | None:
-    """Start the dashboard server as a background asyncio task.
+) -> tuple[int, bool] | tuple[None, bool]:
+    """Start the dashboard or connect to an existing one.
 
-    Returns the port number, or None if it couldn't start.
+    Returns ``(port, is_owner)`` where *is_owner* is True if this
+    process started the dashboard, False if it connected to an
+    existing one.  Returns ``(None, False)`` on failure.
     """
     try:
+        from memfun_cli.dashboard.server import read_lockfile
+
+        # Check for an already-running dashboard for this project
+        lock = read_lockfile(Path.cwd())
+        if lock:
+            port = lock["port"]
+            # Verify it's actually responsive
+            try:
+                import httpx
+
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    resp = await client.get(
+                        f"http://127.0.0.1:{port}/api/health",
+                    )
+                    if resp.status_code == 200:
+                        logger.info(
+                            "Reusing existing dashboard on port %d", port,
+                        )
+                        return port, False
+            except Exception:
+                logger.debug("Stale dashboard on port %d", port)
+
+        # No running dashboard — start a new one
         import socket
 
         import uvicorn
 
+        from memfun_cli.dashboard import server as _dashboard_mod
         from memfun_cli.dashboard.server import create_app
 
-        # Find available port
         port = None
         for candidate in range(8081, 8100):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -2024,7 +2049,10 @@ async def _start_dashboard_background(
 
         if port is None:
             logger.debug("No available dashboard port in 8081-8099")
-            return None
+            return None, False
+
+        # Set the port so the lifespan can write the lockfile
+        _dashboard_mod._dashboard_port = port
 
         app = create_app(
             event_bus=runtime.event_bus,
@@ -2037,10 +2065,42 @@ async def _start_dashboard_background(
         server = uvicorn.Server(config)
         task = asyncio.create_task(server.serve())
         task.add_done_callback(lambda _t: None)  # prevent GC
-        return port
+        return port, True
     except Exception:
         logger.debug("Failed to start dashboard", exc_info=True)
-        return None
+        return None, False
+
+
+async def _start_event_forwarder(
+    event_bus: Any, dashboard_port: int,
+) -> None:
+    """Forward local event bus events to an external dashboard via HTTP."""
+    import httpx
+    from memfun_runtime.distributed import EVENT_TOPIC as _TOPIC
+    from memfun_runtime.distributed import DistributedEvent
+
+    url = f"http://127.0.0.1:{dashboard_port}/api/event"
+    logger.info("Event forwarder started → %s", url)
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        async for msg in event_bus.subscribe(_TOPIC):
+            try:
+                event = DistributedEvent.from_bytes(msg.payload)
+                body = {
+                    "event_type": event.event_type,
+                    "task_id": event.task_id,
+                    "agent_name": event.agent_name,
+                    "worker_id": event.worker_id,
+                    "success": event.success,
+                    "duration_ms": event.duration_ms,
+                    "detail": event.detail,
+                    "ts": event.ts,
+                    "project": event.project,
+                    "workflow_id": event.workflow_id,
+                }
+                await client.post(url, json=body)
+            except Exception:
+                logger.debug("Forwarder: failed to send event")
 
 
 async def _async_chat_loop() -> None:
@@ -2062,8 +2122,18 @@ async def _async_chat_loop() -> None:
             console.print(f"\n  [red]✗ Failed to start: {type(exc).__name__}: {exc}[/red]\n")
             return
 
-    # Auto-start dashboard
-    dashboard_port = await _start_dashboard_background(session._runtime)
+    # Auto-start dashboard (or reuse existing one)
+    dashboard_port, is_dashboard_owner = await _start_dashboard_background(
+        session._runtime,
+    )
+    if dashboard_port and not is_dashboard_owner:
+        # Forward our events to the existing dashboard
+        fwd_task = asyncio.create_task(
+            _start_event_forwarder(
+                session._runtime.event_bus, dashboard_port,
+            ),
+        )
+        fwd_task.add_done_callback(lambda _t: None)
 
     # Compact welcome banner
     console.print()
