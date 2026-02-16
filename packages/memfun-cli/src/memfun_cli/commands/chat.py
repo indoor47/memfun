@@ -2734,11 +2734,16 @@ def chat_command() -> None:
 
     # Suppress uvicorn/websockets deprecation warnings before
     # the event loop starts (dashboard runs uvicorn in-process).
+    import os
     import warnings
 
-    warnings.filterwarnings("ignore", message=".*websockets.legacy.*")
-    warnings.filterwarnings("ignore", message=".*WebSocketServerProtocol.*")
-    warnings.filterwarnings("ignore", message=".*ws_handler.*")
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"websockets")
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"uvicorn")
+    warnings.filterwarnings("ignore", message=".*websockets.*", category=DeprecationWarning)
+    # Also set env var — works across threads and lazy imports
+    _pw = os.environ.get("PYTHONWARNINGS", "")
+    _extra = "ignore::DeprecationWarning:websockets,ignore::DeprecationWarning:uvicorn"
+    os.environ["PYTHONWARNINGS"] = f"{_pw},{_extra}" if _pw else _extra
 
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(_async_chat_loop())

@@ -18,7 +18,9 @@ import argparse
 import asyncio
 import json
 import time
+import warnings
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -33,6 +35,12 @@ except ImportError as _fastapi_err:
     FastAPI = WebSocket = WebSocketDisconnect = HTMLResponse = None  # type: ignore[assignment, misc]
     _fastapi_err_msg = str(_fastapi_err)
 
+# Suppress websockets/uvicorn DeprecationWarning before they get imported.
+# These fire when a browser connects to the dashboard WebSocket.
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"websockets")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"uvicorn")
+warnings.filterwarnings("ignore", message=".*websockets.*", category=DeprecationWarning)
+
 logger = get_logger("dashboard")
 
 # ── Module-level state ───────────────────────────────────────
@@ -44,11 +52,64 @@ _workers: dict[str, dict] = {}  # worker_id -> {agent_name, status, last_seen}
 _tasks: dict[str, dict] = {}  # task_id -> {agent_name, status, worker_id, ...}
 _requests: dict[str, dict] = {}  # workflow_id -> {description, status, ts, ...}
 _event_bus: Any | None = None  # Shared event bus (set by create_app)
+_project_root: Path | None = None  # Project dir for state persistence
 
 MAX_EVENTS = 500
+_save_counter: int = 0  # debounce saves (every 3 events)
 
 
 EVENT_TOPIC = "memfun.distributed.events"
+
+
+def _state_path() -> Path | None:
+    """Path to the persisted dashboard state file."""
+    if _project_root is None:
+        return None
+    return _project_root / ".memfun" / "dashboard.json"
+
+
+def _save_state(*, force: bool = False) -> None:
+    """Persist dashboard state to disk (debounced, every 3rd event)."""
+    global _save_counter
+    _save_counter += 1
+    if not force and _save_counter % 3 != 0:
+        return
+    path = _state_path()
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "requests": _requests,
+            "tasks": _tasks,
+            "workers": _workers,
+            "events": _events[-MAX_EVENTS:],
+        }
+        path.write_text(json.dumps(data, default=str), "utf-8")
+    except Exception:
+        logger.debug("Failed to save dashboard state", exc_info=True)
+
+
+def _load_state() -> None:
+    """Load persisted dashboard state from disk."""
+    path = _state_path()
+    if path is None or not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text("utf-8"))
+        _requests.update(data.get("requests", {}))
+        _tasks.update(data.get("tasks", {}))
+        # Don't restore workers — they're per-session
+        _events.extend(data.get("events", []))
+        # Trim to max
+        while len(_events) > MAX_EVENTS:
+            _events.pop(0)
+        logger.info(
+            "Restored dashboard state: %d requests, %d tasks, %d events",
+            len(_requests), len(_tasks), len(_events),
+        )
+    except Exception:
+        logger.debug("Failed to load dashboard state", exc_info=True)
 
 
 async def _event_listener(bus: Any) -> None:
@@ -178,6 +239,9 @@ def _update_state(event: dict) -> None:
             )
             _workers[worker_id]["last_seen"] = time.time()
 
+    # Persist state to disk (debounced)
+    _save_state()
+
 
 def _get_state() -> dict:
     """Current snapshot for newly connected clients."""
@@ -209,14 +273,16 @@ def create_app(
         logger.error("Install fastapi: pip install fastapi uvicorn")
         raise ImportError(_fastapi_err_msg)
 
-    global _event_bus, _project_name
+    global _event_bus, _project_name, _project_root
     _event_bus = event_bus
     _project_name = project_name or ""
+    _project_root = Path.cwd()
 
     _bg_tasks: set[asyncio.Task[None]] = set()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+        _load_state()
         if _event_bus is not None:
             task = asyncio.create_task(_event_listener(_event_bus))
         else:
@@ -224,6 +290,7 @@ def create_app(
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
         yield
+        _save_state(force=True)  # final flush
         task.cancel()
 
     app = FastAPI(title="Memfun Agent Dashboard", lifespan=lifespan)
