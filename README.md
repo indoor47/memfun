@@ -12,45 +12,6 @@
   </p>
 </p>
 
----
-
-```
-$ memfun
-
-memfun > add JWT auth to the Flask API with refresh tokens
-
-  Context-first: gathered 12 files via code map (48 KB)
-  Solving...
-
-  Operations:
-    write  src/auth/jwt.py           JWT creation, verification, refresh
-    write  src/auth/middleware.py     require_auth decorator
-    edit   src/routes/api.py          added @require_auth to protected endpoints
-    write  tests/test_auth.py         12 test cases
-    run    ruff check src/            passed
-  Verified: 0 lint errors  •  Consistency: ok
-
-  32s  •  8.2k tokens
-
-memfun > now refactor the database layer to async with connection pooling
-
-  Workflow: decomposed into 3 parallel agents
-    ✓ coder-agent    8 iter, 4 ops    (42s)
-    ✓ test-agent     5 iter, 2 ops    (28s)
-    ✓ review-agent   3 iter, 0 ops    (12s)
-  Cross-agent review: no conflicts
-
-  Operations:
-    edit   src/db/connection.py       replaced sync pool with asyncpg
-    edit   src/db/queries.py          async context managers throughout
-    edit   src/db/models.py           async classmethod factories
-    write  tests/test_db_async.py     8 new async test cases
-    run    ruff check src/            passed
-    run    pytest tests/test_db*.py   6 passed
-
-  1m 48s  •  22.1k tokens
-```
-
 ## Three Pillars
 
 Memfun is built on three foundational ideas that work together. Each one solves a
@@ -370,6 +331,45 @@ uv sync --all-packages
 2. **API key** -- securely stored in `~/.memfun/credentials.json`
 3. **Backend** -- SQLite (default), in-memory, Redis, or NATS
 4. **Sandbox** -- local (default), Docker, or Modal
+
+### What It Looks Like
+
+```
+$ memfun
+
+memfun > add JWT auth to the Flask API with refresh tokens
+
+  Context-first: gathered 12 files via code map (48 KB)
+  Solving...
+
+  Operations:
+    write  src/auth/jwt.py           JWT creation, verification, refresh
+    write  src/auth/middleware.py     require_auth decorator
+    edit   src/routes/api.py          added @require_auth to protected endpoints
+    write  tests/test_auth.py         12 test cases
+    run    ruff check src/            passed
+  Verified: 0 lint errors  •  Consistency: ok
+
+  32s  •  8.2k tokens
+
+memfun > now refactor the database layer to async with connection pooling
+
+  Workflow: decomposed into 3 parallel agents
+    ✓ coder-agent    8 iter, 4 ops    (42s)
+    ✓ test-agent     5 iter, 2 ops    (28s)
+    ✓ review-agent   3 iter, 0 ops    (12s)
+  Cross-agent review: no conflicts
+
+  Operations:
+    edit   src/db/connection.py       replaced sync pool with asyncpg
+    edit   src/db/queries.py          async context managers throughout
+    edit   src/db/models.py           async classmethod factories
+    write  tests/test_db_async.py     8 new async test cases
+    run    ruff check src/            passed
+    run    pytest tests/test_db*.py   6 passed
+
+  1m 48s  •  22.1k tokens
+```
 
 ### Slash Commands
 
