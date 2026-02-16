@@ -69,6 +69,7 @@ class WorkflowState:
     completed_at: float = 0.0
     error: str | None = None
     shared_context: str = ""
+    project: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,10 +146,11 @@ class WorkflowEngine:
         task_description: str,
         project_context: str,
         conversation_history: list[dict[str, Any]] | None = None,
+        project: str = "",
     ) -> WorkflowResult:
         """Execute a full multi-agent workflow."""
         workflow_id = uuid.uuid4().hex[:12]
-        state = WorkflowState(workflow_id=workflow_id)
+        state = WorkflowState(workflow_id=workflow_id, project=project)
         start = time.perf_counter()
 
         try:
@@ -180,6 +182,14 @@ class WorkflowEngine:
         history: list[dict[str, Any]] | None,
     ) -> WorkflowResult:
         start = time.perf_counter()
+
+        # Emit workflow.started for dashboard
+        await self._emit_dashboard(
+            "workflow.started",
+            detail=task_description[:200],
+            workflow_id=state.workflow_id,
+            project=state.project,
+        )
 
         # ── Phase 1: DECOMPOSE ────────────────────────────────
         state.status = WorkflowStatus.DECOMPOSING
@@ -218,7 +228,7 @@ class WorkflowEngine:
         await self._spec_store.save(spec)
 
         # Ensure specialist agents are running.
-        await self._ensure_agents_running(decomposition.sub_tasks)
+        await self._ensure_agents_running(decomposition.sub_tasks, state)
 
         # Initialise sub-task statuses.
         for st in decomposition.sub_tasks:
@@ -427,6 +437,8 @@ class WorkflowEngine:
                 task_id=sub_status.task_id,
                 agent_name=sub_status.agent_name,
                 detail=sub_status.sub_task.description[:80],
+                workflow_id=state.workflow_id,
+                project=state.project,
             )
 
         if not tasks:
@@ -450,6 +462,8 @@ class WorkflowEngine:
                     "task.picked_up",
                     task_id=ss.task_id,
                     agent_name=ss.agent_name,
+                    workflow_id=state.workflow_id,
+                    project=state.project,
                 )
         results = await self._orchestrator.fan_out(
             tasks, agent_names, timeout=600.0,
@@ -479,6 +493,8 @@ class WorkflowEngine:
                 agent_name=sub_status.agent_name,
                 success=result.success,
                 duration_ms=dur,
+                workflow_id=state.workflow_id,
+                project=state.project,
             )
 
             data = result.result or {}
@@ -780,7 +796,11 @@ class WorkflowEngine:
 
     # ── Agent management ──────────────────────────────────────
 
-    async def _ensure_agents_running(self, sub_tasks: list[SubTask]) -> None:
+    async def _ensure_agents_running(
+        self,
+        sub_tasks: list[SubTask],
+        state: WorkflowState | None = None,
+    ) -> None:
         """Start needed specialist agents."""
         needed = {agent_name_for_type(st.agent_type) for st in sub_tasks}
         needed.add("review-agent")
@@ -797,6 +817,8 @@ class WorkflowEngine:
                 logger.info("Started agent %s", name)
                 await self._emit_dashboard(
                     "worker.online", agent_name=name,
+                    workflow_id=state.workflow_id if state else None,
+                    project=state.project if state else None,
                 )
             except Exception as exc:
                 failed.append(name)
@@ -956,6 +978,8 @@ class WorkflowEngine:
         success: bool | None = None,
         duration_ms: float | None = None,
         detail: str | None = None,
+        workflow_id: str | None = None,
+        project: str | None = None,
     ) -> None:
         """Best-effort publish event to dashboard stream."""
         try:
@@ -972,6 +996,8 @@ class WorkflowEngine:
                 success=success,
                 duration_ms=duration_ms,
                 detail=detail,
+                project=project,
+                workflow_id=workflow_id,
             )
             await self._context.event_bus.publish(
                 EVENT_TOPIC, event.to_bytes(),

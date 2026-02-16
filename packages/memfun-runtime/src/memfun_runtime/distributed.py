@@ -97,7 +97,8 @@ def bytes_to_result(data: bytes) -> TaskResult:
 class DistributedEvent:
     """An event emitted to the dashboard stream."""
 
-    # task.published, task.picked_up, task.completed, worker.online, worker.offline
+    # task.published, task.picked_up, task.completed,
+    # worker.online, worker.offline, workflow.started
     event_type: str
     task_id: str | None = None
     agent_name: str | None = None
@@ -106,6 +107,8 @@ class DistributedEvent:
     duration_ms: float | None = None
     detail: str | None = None
     ts: float = 0.0
+    project: str | None = None
+    workflow_id: str | None = None
 
     def to_bytes(self) -> bytes:
         self.ts = self.ts or time.time()
@@ -118,12 +121,25 @@ class DistributedEvent:
             "duration_ms": self.duration_ms,
             "detail": self.detail,
             "ts": self.ts,
+            "project": self.project,
+            "workflow_id": self.workflow_id,
         }).encode()
 
     @classmethod
     def from_bytes(cls, data: bytes) -> DistributedEvent:
         d = json.loads(data)
-        return cls(**d)
+        return cls(
+            event_type=d["event_type"],
+            task_id=d.get("task_id"),
+            agent_name=d.get("agent_name"),
+            worker_id=d.get("worker_id"),
+            success=d.get("success"),
+            duration_ms=d.get("duration_ms"),
+            detail=d.get("detail"),
+            ts=d.get("ts", 0.0),
+            project=d.get("project"),
+            workflow_id=d.get("workflow_id"),
+        )
 
 
 # ── Distributed Orchestrator ─────────────────────────────────────────

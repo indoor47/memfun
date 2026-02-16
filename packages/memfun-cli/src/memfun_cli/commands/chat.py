@@ -729,6 +729,7 @@ class ChatSession:
                     task_description=user_input,
                     project_context=context,
                     conversation_history=self._history,
+                    project=Path.cwd().name,
                 )
                 # Auto-switch back to "auto" after workflow completes.
                 if self._mode == "workflow":
@@ -766,6 +767,7 @@ class ChatSession:
                     task_description=user_input,
                     project_context=context,
                     conversation_history=self._history,
+                    project=Path.cwd().name,
                 )
                 # Auto-switch back to "auto" after workflow completes.
                 if self._mode == "workflow":
@@ -1958,6 +1960,49 @@ def _configure_dspy(config: MemfunConfig) -> None:
         logger.warning("Failed to configure DSPy LM: %s", exc)
 
 
+async def _start_dashboard_background(
+    runtime: Any,
+) -> int | None:
+    """Start the dashboard server as a background asyncio task.
+
+    Returns the port number, or None if it couldn't start.
+    """
+    try:
+        import socket
+
+        import uvicorn
+
+        from memfun_cli.dashboard.server import create_app
+
+        # Find available port
+        port = None
+        for candidate in range(8081, 8100):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                if s.connect_ex(("127.0.0.1", candidate)) != 0:
+                    port = candidate
+                    break
+
+        if port is None:
+            logger.debug("No available dashboard port in 8081-8099")
+            return None
+
+        app = create_app(
+            event_bus=runtime.event_bus,
+            project_name=Path.cwd().name,
+        )
+        config = uvicorn.Config(
+            app, host="0.0.0.0", port=port,
+            log_level="warning",
+        )
+        server = uvicorn.Server(config)
+        task = asyncio.create_task(server.serve())
+        task.add_done_callback(lambda _t: None)  # prevent GC
+        return port
+    except Exception:
+        logger.debug("Failed to start dashboard", exc_info=True)
+        return None
+
+
 async def _async_chat_loop() -> None:
     """The async chat loop — called from chat_command."""
     from prompt_toolkit import PromptSession
@@ -1977,13 +2022,22 @@ async def _async_chat_loop() -> None:
             console.print(f"\n  [red]✗ Failed to start: {type(exc).__name__}: {exc}[/red]\n")
             return
 
+    # Auto-start dashboard
+    dashboard_port = await _start_dashboard_background(session._runtime)
+
     # Compact welcome banner
     console.print()
-    console.print(
+    banner = (
         f"  [bold cyan]memfun[/bold cyan] v{_get_version()} [dim]({_get_build()})[/dim] "
         f"[dim]│[/dim] {session.model_name} "
         f"[dim]│[/dim] {Path.cwd().name}/ [dim]│[/dim] {session.history_stats}"
     )
+    if dashboard_port:
+        banner += (
+            f"\n  [dim]Dashboard:[/dim] "
+            f"[cyan]http://localhost:{dashboard_port}[/cyan]"
+        )
+    console.print(banner)
     console.print("  [dim]Type a message or /help. Ctrl+C to cancel. Ctrl+D to exit.[/dim]")
     console.print()
 
