@@ -472,6 +472,14 @@ _DASHBOARD_HTML = (
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Memfun Agent Dashboard</title>
+<link rel="stylesheet"
+  href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css"/>
+<script
+  src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js">
+</script>
+<script
+  src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js">
+</script>
 <style>
   :root {
     --bg: #0d1117; --surface: #161b22; --border: #30363d;
@@ -604,42 +612,11 @@ _DASHBOARD_HTML = (
     width: 8px; height: 8px; border-radius: 50%;
     background: var(--muted);
   }
-  .terminal-output {
-    flex: 1; overflow-y: auto; padding: 8px 12px;
-    font-size: 13px; line-height: 1.6;
+  #xterm-container {
+    flex: 1; overflow: hidden;
   }
-  .terminal-input-row {
-    display: flex; align-items: center;
-    padding: 6px 12px;
-    border-top: 1px solid var(--border);
-    background: var(--surface); flex-shrink: 0;
-  }
-  .terminal-prompt {
-    color: var(--accent); font-weight: 600;
-    margin-right: 8px; white-space: nowrap;
-    font-size: 13px;
-  }
-  .terminal-input-row input {
-    flex: 1; background: transparent;
-    color: var(--text); border: none; outline: none;
-    font-family: inherit; font-size: 13px;
-  }
-
-  /* Terminal line styles */
-  .t-line {
-    white-space: pre-wrap; word-break: break-word;
-  }
-  .t-user { color: var(--accent); }
-  .t-answer { color: var(--text); }
-  .t-status {
-    color: var(--muted); font-style: italic;
-  }
-  .t-error { color: var(--red); }
-  .t-meta {
-    color: var(--muted); font-size: 11px;
-  }
-  .t-files { color: var(--green); font-size: 12px; }
-  .t-welcome { color: var(--purple); }
+  #xterm-container .xterm { height: 100%; }
+  #xterm-container .xterm-viewport { overflow-y: auto; }
 
   /* Workers panel */
   .worker {
@@ -779,13 +756,7 @@ _DASHBOARD_HTML = (
       <span style="margin-left:auto;font-size:10px"
             id="agent-status">connecting...</span>
     </div>
-    <div class="terminal-output" id="terminal-output"></div>
-    <div class="terminal-input-row">
-      <span class="terminal-prompt">memfun&gt;</span>
-      <input type="text" id="terminal-input"
-             placeholder="Ask memfun anything..."
-             autocomplete="off" disabled />
-    </div>
+    <div id="xterm-container"></div>
   </div>
 </div>
 
@@ -924,142 +895,288 @@ function render() {
     .textContent = resolved;
 }
 
-// ── Terminal / Chat WebSocket ─────────────────────────────
-const termOut = document.getElementById('terminal-output');
-const termIn = document.getElementById('terminal-input');
+// ── xterm.js Terminal ─────────────────────────────────────
 const agentDot = document.getElementById('agent-dot');
 const agentStatus = document.getElementById('agent-status');
 
-let chatWs = null;
-let chatBusy = false;
-let statusEl = null;
+const term = new Terminal({
+  cursorBlink: true,
+  fontSize: 13,
+  fontFamily: "'SF Mono','Fira Code','Cascadia Code',monospace",
+  theme: {
+    background: '#0d1117',
+    foreground: '#e6edf3',
+    cursor: '#58a6ff',
+    cursorAccent: '#0d1117',
+    selectionBackground: '#264f78',
+    black: '#0d1117',
+    red: '#f85149',
+    green: '#3fb950',
+    yellow: '#d29922',
+    blue: '#58a6ff',
+    magenta: '#bc8cff',
+    cyan: '#39c5cf',
+    white: '#e6edf3',
+    brightBlack: '#8b949e',
+    brightRed: '#f85149',
+    brightGreen: '#3fb950',
+    brightYellow: '#d29922',
+    brightBlue: '#58a6ff',
+    brightMagenta: '#bc8cff',
+    brightCyan: '#39c5cf',
+    brightWhite: '#ffffff',
+  },
+  scrollback: 5000,
+  convertEol: true,
+});
+const fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open(document.getElementById('xterm-container'));
+fitAddon.fit();
 
+// ANSI helpers
+const C = {
+  reset: '\\x1b[0m',
+  bold: '\\x1b[1m',
+  dim: '\\x1b[2m',
+  italic: '\\x1b[3m',
+  blue: '\\x1b[34m',
+  green: '\\x1b[32m',
+  red: '\\x1b[31m',
+  yellow: '\\x1b[33m',
+  magenta: '\\x1b[35m',
+  gray: '\\x1b[90m',
+  white: '\\x1b[37m',
+  bBlue: '\\x1b[1;34m',
+};
+const PROMPT = `${C.bBlue}memfun>${C.reset} `;
+
+// Line editor state
+let lineBuffer = '';
+let cursorPos = 0;
+let chatBusy = false;
+let chatWs = null;
+let lastStatusLine = '';
+
+function showPrompt() {
+  term.write(PROMPT);
+}
+
+function redrawLine() {
+  // Clear current line after prompt, rewrite buffer, reposition cursor
+  term.write('\\x1b[2K\\r');
+  term.write(PROMPT + lineBuffer);
+  // Move cursor to correct position
+  const back = lineBuffer.length - cursorPos;
+  if (back > 0) term.write(`\\x1b[${back}D`);
+}
+
+// Handle terminal input
+term.onData(data => {
+  if (chatBusy) return;
+
+  for (let i = 0; i < data.length; i++) {
+    const ch = data.charCodeAt(i);
+
+    if (data === '\\r' || data === '\\n') {
+      // Enter
+      term.write('\\r\\n');
+      const text = lineBuffer.trim();
+      lineBuffer = '';
+      cursorPos = 0;
+      if (text && chatWs
+          && chatWs.readyState === WebSocket.OPEN) {
+        chatBusy = true;
+        agentDot.className = 'dot-gray';
+        agentStatus.textContent = 'thinking...';
+        chatWs.send(JSON.stringify({
+          type: 'message', text,
+        }));
+      } else if (text) {
+        writeLn(C.red, 'Not connected. Select a session.');
+        showPrompt();
+      } else {
+        showPrompt();
+      }
+      return;
+    }
+
+    if (ch === 127 || ch === 8) {
+      // Backspace
+      if (cursorPos > 0) {
+        lineBuffer = lineBuffer.slice(0, cursorPos - 1)
+          + lineBuffer.slice(cursorPos);
+        cursorPos--;
+        redrawLine();
+      }
+      return;
+    }
+
+    if (ch === 3) {
+      // Ctrl+C
+      lineBuffer = '';
+      cursorPos = 0;
+      term.write('^C\\r\\n');
+      showPrompt();
+      return;
+    }
+
+    if (ch === 12) {
+      // Ctrl+L: clear
+      term.clear();
+      showPrompt();
+      term.write(lineBuffer);
+      const back = lineBuffer.length - cursorPos;
+      if (back > 0) term.write(`\\x1b[${back}D`);
+      return;
+    }
+
+    // Escape sequences (arrows etc)
+    if (data.startsWith('\\x1b[', i)) {
+      const code = data[i + 2];
+      if (code === 'D' && cursorPos > 0) {
+        // Left arrow
+        cursorPos--;
+        term.write('\\x1b[D');
+      } else if (code === 'C'
+                 && cursorPos < lineBuffer.length) {
+        // Right arrow
+        cursorPos++;
+        term.write('\\x1b[C');
+      } else if (code === 'H') {
+        // Home
+        if (cursorPos > 0) {
+          term.write(`\\x1b[${cursorPos}D`);
+          cursorPos = 0;
+        }
+      } else if (code === 'F') {
+        // End
+        const fwd = lineBuffer.length - cursorPos;
+        if (fwd > 0) {
+          term.write(`\\x1b[${fwd}C`);
+          cursorPos = lineBuffer.length;
+        }
+      }
+      return;
+    }
+
+    // Regular character
+    if (ch >= 32) {
+      lineBuffer = lineBuffer.slice(0, cursorPos)
+        + data[i] + lineBuffer.slice(cursorPos);
+      cursorPos++;
+      redrawLine();
+      return;
+    }
+  }
+});
+
+function writeLn(color, text) {
+  const lines = text.split('\\n');
+  lines.forEach(l => {
+    term.write(`${color}${l}${C.reset}\\r\\n`);
+  });
+}
+
+function clearStatusLine() {
+  if (lastStatusLine) {
+    // Overwrite the status line
+    term.write('\\x1b[2K\\r');
+    lastStatusLine = '';
+  }
+}
+
+function writeStatus(text) {
+  clearStatusLine();
+  term.write(`${C.gray}${C.italic}${text}${C.reset}`);
+  lastStatusLine = text;
+  agentStatus.textContent = text.substring(0, 40);
+}
+
+// ── Chat WebSocket ────────────────────────────────────────
 function connectChat() {
   chatWs = new WebSocket(`ws://${location.host}/ws/chat`);
 
   chatWs.onopen = () => {
-    agentStatus.textContent = 'initializing...';
+    agentStatus.textContent = 'connected';
   };
 
   chatWs.onmessage = (e) => {
     const msg = JSON.parse(e.data);
 
     if (msg.type === 'status') {
-      updateStatus(msg.text);
+      writeStatus(msg.text);
       if (msg.text === 'Agent ready.') {
+        clearStatusLine();
         agentDot.className = 'dot-green';
         agentStatus.textContent = 'ready';
-        termIn.disabled = false;
-        termIn.placeholder = 'Ask memfun anything...';
-        termIn.focus();
+        chatBusy = false;
+        showPrompt();
       }
     } else if (msg.type === 'answer') {
-      clearStatus();
-      tLine('t-answer', msg.text);
+      clearStatusLine();
+      writeLn(C.white, msg.text);
       const parts = [];
       if (msg.method) parts.push(msg.method);
       if (msg.duration) parts.push(msg.duration + 's');
-      if (parts.length) tLine('t-meta', parts.join(' | '));
+      if (parts.length) {
+        writeLn(C.gray, parts.join(' | '));
+      }
       if (msg.files && msg.files.length) {
-        tLine('t-files',
+        writeLn(C.green,
           'Files: ' + msg.files.join(', '));
       }
-      tLine('t-answer', '');  // blank line
+      term.write('\\r\\n');
       chatBusy = false;
       agentDot.className = 'dot-green';
       agentStatus.textContent = 'ready';
-      termIn.disabled = false;
-      termIn.placeholder = 'Ask memfun anything...';
-      termIn.focus();
+      showPrompt();
     } else if (msg.type === 'error') {
-      clearStatus();
-      tLine('t-error', 'Error: ' + msg.text);
+      clearStatusLine();
+      writeLn(C.red, 'Error: ' + msg.text);
+      term.write('\\r\\n');
       chatBusy = false;
       agentDot.className = 'dot-green';
       agentStatus.textContent = 'ready';
-      termIn.disabled = false;
-      termIn.focus();
+      showPrompt();
     } else if (msg.type === 'history') {
-      (msg.messages || []).slice(-10).forEach(m => {
-        if (m.role === 'user') {
-          tLine('t-user', '> ' + m.content);
-        } else {
-          tLine('t-answer', m.content);
-        }
-      });
+      replayHistory(msg.messages || []);
     } else if (msg.type === 'session_switched') {
-      clearStatus();
-      termOut.innerHTML = '';
-      tLine('t-welcome',
+      term.clear();
+      writeLn(C.magenta,
         'Session: ' + msg.session);
-      (msg.history || []).slice(-10).forEach(m => {
-        if (m.role === 'user') {
-          tLine('t-user', '> ' + m.content);
-        } else {
-          tLine('t-answer', m.content);
-        }
-      });
+      term.write('\\r\\n');
+      replayHistory(msg.history || []);
+      chatBusy = false;
       agentDot.className = 'dot-green';
       agentStatus.textContent = 'ready';
-      chatBusy = false;
-      termIn.disabled = false;
-      termIn.placeholder = 'Ask memfun anything...';
-      termIn.focus();
+      showPrompt();
     }
   };
 
   chatWs.onclose = () => {
     agentDot.className = 'dot-gray';
     agentStatus.textContent = 'disconnected';
-    termIn.disabled = true;
-    termIn.placeholder = 'Reconnecting...';
+    chatBusy = false;
     setTimeout(connectChat, 3000);
   };
 }
 
-termIn.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !chatBusy) {
-    const text = termIn.value.trim();
-    if (!text) return;
-    termIn.value = '';
-    tLine('t-user', '> ' + text);
-    chatWs.send(JSON.stringify({
-      type: 'message', text: text,
-    }));
-    chatBusy = true;
-    termIn.disabled = true;
-    termIn.placeholder = 'Thinking...';
-    agentDot.className = 'dot-gray';
-    agentStatus.textContent = 'thinking...';
-  }
-});
-
-function tLine(cls, text) {
-  const div = document.createElement('div');
-  div.className = 't-line ' + cls;
-  div.textContent = text;
-  termOut.appendChild(div);
-  termOut.scrollTop = termOut.scrollHeight;
-}
-
-function updateStatus(text) {
-  if (!statusEl) {
-    statusEl = document.createElement('div');
-    statusEl.className = 't-line t-status';
-    termOut.appendChild(statusEl);
-  }
-  statusEl.textContent = text;
-  agentStatus.textContent = text.substring(0, 40);
-  termOut.scrollTop = termOut.scrollHeight;
-}
-
-function clearStatus() {
-  if (statusEl) { statusEl.remove(); statusEl = null; }
+function replayHistory(msgs) {
+  msgs.slice(-10).forEach(m => {
+    if (m.role === 'user') {
+      writeLn(C.blue, '> ' + m.content);
+    } else {
+      writeLn(C.white, m.content);
+    }
+  });
 }
 
 // ── Session picker ────────────────────────────────────────
-const sessionSelect = document.getElementById('session-select');
-const newSessionBtn = document.getElementById('new-session-btn');
+const sessionSelect =
+  document.getElementById('session-select');
+const newSessionBtn =
+  document.getElementById('new-session-btn');
 
 async function loadSessions() {
   try {
@@ -1067,13 +1184,13 @@ async function loadSessions() {
     const data = await resp.json();
     const sessions = data.sessions || [];
     const active = data.active || '';
-    // Keep the placeholder
     sessionSelect.innerHTML =
       '<option value="">-- select session --</option>';
     sessions.forEach(s => {
       const opt = document.createElement('option');
       opt.value = s.name;
-      opt.textContent = s.name + (s.has_memfun ? ' *' : '');
+      opt.textContent = s.name
+        + (s.has_memfun ? ' *' : '');
       if (s.name === active) opt.selected = true;
       sessionSelect.appendChild(opt);
     });
@@ -1089,8 +1206,7 @@ sessionSelect.addEventListener('change', () => {
     chatWs.send(JSON.stringify({
       type: 'switch_session', session: name,
     }));
-    termIn.disabled = true;
-    termIn.placeholder = 'Switching session...';
+    chatBusy = true;
     agentDot.className = 'dot-gray';
     agentStatus.textContent = 'switching...';
   }
@@ -1108,21 +1224,20 @@ newSessionBtn.addEventListener('click', async () => {
     const data = await resp.json();
     if (data.error) { alert(data.error); return; }
     await loadSessions();
-    // Auto-switch to the new session
     const sName = data.session.name;
     sessionSelect.value = sName;
     sessionSelect.dispatchEvent(new Event('change'));
   } catch (e) {
-    alert('Failed to create session: ' + e.message);
+    alert('Failed: ' + e.message);
   }
 });
 
-// Welcome message
-tLine('t-welcome',
-  'Memfun Agent Terminal');
-tLine('t-meta',
+// ── Welcome + init ────────────────────────────────────────
+writeLn(C.magenta, 'Memfun Agent Terminal');
+writeLn(C.gray,
   'Select a session above, then type a message.');
-tLine('t-answer', '');
+term.write('\\r\\n');
+showPrompt();
 
 connectChat();
 loadSessions();
@@ -1151,6 +1266,7 @@ document.addEventListener('mousemove', (e) => {
     window.innerHeight - 200, startH + delta
   ));
   termArea.style.height = newH + 'px';
+  fitAddon.fit();
 });
 
 document.addEventListener('mouseup', () => {
@@ -1159,7 +1275,10 @@ document.addEventListener('mouseup', () => {
   handle.classList.remove('active');
   document.body.style.cursor = '';
   document.body.style.userSelect = '';
+  fitAddon.fit();
 });
+
+window.addEventListener('resize', () => fitAddon.fit());
 </script>
 </body>
 </html>"""
