@@ -186,6 +186,16 @@ def run_project_init(
     }
     if backend == "sqlite":
         config["backend"]["sqlite_path"] = ".memfun/memfun.db"
+    elif backend == "redis":
+        redis_url = os.environ.get(
+            "MEMFUN_REDIS_URL", "redis://localhost:6379",
+        )
+        config["backend"]["redis_url"] = redis_url
+    elif backend == "nats":
+        nats_url = os.environ.get(
+            "MEMFUN_NATS_URL", "nats://localhost:4222",
+        )
+        config["backend"]["nats_url"] = nats_url
 
     config_path = memfun_dir / "config.toml"
     if not config_path.exists():
@@ -252,6 +262,20 @@ def _interactive_project_init(
             ],
             default="sqlite",
         ).execute()
+
+    if backend == "redis":
+        redis_url = inquirer.text(
+            message="Redis URL:",
+            default="redis://localhost:6379",
+        ).execute()
+        os.environ["MEMFUN_REDIS_URL"] = redis_url
+
+    if backend == "nats":
+        nats_url = inquirer.text(
+            message="NATS URL:",
+            default="nats://localhost:4222",
+        ).execute()
+        os.environ["MEMFUN_NATS_URL"] = nats_url
 
     if not sandbox:
         sandbox = inquirer.select(
