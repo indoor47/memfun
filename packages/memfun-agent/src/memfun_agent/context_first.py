@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+import time
+import uuid
+
 import dspy
 from memfun_core.logging import get_logger
 
@@ -1205,10 +1208,12 @@ class ContextFirstSolver:
         project_root: str | Path = ".",
         config: ContextFirstConfig | None = None,
         on_status: Callable[[str], None] | None = None,
+        on_dashboard: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self.config = config or ContextFirstConfig()
         self._on_status = on_status
+        self._on_dashboard = on_dashboard
 
         self.planner = ContextPlanner()
         self.gatherer = ContextGatherer(
@@ -1227,6 +1232,35 @@ class ContextFirstSolver:
         if self._on_status is not None:
             with contextlib.suppress(Exception):
                 self._on_status(msg)
+
+    def _dashboard(
+        self,
+        event_type: str,
+        *,
+        task_id: str | None = None,
+        agent_name: str = "context-first-solver",
+        success: bool | None = None,
+        duration_ms: float | None = None,
+        detail: str | None = None,
+        workflow_id: str | None = None,
+        project: str | None = None,
+    ) -> None:
+        """Emit a dashboard event (best-effort, sync callback)."""
+        if self._on_dashboard is None:
+            return
+        with contextlib.suppress(Exception):
+            self._on_dashboard({
+                "event_type": event_type,
+                "task_id": task_id,
+                "agent_name": agent_name,
+                "worker_id": agent_name,
+                "success": success,
+                "duration_ms": duration_ms,
+                "detail": detail,
+                "workflow_id": workflow_id,
+                "project": project,
+                "ts": time.time(),
+            })
 
     async def asolve(
         self,
@@ -1287,6 +1321,22 @@ class ContextFirstSolver:
         raw_query: str = "",
     ) -> ContextFirstResult:
         tokens_before = _get_dspy_token_usage()
+        workflow_id = uuid.uuid4().hex[:12]
+        project = self.project_root.name
+
+        # Emit solver started (acts like workflow.started for dashboard)
+        self._dashboard(
+            "workflow.started",
+            detail=(raw_query or query)[:200],
+            workflow_id=workflow_id,
+            project=project,
+        )
+        self._dashboard(
+            "worker.online",
+            agent_name="context-first-solver",
+            workflow_id=workflow_id,
+            project=project,
+        )
 
         # 1. Build file manifest.
         self._status("Scanning project files...")
@@ -1322,6 +1372,19 @@ class ContextFirstSolver:
         # 2. Decide strategy: fast path vs planner.
         #    "web" category always goes through planner so web searches
         #    are planned and executed.
+        gather_id = f"gather-{workflow_id}"
+        t_gather = time.monotonic()
+        self._dashboard(
+            "task.published", task_id=gather_id,
+            agent_name="context-first-solver",
+            detail="Gathering context",
+            workflow_id=workflow_id, project=project,
+        )
+        self._dashboard(
+            "task.picked_up", task_id=gather_id,
+            agent_name="context-first-solver",
+            workflow_id=workflow_id, project=project,
+        )
         if (
             category != "web"
             and (
@@ -1363,6 +1426,12 @@ class ContextFirstSolver:
             )
             full_context += extra_context
             method = "context_first_planned"
+        self._dashboard(
+            "task.completed", task_id=gather_id,
+            agent_name="context-first-solver", success=True,
+            duration_ms=(time.monotonic() - t_gather) * 1000,
+            workflow_id=workflow_id, project=project,
+        )
 
         if not full_context.strip():
             return ContextFirstResult(
@@ -1375,16 +1444,30 @@ class ContextFirstSolver:
             )
 
         # 3. Single-shot solve.
-        # Use raw_query (the un-enriched user message) as the solver's
-        # query.  The enriched query contains RLM-specific rules
-        # (read_file, search_history) and prior turn content that
-        # mislead the single-shot solver into scope creep.  All useful
-        # context is already in full_context.
+        solve_id = f"solve-{workflow_id}"
+        t_solve = time.monotonic()
+        self._dashboard(
+            "task.published", task_id=solve_id,
+            agent_name="context-first-solver",
+            detail="Solving in single shot",
+            workflow_id=workflow_id, project=project,
+        )
+        self._dashboard(
+            "task.picked_up", task_id=solve_id,
+            agent_name="context-first-solver",
+            workflow_id=workflow_id, project=project,
+        )
         self._status("Solving in single shot...")
         solver_query = raw_query or query
         solve_result = await self.solver.asolve(
             query=solver_query,
             full_context=full_context,
+        )
+        self._dashboard(
+            "task.completed", task_id=solve_id,
+            agent_name="context-first-solver", success=True,
+            duration_ms=(time.monotonic() - t_solve) * 1000,
+            workflow_id=workflow_id, project=project,
         )
 
         # 3a. Truncation detection — if the LLM response was cut off,
@@ -1415,14 +1498,33 @@ class ContextFirstSolver:
             )
 
         # 4. Execute operations.
+        exec_id = f"exec-{workflow_id}"
+        t_exec = time.monotonic()
         executor = OperationExecutor(
             self.project_root, on_status=self._on_status
         )
         if solve_result.operations:
+            self._dashboard(
+                "task.published", task_id=exec_id,
+                agent_name="context-first-solver",
+                detail=f"Executing {len(solve_result.operations)} operations",
+                workflow_id=workflow_id, project=project,
+            )
+            self._dashboard(
+                "task.picked_up", task_id=exec_id,
+                agent_name="context-first-solver",
+                workflow_id=workflow_id, project=project,
+            )
             self._status(
                 f"Executing {len(solve_result.operations)} operations..."
             )
             await executor.execute(solve_result.operations)
+            self._dashboard(
+                "task.completed", task_id=exec_id,
+                agent_name="context-first-solver", success=True,
+                duration_ms=(time.monotonic() - t_exec) * 1000,
+                workflow_id=workflow_id, project=project,
+            )
 
         # 4a. Retry failed edits with diagnostic feedback.
         if self.config.enable_edit_retry and executor.edit_diagnostics:
@@ -1433,24 +1535,59 @@ class ContextFirstSolver:
             )
 
         # 4b. Consistency review & polish (semantic check).
-        # Use raw_query (the un-enriched user message) so the reviewer
-        # compares against what the user actually asked, not the
-        # noise-laden enriched query with memory/history/rules.
         if self.config.enable_consistency_review and executor.files_created:
+            review_id = f"review-{workflow_id}"
+            t_review = time.monotonic()
+            self._dashboard(
+                "task.published", task_id=review_id,
+                agent_name="context-first-solver",
+                detail="Consistency review",
+                workflow_id=workflow_id, project=project,
+            )
+            self._dashboard(
+                "task.picked_up", task_id=review_id,
+                agent_name="context-first-solver",
+                workflow_id=workflow_id, project=project,
+            )
             await self._consistency_review_and_polish(
                 query=raw_query or query,
                 solve_result=solve_result,
                 executor=executor,
             )
+            self._dashboard(
+                "task.completed", task_id=review_id,
+                agent_name="context-first-solver", success=True,
+                duration_ms=(time.monotonic() - t_review) * 1000,
+                workflow_id=workflow_id, project=project,
+            )
 
         # 5. Verify & fix loop.
         verify_cmds = self._get_verify_commands()
         if verify_cmds and executor.files_created:
+            verify_id = f"verify-{workflow_id}"
+            t_verify = time.monotonic()
+            self._dashboard(
+                "task.published", task_id=verify_id,
+                agent_name="context-first-solver",
+                detail="Verifying",
+                workflow_id=workflow_id, project=project,
+            )
+            self._dashboard(
+                "task.picked_up", task_id=verify_id,
+                agent_name="context-first-solver",
+                workflow_id=workflow_id, project=project,
+            )
             await self._verify_and_fix(
                 query=solver_query,
                 full_context=full_context,
                 executor=executor,
                 verify_cmds=verify_cmds,
+            )
+            self._dashboard(
+                "task.completed", task_id=verify_id,
+                agent_name="context-first-solver", success=True,
+                duration_ms=(time.monotonic() - t_verify) * 1000,
+                workflow_id=workflow_id, project=project,
             )
 
         tokens_after = _get_dspy_token_usage()

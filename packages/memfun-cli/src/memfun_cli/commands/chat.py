@@ -337,6 +337,9 @@ class ChatSession:
         self._agent.on_context_first_status = (
             self._on_context_first_status_callback
         )
+        self._agent.on_context_first_dashboard = (
+            self._on_context_first_dashboard_callback
+        )
         await self._agent.on_start()
 
         # Initialize persistent learning memory
@@ -398,6 +401,43 @@ class ChatSession:
                 self._context_first_status
             )
         self._context_first_status = msg
+
+    def _on_context_first_dashboard_callback(
+        self, event: dict,
+    ) -> None:
+        """Publish a dashboard event from the context-first solver."""
+        try:
+            from memfun_runtime.distributed import (
+                EVENT_TOPIC,
+                DistributedEvent,
+            )
+
+            de = DistributedEvent(
+                event_type=event.get("event_type", ""),
+                task_id=event.get("task_id"),
+                agent_name=event.get("agent_name"),
+                worker_id=event.get("worker_id"),
+                success=event.get("success"),
+                duration_ms=event.get("duration_ms"),
+                detail=event.get("detail"),
+                ts=event.get("ts", 0.0),
+                project=event.get("project"),
+                workflow_id=event.get("workflow_id"),
+            )
+            # Schedule the async publish on the running event loop
+            import asyncio
+
+            loop = asyncio.get_event_loop()
+            task = loop.create_task(
+                self._runtime.event_bus.publish(
+                    EVENT_TOPIC, de.to_bytes(),
+                ),
+            )
+            task.add_done_callback(lambda _t: None)
+        except Exception:
+            logger.debug(
+                "Failed to emit CF dashboard event", exc_info=True,
+            )
 
     # ── Multi-agent workflow support ──────────────────────
 

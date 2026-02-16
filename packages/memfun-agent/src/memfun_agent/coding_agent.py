@@ -86,6 +86,7 @@ class RLMCodingAgent(BaseAgent):
         self.on_plan: Any | None = None
         self.on_step_status: Any | None = None
         self.on_context_first_status: Any | None = None
+        self.on_context_first_dashboard: Any | None = None
 
         # DSPy predictors for simple (non-RLM) tasks
         self._analyzers: dict[str, dspy.Module] = {}
@@ -145,6 +146,7 @@ class RLMCodingAgent(BaseAgent):
                 project_root=os.getcwd(),
                 config=ContextFirstConfig(),
                 on_status=self.on_context_first_status,
+                on_dashboard=self.on_context_first_dashboard,
             )
         except Exception as exc:
             logger.warning(
