@@ -1969,10 +1969,15 @@ async def _start_dashboard_background(
     """
     try:
         import socket
+        import warnings
 
         import uvicorn
 
         from memfun_cli.dashboard.server import create_app
+
+        # Suppress uvicorn/websockets deprecation warnings
+        warnings.filterwarnings("ignore", module="websockets")
+        warnings.filterwarnings("ignore", module="uvicorn")
 
         # Find available port
         port = None
