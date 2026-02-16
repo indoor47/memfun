@@ -422,6 +422,12 @@ class WorkflowEngine:
             sub_status.status = "running"
             sub_status.started_at = time.time()
             self._emit_sub_task(tid, sub_status)
+            await self._emit_dashboard(
+                "task.published",
+                task_id=sub_status.task_id,
+                agent_name=sub_status.agent_name,
+                detail=sub_status.sub_task.description[:80],
+            )
 
         if not tasks:
             logger.warning(
@@ -437,6 +443,14 @@ class WorkflowEngine:
             len(tasks),
             matched_tids,
         )
+        for tid in matched_tids:
+            ss = state.sub_task_statuses.get(tid)
+            if ss:
+                await self._emit_dashboard(
+                    "task.picked_up",
+                    task_id=ss.task_id,
+                    agent_name=ss.agent_name,
+                )
         results = await self._orchestrator.fan_out(
             tasks, agent_names, timeout=600.0,
         )
@@ -452,6 +466,20 @@ class WorkflowEngine:
             sub_status.completed_at = time.time()
             sub_status.status = "completed" if result.success else "failed"
             self._emit_sub_task(tid, sub_status)
+
+            dur = (
+                (sub_status.completed_at - sub_status.started_at)
+                * 1000
+                if sub_status.started_at
+                else result.duration_ms
+            )
+            await self._emit_dashboard(
+                "task.completed",
+                task_id=sub_status.task_id,
+                agent_name=sub_status.agent_name,
+                success=result.success,
+                duration_ms=dur,
+            )
 
             data = result.result or {}
             logger.info(
@@ -767,6 +795,9 @@ class WorkflowEngine:
                 await self._manager.start_agent(name)
                 started.append(name)
                 logger.info("Started agent %s", name)
+                await self._emit_dashboard(
+                    "worker.online", agent_name=name,
+                )
             except Exception as exc:
                 failed.append(name)
                 logger.error("Failed to start %s: %s", name, exc)
@@ -915,3 +946,33 @@ class WorkflowEngine:
         if self._on_sub_task_status:
             with contextlib.suppress(Exception):
                 self._on_sub_task_status(tid, status)
+
+    async def _emit_dashboard(
+        self,
+        event_type: str,
+        *,
+        task_id: str | None = None,
+        agent_name: str | None = None,
+        success: bool | None = None,
+        duration_ms: float | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Best-effort publish event to dashboard stream."""
+        with contextlib.suppress(Exception):
+            from memfun_runtime.distributed import (
+                EVENT_TOPIC,
+                DistributedEvent,
+            )
+
+            event = DistributedEvent(
+                event_type=event_type,
+                task_id=task_id,
+                agent_name=agent_name,
+                worker_id="workflow-engine",
+                success=success,
+                duration_ms=duration_ms,
+                detail=detail,
+            )
+            await self._context.event_bus.publish(
+                EVENT_TOPIC, event.to_bytes(),
+            )
