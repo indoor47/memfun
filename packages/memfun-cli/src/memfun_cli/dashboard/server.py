@@ -507,7 +507,8 @@ _DASHBOARD_HTML = (
     font-size: 11px; font-weight: 700;
   }
   .header .session-picker {
-    display: flex; align-items: center; gap: 8px;
+    display: none; /* TODO: re-enable when chat is ready */
+    align-items: center; gap: 8px;
     margin-left: 16px;
   }
   .header .session-picker select {
@@ -569,8 +570,9 @@ _DASHBOARD_HTML = (
     overflow-y: auto; flex: 1; padding: 8px;
   }
 
-  /* Drag handle */
+  /* Drag handle - hidden until chat is ready */
   .drag-handle {
+    display: none;
     height: 6px; background: var(--border);
     cursor: ns-resize; flex-shrink: 0;
     position: relative;
@@ -587,10 +589,11 @@ _DASHBOARD_HTML = (
     background: var(--muted); border-radius: 1px;
   }
 
-  /* Terminal panel at bottom */
+  /* Terminal panel at bottom - hidden until chat is ready */
   .terminal-area {
+    display: none;
     height: 280px; min-height: 80px;
-    display: flex; flex-direction: column;
+    flex-direction: column;
     background: var(--bg);
     border-top: 1px solid var(--border);
   }
