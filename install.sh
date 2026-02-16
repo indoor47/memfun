@@ -43,13 +43,13 @@ WRAPPER="$BIN_DIR/memfun"
 if [ -w "$BIN_DIR" ] || [ "$(id -u)" = "0" ]; then
     cat > "$WRAPPER" << WRAP
 #!/usr/bin/env bash
-exec "$INSTALL_DIR/.venv/bin/python" -m memfun_cli "\$@"
+exec "$INSTALL_DIR/.venv/bin/memfun" "\$@"
 WRAP
     chmod +x "$WRAPPER"
 else
     sudo tee "$WRAPPER" > /dev/null << WRAP
 #!/usr/bin/env bash
-exec "$INSTALL_DIR/.venv/bin/python" -m memfun_cli "\$@"
+exec "$INSTALL_DIR/.venv/bin/memfun" "\$@"
 WRAP
     sudo chmod +x "$WRAPPER"
 fi
