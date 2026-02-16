@@ -18,7 +18,11 @@ import argparse
 import asyncio
 import json
 import time
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 from memfun_core.logging import get_logger
 
@@ -209,20 +213,20 @@ def create_app(
     _event_bus = event_bus
     _project_name = project_name or ""
 
-    app = FastAPI(title="Memfun Agent Dashboard")
-
     _bg_tasks: set[asyncio.Task[None]] = set()
 
-    @app.on_event("startup")
-    async def startup() -> None:
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         if _event_bus is not None:
-            # Embedded mode: use the shared event bus directly
             task = asyncio.create_task(_event_listener(_event_bus))
         else:
-            # Standalone mode: connect to Redis
             task = asyncio.create_task(_redis_listener())
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
+        yield
+        task.cancel()
+
+    app = FastAPI(title="Memfun Agent Dashboard", lifespan=lifespan)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
