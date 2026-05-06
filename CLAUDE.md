@@ -101,6 +101,45 @@ This project uses 18 specialized implementation agents organized into 9 groups:
 | `code-reviewer` | Code quality review: correctness, consistency, types, errors, docs | `/code-reviewer` |
 | `debug-detective` | Bug diagnosis: async issues, race conditions, backend bugs, perf | `/debug-detective` |
 | `devops-deployer` | CI/CD, Docker, NATS deployment, PyPI packaging, monitoring | `/devops-deployer` |
+| `reliability-monitor` | Drift detection between plan/docs/code/tracker; curates `docs/LEARNINGS.md` | `/reliability-monitor` |
+
+## Implementation conventions (parallel-agent epic, 2026-05+)
+
+### Agent pairing — every implementer pairs with an auditor
+Every code-changing task is dispatched as **two** Agent invocations on Opus 4.7:
+
+1. **Implementer** writes the change, tests, and commits on a per-issue feature branch (`feat/issue-N-shortname`). Opens the PR.
+2. **Auditor** (a different agent type — never the same one as the implementer) reviews the PR diff against the issue's acceptance criteria, runs `ruff` + `pyright` + `pytest`, and performs one independent verification (e.g. for FS-isolation work, attempts a path-escape; for concurrency work, asserts the cap holds at the configured limit).
+
+Auditors are **advisory** by default — they comment, the human (or Claude Code) merges. Auditors get veto only on critical-severity findings (security exploit, data loss, broken protocol contract).
+
+Default pairings:
+- `runtime-implementer` ↔ `code-reviewer` or `security-auditor`
+- `agent-system` ↔ `code-reviewer`
+- `code-tools` ↔ `security-auditor`
+- `cli-implementer` ↔ `code-reviewer`
+
+After every merge, `reliability-monitor` runs once.
+
+### Reliability monitor — required after each meaningful work unit
+After any of the following events, invoke `reliability-monitor`:
+- A PR is opened or merged.
+- A GitHub issue closes.
+- A planning decision changes (e.g. an issue is deferred or re-prioritized).
+- An experiment produces new findings.
+- The user explicitly requests a sync.
+
+It does NOT run after every shell command or every tool call (that produces noise). See `agents/reliability-monitor/AGENT.md` for the full contract — it audits drift across plan/docs/code/tracker, appends to `docs/LEARNINGS.md`, and is non-blocking.
+
+### Learnings register
+Non-obvious findings live in `docs/LEARNINGS.md` (versioned, in repo). Format: H3 title with date, **What** / **Why it matters** / **Source** lines. Append-only. Reliability monitor is the primary maintainer; humans and other agents may also append.
+
+### Test runtimes
+Live OpenAI-compatible endpoints used in integration smoke tests during PR review:
+- **Hetzner CCX33** (77.42.64.229) — Qwen 2.5 Coder 7B at port 8080 (fast lane), Qwen 2.5 Coder 14B at port 8081 (default test runtime). Tunnels: `localhost:8089` → 7B, `localhost:8090` → 14B. ~€0.12/hr while running.
+- **Hetzner CX33** (89.167.76.186, `memfun-eval`) — Qwen 2.5 Coder 3B at port 8080. Kept alive for SWE-bench history. ~€0.005/hr.
+
+Implementer agents themselves run on Anthropic Opus 4.7 — the local Hetzner models are only used to drive memfun in tests.
 
 ## Agent Interaction Map
 
