@@ -134,6 +134,11 @@ def _configure_dspy(config: MemfunConfig) -> None:
     model = config.llm.model
     api_key = os.environ.get(config.llm.api_key_env, "")
 
+    # openai-compat endpoints (local llama.cpp / vLLM / OpenRouter) often
+    # don't require a real key — inject placeholder if absent.
+    if provider == "openai-compat" and not api_key:
+        api_key = "sk-local"
+
     if not api_key and provider != "ollama":
         console.print(
             f"[yellow]Warning: No API key for {provider} "
@@ -144,6 +149,8 @@ def _configure_dspy(config: MemfunConfig) -> None:
     if provider == "anthropic":
         lm_model = f"anthropic/{model}"
     elif provider == "openai":
+        lm_model = f"openai/{model}"
+    elif provider == "openai-compat":
         lm_model = f"openai/{model}"
     elif provider == "ollama":
         lm_model = f"ollama_chat/{model}"
