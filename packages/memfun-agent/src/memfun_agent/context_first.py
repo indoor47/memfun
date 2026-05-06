@@ -773,15 +773,50 @@ class OperationExecutor:
         on_status: Callable[[str], None] | None = None,
         *,
         edit_only: bool = False,
+        base_dir: str | Path | None = None,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self._on_status = on_status
         self._edit_only = edit_only
+        # When set, every write/edit path is resolved against base_dir
+        # (relative paths) and rejected if it would escape base_dir
+        # (absolute or `..`-traversing paths).  Used to confine
+        # specialists to their per-task git worktree.
+        self.base_dir: Path | None = (
+            Path(base_dir).resolve() if base_dir is not None else None
+        )
         self.ops: list[tuple[str, str, Any]] = []
         self.files_created: list[str] = []
         self.attempted: int = 0  # total operations attempted
         self.failed: int = 0  # operations that silently failed
         self.edit_diagnostics: list[EditDiagnostic] = []
+
+    def _resolve_path(self, path_str: str) -> Path | None:
+        """Resolve *path_str* and (when ``base_dir`` is set) confine it.
+
+        Returns ``None`` if the path would escape ``base_dir``; the
+        caller should treat that as a soft failure (increment
+        ``self.failed`` and continue).  When ``base_dir`` is unset
+        the legacy behaviour — ``Path(os.path.abspath(path_str))`` —
+        is preserved so existing tests / callers see no change.
+        """
+        if self.base_dir is None:
+            return Path(os.path.abspath(path_str))
+
+        candidate = Path(path_str)
+        if not candidate.is_absolute():
+            candidate = self.base_dir / candidate
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(self.base_dir):
+            logger.warning(
+                "Refusing path outside base_dir: %s (base=%s)",
+                resolved, self.base_dir,
+            )
+            self._status(
+                f"Blocked path outside worktree: {path_str}"
+            )
+            return None
+        return resolved
 
     def _status(self, msg: str) -> None:
         """Emit a per-operation status update."""
@@ -822,7 +857,10 @@ class OperationExecutor:
             self.failed += 1
             return
 
-        path = Path(os.path.abspath(path_str))
+        path = self._resolve_path(path_str)
+        if path is None:
+            self.failed += 1
+            return
 
         # edit_only mode: block write_file for existing files entirely.
         # Used by polish/fix steps that should only make targeted edits.
@@ -895,7 +933,10 @@ class OperationExecutor:
         if not path_str or not old_text:
             return
 
-        path = Path(os.path.abspath(path_str))
+        path = self._resolve_path(path_str)
+        if path is None:
+            self.failed += 1
+            return
         if not path.is_file():
             logger.warning("edit_file: %s does not exist", path)
             self.failed += 1

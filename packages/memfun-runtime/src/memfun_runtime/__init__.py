@@ -19,6 +19,7 @@ from memfun_runtime.protocols import (
     SkillRegistryAdapter,
     StateStoreAdapter,
 )
+from memfun_runtime.worktree import WorktreeError, WorktreeInfo, WorktreeManager
 
 __all__ = [
     "AgentLifecycle",
@@ -37,6 +38,9 @@ __all__ = [
     "SkillInfo",
     "SkillRegistryAdapter",
     "StateStoreAdapter",
+    "WorktreeError",
+    "WorktreeInfo",
+    "WorktreeManager",
     "agent",
     "get_agent_registry",
 ]

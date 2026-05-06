@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -22,12 +23,29 @@ _BLOCKED_PATH_NAMES: frozenset[str] = frozenset({
 })
 
 
+def _project_root_guard() -> Path | None:
+    """Return the configured project root, or ``None`` if unscoped.
+
+    When the ``MEMFUN_PROJECT_ROOT`` environment variable is set, all
+    filesystem tool calls must resolve to a path strictly inside that
+    directory.  This is used by per-task worktrees to confine
+    specialists to their isolated checkout.  Issue #13 will harden
+    the guard further; for now we just refuse anything outside.
+    """
+    raw = os.environ.get("MEMFUN_PROJECT_ROOT")
+    if not raw:
+        return None
+    return Path(raw).resolve()
+
+
 def _assert_safe_path(p: Path) -> None:
     """Raise if *p* resolves to a known-sensitive location.
 
     This is a defence-in-depth measure: the agent should
     already be scoped to the project working directory, but
     we block obvious sensitive paths as an extra safeguard.
+    Additionally, when ``MEMFUN_PROJECT_ROOT`` is set, paths
+    outside that root are refused.
     """
     resolved = str(p)
     for prefix in _BLOCKED_PATH_PREFIXES:
@@ -39,6 +57,12 @@ def _assert_safe_path(p: Path) -> None:
     if p.name in _BLOCKED_PATH_NAMES:
         raise PermissionError(
             f"Access denied: {p.name} may contain secrets"
+        )
+
+    root = _project_root_guard()
+    if root is not None and not p.resolve().is_relative_to(root):
+        raise ValueError(
+            f"Access denied: {p} is outside MEMFUN_PROJECT_ROOT={root}"
         )
 
 
@@ -95,6 +119,11 @@ async def list_directory(
         recursive: If true, list recursively (max 1000).
     """
     p = Path(path).resolve()
+    root = _project_root_guard()
+    if root is not None and not p.is_relative_to(root):
+        raise ValueError(
+            f"Access denied: {p} is outside MEMFUN_PROJECT_ROOT={root}"
+        )
     if not p.is_dir():
         raise NotADirectoryError(f"Not a directory: {path}")
 
@@ -131,6 +160,11 @@ async def glob_files(
         path: Base directory to search from.
     """
     base = Path(path).resolve()
+    root = _project_root_guard()
+    if root is not None and not base.is_relative_to(root):
+        raise ValueError(
+            f"Access denied: {base} is outside MEMFUN_PROJECT_ROOT={root}"
+        )
     matches = sorted(base.glob(pattern))[:500]
     return (
         "\n".join(str(m.relative_to(base)) for m in matches)
