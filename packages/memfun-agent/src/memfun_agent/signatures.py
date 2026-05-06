@@ -382,6 +382,20 @@ class TaskDecomposition(dspy.Signature):
     Let the task description guide you. Most bug fixes are simple.
     When in doubt, use fewer sub-tasks — the system can escalate later.
 
+    INPUT/OUTPUT FILE DECLARATIONS (REQUIRED):
+    For every sub-task, ALWAYS list every file path the sub-task will read
+    in `inputs` and every file path it will write in `outputs`.  Empty
+    lists are NOT acceptable for code-modification tasks — the orchestrator
+    relies on these declarations to detect when two parallel sub-tasks
+    would overwrite the same file and must serialise them.  When you do
+    not yet know the exact file, write the most likely path (e.g.
+    `src/auth/middleware.py`) rather than leaving the list empty.
+
+    PARALLELISM GROUPS — DO NOT OVERLAP OUTPUTS:
+    Two sub-tasks that share an output path MUST NOT appear in the same
+    parallelism group.  Either give them an explicit `depends_on` chain
+    or place them in separate groups.  Cross-group ordering is fine.
+
     Complex examples:
       "Redesign the sidebar with animations" ->
         T1 (file): Analyze current sidebar code and CSS structure

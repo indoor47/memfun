@@ -14,7 +14,9 @@ Public API:
   ``AgentValidator``, ``AgentRegistryBridge``, ``DefinedAgent``,
   ``parse_agent_md``.
 - Multi-agent: ``QueryResolver``, ``TaskDecomposer``, ``SubTask``,
-  ``DecompositionResult``, ``SharedSpec``, ``SharedSpecStore``,
+  ``DecompositionResult``, ``DecompositionConfig``, ``DecompositionError``,
+  ``detect_output_overlap``, ``resolve_output_overlap``,
+  ``SharedSpec``, ``SharedSpecStore``,
   ``WorkflowEngine``, ``WorkflowResult``, ``WorkflowState``.
 - Specialist agents: ``FileAgent``, ``CoderAgent``, ``TestAgent``,
   ``ReviewAgent``, ``WebSearchAgent``, ``WebFetchAgent``,
@@ -38,9 +40,13 @@ from memfun_agent.context_first import (
     EditDiagnostic,
 )
 from memfun_agent.decomposer import (
+    DecompositionConfig,
+    DecompositionError,
     DecompositionResult,
     SubTask,
     TaskDecomposer,
+    detect_output_overlap,
+    resolve_output_overlap,
 )
 from memfun_agent.definitions import (
     AgentDefinition,
@@ -124,6 +130,8 @@ __all__ = [
     "ContextFirstSolver",
     "ContextPlanning",
     "DebugAgent",
+    "DecompositionConfig",
+    "DecompositionError",
     "DecompositionResult",
     "DefinedAgent",
     "Definition",
@@ -166,5 +174,7 @@ __all__ = [
     "build_context_metadata",
     "code_map_to_string",
     "create_tool_bridge",
+    "detect_output_overlap",
     "parse_agent_md",
+    "resolve_output_overlap",
 ]
