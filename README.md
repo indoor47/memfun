@@ -7,7 +7,7 @@
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License" /></a>
     <a href="https://python.org"><img src="https://img.shields.io/badge/python-3.12%2B-blue.svg" alt="Python" /></a>
     <a href="https://github.com/indoor47/memfun/actions/workflows/ci.yml"><img src="https://github.com/indoor47/memfun/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <img src="https://img.shields.io/badge/tests-844_pass-brightgreen.svg" alt="Tests" />
+    <img src="https://img.shields.io/badge/tests-854_pass-brightgreen.svg" alt="Tests" />
     <img src="https://img.shields.io/badge/packages-7-orange.svg" alt="Packages" />
   </p>
 </p>
@@ -441,7 +441,7 @@ memfun/
 ├── skills/                 8 built-in Agent Skills (SKILL.md format)
 ├── agents/                 Built-in agent definitions (AGENT.md format)
 ├── evals/                  SWE-bench + Terminal-Bench evaluation harnesses
-└── tests/                  844 tests (88 skipped for Redis/NATS without servers)
+└── tests/                  854 tests (88 skipped for Redis/NATS without servers)
 ```
 
 ## Built-in Skills
@@ -469,7 +469,7 @@ git clone https://github.com/indoor47/memfun.git
 cd memfun
 uv sync --all-packages
 
-make test                       # 844 pass, 88 skip
+make test                       # 854 pass, 88 skip
 make lint                       # 0 errors
 make typecheck                  # Pyright strict mode
 uv run memfun                   # run in dev mode
