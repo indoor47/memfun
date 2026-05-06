@@ -159,8 +159,12 @@ class AgentOrchestrator:
     ) -> list[TaskResult]:
         """Execute *tasks* in parallel, one per agent.
 
-        *tasks* and *agent_names* must have the same length.  Returns a
-        list of :class:`TaskResult` in corresponding order.
+        *tasks* and *agent_names* must have the same length. Each entry
+        in *agent_names* may be either a name (resolves to the first
+        running instance of that name — backward compat) or an explicit
+        instance id (direct dispatch to that one Python object).
+
+        Returns a list of :class:`TaskResult` in corresponding order.
         """
         if len(tasks) != len(agent_names):
             raise ValueError(
@@ -180,6 +184,40 @@ class AgentOrchestrator:
             else r
             for i, r in enumerate(results)
         ]
+
+    async def fan_out_to_pool(
+        self,
+        tasks: list[TaskMessage],
+        pool_name: str,
+        *,
+        timeout: float | None = None,
+    ) -> list[TaskResult]:
+        """Execute *tasks* in parallel against a per-instance pool.
+
+        Spawns ``len(tasks)`` distinct instances of *pool_name* (reusing
+        any already-running instances of that name first) so each task
+        runs on its own Python ``BaseAgent`` object — sidesteps the
+        single-instance-per-name parallelism cap. New instances launched
+        here are *not* auto-stopped: callers that own the lifecycle of a
+        scratch pool should call :meth:`AgentManager.stop_agent` with
+        either each id or the *pool_name* once results are in.
+
+        Returns a list of :class:`TaskResult` in corresponding order.
+        """
+        if not tasks:
+            return []
+
+        manager = self._manager
+        existing = list(manager.instance_ids_for(pool_name))
+        needed = len(tasks) - len(existing)
+        if needed > 0:
+            new_ids = await manager.start_pool(pool_name, needed)
+            existing.extend(new_ids)
+
+        # Pair each task with a distinct instance id (round-robin if more
+        # tasks than instances, though needed > 0 above guarantees parity).
+        target_ids = [existing[i % len(existing)] for i in range(len(tasks))]
+        return await self.fan_out(tasks, target_ids, timeout=timeout)
 
     async def pipeline(
         self,
@@ -395,6 +433,9 @@ class AgentOrchestrator:
         timeout: float,
     ) -> TaskResult:
         """Run a single task dispatch to an agent with a timeout.
+
+        *agent_name* may be either a name (first running instance wins —
+        backward-compat) or an explicit ``instance_id`` (direct dispatch).
 
         Acquires the orchestrator-wide semaphore *before* the LLM /
         agent call so that at most ``config.max_concurrency`` dispatches
