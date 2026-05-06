@@ -104,9 +104,8 @@ def explain(
 @app.command()
 def version() -> None:
     """Show the Memfun version."""
-    from rich.console import Console
-
     from memfun_core._version import __version__
+    from rich.console import Console
     Console().print(f"memfun {__version__}")
 
 

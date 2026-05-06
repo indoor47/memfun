@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,7 +80,7 @@ def _configure_dspy() -> None:
     else:
         lm_model = model
 
-    kwargs: dict[str, object] = {
+    kwargs: dict[str, Any] = {
         "temperature": config.llm.temperature,
         "max_tokens": config.llm.max_tokens,
     }

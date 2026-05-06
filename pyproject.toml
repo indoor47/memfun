@@ -29,6 +29,7 @@ dev = [
     "ruff>=0.8",
     "pyright>=1.1",
     "aiosqlite>=0.20",
+    "pip-audit>=2.7",
 ]
 
 [tool.ruff]
@@ -43,6 +44,9 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH", "RUF"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 reportMissingTypeStubs = false
+# evals/ depends heavily on untyped third-party libs (dspy, swebench, datasets);
+# strict mode produces hundreds of unactionable errors. Excluded from CI typecheck.
+exclude = ["evals", ".claude/worktrees", ".memfun/worktrees"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
