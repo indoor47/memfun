@@ -123,6 +123,16 @@ class WorktreeManager:
         """Absolute path of the directory containing all worktrees."""
         return self._project_root / self.BASE_REL
 
+    @property
+    def _managed_root(self) -> Path:
+        """Resolved root under which all managed worktrees must live.
+
+        Equivalent to ``base_dir.resolve()``.  Cleanup operations
+        refuse to touch any path that does not resolve into this
+        subtree — see :func:`_check_in_managed_root`.
+        """
+        return self.base_dir.resolve()
+
     # ── Public API ────────────────────────────────────────────
 
     def make_worktree(
@@ -191,10 +201,25 @@ class WorktreeManager:
         "directory missing", "git doesn't know about it", and
         "branch already deleted" succeeds silently.
 
+        The path is gated by :func:`_check_in_managed_root` *before*
+        any destructive operation runs — passing a path outside
+        ``<project_root>/.memfun/worktrees/`` raises
+        :class:`WorktreeError` and performs no filesystem or git
+        side-effects.  Symlinks are resolved before the check, so a
+        symlink whose target escapes the managed root is also
+        rejected.
+
         Args:
             path: Absolute or relative path of the worktree.
+
+        Raises:
+            WorktreeError: If *path* resolves outside the managed
+                ``<project_root>/.memfun/worktrees/`` subtree.
         """
-        target = Path(path).resolve()
+        # Gate FIRST.  ``_check_in_managed_root`` resolves symlinks
+        # before comparing against the managed root, so neither a
+        # ``..``-traversal nor a symlinked component can sneak past.
+        target = self._check_in_managed_root(path)
 
         # Worktree remove (best-effort).
         if target.exists() or self._is_registered_worktree(target):
@@ -233,6 +258,52 @@ class WorktreeManager:
         # Always prune stale entries from git's bookkeeping.
         with contextlib.suppress(WorktreeError):
             self._run_git("worktree", "prune")
+
+    def cleanup_worktrees(self, workflow_id: str) -> None:
+        """Remove every managed worktree under *workflow_id*.
+
+        Iterates the ``<managed_root>/<workflow_id>/`` subtree and
+        delegates each entry to :func:`cleanup_worktree`.  The
+        ``workflow_id`` itself is gated against the managed root
+        before any directory listing happens — defense-in-depth
+        against ``workflow_id="../../etc"`` or similar injection.
+
+        Safe to call when the workflow directory does not exist:
+        it is a silent no-op.
+
+        Args:
+            workflow_id: Outer workflow identifier whose worktrees
+                should be reaped.
+
+        Raises:
+            WorktreeError: If *workflow_id* would escape the managed
+                root (e.g. contains ``..`` or absolute-path
+                components).
+        """
+        # Gate the constructed parent path before doing any I/O.
+        wf_dir_unresolved = self.base_dir / workflow_id
+        wf_dir = self._check_in_managed_root(wf_dir_unresolved)
+        # Refuse the bare managed root — that would wipe everyone.
+        if wf_dir == self._managed_root:
+            raise WorktreeError(
+                f"refusing to operate on worktree outside managed root: "
+                f"{wf_dir_unresolved}"
+            )
+        if not wf_dir.is_dir():
+            logger.debug("workflow worktree dir %s missing; nothing to do", wf_dir)
+            return
+        for entry in sorted(wf_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            try:
+                self.cleanup_worktree(entry)
+            except WorktreeError as exc:
+                logger.warning(
+                    "cleanup_worktree(%s) failed: %s", entry, exc,
+                )
+        # Best-effort remove of the now-empty workflow dir.
+        with contextlib.suppress(OSError):
+            wf_dir.rmdir()
 
     def list_worktrees(self) -> list[WorktreeInfo]:
         """Return memfun-managed worktrees currently registered with git.
@@ -289,6 +360,42 @@ class WorktreeManager:
         return results
 
     # ── Internals ─────────────────────────────────────────────
+
+    def _check_in_managed_root(self, path: Path | str) -> Path:
+        """Resolve *path* and require it to live under the managed root.
+
+        ``Path.resolve()`` is called BEFORE the containment check so
+        that symlinked components (whether the leaf or any ancestor)
+        cannot point outside ``<project_root>/.memfun/worktrees/`` and
+        slip past the gate.  ``..`` traversal is normalized away by
+        ``resolve()`` for the same reason.
+
+        Args:
+            path: Candidate worktree path (absolute or relative).
+
+        Returns:
+            The resolved absolute :class:`Path`.
+
+        Raises:
+            WorktreeError: If the resolved path is not contained
+                inside the managed root.  Used by every destructive
+                cleanup entry-point so callers cannot hand the
+                manager an arbitrary directory.
+        """
+        candidate = Path(path)
+        # ``resolve(strict=False)`` follows links for any existing
+        # components and normalizes ``..`` for the rest, which is
+        # exactly what we want — non-existent paths still produce a
+        # canonical absolute form for the containment check.
+        resolved = candidate.resolve()
+        managed = self._managed_root
+        try:
+            resolved.relative_to(managed)
+        except ValueError as exc:
+            raise WorktreeError(
+                f"refusing to operate on worktree outside managed root: {path}"
+            ) from exc
+        return resolved
 
     def _branch_name(self, workflow_id: str, task_id: str) -> str:
         return f"{self.BRANCH_PREFIX}/{workflow_id}/{task_id}"
