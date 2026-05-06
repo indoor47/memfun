@@ -151,6 +151,11 @@ class DistributedConfig:
 
     default_timeout_seconds: float = 300.0
     result_poll_interval_ms: int = 100
+    # Maximum number of in-flight task publishes at any time.  Caps
+    # concurrency in :meth:`DistributedOrchestrator.fan_out` so a
+    # 100-way fan-out cannot saturate the worker pool or 429-cascade
+    # downstream LLM providers.  See issue #10.
+    max_concurrency: int = 8
 
 
 class DistributedOrchestrator:
@@ -168,6 +173,10 @@ class DistributedOrchestrator:
     ) -> None:
         self._bus = event_bus
         self._config = config or DistributedConfig()
+        # Bounded concurrency for distributed dispatch.  Shared across
+        # all fan_out / dispatch calls on this orchestrator instance so
+        # the cap is global, not per-call (issue #10).
+        self._semaphore = asyncio.Semaphore(self._config.max_concurrency)
 
     async def dispatch(
         self,
@@ -176,7 +185,14 @@ class DistributedOrchestrator:
         *,
         timeout: float | None = None,
     ) -> TaskResult:
-        """Publish a task and wait for the remote worker to return a result."""
+        """Publish a task and wait for the remote worker to return a result.
+
+        Acquires the orchestrator-wide semaphore so at most
+        ``config.max_concurrency`` dispatches are in flight at once
+        (issue #10).  The acquire wraps publish + wait so the cap
+        bounds the number of outstanding worker requests, not just the
+        publish step.
+        """
         timeout = timeout or self._config.default_timeout_seconds
 
         # Stamp the target agent into the task
@@ -188,30 +204,31 @@ class DistributedOrchestrator:
             parent_task_id=task.parent_task_id,
         )
 
-        # Emit dashboard event
-        await self._emit(DistributedEvent(
-            event_type="task.published",
-            task_id=task.task_id,
-            agent_name=agent_name,
-            detail=task.payload.get("query", "")[:200],
-        ))
+        async with self._semaphore:
+            # Emit dashboard event
+            await self._emit(DistributedEvent(
+                event_type="task.published",
+                task_id=task.task_id,
+                agent_name=agent_name,
+                detail=task.payload.get("query", "")[:200],
+            ))
 
-        # Publish task
-        await self._bus.publish(TASK_TOPIC, task_to_bytes(stamped), key=task.task_id)
-        logger.info("Published task %s -> %s", task.task_id, agent_name)
+            # Publish task
+            await self._bus.publish(TASK_TOPIC, task_to_bytes(stamped), key=task.task_id)
+            logger.info("Published task %s -> %s", task.task_id, agent_name)
 
-        # Poll for result on the reply topic
-        reply_topic = _result_topic(task.task_id)
-        result = await self._wait_for_result(reply_topic, task, agent_name, timeout)
+            # Poll for result on the reply topic
+            reply_topic = _result_topic(task.task_id)
+            result = await self._wait_for_result(reply_topic, task, agent_name, timeout)
 
-        # Emit completion event
-        await self._emit(DistributedEvent(
-            event_type="task.completed",
-            task_id=task.task_id,
-            agent_name=agent_name,
-            success=result.success,
-            duration_ms=result.duration_ms,
-        ))
+            # Emit completion event
+            await self._emit(DistributedEvent(
+                event_type="task.completed",
+                task_id=task.task_id,
+                agent_name=agent_name,
+                success=result.success,
+                duration_ms=result.duration_ms,
+            ))
 
         return result
 
