@@ -82,3 +82,30 @@ A versioned, shared record of non-obvious findings discovered while building mem
 - **What**: README claims "597 tests" in three places (badge, repo tree, Make target comment); actual collected count after #16+#17 is 722. CLAUDE.md doesn't claim a test count, but MEMORY.md auto-memory says "597 tests" and "8 packages" (7 packages on disk). Test counts and package counts in narrative docs go stale fast.
 - **Why it matters**: Hard-coded counts in README are pure tech debt. Either replace with a CI-generated badge that reads pytest collect, or stop printing exact counts and use ranges ("700+ tests"). The package-count drift suggests MEMORY.md needs a periodic rewrite as the project grows.
 - **Source**: Reliability-monitor sweep, 2026-05-06 (README:10, README:444, README:472).
+
+## 2026-05-06 — Post-merge sweep after Tier 1-4 (#19-#24) + dependabot
+
+### Two PRs touching the same module merge close together → conflict-on-rebase even when changes are non-functional
+- **What**: PR #21 (per-instance agents) and PR #22 (semaphore in fan_out) both touched `packages/memfun-runtime/src/memfun_runtime/orchestrator.py`. They didn't conflict semantically, but a docstring edit overlapped enough that the second PR's queue rebase failed. Resolved by manual rebase + force-push of the still-open branch.
+- **Why it matters**: When fanning out parallel implementer agents, route same-module work serially (or merge-queue them with `auto-rebase`) — even "safe" edits like docstrings will block the queue when both PRs land within minutes. The git tooling can't distinguish "comment-only" from "logic" overlap.
+- **Source**: Tier 2-3 merge sequence #21 → #22, 2026-05-06.
+
+### Long Opus 4.7 implementer runs (>~20min wall-time) can exit ambiguously — verify the PR opened, don't trust the final result message
+- **What**: The implementer agent for issue #13 (scope file tools to project_root) returned a malformed final message (`"I'll wait for the b2ir4aibs notification"`) without ever calling `gh pr create`. The work was committable on the worktree branch but no PR existed. Recovered by manually committing + pushing + opening PR #24 from the worktree.
+- **Why it matters**: After dispatching a long-running implementer agent, do not trust the natural-language final result alone. Always run `gh pr list --head <branch>` to confirm a PR was actually opened, and inspect the worktree for uncommitted work before declaring the agent task done.
+- **Source**: Issue #13 implementer recovery → PR #24, 2026-05-06.
+
+### 12 simultaneous Claude-Code worktrees can fill a 233GB disk; locked worktrees resist `git worktree remove`
+- **What**: Tier 1-4 fan-out spun up ~12 parallel worktrees under `.claude/worktrees/`. Disk hit 94% capacity briefly. Some worktrees were locked by their managing Claude-Code session and `git worktree remove <path>` refused to clean them — they have to either be unlocked from inside that session or force-removed once the session exits.
+- **Why it matters**: Plan disk for the worst case before fan-out: each worktree carries a full checkout (≈hundreds of MB for memfun) + venv state. For N=12 parallel agents budget ≥10GB free; for N=30+ provision a dedicated SSD or use shallow clones. Don't try to free space mid-fan-out by removing locked worktrees — wait for the sessions to release them.
+- **Source**: Tier 1-4 parallel fan-out, 2026-05-06.
+
+### Tier 1-4 epic complete — all #7-#15 issues closed, only stretch goals remain open
+- **What**: All eight tracker checkboxes ticked (#7, #8, #9, #10, #11, #12, #13, #15) have corresponding code on main. Open issues are #6 (tracker), #14 (P6 stretch — MergeCoordinator), and #18 (P0 follow-up — gate `cleanup_worktree` against external paths). No orphaned in-flight work.
+- **Why it matters**: The "scale to 30-100 coordinating agents" epic now has its core merged; remaining work is genuinely optional / hardening rather than blocking. Reliability-monitor confirms zero drift between tracker checkboxes and code on main.
+- **Source**: Reliability sweep over PRs #16, #17, #19, #20, #21, #22, #23, #24 + dependabot #1, #3, #4, #5, 2026-05-06.
+
+### `pip-audit` reports 21 CVEs in transitive deps post-merge — none introduced by this batch, but worth tracking
+- **What**: `uv run pip-audit` flags 21 advisories in third-party packages (authlib, cryptography, fastmcp, litellm, lxml, pygments, pyjwt, pytest, python-dotenv, python-multipart, requests, lupa, diskcache). All 8 PRs in this batch only touched workspace-internal packages; none of them upgraded or pinned new third-party deps, so the CVE list was already present before the sweep.
+- **Why it matters**: Transitive-dep CVEs accumulate independently of feature work. This sweep doesn't fix them, but logging the count establishes a baseline; the next reliability run should compare and either bump versions in `pyproject.toml` or document why specific advisories are tolerated.
+- **Source**: `uv run pip-audit` post-#24, 2026-05-06.
