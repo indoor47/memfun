@@ -150,7 +150,7 @@ class TestDoctorHappyPath:
         call_kwargs = mock_completion.call_args.kwargs
         assert call_kwargs["max_tokens"] == 4
         assert call_kwargs["temperature"] == 0
-        assert call_kwargs["model"] == "anthropic/claude-opus-4-6"
+        assert call_kwargs["model"] == "anthropic/claude-sonnet-4-6"
         assert call_kwargs["api_key"] == "sk-ant-test-AAAA"
 
 
