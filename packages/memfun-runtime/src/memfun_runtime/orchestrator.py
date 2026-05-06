@@ -37,6 +37,11 @@ class OrchestratorConfig:
     max_retries: int = 3
     retry_delay_seconds: float = 1.0
     pipeline_carry_key: str = "pipeline_payload"
+    # Maximum number of in-flight agent dispatches at any time.  Caps
+    # concurrency in :meth:`AgentOrchestrator.fan_out` (and any other
+    # path that goes through ``_execute_single``) so a 100-way fan-out
+    # cannot 429-cascade an LLM provider.  See issue #10.
+    max_concurrency: int = 8
 
 
 @dataclass(slots=True)
@@ -85,6 +90,10 @@ class AgentOrchestrator:
         self._capability_index: dict[str, set[str]] = {}
         # Pending dependencies: task_id -> (remaining upstream ids, future)
         self._pending: dict[str, tuple[set[str], asyncio.Future[list[TaskResult]]]] = {}
+        # Bounded concurrency for agent dispatch.  Shared across all
+        # fan_out / dispatch / pipeline calls on this orchestrator
+        # instance so the cap is global, not per-call (issue #10).
+        self._semaphore = asyncio.Semaphore(self._config.max_concurrency)
 
     # ── Route registration ──────────────────────────────────────────
 
@@ -385,14 +394,22 @@ class AgentOrchestrator:
         agent_name: str,
         timeout: float,
     ) -> TaskResult:
-        """Run a single task dispatch to an agent with a timeout."""
+        """Run a single task dispatch to an agent with a timeout.
+
+        Acquires the orchestrator-wide semaphore *before* the LLM /
+        agent call so that at most ``config.max_concurrency`` dispatches
+        are in flight at once (issue #10).  The acquire happens outside
+        ``asyncio.wait_for`` so waiting on the semaphore does not eat
+        into the per-task timeout budget.
+        """
         if not self._manager.is_running(agent_name):
             raise RuntimeError(f"Agent {agent_name!r} is not running")
 
         agent = self._manager.get_agent(agent_name)
-        start = time.monotonic()
-        result = await asyncio.wait_for(agent.handle(task), timeout=timeout)
-        elapsed_ms = (time.monotonic() - start) * 1000
+        async with self._semaphore:
+            start = time.monotonic()
+            result = await asyncio.wait_for(agent.handle(task), timeout=timeout)
+            elapsed_ms = (time.monotonic() - start) * 1000
 
         await self._emit_dispatch_event(task, agent_name, result, elapsed_ms)
         return result
