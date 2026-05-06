@@ -26,9 +26,12 @@ from memfun_agent.shared_spec import SharedSpec, SharedSpecStore
 from memfun_agent.specialists import agent_name_for_type
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from memfun_runtime.context import RuntimeContext
     from memfun_runtime.lifecycle import AgentManager
     from memfun_runtime.orchestrator import AgentOrchestrator
+    from memfun_runtime.worktree import WorktreeManager
 
 logger = get_logger("agent.workflow")
 
@@ -130,6 +133,7 @@ class WorkflowEngine:
         *,
         on_workflow_status: OnWorkflowStatus | None = None,
         on_sub_task_status: OnSubTaskStatus | None = None,
+        worktree_manager: WorktreeManager | None = None,
     ) -> None:
         self._context = context
         self._orchestrator = orchestrator
@@ -138,6 +142,14 @@ class WorkflowEngine:
         self._spec_store = SharedSpecStore(context.state_store)
         self._on_workflow_status = on_workflow_status
         self._on_sub_task_status = on_sub_task_status
+        # Optional per-task git worktree provisioning.  When set, each
+        # sub-task in a parallel group gets an isolated checkout under
+        # ``.memfun/worktrees/<workflow_id>/<task_id>`` and its cwd is
+        # injected into ``TaskMessage.payload["cwd"]``.  When None,
+        # fan-out behaves exactly as before.
+        self._worktree_manager = worktree_manager
+        # workflow_id -> {sub_task_id -> Path}.
+        self._worktrees: dict[str, dict[str, Path]] = {}
 
     # ── Public API ────────────────────────────────────────────
 
@@ -410,19 +422,25 @@ class WorkflowEngine:
                 )
                 continue
 
+            task_cwd = self._provision_worktree(state.workflow_id, tid)
+
+            payload: dict[str, Any] = {
+                "type": "ask",
+                "query": sub_status.sub_task.description,
+                "context": project_context,
+                "workflow_id": state.workflow_id,
+                "sub_task_id": tid,
+                "inputs": sub_status.sub_task.inputs,
+                "outputs": sub_status.sub_task.outputs,
+                "conversation_history": history,
+            }
+            if task_cwd is not None:
+                payload["cwd"] = str(task_cwd)
+
             task_msg = TaskMessage(
                 task_id=sub_status.task_id,
                 agent_id=sub_status.agent_name,
-                payload={
-                    "type": "ask",
-                    "query": sub_status.sub_task.description,
-                    "context": project_context,
-                    "workflow_id": state.workflow_id,
-                    "sub_task_id": tid,
-                    "inputs": sub_status.sub_task.inputs,
-                    "outputs": sub_status.sub_task.outputs,
-                    "conversation_history": history,
-                },
+                payload=payload,
                 correlation_id=state.workflow_id,
             )
             tasks.append(task_msg)
@@ -611,17 +629,26 @@ class WorkflowEngine:
                 f"other agents' outputs."
             )
 
+            rev_payload: dict[str, Any] = {
+                "type": "ask",
+                "query": revision_query,
+                "context": project_context,
+                "workflow_id": state.workflow_id,
+                "sub_task_id": tid,
+                "conversation_history": history,
+            }
+            # Reuse the existing worktree if one was provisioned for
+            # this sub_task during the original fan-out.
+            existing_path = self._worktrees.get(
+                state.workflow_id, {},
+            ).get(tid)
+            if existing_path is not None:
+                rev_payload["cwd"] = str(existing_path)
+
             rev_task = TaskMessage(
                 task_id=f"{state.workflow_id}_{tid}_rev{state.review_rounds}",
                 agent_id=sub_status.agent_name,
-                payload={
-                    "type": "ask",
-                    "query": revision_query,
-                    "context": project_context,
-                    "workflow_id": state.workflow_id,
-                    "sub_task_id": tid,
-                    "conversation_history": history,
-                },
+                payload=rev_payload,
                 correlation_id=state.workflow_id,
             )
             revision_tasks.append(rev_task)
@@ -793,6 +820,61 @@ class WorkflowEngine:
             + "\n".join(parts)
         )
         return base_context + prior_block
+
+    # ── Worktree provisioning ─────────────────────────────────
+
+    def _provision_worktree(
+        self, workflow_id: str, sub_task_id: str,
+    ) -> Path | None:
+        """Create (or return cached) worktree path for a sub-task.
+
+        Returns ``None`` when no :class:`WorktreeManager` is
+        configured (legacy behaviour: all specialists share the
+        process cwd) or when worktree creation fails — in that
+        case the engine logs and falls back to the shared cwd
+        rather than aborting the whole workflow.
+        """
+        if self._worktree_manager is None:
+            return None
+
+        cache = self._worktrees.setdefault(workflow_id, {})
+        cached = cache.get(sub_task_id)
+        if cached is not None:
+            return cached
+
+        try:
+            path = self._worktree_manager.make_worktree(
+                workflow_id, sub_task_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to provision worktree for %s/%s: %s",
+                workflow_id, sub_task_id, exc,
+            )
+            return None
+        cache[sub_task_id] = path
+        return path
+
+    def cleanup_worktrees(self, workflow_id: str) -> None:
+        """Remove every worktree provisioned for *workflow_id*.
+
+        Safe to call when no manager is configured or no worktrees
+        were created — it is a no-op in those cases.  The caller
+        decides when (if ever) to invoke this — keeping the
+        worktrees around after a failed run is often useful for
+        debugging.
+        """
+        if self._worktree_manager is None:
+            return
+        paths = self._worktrees.pop(workflow_id, {})
+        for tid, path in paths.items():
+            try:
+                self._worktree_manager.cleanup_worktree(path)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clean up worktree for %s/%s: %s",
+                    workflow_id, tid, exc,
+                )
 
     # ── Agent management ──────────────────────────────────────
 

@@ -115,6 +115,11 @@ class _SpecialistBase(BaseAgent):
         workflow_id = payload.get("workflow_id", "")
         history = payload.get("conversation_history")
 
+        # Per-task working directory, injected by WorkflowEngine when
+        # a WorktreeManager is configured.  Falls back to the process
+        # cwd when not set, preserving existing single-tree semantics.
+        task_cwd = payload.get("cwd") or os.getcwd()
+
         # Augment context with sub-task specific input files if
         # they weren't already gathered by the shared context pass.
         inputs = payload.get("inputs", [])
@@ -126,7 +131,7 @@ class _SpecialistBase(BaseAgent):
                     max_bytes=100_000, max_files=10,
                 )
                 extra = await gatherer.agather(
-                    files=inputs, project_root=os.getcwd(),
+                    files=inputs, project_root=task_cwd,
                 )
                 if extra.strip():
                     context = extra + "\n\n" + context
@@ -144,7 +149,7 @@ class _SpecialistBase(BaseAgent):
             try:
                 from memfun_agent.context_first import read_affected_files
 
-                project_root = Path(os.getcwd())
+                project_root = Path(task_cwd)
                 existing = await read_affected_files(
                     outputs, project_root,
                 )
@@ -225,6 +230,7 @@ class _SpecialistBase(BaseAgent):
                 query=query,
                 rlm_result=rlm_result,
                 sub_task_id=sub_task_id,
+                cwd=task_cwd,
             )
 
         # Report file creations back to shared spec.
@@ -261,6 +267,7 @@ class _SpecialistBase(BaseAgent):
         query: str,
         rlm_result: RLMResult,
         sub_task_id: str,
+        cwd: str | None = None,
     ) -> RLMResult:
         """Verify, consistency-check, and polish specialist output.
 
@@ -280,7 +287,7 @@ class _SpecialistBase(BaseAgent):
             read_affected_files,
         )
 
-        project_root = Path(os.getcwd())
+        project_root = Path(cwd or os.getcwd())
         extra_ops: list[tuple[str, str, Any]] = []
         extra_files: list[str] = []
 
