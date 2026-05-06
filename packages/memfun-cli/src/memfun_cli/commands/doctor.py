@@ -67,11 +67,13 @@ def _resolve_lite_llm_model(provider: str, model: str) -> tuple[str, str | None]
         return f"anthropic/{model}", None
     if provider == "openai":
         return f"openai/{model}", None
+    if provider == "openai-compat":
+        # OpenAI-compatible local server (llama.cpp / vLLM / OpenRouter etc.).
+        # LiteLLM treats it as openai with a custom api_base; we need the prefix.
+        return f"openai/{model}", "sk-local"
     if provider == "ollama":
         return f"ollama_chat/{model}", "ollama"
-    # Custom / openai-compat: assume the model is already a fully-qualified
-    # LiteLLM identifier OR the user is targeting an OpenAI-compatible base
-    # URL (in which case they should write the model as ``openai/<name>``).
+    # Custom: assume the model is already a fully-qualified LiteLLM identifier.
     return model, None
 
 
