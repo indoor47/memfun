@@ -37,6 +37,14 @@ def init_command(
     non_interactive: bool = typer.Option(
         False, "--non-interactive", "-y"
     ),
+    check: bool = typer.Option(
+        True,
+        "--check/--no-check",
+        help=(
+            "Run 'memfun doctor' after init to validate the LLM "
+            "credentials. Pass --no-check to skip the network ping."
+        ),
+    ),
 ) -> None:
     """Initialize Memfun (global setup + project init)."""
     global_config = Path.home() / ".memfun" / "config.toml"
@@ -69,6 +77,29 @@ def init_command(
             _interactive_project_init(backend, sandbox)
     else:
         console.print("[dim]Project config: .memfun/ (exists)[/dim]")
+
+    # Step 3: Run doctor to validate the freshly-pasted credentials.
+    # Skipped via --no-check so users can finish init even when offline
+    # or when the wizard wrote a placeholder key intentionally.
+    if check:
+        console.print()
+        # Local import to avoid a top-level cycle and to defer the
+        # litellm import cost until the user actually runs init.
+        from memfun_cli.commands.doctor import doctor_command
+
+        try:
+            doctor_command(timeout=5.0, verbose=False)
+        except typer.Exit as exit_:  # doctor signals failure via exit code
+            if exit_.exit_code:
+                console.print()
+                console.print(
+                    "[yellow]![/yellow] doctor failed — your credentials "
+                    "may not work yet. Re-run [bold]memfun init[/bold] or "
+                    "fix the config and run [bold]memfun doctor[/bold] "
+                    "to retry. Pass [bold]--no-check[/bold] to skip this "
+                    "step on init."
+                )
+                raise
 
     console.print()
     console.print(
