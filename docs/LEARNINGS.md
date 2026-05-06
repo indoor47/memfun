@@ -55,3 +55,30 @@ A versioned, shared record of non-obvious findings discovered while building mem
 - **What**: Default `--parallel 4` with 8K context = 4 × 8K KV cache slots. Hitting 5 concurrent requests with 2K-token prompts each makes `decode: failed to find a memory slot for batch of size 1`; the server purges and retries, latency goes from 10s → 600s+. Fix: `--parallel 1` (single-inference) and serialize requests at the client.
 - **Why it matters**: Concurrency on a small CPU box is gated by KV cache, not CPU. 1×8 cores on one inference beats 5×1.6 cores fighting for cache.
 - **Source**: Experiment A first run, 2026-05-06.
+
+## 2026-05-06 — Post-merge sweep after #16 / #17
+
+### Pre-existing CI failures on `main` block every PR — fix on `main` first, not in the feature PR
+- **What**: When PRs #16 and #17 reached the merge queue, three CI jobs failed for reasons unrelated to either PR: ruff `I001` (unsorted imports in `packages/memfun-cli/src/memfun_cli/main.py:107`), pyright strict-mode noise from `evals/swebench_harness.py` (57 errors driven by untyped `dspy`/`swebench`/`datasets`), and a missing `pip-audit` in dev deps. Resolved by `39a683d` directly on `main` (lint auto-fix + `pyproject.toml` `pyright.exclude = ["evals", ".claude/worktrees", ".memfun/worktrees"]` + `dev` dep).
+- **Why it matters**: When CI breaks on `main`, every downstream PR inherits red status. The right move is a small, behavior-neutral "ci: unblock pipeline" commit on `main` rather than dragging unrelated fixes into the feature PR — keeps the audit trail clean and unblocks the queue immediately.
+- **Source**: Commit `39a683d` (ci: unblock pipeline), 2026-05-06.
+
+### Pyright strict mode is unusable on directories that import untyped third-party libs — exclude, don't try to type
+- **What**: `evals/swebench_harness.py` produced 57 strict-mode errors purely because `dspy`, `swebench`, and `datasets` ship without type stubs. Adding `# type: ignore` everywhere is noise; the durable fix is `[tool.pyright].exclude = ["evals", ...]` in `pyproject.toml`. Production packages stay strict; eval/research scripts are excluded.
+- **Why it matters**: Future agents tempted to "fix the pyright errors in evals/" will burn a turn on it. Don't — the directory is intentionally excluded from CI typecheck.
+- **Source**: `pyproject.toml` `[tool.pyright]` exclude list, commit `39a683d`.
+
+### `WorktreeManager.cleanup_worktree(path)` is unscoped — gate by `base_dir` even though current callers are well-behaved
+- **What**: Security audit on PR #17 (HIGH finding) — `cleanup_worktree(Path("/tmp/user-wt"))` will succeed and wipe a user-created worktree if a buggy caller passes its path. Branch deletion *is* gated by `_branch_from_path`, but the worktree removal itself isn't. `WorkflowEngine` only ever calls cleanup with paths it stored from `make_worktree`, so this is not exploitable today, but the API contract is unsafe for future callers and inconsistent with `list_worktrees` (which IS scoped).
+- **Why it matters**: General pattern — when an API takes a `path` argument and performs a destructive op, scope it to a known base dir at the entry point. Don't rely on every future caller getting it right. Tracked as issue #18.
+- **Source**: PR #17 security-auditor (Opus 4.7) audit comment; issue #18 filed, 2026-05-06.
+
+### `pip-audit --strict` exits non-zero on workspace-internal packages
+- **What**: `pip-audit --strict` errors with `memfun-agent: Dependency not found on PyPI and could not be audited: memfun-agent (0.2.0)` because workspace-internal packages aren't published to PyPI. The exit code is 0 in this case (no actual CVEs), but the stderr line looks alarming and could be misread as a finding.
+- **Why it matters**: Don't grep pip-audit output for "ERROR" to gate CI — read the structured findings list. The internal-package "not found on PyPI" message is expected for any uv workspace and is not a vulnerability.
+- **Source**: Reliability-monitor sweep, 2026-05-06.
+
+### `README.md` tests-passed badge and `tests/` line drift after every test-adding PR
+- **What**: README claims "597 tests" in three places (badge, repo tree, Make target comment); actual collected count after #16+#17 is 722. CLAUDE.md doesn't claim a test count, but MEMORY.md auto-memory says "597 tests" and "8 packages" (7 packages on disk). Test counts and package counts in narrative docs go stale fast.
+- **Why it matters**: Hard-coded counts in README are pure tech debt. Either replace with a CI-generated badge that reads pytest collect, or stop printing exact counts and use ranges ("700+ tests"). The package-count drift suggests MEMORY.md needs a periodic rewrite as the project grows.
+- **Source**: Reliability-monitor sweep, 2026-05-06 (README:10, README:444, README:472).
