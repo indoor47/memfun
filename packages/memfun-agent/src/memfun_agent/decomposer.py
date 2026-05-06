@@ -70,9 +70,48 @@ class DecompositionConfig:
         the same output path.  ``"sequence"`` (default) splits the
         overlapping tasks into separate parallelism groups so they run
         sequentially.  ``"reject"`` raises a :class:`DecompositionError`.
+    enable_hierarchical:
+        When ``True`` (default), the decomposer recursively re-invokes
+        itself on each sub-task whose heuristic complexity exceeds
+        ``recurse_threshold`` (and depth is below ``max_depth``).  When
+        ``False``, the decomposer behaves like the pre-issue-#11
+        single-pass version — useful for backward compatibility tests
+        and to disable LLM-fan-out cost amplification.
+    max_depth:
+        Hard cap on recursion levels.  Recursion is gated by
+        ``current_depth < max_depth``, so:
+
+        * ``max_depth=0`` — never recurse (single-pass behavior).
+        * ``max_depth=1`` — top-level may recurse once into children;
+          children stay leaves regardless of complexity.
+        * ``max_depth=3`` (default) — three levels of recursion below
+          the top, fan-out up to ``branch_factor**4`` leaves in the
+          worst case.
+
+        This is the **non-negotiable** termination invariant — even
+        pathological LLM output stops here, enforced by an ``assert``
+        at the top of :meth:`TaskDecomposer.adecompose`.
+    branch_factor:
+        Soft target for the number of sub-tasks per level.  Used by
+        downstream coordinators (orchestrator AGENT.md) as the parallel-
+        fan-out hint.  The decomposer itself does not enforce this — it
+        accepts whatever the LLM emits — but ``branch_factor`` is the
+        documented "do not exceed" number for any single layer.
+    recurse_threshold:
+        Numeric heuristic threshold above which a sub-task is
+        considered too coarse-grained and is recursively re-decomposed.
+        See :func:`_estimate_complexity` for the exact heuristic
+        (counts of ``inputs``+``outputs``, description length, file-
+        path mentions).  Default ``12`` was chosen so a sub-task that
+        touches 6+ files with a long description recurses, while a
+        small "edit one file" task does not.
     """
 
     overlap_strategy: Literal["reject", "sequence"] = "sequence"
+    enable_hierarchical: bool = True
+    max_depth: int = 3
+    branch_factor: int = 8
+    recurse_threshold: int = 12
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -445,6 +484,134 @@ def _backfill_outputs_with_heuristic(tasks: list[SubTask]) -> list[SubTask]:
     return out
 
 
+# ── Hierarchical complexity heuristic ─────────────────────────
+
+
+def _estimate_complexity(task: SubTask | Any) -> int:
+    """Heuristically score how "big" a sub-task is.
+
+    Used by :class:`TaskDecomposer` to decide whether a sub-task is
+    coarse-grained enough to warrant recursive decomposition.  The
+    score combines four cheap signals:
+
+    1. ``len(inputs)`` — read-set cardinality.
+    2. ``len(outputs)`` — write-set cardinality (weighted 2x because
+       writes drive overlap conflicts and parallelism is gated by
+       output disjointness).
+    3. Number of distinct path-like tokens in the description (caught
+       by :func:`_heuristic_paths_from_text`).
+    4. ``len(description) // 80`` — long descriptions are usually
+       compound asks ("do X, then Y, also Z").
+
+    If the parsed ``SubTask`` carries an explicit numeric ``complexity``
+    attribute (future-proofing — the dataclass currently doesn't
+    declare one, but raw LLM dicts may), it is preferred over the
+    heuristic.
+
+    Returns a non-negative integer.  Compared against
+    ``DecompositionConfig.recurse_threshold``.
+    """
+    explicit = getattr(task, "complexity", None)
+    if isinstance(explicit, (int, float)) and explicit >= 0:
+        return int(explicit)
+
+    inputs = getattr(task, "inputs", []) or []
+    outputs = getattr(task, "outputs", []) or []
+    description = str(getattr(task, "description", "") or "")
+
+    paths_in_desc = _heuristic_paths_from_text(description)
+    desc_chunks = len(description) // 80
+
+    return len(inputs) + 2 * len(outputs) + len(paths_in_desc) + desc_chunks
+
+
+def _renumber_children(parent_id: str, children: list[SubTask]) -> list[SubTask]:
+    """Rename children of *parent_id* to ``<parent_id>.<i>`` to avoid ID clashes.
+
+    When the recursive call returns sub-tasks named ``T1, T2, ...`` they
+    can collide with siblings of the parent.  Re-namespacing under the
+    parent's ID keeps the global ID space unique without forcing the
+    LLM to know what other tasks exist.
+
+    The original ``depends_on`` references between children are rewritten
+    to use the new namespaced IDs so the DAG stays consistent.
+    """
+    if not children:
+        return []
+    old_to_new = {child.id: f"{parent_id}.{i + 1}" for i, child in enumerate(children)}
+    out: list[SubTask] = []
+    for child in children:
+        new_deps = [old_to_new.get(d, d) for d in child.depends_on]
+        out.append(SubTask(
+            id=old_to_new[child.id],
+            description=child.description,
+            agent_type=child.agent_type,
+            inputs=child.inputs,
+            outputs=child.outputs,
+            depends_on=new_deps,
+            max_iterations=child.max_iterations,
+        ))
+    return out
+
+
+def _splice_children_into_groups(
+    groups: list[list[str]],
+    parent_id: str,
+    child_ids: list[str],
+    child_groups: list[list[str]],
+) -> list[list[str]]:
+    """Replace ``parent_id`` in *groups* with the flattened ``child_groups``.
+
+    The simple model: parent's slot becomes a sequence of groups, where
+    each child group runs in parallel internally and the child groups
+    run sequentially relative to each other.  Other tasks in the parent's
+    original group remain parallel to the *first* child group only —
+    after that the children are sequential, so the rest of the parent's
+    group siblings stay parallel only with the first child wave.
+
+    To keep semantics straightforward and conservative, we adopt the
+    following policy:
+
+    * Sibling tasks that shared the parent's group remain in that
+      group (unchanged) — except the parent itself is replaced by the
+      first wave of children.
+    * Subsequent waves of children are appended as their own groups
+      immediately after, sequenced before any later groups in the
+      original plan.
+
+    If ``child_groups`` is empty (LLM returned nothing usable for the
+    recursion), we leave the parent in place — caller should not call
+    this when child_groups is empty, but we defend.
+    """
+    if not child_ids or not child_groups:
+        return groups
+
+    # Validate that every child id appears in some child_group.
+    seen_in_groups: set[str] = set()
+    for grp in child_groups:
+        seen_in_groups.update(grp)
+    missing = [cid for cid in child_ids if cid not in seen_in_groups]
+    if missing:
+        # Fall back: just put the missing ids in a final group so they run.
+        child_groups = [*child_groups, missing]
+
+    new_groups: list[list[str]] = []
+    for grp in groups:
+        if parent_id not in grp:
+            new_groups.append(list(grp))
+            continue
+        # Replace parent_id with the first wave of children, preserve siblings.
+        first_wave = list(child_groups[0])
+        rest = grp[:]
+        rest.remove(parent_id)
+        merged = list(dict.fromkeys(rest + first_wave))  # de-dup, preserve order
+        new_groups.append(merged)
+        # Append any remaining waves immediately after.
+        for wave in child_groups[1:]:
+            new_groups.append(list(wave))
+    return new_groups
+
+
 # ── Main module ───────────────────────────────────────────────
 
 
@@ -460,13 +627,40 @@ class TaskDecomposer(dspy.Module):
         self,
         task_description: str,
         project_context: str,
+        _depth: int = 0,
     ) -> DecompositionResult:
         """Decompose *task_description* into sub-tasks.
 
         Returns a :class:`DecompositionResult` with sub-tasks,
         shared spec, and parallelism groups.  Falls back to a
         single-task result on failure.
+
+        Hierarchical mode (``DecompositionConfig.enable_hierarchical=True``,
+        default) walks the result and recursively re-decomposes any
+        sub-task whose heuristic complexity exceeds
+        ``recurse_threshold``, up to ``max_depth`` levels.  Children are
+        re-namespaced under their parent's ID so the global ID space
+        stays unique.
+
+        Termination: ``_depth`` is bounded by ``max_depth`` and asserted
+        — even pathological LLM output cannot recurse forever.
+
+        Parameters
+        ----------
+        task_description:
+            Resolved task description.
+        project_context:
+            Truncated to 4000 chars before sending to the LLM.
+        _depth:
+            Current recursion depth.  Caller passes 0; recursive calls
+            pass ``_depth + 1``.  Capped at ``self.config.max_depth``.
         """
+        # Hard termination invariant — assert before *any* LLM call.
+        assert _depth <= self.config.max_depth, (
+            f"hierarchical decomposer recursed past max_depth="
+            f"{self.config.max_depth} (got {_depth})"
+        )
+
         try:
             result = await asyncio.to_thread(
                 self.decomposer,
@@ -517,6 +711,22 @@ class TaskDecomposer(dspy.Module):
             # empty outputs, defeating the overlap detector.
             sub_tasks = _backfill_outputs_with_heuristic(sub_tasks)
 
+            # ── Hierarchical recursion (issue #11) ────────────────
+            # If enabled, walk each sub-task and recursively decompose
+            # the coarse-grained ones.  This must happen BEFORE the
+            # overlap detector so the (now-finer) leaves are what the
+            # detector sees.
+            if (
+                self.config.enable_hierarchical
+                and _depth < self.config.max_depth
+            ):
+                sub_tasks, groups = await self._recurse_into_subtasks(
+                    sub_tasks,
+                    groups,
+                    project_context,
+                    _depth=_depth,
+                )
+
             # Detect and resolve declared output overlaps inside any
             # parallelism group.  See issue #9.
             overlaps = detect_output_overlap(sub_tasks, groups)
@@ -543,12 +753,157 @@ class TaskDecomposer(dspy.Module):
         except DecompositionError:
             # `reject` strategy intentionally surfaces the conflict.
             raise
+        except AssertionError:
+            # Termination invariant — re-raise so the test catches it.
+            raise
         except Exception as exc:
             logger.warning(
                 "Task decomposition failed: %s — using single-task fallback",
                 exc,
             )
             return self._single_fallback(task_description)
+
+    async def _recurse_into_subtasks(
+        self,
+        sub_tasks: list[SubTask],
+        groups: list[list[str]],
+        project_context: str,
+        _depth: int,
+    ) -> tuple[list[SubTask], list[list[str]]]:
+        """For each sub-task whose complexity exceeds the threshold,
+        recursively re-decompose it and splice the children in.
+
+        Cheap path: most sub-tasks score below the threshold and are
+        emitted as leaves — only the LLM call that spawned them is
+        billed.  Only coarse-grained sub-tasks pay an extra LLM call.
+
+        Termination is guaranteed by ``_depth < self.config.max_depth``
+        gating the recursive call.
+        """
+        threshold = self.config.recurse_threshold
+        new_tasks: list[SubTask] = []
+        new_groups = [list(g) for g in groups]
+
+        for task in sub_tasks:
+            score = _estimate_complexity(task)
+            if score <= threshold:
+                new_tasks.append(task)
+                continue
+
+            # Recurse — note ``_depth + 1`` and the assert at the top of
+            # adecompose enforce termination.
+            try:
+                child_result = await self.adecompose(
+                    task.description,
+                    project_context,
+                    _depth=_depth + 1,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Recursive decomposition of %s failed (%s) — "
+                    "keeping as leaf",
+                    task.id,
+                    exc,
+                )
+                new_tasks.append(task)
+                continue
+
+            if not child_result.sub_tasks or child_result.is_single_task:
+                # Either nothing came back or the recursive call gave
+                # us a single-task fallback — splicing that in adds no
+                # value, so keep the original.
+                new_tasks.append(task)
+                continue
+
+            children = _renumber_children(task.id, child_result.sub_tasks)
+            child_id_map = {
+                old.id: new.id
+                for old, new in zip(child_result.sub_tasks, children, strict=True)
+            }
+            child_groups = [
+                [child_id_map[cid] for cid in grp if cid in child_id_map]
+                for grp in child_result.parallelism_groups
+            ]
+            child_groups = [g for g in child_groups if g]
+            child_ids = [c.id for c in children]
+
+            # Anything that depended on the parent now depends on every
+            # leaf of the parent's expansion (conservative — guarantees
+            # the dependency invariant).
+            new_tasks_after_rewrite: list[SubTask] = []
+            for existing in new_tasks:
+                if task.id in existing.depends_on:
+                    rewritten_deps = [
+                        d for d in existing.depends_on if d != task.id
+                    ] + child_ids
+                    new_tasks_after_rewrite.append(SubTask(
+                        id=existing.id,
+                        description=existing.description,
+                        agent_type=existing.agent_type,
+                        inputs=existing.inputs,
+                        outputs=existing.outputs,
+                        depends_on=rewritten_deps,
+                        max_iterations=existing.max_iterations,
+                    ))
+                else:
+                    new_tasks_after_rewrite.append(existing)
+            new_tasks = new_tasks_after_rewrite
+
+            new_tasks.extend(children)
+            new_groups = _splice_children_into_groups(
+                new_groups, task.id, child_ids, child_groups,
+            )
+
+        # Same dependency rewrite for siblings later in the list — any
+        # task in the original ``sub_tasks`` list past this point that
+        # depends on a now-expanded parent must be patched too.  The
+        # loop above only patched tasks already added to ``new_tasks``
+        # at the time the parent was expanded.  Run a second pass.
+        expanded_ids = {t.id for t in sub_tasks} - {t.id for t in new_tasks}
+        if expanded_ids:
+            children_per_parent: dict[str, list[str]] = {}
+            for t in new_tasks:
+                # Children of ``parent_id`` are renamed to
+                # ``parent_id.<i>`` — recover the parent prefix.
+                if "." in t.id:
+                    parent = t.id.rsplit(".", 1)[0]
+                    children_per_parent.setdefault(parent, []).append(t.id)
+
+            patched: list[SubTask] = []
+            for t in new_tasks:
+                new_deps: list[str] = []
+                changed = False
+                for d in t.depends_on:
+                    if d in expanded_ids and d in children_per_parent:
+                        new_deps.extend(children_per_parent[d])
+                        changed = True
+                    else:
+                        new_deps.append(d)
+                if changed:
+                    patched.append(SubTask(
+                        id=t.id,
+                        description=t.description,
+                        agent_type=t.agent_type,
+                        inputs=t.inputs,
+                        outputs=t.outputs,
+                        depends_on=new_deps,
+                        max_iterations=t.max_iterations,
+                    ))
+                else:
+                    patched.append(t)
+            new_tasks = patched
+
+        # Drop any group entries that no longer correspond to a known task
+        # (defensive — shouldn't happen, but keeps the result internally
+        # consistent).
+        valid_ids = {t.id for t in new_tasks}
+        cleaned_groups: list[list[str]] = []
+        for grp in new_groups:
+            kept = [tid for tid in grp if tid in valid_ids]
+            if kept:
+                cleaned_groups.append(kept)
+
+        return new_tasks, cleaned_groups
 
     @staticmethod
     def _single_fallback(description: str) -> DecompositionResult:
