@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any, cast
 
 import typer
 from InquirerPy import inquirer
@@ -90,7 +91,7 @@ def run_global_setup() -> None:
     console.print()
 
     # LLM Provider
-    provider = inquirer.select(
+    provider = _prompt_select(
         message="Which LLM provider?",
         choices=[
             {
@@ -98,13 +99,33 @@ def run_global_setup() -> None:
                 "value": "anthropic",
             },
             {"name": "OpenAI (GPT)", "value": "openai"},
-            {"name": "Ollama / vLLM (local)", "value": "ollama"},
+            {
+                "name": (
+                    "OpenAI-compatible "
+                    "(local llama.cpp / vLLM / OpenRouter)"
+                ),
+                "value": "openai-compat",
+            },
+            {"name": "Ollama (local)", "value": "ollama"},
             {"name": "Custom endpoint", "value": "custom"},
         ],
         default="anthropic",
-    ).execute()
+    )
 
-    config = {"llm": {"provider": provider}}
+    config: dict[str, dict[str, str]] = {"llm": {"provider": provider}}
+
+    # OpenAI-compatible: prompt for base_url first, then model is
+    # collected by _pick_model (free-text required).
+    if provider == "openai-compat":
+        base_url = _prompt_text(
+            message="Base URL (OpenAI-compatible endpoint)",
+            default="http://localhost:8080/v1",
+        )
+        config["llm"]["base_url"] = base_url
+
+    # Pick a model per-provider (curated list + custom fallback).
+    model = _pick_model(provider)
+    config["llm"]["model"] = model
 
     # API key
     env_var = _get_api_key_env(provider)
@@ -117,11 +138,29 @@ def run_global_setup() -> None:
                 f"  [green]✓[/green] Found {env_var} in environment"
             )
             api_key = existing
+        elif provider == "openai-compat":
+            # Optional API key for openai-compatible endpoints — many
+            # local servers (llama.cpp, vLLM) accept any non-empty
+            # value or no key at all.
+            key = _prompt_secret(
+                message=(
+                    "Paste API key "
+                    "(optional — leave blank for local endpoints)"
+                ),
+            )
+            if key.strip():
+                api_key = key.strip()
+                console.print("  [green]✓[/green] API key saved")
+            else:
+                console.print(
+                    "  [dim]No API key — using placeholder "
+                    "'sk-local' for local endpoints[/dim]"
+                )
         else:
-            key = inquirer.secret(
+            key = _prompt_secret(
                 message=f"Paste your API key ({env_var})",
-            ).execute()
-            if key and key.strip():
+            )
+            if key.strip():
                 api_key = key.strip()
                 console.print("  [green]✓[/green] API key saved")
             else:
@@ -455,6 +494,125 @@ def _get_api_key_env(provider: str) -> str | None:
     return {
         "anthropic": "ANTHROPIC_API_KEY",
         "openai": "OPENAI_API_KEY",
+        # openai-compatible endpoints (local llama.cpp / vLLM /
+        # OpenRouter) often need any non-empty key. We expose the
+        # placeholder env var name so users can override; if blank,
+        # the chat layer injects "sk-local" at request time.
+        "openai-compat": "MEMFUN_LOCAL_API_KEY",
         "ollama": None,
         "custom": "MEMFUN_API_KEY",
     }.get(provider)
+
+
+# Curated per-provider model lists for the wizard. Users can always
+# pick "Type custom..." to enter an arbitrary model name.
+_PROVIDER_MODELS: dict[str, list[tuple[str, str]]] = {
+    "anthropic": [
+        (
+            "claude-sonnet-4-6",
+            "Sonnet 4.6 — fast + smart, good for most tasks "
+            "(default)",
+        ),
+        (
+            "claude-opus-4-6",
+            "Opus 4.6 — most intelligent (slower / pricier)",
+        ),
+        (
+            "claude-haiku-4-5",
+            "Haiku 4.5 — fastest / cheapest",
+        ),
+    ],
+    "openai": [
+        ("gpt-5", "GPT-5 — flagship (default)"),
+        ("gpt-5-mini", "GPT-5 Mini — fast"),
+        ("gpt-5-nano", "GPT-5 Nano — cheapest"),
+    ],
+}
+
+
+def _prompt_text(message: str, default: str | None = None) -> str:
+    """Thin wrapper around `inquirer.text` returning a typed str."""
+    text_fn = cast("Any", inquirer).text
+    if default is not None:
+        raw: Any = text_fn(message=message, default=default).execute()
+    else:
+        raw = text_fn(message=message).execute()
+    return str(raw or "")
+
+
+def _prompt_secret(message: str) -> str:
+    """Thin wrapper around `inquirer.secret` returning a typed str."""
+    secret_fn = cast("Any", inquirer).secret
+    raw: Any = secret_fn(message=message).execute()
+    return str(raw or "")
+
+
+def _prompt_select(
+    message: str,
+    choices: list[dict[str, str]],
+    default: str | None = None,
+) -> str:
+    """Thin wrapper around `inquirer.select` returning a typed str."""
+    select_fn = cast("Any", inquirer).select
+    raw: Any = select_fn(
+        message=message, choices=choices, default=default
+    ).execute()
+    return str(raw)
+
+
+def _pick_model(provider: str) -> str:
+    """Prompt the user for a model name appropriate for the provider.
+
+    For providers with a curated list (anthropic, openai), show a
+    select with a "Type custom..." escape hatch. For openai-compat
+    and ollama and custom, prompt for free-text input (with a
+    sensible default for ollama).
+    """
+    if provider in _PROVIDER_MODELS:
+        models = _PROVIDER_MODELS[provider]
+        choices: list[dict[str, str]] = [
+            {"name": f"{name} — {desc}", "value": name}
+            for name, desc in models
+        ]
+        choices.append({"name": "Type custom...", "value": "__custom__"})
+        selection = _prompt_select(
+            message="Which model?",
+            choices=choices,
+            default=models[0][0],
+        )
+        if selection == "__custom__":
+            custom = _prompt_text(message="Enter model name")
+            return custom.strip() or models[0][0]
+        return selection
+
+    if provider == "ollama":
+        # Free-text with a sensible default.
+        result = _prompt_text(
+            message="Ollama model",
+            default="qwen2.5-coder:7b",
+        )
+        return result.strip() or "qwen2.5-coder:7b"
+
+    if provider == "openai-compat":
+        # Free-text, required (no default — depends on the endpoint).
+        while True:
+            result = _prompt_text(
+                message=(
+                    "Model name (e.g. qwen-coder-7b, "
+                    "meta-llama/Llama-3.1-70B)"
+                ),
+            )
+            stripped = result.strip()
+            if stripped:
+                return stripped
+            console.print(
+                "  [yellow]Model name is required for "
+                "OpenAI-compatible endpoints.[/yellow]"
+            )
+
+    # provider == "custom" — free-text fallback.
+    result = _prompt_text(
+        message="Model name",
+        default="qwen2.5-coder:7b",
+    )
+    return result.strip() or "qwen2.5-coder:7b"
