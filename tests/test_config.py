@@ -11,6 +11,9 @@ class TestConfig:
         config = MemfunConfig()
         assert config.backend.tier == "sqlite"
         assert config.llm.provider == "anthropic"
+        # Default model is Sonnet 4.6 (issue #15) — fast + smart,
+        # cheaper than Opus, good for most tasks.
+        assert config.llm.model == "claude-sonnet-4-6"
         assert config.sandbox.backend == "local"
 
     def test_from_toml_missing_file(self):

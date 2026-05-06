@@ -34,7 +34,10 @@ def _deep_merge(base: dict, override: dict) -> dict:
 @dataclass(frozen=True, slots=True)
 class LLMConfig:
     provider: str = "anthropic"
-    model: str = "claude-opus-4-6"
+    # Default to Sonnet 4.6: fast + smart, good for most tasks. Users
+    # can pick Opus (most intelligent) or Haiku (cheapest/fastest)
+    # via the wizard or by editing config.toml.
+    model: str = "claude-sonnet-4-6"
     sub_model: str | None = None
     api_key_env: str = "ANTHROPIC_API_KEY"
     base_url: str | None = None

@@ -250,18 +250,25 @@ _HELP_TEXT = """\
 # Models available for switching via /model
 _AVAILABLE_MODELS: dict[str, list[tuple[str, str]]] = {
     "anthropic": [
-        ("claude-opus-4-6", "Opus 4.6 — most intelligent (default)"),
-        ("claude-sonnet-4-5", "Sonnet 4.5 — fast + smart"),
+        ("claude-sonnet-4-6", "Sonnet 4.6 — fast + smart (default)"),
+        ("claude-opus-4-6", "Opus 4.6 — most intelligent"),
         ("claude-haiku-4-5", "Haiku 4.5 — fastest"),
     ],
     "openai": [
-        ("gpt-4.1", "GPT-4.1 — smartest non-reasoning"),
-        ("gpt-4.1-mini", "GPT-4.1 Mini — fast"),
-        ("gpt-4.1-nano", "GPT-4.1 Nano — cheapest"),
+        ("gpt-5", "GPT-5 — flagship"),
+        ("gpt-5-mini", "GPT-5 Mini — fast"),
+        ("gpt-5-nano", "GPT-5 Nano — cheapest"),
+        ("gpt-4.1", "GPT-4.1 — smartest non-reasoning (legacy)"),
+        ("gpt-4.1-mini", "GPT-4.1 Mini — fast (legacy)"),
         ("o3", "o3 — reasoning"),
         ("o4-mini", "o4-mini — fast reasoning"),
     ],
+    "openai-compat": [
+        ("qwen2.5-coder:7b", "Qwen 2.5 Coder 7B (local llama.cpp)"),
+        ("qwen2.5-coder:14b", "Qwen 2.5 Coder 14B (local llama.cpp)"),
+    ],
     "ollama": [
+        ("qwen2.5-coder:7b", "Qwen 2.5 Coder 7B"),
         ("llama3.1", "Llama 3.1"),
         ("codellama", "Code Llama"),
         ("mistral", "Mistral"),
@@ -1964,6 +1971,13 @@ def _configure_dspy(config: MemfunConfig) -> None:
     model = config.llm.model
     api_key = os.environ.get(config.llm.api_key_env, "")
 
+    # openai-compat endpoints (local llama.cpp / vLLM / OpenRouter)
+    # often run without auth. LiteLLM still requires a non-empty
+    # api_key, so inject "sk-local" as a placeholder when none is
+    # configured.
+    if provider == "openai-compat" and not api_key:
+        api_key = "sk-local"
+
     if not api_key and provider != "ollama":
         logger.warning(
             "No API key found for %s (set %s). LLM calls will fail.",
@@ -1981,6 +1995,9 @@ def _configure_dspy(config: MemfunConfig) -> None:
     if provider == "anthropic":
         lm_model = f"anthropic/{model}"
     elif provider == "openai":
+        lm_model = f"openai/{model}"
+    elif provider == "openai-compat":
+        # LiteLLM treats this as openai with a custom api_base.
         lm_model = f"openai/{model}"
     elif provider == "ollama":
         lm_model = f"ollama_chat/{model}"
