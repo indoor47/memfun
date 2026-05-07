@@ -1721,3 +1721,53 @@ async def test_web_category_forces_planner(tmp_path: Path):
     assert planner_called is True
     assert result.success is True
     assert result.method == "context_first_planned"
+
+
+# ── _detect_verify_commands tests ─────────────────────────────
+
+
+def test_detect_returns_fallback_for_python_no_linter(tmp_path: Path):
+    """When Python files exist but no linter config, returns py_compile."""
+    (tmp_path / "app.py").write_text("print('hello')")
+    cmds = _detect_verify_commands(tmp_path)
+    assert any("py_compile" in c for c in cmds)
+
+
+def test_detect_returns_ruff_when_config_exists(tmp_path: Path):
+    """When pyproject.toml exists, ruff is preferred over py_compile."""
+    (tmp_path / "pyproject.toml").write_text("[tool.ruff]\n")
+    (tmp_path / "app.py").write_text("print('hello')")
+    cmds = _detect_verify_commands(tmp_path)
+    assert "ruff check ." in cmds
+
+
+def test_detect_returns_node_check_for_js_projects(tmp_path: Path):
+    """When package.json exists, node --check is added."""
+    (tmp_path / "package.json").write_text("{}")
+    (tmp_path / "app.js").write_text("console.log('hi')")
+    cmds = _detect_verify_commands(tmp_path)
+    assert any("node --check" in c for c in cmds)
+
+
+def test_detect_returns_tsc_for_ts_projects(tmp_path: Path):
+    """When tsconfig.json exists, tsc --noEmit is added."""
+    (tmp_path / "tsconfig.json").write_text("{}")
+    (tmp_path / "app.ts").write_text("const x: number = 1")
+    cmds = _detect_verify_commands(tmp_path)
+    assert any("tsc --noEmit" in c for c in cmds)
+
+
+def test_detect_returns_empty_for_unknown_project(tmp_path: Path):
+    """No config, no source files → empty list."""
+    cmds = _detect_verify_commands(tmp_path)
+    assert cmds == []
+
+
+def test_detect_prefers_ruff_over_py_compile(tmp_path: Path):
+    """When both ruff and py_compile would match, ruff is first."""
+    (tmp_path / "pyproject.toml").write_text("[tool.ruff]\n")
+    (tmp_path / "app.py").write_text("print('hello')")
+    cmds = _detect_verify_commands(tmp_path)
+    ruff_idx = next(i for i, c in enumerate(cmds) if "ruff" in c)
+    py_idx = next(i for i, c in enumerate(cmds) if "py_compile" in c)
+    assert ruff_idx < py_idx

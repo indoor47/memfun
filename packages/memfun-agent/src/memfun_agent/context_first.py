@@ -1062,7 +1062,9 @@ def _detect_verify_commands(
     """Auto-detect verification commands for the project.
 
     Looks for common linter config files and returns appropriate
-    commands.  Returns an empty list if nothing is detected.
+    commands.  When no linter is detected, falls back to language-
+    specific parse checks so that broken code is never silently
+    accepted (e.g. a Python file with IndentationError).
     """
     cmds: list[str] = []
 
@@ -1094,6 +1096,23 @@ def _detect_verify_commands(
     # Rust
     if (project_root / "Cargo.toml").is_file():
         cmds.append("cargo check")
+
+    # ── Fallback parse checks ──────────────────────────────────
+    # When no linter is detected, use language-built-in parse
+    # checks.  These are bounded, config-free, and catch
+    # syntax errors that would otherwise slip through silently.
+
+    # Python: py_compile catches SyntaxError, IndentationError, etc.
+    if has_python:
+        cmds.append("python -m py_compile **/*.py")
+
+    # JavaScript: node --check catches syntax errors in .js files
+    if (project_root / "package.json").is_file():
+        cmds.append("node --check **/*.js")
+
+    # TypeScript: tsc --noEmit catches type and syntax errors
+    if (project_root / "tsconfig.json").is_file():
+        cmds.append("npx tsc --noEmit")
 
     return cmds
 
