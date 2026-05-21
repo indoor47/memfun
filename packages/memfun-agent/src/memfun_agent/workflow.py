@@ -378,7 +378,7 @@ class WorkflowEngine:
         )
 
         result = await self._orchestrator.dispatch(
-            task_msg, "rlm-coder", timeout=600.0,
+            task_msg, "rlm-coder",
         )
 
         state.status = WorkflowStatus.COMPLETED
@@ -575,7 +575,7 @@ class WorkflowEngine:
         # the simplest correct behaviour — one task per running instance.
         if all(len(v) == 1 for v in by_name.values()):
             raw = await self._orchestrator.fan_out(
-                tasks, agent_names, timeout=600.0,
+                tasks, agent_names,
             )
             return list(raw)
 
@@ -597,11 +597,10 @@ class WorkflowEngine:
                 return await self._orchestrator.fan_out(
                     sub_tasks,
                     [name] * len(sub_tasks),
-                    timeout=600.0,
                 )
             try:
                 return await pool_fn(
-                    sub_tasks, name, timeout=600.0,
+                    sub_tasks, name,
                 )
             except Exception as exc:
                 logger.warning(
@@ -612,7 +611,6 @@ class WorkflowEngine:
                 return await self._orchestrator.fan_out(
                     sub_tasks,
                     [name] * len(sub_tasks),
-                    timeout=600.0,
                 )
 
         coros = [
@@ -786,7 +784,7 @@ class WorkflowEngine:
             return
 
         results = await self._orchestrator.fan_out(
-            revision_tasks, revision_agents, timeout=600.0,
+            revision_tasks, revision_agents,
         )
 
         for tid, result in zip(revision_tids, results, strict=False):
