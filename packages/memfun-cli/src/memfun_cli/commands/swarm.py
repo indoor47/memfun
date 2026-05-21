@@ -21,6 +21,7 @@ Example::
 
     memfun swarm "Add a /health endpoint with handler, tests, and docs"
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -106,11 +107,7 @@ def _on_sub_task_status_factory(
         }.get(st, "?")
         agent_label = status.agent_name or "?"
         desc = (status.sub_task.description or "")[:80]
-        console.print(
-            f"  {symbol} [cyan]{tid}[/cyan] "
-            f"[dim]({agent_label})[/dim] "
-            f"{st:<10} {desc}"
-        )
+        console.print(f"  {symbol} [cyan]{tid}[/cyan] [dim]({agent_label})[/dim] {st:<10} {desc}")
 
     return on_sub_task_status
 
@@ -120,12 +117,8 @@ def _display_final_summary(
     wall_seconds: float,
 ) -> None:
     """Render the post-workflow summary panel."""
-    succeeded = sum(
-        1 for r in result.sub_task_results.values() if r.success
-    )
-    failed = sum(
-        1 for r in result.sub_task_results.values() if not r.success
-    )
+    succeeded = sum(1 for r in result.sub_task_results.values() if r.success)
+    failed = sum(1 for r in result.sub_task_results.values() if not r.success)
 
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("key", style="dim")
@@ -161,11 +154,13 @@ def _display_final_summary(
             )
             if cr.pushed:
                 table.add_row(
-                    "push", "[green]pushed to origin[/green]",
+                    "push",
+                    "[green]pushed to origin[/green]",
                 )
             elif cr.push_error:
                 table.add_row(
-                    "push", f"[yellow]not pushed: {cr.push_error}[/yellow]",
+                    "push",
+                    f"[yellow]not pushed: {cr.push_error}[/yellow]",
                 )
         elif cr.skipped:
             table.add_row(
@@ -174,28 +169,30 @@ def _display_final_summary(
             )
         elif cr.error:
             table.add_row(
-                "commit", f"[red]failed: {cr.error}[/red]",
+                "commit",
+                f"[red]failed: {cr.error}[/red]",
             )
 
     border = "green" if result.success else "red"
     console.print()
-    console.print(Panel(
-        table,
-        title="Swarm result",
-        border_style=border,
-    ))
+    console.print(
+        Panel(
+            table,
+            title="Swarm result",
+            border_style=border,
+        )
+    )
 
     if result.answer:
         console.print()
-        console.print(Panel(
-            result.answer[:5000] + (
-                "\n\n[dim]...truncated...[/dim]"
-                if len(result.answer) > 5000
-                else ""
-            ),
-            title="Merged answer",
-            border_style="cyan",
-        ))
+        console.print(
+            Panel(
+                result.answer[:5000]
+                + ("\n\n[dim]...truncated...[/dim]" if len(result.answer) > 5000 else ""),
+                title="Merged answer",
+                border_style="cyan",
+            )
+        )
 
 
 # ── Async runner ───────────────────────────────────────────────────
@@ -211,6 +208,7 @@ async def _run_swarm(
     auto_commit: bool | None,
     auto_push: bool | None,
     auto_branch: str | None,
+    gh_pr: bool | None,
 ) -> int:
     """Execute the swarm workflow.  Returns the desired exit code."""
     # Lazy imports — keep CLI startup cheap when other commands run.
@@ -230,6 +228,7 @@ async def _run_swarm(
     # is called.  Same import as chat.py.
     try:
         import memfun_agent.specialists as _specialists
+
         _ = _specialists  # quiet "unused import" without dropping side effect
     except Exception:
         logger.debug("Specialist agents unavailable", exc_info=True)
@@ -253,60 +252,54 @@ async def _run_swarm(
     # user gets a commit by default — but we honour
     # ``--no-commit`` to suppress it explicitly.
     wf_cfg = config.workflow
-    effective_auto_commit = (
-        auto_commit if auto_commit is not None else wf_cfg.auto_commit
-    )
-    effective_auto_push = (
-        auto_push if auto_push is not None else wf_cfg.auto_push
-    )
-    effective_auto_branch = (
-        auto_branch if auto_branch is not None else wf_cfg.auto_branch
-    )
+    effective_auto_commit = auto_commit if auto_commit is not None else wf_cfg.auto_commit
+    effective_auto_push = auto_push if auto_push is not None else wf_cfg.auto_push
+    effective_auto_branch = auto_branch if auto_branch is not None else wf_cfg.auto_branch
+    effective_gh_pr = gh_pr if gh_pr is not None else wf_cfg.gh_pr
 
     # ── Optional pre-workflow branch creation (issue #37) ────
     if effective_auto_branch:
         if not _project_is_git_repo(project_root):
-            console.print(
-                "[yellow]--branch ignored: not a git repository.[/yellow]"
-            )
+            console.print("[yellow]--branch ignored: not a git repository.[/yellow]")
         else:
             branch_name, branch_err = create_swarm_branch(
-                project_root, effective_auto_branch,
+                project_root,
+                effective_auto_branch,
             )
             if branch_err:
-                console.print(Panel(
-                    f"[red]Could not create branch "
-                    f"'{branch_name}': {branch_err}[/red]",
-                    title="Branch error",
-                    border_style="red",
-                ))
+                console.print(
+                    Panel(
+                        f"[red]Could not create branch '{branch_name}': {branch_err}[/red]",
+                        title="Branch error",
+                        border_style="red",
+                    )
+                )
                 return 1
             console.print(
-                f"[dim]Branch:[/dim] [green]{branch_name}[/green] "
-                "[dim](created off HEAD)[/dim]"
+                f"[dim]Branch:[/dim] [green]{branch_name}[/green] [dim](created off HEAD)[/dim]"
             )
 
     # Worktree manager (requires a git repo).
     worktree_manager: WorktreeManager | None = None
     if use_worktrees:
         if not _project_is_git_repo(project_root):
-            console.print(Panel(
-                f"[red]--use-worktrees requires a git repository, "
-                f"but {project_root} is not one.[/red]\n\n"
-                "Re-run with [bold]--no-use-worktrees[/bold] or "
-                "initialise a git repo first (`git init`).",
-                title="Swarm error",
-                border_style="red",
-            ))
+            console.print(
+                Panel(
+                    f"[red]--use-worktrees requires a git repository, "
+                    f"but {project_root} is not one.[/red]\n\n"
+                    "Re-run with [bold]--no-use-worktrees[/bold] or "
+                    "initialise a git repo first (`git init`).",
+                    title="Swarm error",
+                    border_style="red",
+                )
+            )
             return 2
         worktree_manager = WorktreeManager(project_root=project_root)
         if base_sha is not None:
             # Stash the override on the manager for later — but since
             # WorktreeManager.make_worktree takes base_sha per-call,
             # we wire it through via a closure-based wrapper below.
-            console.print(
-                f"[dim]Worktrees rooted at HEAD ref:[/dim] {base_sha}"
-            )
+            console.print(f"[dim]Worktrees rooted at HEAD ref:[/dim] {base_sha}")
 
     # Wrap the worktree manager if a custom base_sha was provided so
     # every make_worktree call pulls from that ref.
@@ -353,7 +346,9 @@ async def _run_swarm(
         max_concurrency=max(max_pool, 1),
     )
     orchestrator = AgentOrchestrator(
-        runtime, manager, config=orch_config,
+        runtime,
+        manager,
+        config=orch_config,
     )
 
     status_by_tid: dict[str, str] = {}
@@ -368,6 +363,7 @@ async def _run_swarm(
         auto_commit=effective_auto_commit,
         auto_push=effective_auto_push,
         project_root=project_root,
+        gh_pr=effective_gh_pr,
     )
     # Expose the per-instance pool cap so _execute_group can read it.
     engine._max_pool = max_pool  # type: ignore[attr-defined]
@@ -390,15 +386,14 @@ async def _run_swarm(
         f"[dim]base_sha:[/dim] {base_sha or 'HEAD'}"
     )
     if dashboard_port:
-        banner += (
-            f"\n[dim]Dashboard:[/dim] "
-            f"[cyan]http://localhost:{dashboard_port}[/cyan]"
+        banner += f"\n[dim]Dashboard:[/dim] [cyan]http://localhost:{dashboard_port}[/cyan]"
+    console.print(
+        Panel(
+            banner,
+            title="memfun swarm",
+            border_style="cyan",
         )
-    console.print(Panel(
-        banner,
-        title="memfun swarm",
-        border_style="cyan",
-    ))
+    )
     console.print()
     console.print("[bold]Sub-task progress:[/bold]")
 
@@ -411,11 +406,13 @@ async def _run_swarm(
             project=project_root.name,
         )
     except Exception as exc:
-        console.print(Panel(
-            f"[red]{type(exc).__name__}: {exc}[/red]",
-            title="Swarm error",
-            border_style="red",
-        ))
+        console.print(
+            Panel(
+                f"[red]{type(exc).__name__}: {exc}[/red]",
+                title="Swarm error",
+                border_style="red",
+            )
+        )
         return 1
     finally:
         # Best-effort: stop all managed agents so the process can exit.
@@ -435,8 +432,7 @@ async def _run_swarm(
 def swarm_command(
     spec: str = typer.Argument(
         ...,
-        help="What to build / refactor.  Passed straight to the "
-        "WorkflowEngine — no triage gate.",
+        help="What to build / refactor.  Passed straight to the WorkflowEngine — no triage gate.",
     ),
     max_pool: int = typer.Option(
         5,
@@ -449,8 +445,7 @@ def swarm_command(
     use_worktrees: bool = typer.Option(
         True,
         "--use-worktrees/--no-use-worktrees",
-        help="Run each sub-task in its own git worktree "
-        "(recommended for parallel safety).",
+        help="Run each sub-task in its own git worktree (recommended for parallel safety).",
     ),
     base_sha: str | None = typer.Option(
         None,
@@ -485,6 +480,14 @@ def swarm_command(
         "``memfun/swarm-<ts>`` name, or any other string to use that "
         "name verbatim.",
     ),
+    gh_pr: bool | None = typer.Option(
+        None,
+        "--gh-pr/--no-gh-pr",
+        help="Open a GitHub PR per sub-task and route each one "
+        "through the pr-reviewer agent (issue #38). "
+        "Requires `gh` authenticated with the project's remote. "
+        "Unset → read [workflow] gh_pr from memfun.toml (default OFF).",
+    ),
 ) -> None:
     """Force the multi-agent WorkflowEngine path, bypassing triage.
 
@@ -503,6 +506,7 @@ def swarm_command(
             auto_commit=commit,
             auto_push=push,
             auto_branch=branch,
+            gh_pr=gh_pr,
         )
     )
     if exit_code != 0:

@@ -20,11 +20,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
     """Merge override into base (1 level deep for TOML sections)."""
     merged = dict(base)
     for key, val in override.items():
-        if (
-            key in merged
-            and isinstance(merged[key], dict)
-            and isinstance(val, dict)
-        ):
+        if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
             merged[key] = {**merged[key], **val}
         else:
             merged[key] = val
@@ -88,11 +84,16 @@ class WorkflowConfig:
             branch.  ``"auto"`` creates a new
             ``memfun/swarm-<timestamp>`` branch.  Any other string is
             used verbatim as the new branch name.
+        gh_pr: When ``True``, ``memfun swarm`` opens a draft GitHub PR
+            per sub-task and routes each PR through the ``pr-reviewer``
+            agent (issue #38).  Defaults to ``False`` — opt-in only,
+            because the feature requires ``gh auth`` and a remote repo.
     """
 
     auto_commit: bool = True
     auto_push: bool = False
     auto_branch: str | None = None
+    gh_pr: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +115,7 @@ class WebToolsConfig:
 @dataclass(frozen=True, slots=True)
 class MemfunConfig:
     """Top-level configuration, parsed from memfun.toml."""
+
     project_name: str = "memfun-project"
     llm: LLMConfig = field(default_factory=LLMConfig)
     backend: BackendConfig = field(default_factory=BackendConfig)
@@ -122,17 +124,13 @@ class MemfunConfig:
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
 
     @classmethod
-    def from_toml(
-        cls, path: Path | str = "memfun.toml"
-    ) -> MemfunConfig:
+    def from_toml(cls, path: Path | str = "memfun.toml") -> MemfunConfig:
         path = Path(path)
         raw = _load_toml(path)
         return cls._from_raw(raw)
 
     @classmethod
-    def load(
-        cls, project_dir: Path | str | None = None
-    ) -> MemfunConfig:
+    def load(cls, project_dir: Path | str | None = None) -> MemfunConfig:
         """Load config with global → project layering.
 
         Resolution order (later wins):
@@ -142,9 +140,7 @@ class MemfunConfig:
         """
         global_path = Path.home() / ".memfun" / "config.toml"
 
-        project_dir = (
-            Path.cwd() if project_dir is None else Path(project_dir)
-        )
+        project_dir = Path.cwd() if project_dir is None else Path(project_dir)
 
         # Project config: .memfun/config.toml takes priority
         project_path = project_dir / ".memfun" / "config.toml"
@@ -168,25 +164,13 @@ class MemfunConfig:
 
         def _pick(section: dict, dc: type) -> dict:
             fields = dc.__dataclass_fields__
-            return {
-                k: v for k, v in section.items() if k in fields
-            }
+            return {k: v for k, v in section.items() if k in fields}
 
         return cls(
-            project_name=raw.get("project", {}).get(
-                "name", "memfun-project"
-            ),
+            project_name=raw.get("project", {}).get("name", "memfun-project"),
             llm=LLMConfig(**_pick(llm_raw, LLMConfig)),
-            backend=BackendConfig(
-                **_pick(backend_raw, BackendConfig)
-            ),
-            sandbox=SandboxBackendConfig(
-                **_pick(sandbox_raw, SandboxBackendConfig)
-            ),
-            web=WebToolsConfig(
-                **_pick(web_raw, WebToolsConfig)
-            ),
-            workflow=WorkflowConfig(
-                **_pick(workflow_raw, WorkflowConfig)
-            ),
+            backend=BackendConfig(**_pick(backend_raw, BackendConfig)),
+            sandbox=SandboxBackendConfig(**_pick(sandbox_raw, SandboxBackendConfig)),
+            web=WebToolsConfig(**_pick(web_raw, WebToolsConfig)),
+            workflow=WorkflowConfig(**_pick(workflow_raw, WorkflowConfig)),
         )
