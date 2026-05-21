@@ -267,12 +267,30 @@ async def _run_swarm(
     # Expose the per-instance pool cap so _execute_group can read it.
     engine._max_pool = max_pool  # type: ignore[attr-defined]
 
-    console.print(Panel(
+    # Auto-start the embedded dashboard (mirrors chat.py).  Reuses an
+    # existing dashboard for this project if one is already running.
+    dashboard_port: int | None = None
+    try:
+        from memfun_cli.commands.chat import _start_dashboard_background
+
+        dashboard_port, _is_owner = await _start_dashboard_background(runtime)
+    except Exception as exc:
+        logger.debug("Dashboard auto-start skipped: %s", exc)
+
+    banner = (
         f"[bold]Spec:[/bold] {spec}\n"
         f"[dim]project:[/dim] {project_root}\n"
         f"[dim]max_pool:[/dim] {max_pool}  "
         f"[dim]use_worktrees:[/dim] {use_worktrees}  "
-        f"[dim]base_sha:[/dim] {base_sha or 'HEAD'}",
+        f"[dim]base_sha:[/dim] {base_sha or 'HEAD'}"
+    )
+    if dashboard_port:
+        banner += (
+            f"\n[dim]Dashboard:[/dim] "
+            f"[cyan]http://localhost:{dashboard_port}[/cyan]"
+        )
+    console.print(Panel(
+        banner,
         title="memfun swarm",
         border_style="cyan",
     ))
