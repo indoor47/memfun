@@ -6,6 +6,7 @@ decompose -> fan-out parallel tasks -> collect -> review -> revise -> merge.
 Uses the existing :class:`AgentOrchestrator` for dispatch/fan-out and
 :class:`AgentManager` for agent lifecycle.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -24,6 +25,14 @@ from memfun_core.logging import get_logger
 from memfun_core.types import TaskMessage, TaskResult
 
 from memfun_agent.decomposer import DecompositionResult, SubTask, TaskDecomposer
+from memfun_agent.gh_pr_flow import (
+    add_pr_review_comment,
+    current_repo_slug,
+    mark_pr_ready,
+    merge_pr,
+    open_subtask_pr,
+    push_subtask_branch,
+)
 from memfun_agent.git_committer import (
     CommitResult,
     SubTaskReview,
@@ -82,6 +91,10 @@ class WorkflowState:
     # :meth:`WorkflowEngine._execute_group`.  Indexed by sub-task ID
     # (the short ``Tn`` form, not ``workflow_id_Tn``).
     per_task_reviews: dict[str, PerTaskReview] = field(default_factory=dict)
+    # Per-sub-task PR bookkeeping when running with ``gh_pr=True``.
+    # Populated by :meth:`WorkflowEngine._open_pr_for_subtask` and
+    # consumed by :meth:`WorkflowEngine._merge_approved_prs`.
+    pr_states: dict[str, SubTaskPRState] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +126,38 @@ class PerTaskReview:
     issues: list[str] = field(default_factory=list)
     rounds: int = 1
     duration_ms: float = 0.0
+
+
+@dataclass(slots=True)
+class SubTaskPRState:
+    """Per-sub-task GitHub PR bookkeeping (issue #38).
+
+    Populated when :class:`WorkflowEngine` runs with ``gh_pr=True``.
+    Tracks what we did with each sub-task's PR so the final merge
+    pass can decide what's mergeable.
+
+    Attributes:
+        task_id: Short sub-task ID (``T1``, ``T2``, …).
+        branch: Worktree branch name we pushed.
+        pr_number: Opened PR number, or ``None`` if open failed.
+        url: PR URL when known.
+        approved: ``True`` when the pr-reviewer agent's verdict was
+            ``approve``.  ``None`` while still pending.
+        verdict: Raw verdict string from the reviewer
+            (``approve`` / ``request-changes`` / ``comment`` / error).
+        merged: ``True`` after a successful merge_pr call.
+        error: Last error message that stopped progress on this PR
+            (push failure, open failure, merge failure, …).
+    """
+
+    task_id: str
+    branch: str
+    pr_number: int | None = None
+    url: str | None = None
+    approved: bool | None = None
+    verdict: str = ""
+    merged: bool = False
+    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +215,9 @@ class WorkflowEngine:
         auto_commit: bool = False,
         auto_push: bool = False,
         project_root: Path | None = None,
+        gh_pr: bool = False,
+        gh_pr_base: str = "main",
+        gh_pr_merge_strategy: str = "squash",
     ) -> None:
         self._context = context
         self._orchestrator = orchestrator
@@ -207,6 +255,19 @@ class WorkflowEngine:
         # reviewer-leg consistent with the coder-leg so a slow review
         # doesn't outlive a slow code generation.
         self._dispatch_timeout_seconds = dispatch_timeout_seconds
+        # GitHub PR-per-sub-task flow (issue #38).  When enabled the
+        # engine: commits the worktree, pushes the branch, opens a
+        # draft PR, dispatches the ``pr-reviewer`` agent, then merges
+        # approved PRs in dependency order at the end of ``_run``.
+        # All steps are no-ops when ``gh`` isn't installed/authorised.
+        self._gh_pr = gh_pr
+        self._gh_pr_base = gh_pr_base
+        self._gh_pr_merge_strategy = gh_pr_merge_strategy
+        # Cached ``owner/name`` resolved on first use so we don't
+        # shell out to ``gh repo view`` once per sub-task.  ``None``
+        # value means "not yet resolved"; an empty string means
+        # "resolved but no gh-tracked repo here" (disable feature).
+        self._gh_repo_slug: str | None = None
 
     # ── Public API ────────────────────────────────────────────
 
@@ -224,7 +285,10 @@ class WorkflowEngine:
 
         try:
             return await self._run(
-                state, task_description, project_context, conversation_history,
+                state,
+                task_description,
+                project_context,
+                conversation_history,
             )
         except Exception as exc:
             state.status = WorkflowStatus.FAILED
@@ -265,7 +329,8 @@ class WorkflowEngine:
         self._emit_status(state)
 
         decomposition = await self._decomposer.adecompose(
-            task_description, project_context,
+            task_description,
+            project_context,
         )
         state.decomposition = decomposition
 
@@ -313,7 +378,8 @@ class WorkflowEngine:
         # specialists, so they don't waste iterations rediscovering
         # the same files independently.
         state.shared_context = await self._gather_shared_context(
-            project_context, decomposition,
+            project_context,
+            decomposition,
         )
 
         # ── Phase 2: EXECUTE ──────────────────────────────────
@@ -323,13 +389,10 @@ class WorkflowEngine:
         # Final safety: ensure group IDs match sub_task_statuses.
         known_ids = set(state.sub_task_statuses.keys())
         execution_groups = decomposition.parallelism_groups
-        all_group_ids = {
-            tid for grp in execution_groups for tid in grp
-        }
+        all_group_ids = {tid for grp in execution_groups for tid in grp}
         if not all_group_ids.issubset(known_ids):
             logger.warning(
-                "Parallelism group IDs %s don't match known"
-                " sub-task IDs %s — rebuilding groups",
+                "Parallelism group IDs %s don't match known sub-task IDs %s — rebuilding groups",
                 all_group_ids - known_ids,
                 known_ids,
             )
@@ -348,10 +411,14 @@ class WorkflowEngine:
             # Rebuild enriched context from base + all completed so far
             # (avoids O(n²) re-appending of prior results).
             enriched_context = self._enrich_with_prior_results(
-                base_context, state,
+                base_context,
+                state,
             )
             await self._execute_group(
-                state, group, enriched_context, history,
+                state,
+                group,
+                enriched_context,
+                history,
             )
 
         # ── Phase 3: REVIEW ───────────────────────────────────
@@ -361,10 +428,7 @@ class WorkflowEngine:
         review = await self._run_review(state, project_context, history)
 
         # ── Phase 4: REVISE (up to max rounds) ────────────────
-        while (
-            not review.approved
-            and state.review_rounds < state.max_review_rounds
-        ):
+        while not review.approved and state.review_rounds < state.max_review_rounds:
             state.status = WorkflowStatus.REVISING
             state.review_rounds += 1
             self._emit_status(state)
@@ -375,7 +439,10 @@ class WorkflowEngine:
             )
 
             await self._run_revision(
-                state, review, state.shared_context or project_context, history,
+                state,
+                review,
+                state.shared_context or project_context,
+                history,
             )
 
             state.status = WorkflowStatus.REVIEWING
@@ -411,19 +478,48 @@ class WorkflowEngine:
         )
         if commit_result is not None:
             result = dataclasses.replace(
-                result, commit_result=commit_result,
+                result,
+                commit_result=commit_result,
             )
             # A hard commit failure (eg. broken pre-commit hook) MUST
             # propagate as a workflow failure so callers exit non-zero.
-            if (
-                not commit_result.committed
-                and not commit_result.skipped
-                and commit_result.error
-            ):
+            if not commit_result.committed and not commit_result.skipped and commit_result.error:
                 result = dataclasses.replace(
                     result,
                     success=False,
                     error=f"auto-commit failed: {commit_result.error}",
+                )
+
+        # ── Phase 7: GH-PR MERGE (issue #38) ─────────────────
+        # Merge approved per-sub-task PRs in dependency order.
+        # Only when the gh_pr flow ran and at least one PR was
+        # approved by the pr-reviewer agent earlier.
+        if self._gh_pr and state.pr_states:
+            merged_count, merge_failures = await self._merge_approved_prs(
+                state=state,
+                groups=(
+                    state.decomposition.parallelism_groups
+                    if state.decomposition is not None
+                    else []
+                ),
+            )
+            # Surface merge failures as a workflow failure so the
+            # caller can exit non-zero — a silent `success=True` with
+            # un-merged PRs hides the most common real-world failure
+            # mode (the second PR conflicting with the first one's
+            # merge).  Approved PRs that conflict are left OPEN on
+            # GitHub for human inspection.
+            if merge_failures:
+                summary = ", ".join(
+                    f"#{pr} ({err})" for pr, err in merge_failures
+                )
+                result = dataclasses.replace(
+                    result,
+                    success=False,
+                    error=(
+                        f"{merged_count}/{merged_count + len(merge_failures)} "
+                        f"PRs merged; failures: {summary}"
+                    ),
                 )
         return result
 
@@ -466,7 +562,8 @@ class WorkflowEngine:
         )
 
         result = await self._orchestrator.dispatch(
-            task_msg, "rlm-coder",
+            task_msg,
+            "rlm-coder",
         )
 
         state.status = WorkflowStatus.COMPLETED
@@ -501,13 +598,10 @@ class WorkflowEngine:
         )
         if commit_result is not None:
             wf_result = dataclasses.replace(
-                wf_result, commit_result=commit_result,
+                wf_result,
+                commit_result=commit_result,
             )
-            if (
-                not commit_result.committed
-                and not commit_result.skipped
-                and commit_result.error
-            ):
+            if not commit_result.committed and not commit_result.skipped and commit_result.error:
                 wf_result = dataclasses.replace(
                     wf_result,
                     success=False,
@@ -545,8 +639,7 @@ class WorkflowEngine:
             sub_status = state.sub_task_statuses.get(tid)
             if sub_status is None:
                 logger.warning(
-                    "Group task ID %r not found in sub_task_statuses"
-                    " (known: %s)",
+                    "Group task ID %r not found in sub_task_statuses (known: %s)",
                     tid,
                     list(state.sub_task_statuses.keys()),
                 )
@@ -614,7 +707,9 @@ class WorkflowEngine:
                     project=state.project,
                 )
         results = await self._dispatch_group(
-            tasks, agent_names, matched_tids,
+            tasks,
+            agent_names,
+            matched_tids,
         )
 
         # Zip results back using matched_tids (not group)
@@ -630,8 +725,7 @@ class WorkflowEngine:
             self._emit_sub_task(tid, sub_status)
 
             dur = (
-                (sub_status.completed_at - sub_status.started_at)
-                * 1000
+                (sub_status.completed_at - sub_status.started_at) * 1000
                 if sub_status.started_at
                 else result.duration_ms
             )
@@ -647,8 +741,7 @@ class WorkflowEngine:
 
             data = result.result or {}
             logger.info(
-                "Sub-task %s (%s): success=%s, answer_len=%d,"
-                " ops=%d, files=%d, error=%s",
+                "Sub-task %s (%s): success=%s, answer_len=%d, ops=%d, files=%d, error=%s",
                 tid,
                 sub_status.agent_name,
                 result.success,
@@ -666,7 +759,10 @@ class WorkflowEngine:
         # ``max_review_rounds_per_task``).
         if self._pair_with_reviewer:
             await self._pair_review_group(
-                state, matched_tids, project_context, history,
+                state,
+                matched_tids,
+                project_context,
+                history,
             )
 
     async def _dispatch_group(
@@ -702,7 +798,8 @@ class WorkflowEngine:
         # the simplest correct behaviour — one task per running instance.
         if all(len(v) == 1 for v in by_name.values()):
             raw = await self._orchestrator.fan_out(
-                tasks, agent_names,
+                tasks,
+                agent_names,
             )
             return list(raw)
 
@@ -717,7 +814,9 @@ class WorkflowEngine:
         ) -> list[TaskResult]:
             sub_tasks = [tasks[i] for i in indices]
             pool_fn = getattr(
-                self._orchestrator, "fan_out_to_pool", None,
+                self._orchestrator,
+                "fan_out_to_pool",
+                None,
             )
             if pool_fn is None or len(indices) == 1:
                 # Backward-compat or single-task: use plain fan_out.
@@ -727,29 +826,30 @@ class WorkflowEngine:
                 )
             try:
                 return await pool_fn(
-                    sub_tasks, name,
+                    sub_tasks,
+                    name,
                 )
             except Exception as exc:
                 logger.warning(
-                    "fan_out_to_pool(%s, %d) failed: %s; "
-                    "falling back to fan_out",
-                    name, len(sub_tasks), exc,
+                    "fan_out_to_pool(%s, %d) failed: %s; falling back to fan_out",
+                    name,
+                    len(sub_tasks),
+                    exc,
                 )
                 return await self._orchestrator.fan_out(
                     sub_tasks,
                     [name] * len(sub_tasks),
                 )
 
-        coros = [
-            _pool_dispatch(name, indices)
-            for name, indices in by_name.items()
-        ]
+        coros = [_pool_dispatch(name, indices) for name, indices in by_name.items()]
         # Run all pool dispatches concurrently so distinct agent types
         # still execute in parallel.
         gathered = await asyncio.gather(*coros, return_exceptions=False)
 
         for (name, indices), sub_results in zip(
-            by_name.items(), gathered, strict=False,
+            by_name.items(),
+            gathered,
+            strict=False,
         ):
             for local_idx, global_idx in enumerate(indices):
                 if local_idx < len(sub_results):
@@ -767,7 +867,8 @@ class WorkflowEngine:
 
         # Replace any leftover Nones with explicit failures.
         return [
-            r if r is not None
+            r
+            if r is not None
             else TaskResult(
                 task_id=tasks[i].task_id,
                 agent_id=agent_names[i],
@@ -827,6 +928,21 @@ class WorkflowEngine:
             return_exceptions=False,
         )
 
+        # ── gh_pr layer (issue #38) ──────────────────────────
+        # Once the per-task in-process pairing has settled, lift
+        # each successful sub-task to a real GitHub PR and route
+        # it through the ``pr-reviewer`` agent.  Synchronous to
+        # avoid multiplying the gh API call rate when N sub-tasks
+        # finish at the same time.
+        if self._gh_pr:
+            await self._run_gh_pr_layer(
+                state=state,
+                matched_tids=matched_tids,
+                wt_map=wt_map,
+                spec=project_context,
+                history=history,
+            )
+
     async def _pair_single_task(
         self,
         *,
@@ -868,7 +984,8 @@ class WorkflowEngine:
             if review.approved:
                 logger.info(
                     "Per-task review approved %s on round %d",
-                    tid, rounds,
+                    tid,
+                    rounds,
                 )
                 return
 
@@ -887,8 +1004,7 @@ class WorkflowEngine:
                 return
 
             logger.info(
-                "Per-task review for %s requested changes"
-                " (round %d/%d): %s",
+                "Per-task review for %s requested changes (round %d/%d): %s",
                 tid,
                 rounds,
                 self._max_review_rounds_per_task,
@@ -910,9 +1026,7 @@ class WorkflowEngine:
                 return
             sub_status.result = new_result
             sub_status.completed_at = time.time()
-            sub_status.status = (
-                "completed" if new_result.success else "failed"
-            )
+            sub_status.status = "completed" if new_result.success else "failed"
             self._emit_sub_task(tid, sub_status)
 
             if not new_result.success:
@@ -920,7 +1034,8 @@ class WorkflowEngine:
                 # broken coder, just bail.
                 logger.warning(
                     "Coder re-dispatch for %s failed: %s",
-                    tid, new_result.error,
+                    tid,
+                    new_result.error,
                 )
                 return
 
@@ -964,9 +1079,9 @@ class WorkflowEngine:
                 await self._manager.start_agent("review-agent")
             except Exception as exc:
                 logger.warning(
-                    "Cannot start review-agent for per-task review"
-                    " %s: %s — auto-approving",
-                    tid, exc,
+                    "Cannot start review-agent for per-task review %s: %s — auto-approving",
+                    tid,
+                    exc,
                 )
                 return PerTaskReview(
                     task_id=tid,
@@ -991,9 +1106,7 @@ class WorkflowEngine:
         review_round = state.per_task_reviews.get(tid)
         round_idx = (review_round.rounds + 1) if review_round else 1
         review_task = TaskMessage(
-            task_id=(
-                f"{state.workflow_id}_{tid}_review_{round_idx}"
-            ),
+            task_id=(f"{state.workflow_id}_{tid}_review_{round_idx}"),
             agent_id="review-agent",
             payload={
                 "type": "ask",
@@ -1005,10 +1118,7 @@ class WorkflowEngine:
                 # coder so it reads the actual file changes.
                 # Fall back to None — the agent's own handler
                 # treats missing cwd as the process cwd.
-                **(
-                    {"cwd": str(worktree_path)}
-                    if worktree_path is not None else {}
-                ),
+                **({"cwd": str(worktree_path)} if worktree_path is not None else {}),
                 "conversation_history": history,
             },
             correlation_id=state.workflow_id,
@@ -1034,7 +1144,8 @@ class WorkflowEngine:
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             logger.warning(
                 "Per-task review dispatch for %s failed: %s",
-                tid, exc,
+                tid,
+                exc,
             )
             return PerTaskReview(
                 task_id=tid,
@@ -1056,9 +1167,9 @@ class WorkflowEngine:
             agent_name="review-agent",
             success=review.approved,
             duration_ms=elapsed_ms,
-            detail=review.feedback[:200] if review.feedback else (
-                "APPROVED" if review.approved else "CHANGES_REQUESTED"
-            ),
+            detail=review.feedback[:200]
+            if review.feedback
+            else ("APPROVED" if review.approved else "CHANGES_REQUESTED"),
             workflow_id=state.workflow_id,
             project=state.project,
         )
@@ -1134,8 +1245,7 @@ class WorkflowEngine:
                 task_id=tid,
                 approved=True,
                 feedback=(
-                    f"Reviewer task failed ({result.error or 'unknown'})"
-                    " — defaulting to approved"
+                    f"Reviewer task failed ({result.error or 'unknown'}) — defaulting to approved"
                 ),
                 issues=[],
                 rounds=1,
@@ -1172,8 +1282,7 @@ class WorkflowEngine:
         issues = [
             line.lstrip("-* \t").strip()
             for line in answer.splitlines()
-            if line.lstrip().startswith(("-", "*"))
-            and len(line.strip()) > 2
+            if line.lstrip().startswith(("-", "*")) and len(line.strip()) > 2
         ]
 
         return PerTaskReview(
@@ -1251,7 +1360,9 @@ class WorkflowEngine:
         except Exception as exc:
             logger.warning(
                 "Coder re-dispatch for %s round %d failed: %s",
-                tid, round_idx, exc,
+                tid,
+                round_idx,
+                exc,
             )
             return None
 
@@ -1285,7 +1396,8 @@ class WorkflowEngine:
             answer = data.get("answer", "")[:2000]
             files = ", ".join(data.get("files_created", []))
             status_label = (
-                "SUCCESS" if sub_status.result.success
+                "SUCCESS"
+                if sub_status.result.success
                 else f"FAILED: {sub_status.result.error or 'unknown'}"
             )
             review_parts.append(
@@ -1297,12 +1409,10 @@ class WorkflowEngine:
             )
 
         if not review_parts:
-            logger.warning(
-                "No sub-task results found for review"
-                " (all results are None)"
-            )
+            logger.warning("No sub-task results found for review (all results are None)")
             return ReviewResult(
-                approved=True, issues=[],
+                approved=True,
+                issues=[],
                 summary="No sub-task results available",
             )
 
@@ -1318,16 +1428,14 @@ class WorkflowEngine:
                 "  - Type mismatches across module boundaries\n"
                 "  - Conflicting file edits or import cycles\n\n"
                 "If everything is consistent, reply with"
-                " `approved: true`.\n\n"
-                + "\n".join(review_parts)
+                " `approved: true`.\n\n" + "\n".join(review_parts)
             )
         else:
             review_query = (
                 "Review the outputs of the following sub-tasks for"
                 " consistency, quality, and adherence to the shared"
                 " specification. Check for file conflicts, import"
-                " issues, and integration problems.\n\n"
-                + "\n".join(review_parts)
+                " issues, and integration problems.\n\n" + "\n".join(review_parts)
             )
 
         # Ensure review agent running.
@@ -1356,7 +1464,9 @@ class WorkflowEngine:
         )
 
         result = await self._orchestrator.dispatch(
-            review_task, "review-agent", timeout=300.0,
+            review_task,
+            "review-agent",
+            timeout=300.0,
         )
 
         return self._parse_review_result(result)
@@ -1398,7 +1508,8 @@ class WorkflowEngine:
             # Reuse the existing worktree if one was provisioned for
             # this sub_task during the original fan-out.
             existing_path = self._worktrees.get(
-                state.workflow_id, {},
+                state.workflow_id,
+                {},
             ).get(tid)
             if existing_path is not None:
                 rev_payload["cwd"] = str(existing_path)
@@ -1420,7 +1531,8 @@ class WorkflowEngine:
             return
 
         results = await self._orchestrator.fan_out(
-            revision_tasks, revision_agents,
+            revision_tasks,
+            revision_agents,
         )
 
         for tid, result in zip(revision_tids, results, strict=False):
@@ -1462,9 +1574,7 @@ class WorkflowEngine:
         manifest = build_file_manifest(project_root)
 
         if not manifest:
-            logger.info(
-                "No source files found, using raw project context"
-            )
+            logger.info("No source files found, using raw project context")
             return project_context
 
         total_size = sum(size for _, size in manifest)
@@ -1483,10 +1593,7 @@ class WorkflowEngine:
             return gatherer.read_all_files(manifest, project_root)
 
         # Large project: use planner with combined descriptions.
-        all_descriptions = "\n".join(
-            f"- {st.description}"
-            for st in decomposition.sub_tasks
-        )
+        all_descriptions = "\n".join(f"- {st.description}" for st in decomposition.sub_tasks)
         combined_query = (
             f"The following sub-tasks need to be solved:\n"
             f"{all_descriptions}\n\n"
@@ -1514,9 +1621,7 @@ class WorkflowEngine:
                 search_patterns=plan.search_patterns or None,
             )
         except Exception as exc:
-            logger.warning(
-                "Context planner failed: %s, falling back", exc
-            )
+            logger.warning("Context planner failed: %s, falling back", exc)
             return project_context
 
     # ── Result forwarding ─────────────────────────────────────
@@ -1544,45 +1649,30 @@ class WorkflowEngine:
             ops = data.get("ops", [])
             if not answer and not files:
                 continue
-            section = (
-                f"=== PRIOR AGENT RESULT: {tid}"
-                f" ({ss.agent_name}) ===\n"
-            )
+            section = f"=== PRIOR AGENT RESULT: {tid} ({ss.agent_name}) ===\n"
             if answer:
                 section += f"{answer[:3000]}\n"
             if files:
-                section += (
-                    f"Files created: {', '.join(files)}\n"
-                )
+                section += f"Files created: {', '.join(files)}\n"
             if ops:
-                writes = [
-                    o for o in ops
-                    if isinstance(o, dict) and o.get("type") == "write"
-                ]
-                edits = [
-                    o for o in ops
-                    if isinstance(o, dict) and o.get("type") == "edit"
-                ]
+                writes = [o for o in ops if isinstance(o, dict) and o.get("type") == "write"]
+                edits = [o for o in ops if isinstance(o, dict) and o.get("type") == "edit"]
                 if writes or edits:
-                    section += (
-                        f"Operations: {len(writes)} writes,"
-                        f" {len(edits)} edits\n"
-                    )
+                    section += f"Operations: {len(writes)} writes, {len(edits)} edits\n"
             parts.append(section)
 
         if not parts:
             return base_context
 
-        prior_block = (
-            "\n\n=== COMPLETED AGENT RESULTS ===\n"
-            + "\n".join(parts)
-        )
+        prior_block = "\n\n=== COMPLETED AGENT RESULTS ===\n" + "\n".join(parts)
         return base_context + prior_block
 
     # ── Worktree provisioning ─────────────────────────────────
 
     def _provision_worktree(
-        self, workflow_id: str, sub_task_id: str,
+        self,
+        workflow_id: str,
+        sub_task_id: str,
     ) -> Path | None:
         """Create (or return cached) worktree path for a sub-task.
 
@@ -1602,12 +1692,15 @@ class WorkflowEngine:
 
         try:
             path = self._worktree_manager.make_worktree(
-                workflow_id, sub_task_id,
+                workflow_id,
+                sub_task_id,
             )
         except Exception as exc:
             logger.warning(
                 "Failed to provision worktree for %s/%s: %s",
-                workflow_id, sub_task_id, exc,
+                workflow_id,
+                sub_task_id,
+                exc,
             )
             return None
         cache[sub_task_id] = path
@@ -1631,8 +1724,557 @@ class WorkflowEngine:
             except Exception as exc:
                 logger.warning(
                     "Failed to clean up worktree for %s/%s: %s",
-                    workflow_id, tid, exc,
+                    workflow_id,
+                    tid,
+                    exc,
                 )
+
+    # ── GitHub PR flow (issue #38) ────────────────────────────
+
+    def _resolve_repo_slug(self) -> str | None:
+        """Resolve ``owner/name`` once per workflow and cache it.
+
+        Returns the slug on success, ``None`` when this project is
+        not gh-tracked — in which case the gh_pr layer silently
+        no-ops and the rest of the workflow proceeds normally.
+        """
+        if self._gh_repo_slug is None:
+            project_root = self._project_root or Path.cwd()
+            slug = current_repo_slug(project_root)
+            # Cache as empty string for "resolved → not available"
+            # so we don't shell out again on each sub-task.
+            self._gh_repo_slug = slug or ""
+        return self._gh_repo_slug or None
+
+    async def _run_gh_pr_layer(
+        self,
+        *,
+        state: WorkflowState,
+        matched_tids: list[str],
+        wt_map: dict[str, Path],
+        spec: str,
+        history: list[dict[str, Any]] | None,
+    ) -> None:
+        """Open one PR per successful sub-task and route it for review.
+
+        For each *tid* in *matched_tids* whose coder result succeeded:
+
+        1. Resolve the worktree branch (``memfun/<workflow>/<task>``).
+        2. Commit the worktree's changes via
+           :func:`commit_workflow_output` so the push has something
+           to deliver.
+        3. Push the branch via :func:`push_subtask_branch`.
+        4. Open a draft PR via :func:`open_subtask_pr`.
+        5. Dispatch the ``pr-reviewer`` agent.
+        6. Based on the reviewer verdict, ``mark_pr_ready`` (queue
+           for merge) or ``close_pr`` (give up; keep the PR open
+           for a human if review couldn't be completed).
+
+        Runs synchronously across the group — issuing N gh API calls
+        in parallel would multiply rate limits with no benefit.
+        """
+        repo = self._resolve_repo_slug()
+        if not repo:
+            logger.info(
+                "gh_pr: no gh-tracked repo at %s — skipping PR flow",
+                self._project_root or Path.cwd(),
+            )
+            return
+        if self._worktree_manager is None:
+            logger.info(
+                "gh_pr: no WorktreeManager configured — skipping"
+                " PR flow (per-task PRs require isolated worktrees)",
+            )
+            return
+
+        # Ensure the pr-reviewer agent is running before we open
+        # any PRs.  If we can't start it, fall back to leaving the
+        # PRs in draft for human review rather than racing to open
+        # them with no automated reviewer behind them.
+        if not self._manager.is_running("pr-reviewer"):
+            try:
+                await self._manager.start_agent("pr-reviewer")
+            except Exception as exc:
+                logger.warning(
+                    "gh_pr: cannot start pr-reviewer agent: %s —"
+                    " PRs will be opened in draft and left for a"
+                    " human reviewer",
+                    exc,
+                )
+
+        for tid in matched_tids:
+            sub_status = state.sub_task_statuses.get(tid)
+            if sub_status is None or sub_status.result is None:
+                continue
+            if not sub_status.result.success:
+                continue
+            worktree_path = wt_map.get(tid)
+            if worktree_path is None:
+                logger.debug(
+                    "gh_pr: no worktree for %s, skipping",
+                    tid,
+                )
+                continue
+
+            # Resolve the auto-generated branch name from the
+            # worktree manager — this is the SAME convention
+            # used by ``WorktreeManager.make_worktree``.
+            branch = f"{self._worktree_manager.BRANCH_PREFIX}/{state.workflow_id}/{tid}"
+
+            await self._open_pr_for_subtask(
+                state=state,
+                tid=tid,
+                sub_status=sub_status,
+                worktree_path=worktree_path,
+                branch=branch,
+                repo=repo,
+                spec=spec,
+                history=history,
+            )
+
+    async def _open_pr_for_subtask(
+        self,
+        *,
+        state: WorkflowState,
+        tid: str,
+        sub_status: SubTaskStatus,
+        worktree_path: Path,
+        branch: str,
+        repo: str,
+        spec: str,
+        history: list[dict[str, Any]] | None,
+    ) -> None:
+        """Commit → push → open PR → dispatch reviewer for one task.
+
+        Records progress in ``state.pr_states[tid]``.  Every failure
+        path is logged and stored on the SubTaskPRState, never raised
+        — a single bad PR shouldn't blow up a 10-task swarm.
+        """
+        pr_state = SubTaskPRState(task_id=tid, branch=branch)
+        state.pr_states[tid] = pr_state
+
+        # ── Step 1: commit ──────────────────────────────────
+        data = sub_status.result.result or {} if sub_status.result else {}
+        files_written = list(data.get("files_created", []))
+        commit_res = commit_workflow_output(
+            project_root=worktree_path,
+            files_written=files_written,
+            spec=sub_status.sub_task.description,
+            sub_tasks=[],
+            stats=None,
+            push=False,
+        )
+        if not commit_res.committed and not commit_res.skipped:
+            pr_state.error = f"commit failed: {commit_res.error or 'unknown'}"
+            logger.warning(
+                "gh_pr[%s]: commit failed: %s",
+                tid,
+                commit_res.error,
+            )
+            return
+        # An empty / skipped commit is OK only if HEAD already
+        # advanced past the base — the worktree may have been
+        # committed externally.  We just continue to the push.
+
+        # ── Step 2: push ────────────────────────────────────
+        push_res = push_subtask_branch(worktree_path, branch)
+        if not push_res.pushed:
+            pr_state.error = f"push failed: {push_res.error or 'unknown'}"
+            logger.warning(
+                "gh_pr[%s]: push failed: %s",
+                tid,
+                push_res.error,
+            )
+            return
+
+        # ── Step 3: open PR ─────────────────────────────────
+        title = sub_status.sub_task.description.strip().split("\n")[0]
+        if len(title) > 100:
+            title = title[:97] + "..."
+        body = self._build_pr_body(
+            tid=tid,
+            sub_status=sub_status,
+            spec=spec,
+            worktree_path=worktree_path,
+        )
+        open_res = open_subtask_pr(
+            repo=repo,
+            base=self._gh_pr_base,
+            head=branch,
+            title=title,
+            body=body,
+            draft=True,
+        )
+        if open_res.pr_number is None:
+            pr_state.error = f"open PR failed: {open_res.error or 'unknown'}"
+            logger.warning(
+                "gh_pr[%s]: open PR failed: %s",
+                tid,
+                open_res.error,
+            )
+            return
+        pr_state.pr_number = open_res.pr_number
+        pr_state.url = open_res.url
+        logger.info(
+            "gh_pr[%s]: opened draft PR #%d (%s)",
+            tid,
+            open_res.pr_number,
+            open_res.url or "?",
+        )
+        await self._emit_dashboard(
+            "pr.opened",
+            task_id=sub_status.task_id,
+            agent_name=sub_status.agent_name,
+            detail=f"PR #{open_res.pr_number}: {title[:60]}",
+            workflow_id=state.workflow_id,
+            project=state.project,
+        )
+
+        # ── Step 4: dispatch pr-reviewer ────────────────────
+        verdict = await self._dispatch_pr_reviewer(
+            state=state,
+            tid=tid,
+            pr_number=open_res.pr_number,
+            spec=spec,
+            repo=repo,
+            history=history,
+        )
+        pr_state.verdict = verdict
+        pr_state.approved = verdict == "approve"
+
+        # ── Step 5: mark ready / close ──────────────────────
+        if pr_state.approved:
+            if mark_pr_ready(repo, open_res.pr_number):
+                logger.info(
+                    "gh_pr[%s]: PR #%d marked ready (approved)",
+                    tid,
+                    open_res.pr_number,
+                )
+            else:
+                logger.warning(
+                    "gh_pr[%s]: PR #%d approved but could not be marked ready",
+                    tid,
+                    open_res.pr_number,
+                )
+        elif verdict == "request-changes":
+            # Leave the PR open in draft.  A human (or follow-up
+            # coder dispatch) will iterate on the branch.
+            comment_body = (
+                f"pr-reviewer agent requested changes for sub-task"
+                f" {tid}. Leaving PR in draft for follow-up.\n\n"
+                "The orchestrator will NOT auto-merge this PR."
+            )
+            add_pr_review_comment(repo, open_res.pr_number, comment_body)
+            logger.info(
+                "gh_pr[%s]: PR #%d left in draft (changes-requested)",
+                tid,
+                open_res.pr_number,
+            )
+        else:
+            # ``comment`` or error verdict — leave in draft, surface
+            # the reason on the PR.
+            add_pr_review_comment(
+                repo,
+                open_res.pr_number,
+                f"pr-reviewer verdict: {verdict or 'unknown'}.\n"
+                "Leaving PR in draft for human review.",
+            )
+
+    @staticmethod
+    def _build_pr_body(
+        *,
+        tid: str,
+        sub_status: SubTaskStatus,
+        spec: str,
+        worktree_path: Path,
+    ) -> str:
+        """Render the PR body for a sub-task.
+
+        Includes the workflow spec, sub-task description, declared
+        inputs/outputs, per-agent LLM stats (when available), and
+        the worktree path so a human reviewer landing on the PR
+        can reproduce locally.
+        """
+        st = sub_status.sub_task
+        result_data = sub_status.result.result or {} if sub_status.result is not None else {}
+        llm = result_data.get("llm") or {}
+        files_created = result_data.get("files_created", [])
+        ops = result_data.get("ops", [])
+
+        lines: list[str] = [
+            f"## Sub-task {tid}: {st.description}",
+            "",
+            "Opened automatically by `memfun swarm --gh-pr` (issue #38).",
+            "",
+            "### Workflow spec",
+            "",
+            "```",
+            (spec or "(no spec provided)").strip(),
+            "```",
+            "",
+            "### Sub-task",
+            "",
+            f"- **ID**: `{tid}`",
+            f"- **Agent**: `{sub_status.agent_name}`",
+            # Only the basename — never leak the absolute filesystem
+            # path on the developer's machine into a public PR body.
+            f"- **Branch**: `{worktree_path.name}`",
+            f"- **Inputs**: {', '.join(st.inputs) if st.inputs else '(none)'}",
+            f"- **Outputs**: {', '.join(st.outputs) if st.outputs else '(none)'}",
+        ]
+
+        if files_created:
+            lines.extend(
+                [
+                    "",
+                    "### Files touched",
+                    "",
+                    *(f"- `{p}`" for p in files_created[:50]),
+                ]
+            )
+
+        if llm:
+            calls = llm.get("calls")
+            tokens_in = llm.get("tokens_in")
+            tokens_out = llm.get("tokens_out")
+            stats_bits: list[str] = []
+            if isinstance(calls, int):
+                stats_bits.append(f"{calls} calls")
+            if isinstance(tokens_in, int):
+                stats_bits.append(f"{tokens_in} in")
+            if isinstance(tokens_out, int):
+                stats_bits.append(f"{tokens_out} out")
+            if stats_bits:
+                lines.extend(
+                    [
+                        "",
+                        "### LLM telemetry",
+                        "",
+                        "- " + " · ".join(stats_bits),
+                    ]
+                )
+
+        if ops:
+            lines.extend(
+                [
+                    "",
+                    "### Operations",
+                    "",
+                    f"- {len(ops)} operation(s) recorded by the coder agent.",
+                ]
+            )
+
+        return "\n".join(lines) + "\n"
+
+    async def _dispatch_pr_reviewer(
+        self,
+        *,
+        state: WorkflowState,
+        tid: str,
+        pr_number: int,
+        spec: str,
+        repo: str,
+        history: list[dict[str, Any]] | None,
+    ) -> str:
+        """Dispatch the ``pr-reviewer`` agent against a single PR.
+
+        Returns the verdict string (``approve`` / ``request-changes``
+        / ``comment``).  Defaults to ``comment`` on parse failure —
+        we never auto-merge an ambiguous review.
+        """
+        if not self._manager.is_running("pr-reviewer"):
+            logger.warning(
+                "gh_pr[%s]: pr-reviewer not running — defaulting to 'comment' verdict",
+                tid,
+            )
+            return "comment"
+
+        review_task = TaskMessage(
+            task_id=f"{state.workflow_id}_{tid}_pr_review",
+            agent_id="pr-reviewer",
+            payload={
+                "type": "ask",
+                "query": (
+                    f"Review PR #{pr_number} against the spec below.\n\n"
+                    f"=== SPEC ===\n{spec}\n\n"
+                    "=== INSTRUCTIONS ===\n"
+                    "Follow the pr-reviewer AGENT.md protocol. Read"
+                    f" the PR via `gh pr view {pr_number} --repo"
+                    f" {repo}` and `gh pr diff {pr_number} --repo"
+                    f" {repo}`. Post your review and emit the JSON"
+                    " verdict block as your final answer."
+                ),
+                "context": state.shared_context or "",
+                "workflow_id": state.workflow_id,
+                "sub_task_id": tid,
+                "pr_number": pr_number,
+                "spec": spec,
+                "base_repo": repo,
+                "merge_authority": "approve-only",
+                "conversation_history": history,
+            },
+            correlation_id=state.workflow_id,
+        )
+
+        try:
+            result = await self._orchestrator.dispatch(
+                review_task,
+                "pr-reviewer",
+                timeout=self._dispatch_timeout_seconds,
+            )
+        except Exception as exc:
+            logger.warning(
+                "gh_pr[%s]: pr-reviewer dispatch failed: %s",
+                tid,
+                exc,
+            )
+            return "comment"
+
+        if not result.success:
+            logger.warning(
+                "gh_pr[%s]: pr-reviewer returned failure: %s",
+                tid,
+                result.error,
+            )
+            return "comment"
+
+        data = result.result or {}
+        answer = data.get("answer", "") or ""
+        return self._parse_pr_verdict(answer)
+
+    @staticmethod
+    def _parse_pr_verdict(answer: str) -> str:
+        """Extract the verdict from the pr-reviewer's final answer.
+
+        The AGENT.md protocol asks the reviewer to emit a JSON block
+        with a ``verdict`` field as its final output.  We parse the
+        LAST valid JSON object containing a ``verdict`` key rather
+        than substring-matching the whole text — a substring match
+        can be fooled by a diff fragment containing the literal
+        ``"verdict": "approve"`` string (e.g. when reviewing tests
+        for this very function) and would lead to unsafe auto-approve.
+
+        Returns one of ``approve`` / ``request-changes`` / ``comment``.
+        Defaults to ``comment`` on parse failure — we never auto-merge
+        an ambiguous review.
+        """
+        import json
+        import re
+
+        # Match flat JSON objects containing a verdict key.  Non-
+        # recursive on purpose: the verdict block emitted by the
+        # AGENT.md protocol has no nested ``verdict`` objects, so a
+        # plain bracket-match is enough and avoids parsing the entire
+        # answer with a recursive descent grammar.
+        candidates = re.findall(
+            r'\{[^{}]*"verdict"[^{}]*\}', answer,
+        )
+        for blob in reversed(candidates):
+            try:
+                obj = json.loads(blob)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            verdict = obj.get("verdict")
+            if verdict in {"approve", "request-changes", "comment"}:
+                return verdict
+
+        # Loose fallback ONLY when no JSON block exists at all — so a
+        # diff fragment cannot win against a real reviewer verdict.
+        lower = answer.lower()
+        if "lgtm" in lower:
+            return "approve"
+        if "changes-requested" in lower or "changes requested" in lower:
+            return "request-changes"
+        return "comment"
+
+    async def _merge_approved_prs(
+        self,
+        *,
+        state: WorkflowState,
+        groups: list[list[str]],
+    ) -> tuple[int, list[tuple[int, str]]]:
+        """Merge approved PRs in dependency-group order.
+
+        *groups* comes straight from
+        ``DecompositionResult.parallelism_groups`` — group ``N`` is
+        merged before group ``N+1`` so the base branch stays in
+        sync with the workflow's dependency DAG.
+
+        Within a single group merges run sequentially (one PR at a
+        time) to avoid races where two PRs target ``main``
+        simultaneously and the second one needs a rebase.
+
+        Returns:
+            A ``(merged_count, failed_list)`` tuple.  ``failed_list``
+            is ``[(pr_number, error), ...]`` for every approved PR
+            whose ``gh pr merge`` call did not succeed — typically a
+            merge conflict introduced by the previously-merged PR.
+            Caller MUST surface these so the workflow does not return
+            ``success=True`` with broken merges left behind.
+        """
+        repo = self._resolve_repo_slug()
+        if not repo:
+            return 0, []
+
+        # Build an ordered list of (group_idx, tid) honouring the
+        # decomposer's groups.  Any PR not in groups (defensive) is
+        # appended to the end.
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for tid in group:
+                if tid in state.pr_states and tid not in seen:
+                    ordered.append(tid)
+                    seen.add(tid)
+        for tid in state.pr_states:
+            if tid not in seen:
+                ordered.append(tid)
+
+        merged = 0
+        failed: list[tuple[int, str]] = []
+        for tid in ordered:
+            pr_state = state.pr_states[tid]
+            if not pr_state.approved or pr_state.pr_number is None:
+                continue
+            if pr_state.merged:
+                continue
+            merge_res = merge_pr(
+                repo,
+                pr_state.pr_number,
+                self._gh_pr_merge_strategy,
+            )
+            pr_state.merged = merge_res.merged
+            if not merge_res.merged:
+                err = merge_res.error or "unknown"
+                pr_state.error = f"merge failed: {err}"
+                failed.append((pr_state.pr_number, err))
+                logger.warning(
+                    "gh_pr[%s]: merge PR #%d failed: %s",
+                    tid,
+                    pr_state.pr_number,
+                    err,
+                )
+                await self._emit_dashboard(
+                    "pr.merge_failed",
+                    detail=f"PR #{pr_state.pr_number}: {err}",
+                    workflow_id=state.workflow_id,
+                    project=state.project,
+                )
+                continue
+            merged += 1
+            logger.info(
+                "gh_pr[%s]: merged PR #%d (%s)",
+                tid,
+                pr_state.pr_number,
+                self._gh_pr_merge_strategy,
+            )
+            await self._emit_dashboard(
+                "pr.merged",
+                detail=f"PR #{pr_state.pr_number} ({tid})",
+                workflow_id=state.workflow_id,
+                project=state.project,
+            )
+        return merged, failed
 
     # ── Agent management ──────────────────────────────────────
 
@@ -1644,6 +2286,8 @@ class WorkflowEngine:
         """Start needed specialist agents."""
         needed = {agent_name_for_type(st.agent_type) for st in sub_tasks}
         needed.add("review-agent")
+        if self._gh_pr:
+            needed.add("pr-reviewer")
         started = []
         failed = []
 
@@ -1656,7 +2300,8 @@ class WorkflowEngine:
                 started.append(name)
                 logger.info("Started agent %s", name)
                 await self._emit_dashboard(
-                    "worker.online", agent_name=name,
+                    "worker.online",
+                    agent_name=name,
                     workflow_id=state.workflow_id if state else None,
                     project=state.project if state else None,
                 )
@@ -1702,12 +2347,14 @@ class WorkflowEngine:
             tid = match.group(1).upper()
             severity = match.group(2).lower()
             desc = match.group(3).strip()
-            issues.append(ReviewIssue(
-                task_id=tid,
-                description=desc,
-                detail=desc,
-                severity=severity,
-            ))
+            issues.append(
+                ReviewIssue(
+                    task_id=tid,
+                    description=desc,
+                    detail=desc,
+                    severity=severity,
+                )
+            )
 
         # Extract summary (first paragraph or first 200 chars).
         summary_lines = []
@@ -1742,8 +2389,7 @@ class WorkflowEngine:
                 # Agent never ran or result was lost.
                 none_count += 1
                 logger.warning(
-                    "Sub-task %s (%s) has no result — agent"
-                    " never ran or result was lost",
+                    "Sub-task %s (%s) has no result — agent never ran or result was lost",
                     tid,
                     sub_status.agent_name,
                 )
@@ -1764,9 +2410,7 @@ class WorkflowEngine:
 
             answer = data.get("answer", "")
             if answer:
-                answer_parts.append(
-                    f"## {tid}: {sub_status.sub_task.description}\n{answer}"
-                )
+                answer_parts.append(f"## {tid}: {sub_status.sub_task.description}\n{answer}")
             elif not sub_status.result.success:
                 answer_parts.append(
                     f"## {tid}: {sub_status.sub_task.description}\n"
@@ -1852,7 +2496,8 @@ class WorkflowEngine:
             files = tuple(data.get("files_created", []))
             review = state.per_task_reviews.get(tid)
             approved = (
-                review.approved if review is not None
+                review.approved
+                if review is not None
                 else bool(sub_status.result and sub_status.result.success)
             )
             out.append(
@@ -1944,11 +2589,13 @@ class WorkflowEngine:
                 workflow_id=workflow_id,
             )
             await self._context.event_bus.publish(
-                EVENT_TOPIC, event.to_bytes(),
+                EVENT_TOPIC,
+                event.to_bytes(),
             )
             logger.debug("Dashboard event: %s", event_type)
         except Exception:
             logger.warning(
-                "Failed to emit dashboard event %s", event_type,
+                "Failed to emit dashboard event %s",
+                event_type,
                 exc_info=True,
             )

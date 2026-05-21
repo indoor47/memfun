@@ -34,13 +34,17 @@ def _build_app() -> typer.Typer:
 
 @pytest.fixture
 def git_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A tmpdir that looks like a git repository.
+    """A tmpdir that is a real git working tree.
 
-    Only the marker (``.git/`` directory) is needed — the swarm command
-    just checks for the existence of that path before instantiating a
-    :class:`WorktreeManager`.
+    The swarm CLI uses ``git rev-parse --is-inside-work-tree`` to test
+    for a repo (so it works for worktrees + submodules), so a bare
+    ``.git/`` mkdir is not enough — we actually initialise one.
     """
-    (tmp_path / ".git").mkdir()
+    import subprocess
+
+    subprocess.run(
+        ("git", "init", "-q", "-b", "main"), cwd=str(tmp_path), check=True,
+    )
     monkeypatch.chdir(tmp_path)
     return tmp_path
 
