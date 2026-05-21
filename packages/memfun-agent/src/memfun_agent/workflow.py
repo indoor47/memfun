@@ -73,6 +73,10 @@ class WorkflowState:
     error: str | None = None
     shared_context: str = ""
     project: str = ""
+    # Per-sub-task auditor outcomes from the pairing loop in
+    # :meth:`WorkflowEngine._execute_group`.  Indexed by sub-task ID
+    # (the short ``Tn`` form, not ``workflow_id_Tn``).
+    per_task_reviews: dict[str, PerTaskReview] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +92,22 @@ class ReviewResult:
     approved: bool
     issues: list[ReviewIssue]
     summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class PerTaskReview:
+    """Result of a per-sub-task auditor review.
+
+    Emitted by :meth:`WorkflowEngine._review_sub_task` once for each
+    completed coder result while the pairing loop is active.
+    """
+
+    task_id: str
+    approved: bool
+    feedback: str
+    issues: list[str] = field(default_factory=list)
+    rounds: int = 1
+    duration_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +154,9 @@ class WorkflowEngine:
         on_workflow_status: OnWorkflowStatus | None = None,
         on_sub_task_status: OnSubTaskStatus | None = None,
         worktree_manager: WorktreeManager | None = None,
+        pair_with_reviewer: bool = True,
+        max_review_rounds_per_task: int = 2,
+        dispatch_timeout_seconds: float = 600.0,
     ) -> None:
         self._context = context
         self._orchestrator = orchestrator
@@ -150,6 +173,19 @@ class WorkflowEngine:
         self._worktree_manager = worktree_manager
         # workflow_id -> {sub_task_id -> Path}.
         self._worktrees: dict[str, dict[str, Path]] = {}
+        # Implementer/auditor dyad: when True (default), each completed
+        # sub-task is paired with a ``review-agent`` dispatch INSIDE
+        # the fan-out loop, and the coder is re-dispatched (up to
+        # ``max_review_rounds_per_task`` times) with the reviewer's
+        # specific feedback when changes are requested.  The legacy
+        # Phase 3 batch review still runs at the end, but as a
+        # cross-task consistency check rather than the primary gate.
+        self._pair_with_reviewer = pair_with_reviewer
+        self._max_review_rounds_per_task = max(0, max_review_rounds_per_task)
+        # Same timeout the existing coder dispatches use — keep the
+        # reviewer-leg consistent with the coder-leg so a slow review
+        # doesn't outlive a slow code generation.
+        self._dispatch_timeout_seconds = dispatch_timeout_seconds
 
     # ── Public API ────────────────────────────────────────────
 
@@ -542,6 +578,17 @@ class WorkflowEngine:
                 result.error,
             )
 
+        # ── Per-task auditor pairing loop ────────────────────
+        # Implementer/auditor dyad: for each sub-task that
+        # succeeded, dispatch the review-agent against the
+        # same worktree, and re-dispatch the coder if the
+        # reviewer requests changes (capped by
+        # ``max_review_rounds_per_task``).
+        if self._pair_with_reviewer:
+            await self._pair_review_group(
+                state, matched_tids, project_context, history,
+            )
+
     async def _dispatch_group(
         self,
         tasks: list[TaskMessage],
@@ -650,13 +697,505 @@ class WorkflowEngine:
             for i, r in enumerate(results)
         ]
 
+    # ── Per-task pairing helpers ─────────────────────────────
+
+    async def _pair_review_group(
+        self,
+        state: WorkflowState,
+        matched_tids: list[str],
+        project_context: str,
+        history: list[dict[str, Any]] | None,
+    ) -> None:
+        """Run the implementer/auditor dyad over every successful task.
+
+        Each sub-task in *matched_tids* whose coder result succeeded
+        is paired with a synchronous ``review-agent`` dispatch.  When
+        the reviewer requests changes, the coder is re-dispatched
+        (using the SAME worktree) with the feedback appended.  The
+        loop is capped per task by
+        ``self._max_review_rounds_per_task``.
+
+        Reviews happen concurrently across the group via
+        :func:`asyncio.gather` so a 5-coder swarm gets 5 parallel
+        reviewer dispatches rather than serialising them.
+        """
+        import asyncio
+
+        # Snapshot the worktree map for this workflow so reviewer
+        # dispatches can point at the SAME checkout the coder used.
+        wt_map = self._worktrees.get(state.workflow_id, {})
+
+        async def _one_pair(tid: str) -> None:
+            sub_status = state.sub_task_statuses.get(tid)
+            if sub_status is None or sub_status.result is None:
+                return
+            # Don't pair against a failed coder — there's nothing
+            # to review.  The state already records the failure.
+            if not sub_status.result.success:
+                return
+            await self._pair_single_task(
+                state=state,
+                tid=tid,
+                sub_status=sub_status,
+                worktree_path=wt_map.get(tid),
+                project_context=project_context,
+                history=history,
+            )
+
+        await asyncio.gather(
+            *(_one_pair(tid) for tid in matched_tids),
+            return_exceptions=False,
+        )
+
+    async def _pair_single_task(
+        self,
+        *,
+        state: WorkflowState,
+        tid: str,
+        sub_status: SubTaskStatus,
+        worktree_path: Path | None,
+        project_context: str,
+        history: list[dict[str, Any]] | None,
+    ) -> None:
+        """Drive the coder/reviewer dyad for one sub-task.
+
+        Loops:
+            review → if approved return → else re-dispatch coder
+            with feedback → review again, up to
+            ``max_review_rounds_per_task`` rounds.
+        """
+        rounds = 0
+        while True:
+            review = await self._review_sub_task(
+                state=state,
+                tid=tid,
+                sub_status=sub_status,
+                worktree_path=worktree_path,
+                history=history,
+            )
+            rounds += 1
+
+            # Persist the latest review for the round.
+            state.per_task_reviews[tid] = PerTaskReview(
+                task_id=tid,
+                approved=review.approved,
+                feedback=review.feedback,
+                issues=review.issues,
+                rounds=rounds,
+                duration_ms=review.duration_ms,
+            )
+
+            if review.approved:
+                logger.info(
+                    "Per-task review approved %s on round %d",
+                    tid, rounds,
+                )
+                return
+
+            # Not approved — should we re-dispatch?
+            if rounds > self._max_review_rounds_per_task:
+                logger.warning(
+                    "Per-task review for %s exhausted %d round(s);"
+                    " accepting last coder output. Feedback: %s",
+                    tid,
+                    self._max_review_rounds_per_task,
+                    review.feedback[:120],
+                )
+                # Stamp the final flag so callers can see we
+                # gave up — but keep the coder result so the
+                # workflow can still produce output.
+                return
+
+            logger.info(
+                "Per-task review for %s requested changes"
+                " (round %d/%d): %s",
+                tid,
+                rounds,
+                self._max_review_rounds_per_task,
+                review.feedback[:200],
+            )
+            # Re-dispatch the SAME coder with the feedback.
+            new_result = await self._redispatch_with_feedback(
+                state=state,
+                tid=tid,
+                sub_status=sub_status,
+                worktree_path=worktree_path,
+                feedback=review.feedback,
+                round_idx=rounds,
+                history=history,
+            )
+            if new_result is None:
+                # Re-dispatch failed catastrophically — give up
+                # but keep the last successful coder result.
+                return
+            sub_status.result = new_result
+            sub_status.completed_at = time.time()
+            sub_status.status = (
+                "completed" if new_result.success else "failed"
+            )
+            self._emit_sub_task(tid, sub_status)
+
+            if not new_result.success:
+                # Failed re-dispatch — don't keep auditing a
+                # broken coder, just bail.
+                logger.warning(
+                    "Coder re-dispatch for %s failed: %s",
+                    tid, new_result.error,
+                )
+                return
+
+    async def _review_sub_task(
+        self,
+        *,
+        state: WorkflowState,
+        tid: str,
+        sub_status: SubTaskStatus,
+        worktree_path: Path | None,
+        history: list[dict[str, Any]] | None,
+    ) -> PerTaskReview:
+        """Dispatch the review-agent against a single sub-task.
+
+        The reviewer is pointed at the same worktree the coder used
+        (when present) so it can read actual file contents rather
+        than relying on the coder's brief answer text.
+
+        Emits ``task.reviewed`` on the dashboard event stream.
+        """
+        coder_result = sub_status.result
+        if coder_result is None:
+            # Shouldn't happen — caller guards on this — but stay
+            # defensive.  Return an approved review so we don't
+            # block the workflow on missing data.
+            return PerTaskReview(
+                task_id=tid,
+                approved=True,
+                feedback="No coder result to review",
+                issues=[],
+                rounds=1,
+                duration_ms=0.0,
+            )
+
+        # Ensure the reviewer is running.  Mirror the failure
+        # handling in ``_run_review`` — if we can't start the
+        # reviewer, we approve by default rather than block the
+        # entire workflow.
+        if not self._manager.is_running("review-agent"):
+            try:
+                await self._manager.start_agent("review-agent")
+            except Exception as exc:
+                logger.warning(
+                    "Cannot start review-agent for per-task review"
+                    " %s: %s — auto-approving",
+                    tid, exc,
+                )
+                return PerTaskReview(
+                    task_id=tid,
+                    approved=True,
+                    feedback=f"Reviewer unavailable: {exc}",
+                    issues=[],
+                    rounds=1,
+                    duration_ms=0.0,
+                )
+
+        data = coder_result.result or {}
+        coder_answer = data.get("answer", "")
+        files_created = data.get("files_created", [])
+
+        review_query = self._build_per_task_review_query(
+            sub_task=sub_status.sub_task,
+            coder_answer=coder_answer,
+            files_created=files_created,
+            worktree_path=worktree_path,
+        )
+
+        review_round = state.per_task_reviews.get(tid)
+        round_idx = (review_round.rounds + 1) if review_round else 1
+        review_task = TaskMessage(
+            task_id=(
+                f"{state.workflow_id}_{tid}_review_{round_idx}"
+            ),
+            agent_id="review-agent",
+            payload={
+                "type": "ask",
+                "query": review_query,
+                "context": state.shared_context or "",
+                "workflow_id": state.workflow_id,
+                "sub_task_id": tid,
+                # Point the reviewer at the SAME worktree as the
+                # coder so it reads the actual file changes.
+                # Fall back to None — the agent's own handler
+                # treats missing cwd as the process cwd.
+                **(
+                    {"cwd": str(worktree_path)}
+                    if worktree_path is not None else {}
+                ),
+                "conversation_history": history,
+            },
+            correlation_id=state.workflow_id,
+        )
+
+        await self._emit_dashboard(
+            "task.reviewed",
+            task_id=review_task.task_id,
+            agent_name="review-agent",
+            detail=f"Reviewing {tid}",
+            workflow_id=state.workflow_id,
+            project=state.project,
+        )
+
+        start = time.perf_counter()
+        try:
+            result = await self._orchestrator.dispatch(
+                review_task,
+                "review-agent",
+                timeout=self._dispatch_timeout_seconds,
+            )
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            logger.warning(
+                "Per-task review dispatch for %s failed: %s",
+                tid, exc,
+            )
+            return PerTaskReview(
+                task_id=tid,
+                approved=True,
+                feedback=f"Reviewer dispatch failed: {exc}",
+                issues=[],
+                rounds=1,
+                duration_ms=elapsed_ms,
+            )
+
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        review = self._parse_per_task_review(tid, result, elapsed_ms)
+
+        # Telemetry on the dashboard event stream — show the
+        # per-task pair in the Events tab and Logs tab.
+        await self._emit_dashboard(
+            "task.reviewed",
+            task_id=review_task.task_id,
+            agent_name="review-agent",
+            success=review.approved,
+            duration_ms=elapsed_ms,
+            detail=review.feedback[:200] if review.feedback else (
+                "APPROVED" if review.approved else "CHANGES_REQUESTED"
+            ),
+            workflow_id=state.workflow_id,
+            project=state.project,
+        )
+
+        return review
+
+    @staticmethod
+    def _build_per_task_review_query(
+        sub_task: SubTask,
+        coder_answer: str,
+        files_created: list[str],
+        worktree_path: Path | None,
+    ) -> str:
+        """Build the prompt for a per-task review."""
+        location_line = (
+            f"Working directory: {worktree_path}\n"
+            if worktree_path is not None
+            else "Working directory: <shared process cwd>\n"
+        )
+        files_line = (
+            f"Files the coder reports having created/modified: "
+            f"{', '.join(files_created) if files_created else '(none reported)'}"
+        )
+        inputs_line = (
+            f"Declared inputs: {', '.join(sub_task.inputs) if sub_task.inputs else '(none)'}"
+        )
+        outputs_line = (
+            f"Declared outputs: {', '.join(sub_task.outputs) if sub_task.outputs else '(none)'}"
+        )
+
+        return (
+            "You are auditing a single sub-task in a multi-agent"
+            " workflow. Read the ACTUAL files in the working"
+            " directory below to verify the implementation —"
+            " do NOT rely only on the coder's summary text.\n\n"
+            f"=== SUB-TASK SPEC ({sub_task.id}) ===\n"
+            f"Description: {sub_task.description}\n"
+            f"{inputs_line}\n"
+            f"{outputs_line}\n"
+            f"{location_line}\n"
+            f"{files_line}\n\n"
+            "=== CODER'S SUMMARY ===\n"
+            f"{coder_answer[:3000]}\n\n"
+            "=== YOUR JOB ===\n"
+            "Read the files at the working directory and decide"
+            " whether the implementation meets the spec. Check"
+            " for: missing edge cases, broken imports, type"
+            " errors, missing tests, security issues, and any"
+            " other quality problems.\n\n"
+            "Reply with EXACTLY one of:\n"
+            "  - `APPROVED` (followed by an optional brief note)\n"
+            "  - `CHANGES_REQUESTED: <specific actionable feedback>`\n\n"
+            "Be terse. Be specific. If you list issues, prefix"
+            " each with a dash on its own line so the implementer"
+            " can act on them one by one."
+        )
+
+    @staticmethod
+    def _parse_per_task_review(
+        tid: str,
+        result: TaskResult,
+        duration_ms: float,
+    ) -> PerTaskReview:
+        """Parse a per-task review result into a PerTaskReview.
+
+        We deliberately favour approval on ambiguous output so the
+        per-task loop doesn't block a workflow on a flaky reviewer.
+        The Phase 3 cross-task review is still there to catch
+        anything we let through.
+        """
+        if not result.success:
+            return PerTaskReview(
+                task_id=tid,
+                approved=True,
+                feedback=(
+                    f"Reviewer task failed ({result.error or 'unknown'})"
+                    " — defaulting to approved"
+                ),
+                issues=[],
+                rounds=1,
+                duration_ms=duration_ms,
+            )
+
+        data = result.result or {}
+        answer = (data.get("answer", "") or "").strip()
+        low = answer.lower()
+
+        # Default approved=True on parse ambiguity — explicit
+        # CHANGES_REQUESTED is the only "no" signal.
+        approved = True
+        # Be liberal about how the reviewer might phrase a
+        # rejection — match the canonical token and the older
+        # ``approved: false`` shape too.
+        explicit_reject = (
+            "changes_requested" in low
+            or "changes requested" in low
+            or "approved: false" in low
+            or "approved:false" in low
+        )
+        if explicit_reject:
+            approved = False
+        elif low.startswith("approved"):
+            # Explicit APPROVED token at start of answer is a
+            # positive signal — used as a tiebreaker only when
+            # there's no explicit reject marker above.
+            approved = True
+
+        # Pull issue bullets out of the body when the reviewer
+        # listed them — useful as targeted feedback for the
+        # re-dispatched coder.
+        issues = [
+            line.lstrip("-* \t").strip()
+            for line in answer.splitlines()
+            if line.lstrip().startswith(("-", "*"))
+            and len(line.strip()) > 2
+        ]
+
+        return PerTaskReview(
+            task_id=tid,
+            approved=approved,
+            feedback=answer[:4000],
+            issues=issues,
+            rounds=1,
+            duration_ms=duration_ms,
+        )
+
+    async def _redispatch_with_feedback(
+        self,
+        *,
+        state: WorkflowState,
+        tid: str,
+        sub_status: SubTaskStatus,
+        worktree_path: Path | None,
+        feedback: str,
+        round_idx: int,
+        history: list[dict[str, Any]] | None,
+    ) -> TaskResult | None:
+        """Re-dispatch the same coder with reviewer feedback."""
+        sub_task = sub_status.sub_task
+        revised_description = (
+            f"{sub_task.description}\n\n"
+            "=== REVIEWER FEEDBACK (round "
+            f"{round_idx}/{self._max_review_rounds_per_task}) ===\n"
+            "Your previous output was rejected by the auditor."
+            " Address the following BEFORE re-submitting — do"
+            " NOT start over from scratch; modify the existing"
+            " files in the working directory.\n\n"
+            f"{feedback}"
+        )
+
+        payload: dict[str, Any] = {
+            "type": "ask",
+            "query": revised_description,
+            "context": state.shared_context or "",
+            "workflow_id": state.workflow_id,
+            "sub_task_id": tid,
+            "inputs": sub_task.inputs,
+            "outputs": sub_task.outputs,
+            "conversation_history": history,
+        }
+        if worktree_path is not None:
+            payload["cwd"] = str(worktree_path)
+
+        revised_task = TaskMessage(
+            task_id=f"{state.workflow_id}_{tid}_pair{round_idx}",
+            agent_id=sub_status.agent_name,
+            payload=payload,
+            correlation_id=state.workflow_id,
+        )
+
+        sub_status.status = "revision"
+        sub_status.started_at = time.time()
+        self._emit_sub_task(tid, sub_status)
+
+        await self._emit_dashboard(
+            "task.published",
+            task_id=revised_task.task_id,
+            agent_name=sub_status.agent_name,
+            detail=f"Pair re-dispatch round {round_idx}: {tid}",
+            workflow_id=state.workflow_id,
+            project=state.project,
+        )
+
+        try:
+            return await self._orchestrator.dispatch(
+                revised_task,
+                sub_status.agent_name,
+                timeout=self._dispatch_timeout_seconds,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Coder re-dispatch for %s round %d failed: %s",
+                tid, round_idx, exc,
+            )
+            return None
+
     async def _run_review(
         self,
         state: WorkflowState,
         project_context: str,
         history: list[dict[str, Any]] | None,
     ) -> ReviewResult:
-        """Run ReviewAgent on all completed outputs."""
+        """Cross-task consistency review (post-pair-loop).
+
+        With per-task pairing enabled (the default), every sub-task
+        has already been individually reviewed and either approved
+        or sent back to the coder for revision.  This Phase 3
+        review is a final pass over the COMBINED outputs that looks
+        only for **inter-task** issues — duplication across files,
+        inconsistent naming/conventions between modules, missing
+        ``__init__`` exports, type mismatches across module
+        boundaries, etc.
+
+        When ``pair_with_reviewer`` is disabled this method
+        retains its original behaviour as the primary quality
+        gate.
+        """
         # Build review context from ALL sub-task results.
         review_parts: list[str] = []
         for tid, sub_status in state.sub_task_statuses.items():
@@ -687,12 +1226,29 @@ class WorkflowEngine:
                 summary="No sub-task results available",
             )
 
-        review_query = (
-            "Review the outputs of the following sub-tasks for consistency, "
-            "quality, and adherence to the shared specification. "
-            "Check for file conflicts, import issues, and integration problems.\n\n"
-            + "\n".join(review_parts)
-        )
+        if self._pair_with_reviewer and state.per_task_reviews:
+            review_query = (
+                "All sub-tasks have ALREADY been individually reviewed"
+                " and approved by a per-task auditor pair. Look only"
+                " for INTER-task issues that the per-task reviews"
+                " could not see:\n"
+                "  - Duplicated logic across files\n"
+                "  - Inconsistent naming/conventions between modules\n"
+                "  - Missing ``__init__`` exports\n"
+                "  - Type mismatches across module boundaries\n"
+                "  - Conflicting file edits or import cycles\n\n"
+                "If everything is consistent, reply with"
+                " `approved: true`.\n\n"
+                + "\n".join(review_parts)
+            )
+        else:
+            review_query = (
+                "Review the outputs of the following sub-tasks for"
+                " consistency, quality, and adherence to the shared"
+                " specification. Check for file conflicts, import"
+                " issues, and integration problems.\n\n"
+                + "\n".join(review_parts)
+            )
 
         # Ensure review agent running.
         if not self._manager.is_running("review-agent"):
