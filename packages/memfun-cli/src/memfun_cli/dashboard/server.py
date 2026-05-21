@@ -612,6 +612,122 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     text-overflow: ellipsis; white-space: nowrap;
   }
 
+  /* Tab bar (Events / Logs / Stats) */
+  .tab-bar {
+    display: flex; gap: 4px;
+    padding: 4px 8px;
+    align-items: stretch;
+  }
+  .tab-btn {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 6px 12px;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+  }
+  .tab-btn:hover {
+    background: rgba(255,255,255,0.04);
+    color: var(--text);
+  }
+  .tab-btn.active {
+    color: var(--text);
+    font-weight: 600;
+    border-bottom: 2px solid var(--accent);
+  }
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  /* Logs tab */
+  .log-line {
+    padding: 3px 10px;
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    display: flex; gap: 8px; align-items: baseline;
+    white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .log-ts { color: var(--muted); flex-shrink: 0; }
+  .log-task {
+    color: var(--accent);
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .log-type {
+    font-weight: 600;
+    flex-shrink: 0;
+    width: 96px;
+  }
+  .log-type.type-task-picked_up { color: var(--yellow); }
+  .log-type.type-task-completed { color: var(--green); }
+  .log-type.type-task-failed { color: var(--red); }
+  .log-type.type-workflow-started { color: var(--purple); }
+  .log-type.type-workflow-completed { color: var(--purple); }
+  .log-detail {
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .log-hint {
+    padding: 12px 16px;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.5;
+    font-style: italic;
+  }
+
+  /* Stats tab */
+  .stats-wrap { padding: 12px 16px; }
+  .stats-grid {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    column-gap: 16px;
+    row-gap: 6px;
+    font-size: 12px;
+    margin-bottom: 16px;
+  }
+  .stats-grid dt {
+    color: var(--muted);
+  }
+  .stats-grid dd {
+    color: var(--text);
+    font-weight: 600;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .stats-section-title {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--muted);
+    margin: 8px 0 6px;
+  }
+  .stats-evtypes {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+  }
+  .stats-evtypes td {
+    padding: 3px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .stats-evtypes td.evtype-name { color: var(--muted); }
+  .stats-evtypes td.evtype-count {
+    text-align: right;
+    color: var(--text);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
@@ -667,10 +783,16 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Middle bottom: Event Stream -->
+    <!-- Middle bottom: Event Stream / Logs / Stats (tabbed) -->
     <div class="panel">
-      <div class="panel-title">Event Stream</div>
-      <div class="panel-content" id="events"></div>
+      <div class="panel-title tab-bar" role="tablist">
+        <button class="tab-btn active" data-tab="events" type="button">Events</button>
+        <button class="tab-btn" data-tab="logs" type="button">Logs</button>
+        <button class="tab-btn" data-tab="stats" type="button">Stats</button>
+      </div>
+      <div class="panel-content tab-pane active" id="events"></div>
+      <div class="panel-content tab-pane" id="logs"></div>
+      <div class="panel-content tab-pane" id="stats"></div>
     </div>
   </div>
 </div>
@@ -681,6 +803,8 @@ const ws = new WebSocket(`ws://${location.host}/ws`);
 const workersEl = document.getElementById('workers');
 const tasksEl = document.getElementById('tasks');
 const eventsEl = document.getElementById('events');
+const logsEl = document.getElementById('logs');
+const statsEl = document.getElementById('stats');
 const requestListEl = document.getElementById('request-list');
 const showAllBtn = document.getElementById('show-all-btn');
 const projectLabel = document.getElementById('project-label');
@@ -691,6 +815,17 @@ let requests = {};
 let allEvents = [];
 let activeRequest = null;  // null = show all
 let resolved = 0;
+
+// Tabbed right-column state (shared across tabs).
+const LOG_EVENT_TYPES = new Set([
+  'task.picked_up', 'task.completed', 'task.failed',
+  'workflow.started', 'workflow.completed',
+]);
+const MAX_LOGS = 500;
+let logs = [];                 // newest first
+let eventCounts = {};          // event_type -> count
+let workflowStart = null;      // first event ts (epoch seconds)
+let activeTab = 'events';
 
 // ── WebSocket ─────────────────────────────────────────────
 ws.onmessage = (e) => {
@@ -705,12 +840,29 @@ ws.onmessage = (e) => {
     resolved = Object.values(tasks)
       .filter(t => t.status === 'completed').length;
     allEvents = [];
-    (msg.events || []).forEach(ev => allEvents.push(ev));
+    logs = [];
+    eventCounts = {};
+    workflowStart = null;
+    (msg.events || []).forEach(ev => {
+      allEvents.push(ev);
+      ingestForTabs(ev);
+    });
     renderAll();
   } else if (msg.type === 'event') {
     handleEvent(msg.data);
   }
 };
+
+// Update logs / counts / workflowStart from a single event.
+function ingestForTabs(ev) {
+  const et = ev.event_type || '';
+  eventCounts[et] = (eventCounts[et] || 0) + 1;
+  if (workflowStart === null && ev.ts) workflowStart = ev.ts;
+  if (LOG_EVENT_TYPES.has(et)) {
+    logs.unshift(ev);
+    if (logs.length > MAX_LOGS) logs.length = MAX_LOGS;
+  }
+}
 
 function escHtml(s) {
   const d = document.createElement('div');
@@ -791,6 +943,7 @@ function handleEvent(ev) {
   allEvents.push(ev);
   if (allEvents.length > 500) allEvents.shift();
 
+  ingestForTabs(ev);
   renderAll();
 }
 
@@ -819,7 +972,19 @@ function renderAll() {
   renderWorkers();
   renderTasks();
   renderEvents();
-  renderStats();
+  renderLogs();
+  renderStatsPane();
+  renderHeaderStats();
+}
+
+// Cheap "render only the active right-column pane" used by the
+// 1s interval timer.  Events/Logs are timestamp-bearing so the
+// "time since" deltas should refresh even when no new event arrives.
+function renderActivePane() {
+  if (activeTab === 'logs') renderLogs();
+  else if (activeTab === 'stats') renderStatsPane();
+  // Events tab already reflects allEvents on every WS message; no
+  // delta in it changes purely with wall-clock time.
 }
 
 function renderRequests() {
@@ -933,7 +1098,7 @@ function renderEvents() {
   });
 }
 
-function renderStats() {
+function renderHeaderStats() {
   const ft = filteredTasks();
   const tkeys = Object.keys(ft);
   const wkeys = Object.keys(workers);
@@ -946,6 +1111,176 @@ function renderStats() {
   document.getElementById('stat-resolved')
     .textContent = res;
 }
+
+// ── Logs tab ──────────────────────────────────────────────
+function shortType(et) {
+  // 'task.picked_up' -> 'picked_up'
+  return (et || '').split('.').slice(1).join('.') || et || '';
+}
+
+function fmtTimeShort(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return hh + ':' + mm + ':' + ss;
+}
+
+function taskLabel(ev) {
+  if (!ev.task_id) return '';
+  // Show short prefix of the task ID
+  return 'T' + ev.task_id.substring(0, 6);
+}
+
+function logDetail(ev) {
+  const et = ev.event_type || '';
+  if (et === 'task.picked_up') {
+    return 'by ' + (ev.agent_name || ev.worker_id || 'worker');
+  }
+  if (et === 'task.completed') {
+    const dur = ev.duration_ms
+      ? ' in ' + (ev.duration_ms / 1000).toFixed(1) + 's'
+      : '';
+    return (ev.success === false ? 'failed' : 'ok') + dur;
+  }
+  if (et === 'task.failed') {
+    return ev.detail || 'error';
+  }
+  if (et === 'workflow.started' || et === 'workflow.completed') {
+    return ev.detail || ev.workflow_id || '';
+  }
+  return ev.detail || '';
+}
+
+function renderLogs() {
+  if (!logsEl) return;
+  const visible = activeRequest
+    ? logs.filter(ev => ev.workflow_id === activeRequest)
+    : logs;
+  if (visible.length === 0) {
+    logsEl.innerHTML =
+      '<div class="log-hint">' +
+      'Filtering for high-level lifecycle events ' +
+      '(picked_up, completed, failed). ' +
+      'Switch to Events for the full stream.' +
+      '</div>';
+    return;
+  }
+  const rows = visible.slice(0, MAX_LOGS).map(ev => {
+    const et = ev.event_type || '';
+    const cls = 'type-' + et.split('.').join('-');
+    return '<div class="log-line">' +
+      '<span class="log-ts">[' + escHtml(fmtTimeShort(ev.ts)) + ']</span>' +
+      '<span class="log-task">' + escHtml(taskLabel(ev)) + '</span>' +
+      '<span class="log-type ' + cls + '">' +
+        escHtml(shortType(et)) + '</span>' +
+      '<span class="log-detail">' + escHtml(logDetail(ev)) + '</span>' +
+    '</div>';
+  });
+  logsEl.innerHTML = rows.join('');
+}
+
+// ── Stats tab ─────────────────────────────────────────────
+function formatDuration(seconds) {
+  if (!seconds || seconds < 0) return '0s';
+  const s = Math.floor(seconds);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return m + 'm ' + rs + 's';
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return h + 'h ' + rm + 'm';
+}
+
+function renderStatsPane() {
+  if (!statsEl) return;
+  const totalEvents = Object.values(eventCounts)
+    .reduce((a, b) => a + b, 0);
+  if (totalEvents === 0) {
+    statsEl.innerHTML =
+      '<div class="empty">Waiting for events...</div>';
+    return;
+  }
+  const tvals = Object.values(tasks);
+  const running = tvals.filter(t => t.status === 'running').length;
+  const done = tvals.filter(t => t.status === 'completed').length;
+  const failed = tvals.filter(t => t.status === 'failed').length;
+  const pending = tvals.filter(t => t.status === 'pending').length;
+
+  const wvals = Object.values(workers);
+  const busy = wvals.filter(w => w.status === 'busy').length;
+  const idle = wvals.filter(w => w.status === 'idle').length;
+
+  const durations = tvals
+    .filter(t => typeof t.duration_ms === 'number')
+    .map(t => t.duration_ms);
+  const avg = durations.length
+    ? Math.round(
+        durations.reduce((a, b) => a + b, 0) / durations.length,
+      )
+    : null;
+
+  const now = Date.now() / 1000;
+  const sinceStart = workflowStart
+    ? formatDuration(now - workflowStart)
+    : '-';
+
+  const grid = [
+    ['Total events', String(totalEvents)],
+    ['Tasks running', String(running)],
+    ['Tasks pending', String(pending)],
+    ['Tasks done', String(done)],
+    ['Tasks failed', String(failed)],
+    ['Workers busy', String(busy)],
+    ['Workers idle', String(idle)],
+    ['Avg task duration', avg === null ? '-' : avg + ' ms'],
+    ['Time since start', sinceStart],
+  ];
+  const dl =
+    '<dl class="stats-grid">' +
+    grid.map(([k, v]) =>
+      '<dt>' + escHtml(k) + '</dt>' +
+      '<dd>' + escHtml(v) + '</dd>',
+    ).join('') +
+    '</dl>';
+
+  const sortedCounts = Object.entries(eventCounts)
+    .sort((a, b) => b[1] - a[1]);
+  const table =
+    '<div class="stats-section-title">Events by type</div>' +
+    '<table class="stats-evtypes"><tbody>' +
+    sortedCounts.map(([k, v]) =>
+      '<tr>' +
+      '<td class="evtype-name">' + escHtml(k) + '</td>' +
+      '<td class="evtype-count">' + v + '</td>' +
+      '</tr>',
+    ).join('') +
+    '</tbody></table>';
+
+  statsEl.innerHTML = '<div class="stats-wrap">' + dl + table + '</div>';
+}
+
+// ── Tab switching ─────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.tab;
+    if (!tab) return;
+    activeTab = tab;
+    document.querySelectorAll('.tab-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.tab === tab);
+    });
+    document.querySelectorAll('.tab-pane').forEach(p => {
+      p.classList.toggle('active', p.id === tab);
+    });
+    renderActivePane();
+  });
+});
+
+// Refresh the active pane every second so wall-clock fields
+// (time-since-start) stay current even with no new events.
+setInterval(renderActivePane, 1000);
 
 // ── Show All button ───────────────────────────────────────
 showAllBtn.addEventListener('click', () => {
