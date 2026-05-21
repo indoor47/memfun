@@ -406,7 +406,21 @@ class WorkflowEngine:
         project_context: str,
         history: list[dict[str, Any]] | None,
     ) -> None:
-        """Execute a parallelism group via orchestrator.fan_out()."""
+        """Execute a parallelism group, dispatching to per-instance pools.
+
+        When the same ``agent_type`` appears multiple times in *group*,
+        we delegate to :meth:`AgentOrchestrator.fan_out_to_pool` so each
+        sub-task runs on its **own** ``BaseAgent`` instance (sidesteps
+        the single-instance-per-name parallelism cap — see issue #12).
+
+        For mixed-type groups (e.g. one ``file`` + one ``coder``) the
+        engine still routes through a pool per agent name, but each
+        pool only has the one task it needs.
+
+        Falls back to the bare ``fan_out`` path when ``fan_out_to_pool``
+        is unavailable (older orchestrators) so this method remains a
+        drop-in replacement.
+        """
         tasks: list[TaskMessage] = []
         agent_names: list[str] = []
         matched_tids: list[str] = []
@@ -483,8 +497,8 @@ class WorkflowEngine:
                     workflow_id=state.workflow_id,
                     project=state.project,
                 )
-        results = await self._orchestrator.fan_out(
-            tasks, agent_names, timeout=600.0,
+        results = await self._dispatch_group(
+            tasks, agent_names, matched_tids,
         )
 
         # Zip results back using matched_tids (not group)
@@ -527,6 +541,116 @@ class WorkflowEngine:
                 len(data.get("files_created", [])),
                 result.error,
             )
+
+    async def _dispatch_group(
+        self,
+        tasks: list[TaskMessage],
+        agent_names: list[str],
+        matched_tids: list[str],
+    ) -> list[TaskResult]:
+        """Dispatch tasks, using per-instance pools when names repeat.
+
+        When two or more sub-tasks in the same parallel group target the
+        same agent **name** (i.e. the same specialist type), the single
+        already-running instance cannot truly run them in parallel —
+        ``BaseAgent.handle`` serialises on the one Python object.  This
+        method groups sub-tasks by agent name and routes each repeated
+        group through :meth:`AgentOrchestrator.fan_out_to_pool`, which
+        lazily starts additional instances.
+
+        Singleton groups (one task → one name) take the original
+        :meth:`AgentOrchestrator.fan_out` path so the legacy contract
+        (and existing test mocks) is preserved.
+
+        Returns results aligned with the input *tasks* order.
+        """
+        # Group indices by agent name.
+        by_name: dict[str, list[int]] = {}
+        for idx, name in enumerate(agent_names):
+            by_name.setdefault(name, []).append(idx)
+
+        results: list[TaskResult | None] = [None] * len(tasks)
+
+        # If every name appears exactly once, the legacy fan_out path is
+        # the simplest correct behaviour — one task per running instance.
+        if all(len(v) == 1 for v in by_name.values()):
+            raw = await self._orchestrator.fan_out(
+                tasks, agent_names, timeout=600.0,
+            )
+            return list(raw)
+
+        # Repeats present — dispatch one pool-call per repeated name and
+        # one direct fan_out for singletons (keeps behaviour predictable
+        # when other tests mock fan_out specifically).
+        import asyncio
+
+        async def _pool_dispatch(
+            name: str,
+            indices: list[int],
+        ) -> list[TaskResult]:
+            sub_tasks = [tasks[i] for i in indices]
+            pool_fn = getattr(
+                self._orchestrator, "fan_out_to_pool", None,
+            )
+            if pool_fn is None or len(indices) == 1:
+                # Backward-compat or single-task: use plain fan_out.
+                return await self._orchestrator.fan_out(
+                    sub_tasks,
+                    [name] * len(sub_tasks),
+                    timeout=600.0,
+                )
+            try:
+                return await pool_fn(
+                    sub_tasks, name, timeout=600.0,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "fan_out_to_pool(%s, %d) failed: %s; "
+                    "falling back to fan_out",
+                    name, len(sub_tasks), exc,
+                )
+                return await self._orchestrator.fan_out(
+                    sub_tasks,
+                    [name] * len(sub_tasks),
+                    timeout=600.0,
+                )
+
+        coros = [
+            _pool_dispatch(name, indices)
+            for name, indices in by_name.items()
+        ]
+        # Run all pool dispatches concurrently so distinct agent types
+        # still execute in parallel.
+        gathered = await asyncio.gather(*coros, return_exceptions=False)
+
+        for (name, indices), sub_results in zip(
+            by_name.items(), gathered, strict=False,
+        ):
+            for local_idx, global_idx in enumerate(indices):
+                if local_idx < len(sub_results):
+                    results[global_idx] = sub_results[local_idx]
+                else:
+                    # Pool returned fewer results than requested —
+                    # synthesise a failure rather than leaving None.
+                    results[global_idx] = TaskResult(
+                        task_id=tasks[global_idx].task_id,
+                        agent_id=name,
+                        success=False,
+                        error="No result returned from pool dispatch",
+                    )
+            _ = matched_tids  # kept for future logging hooks
+
+        # Replace any leftover Nones with explicit failures.
+        return [
+            r if r is not None
+            else TaskResult(
+                task_id=tasks[i].task_id,
+                agent_id=agent_names[i],
+                success=False,
+                error="Sub-task produced no result",
+            )
+            for i, r in enumerate(results)
+        ]
 
     async def _run_review(
         self,
