@@ -68,6 +68,34 @@ class SandboxBackendConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkflowConfig:
+    """Multi-agent workflow / swarm execution settings.
+
+    Read from the ``[workflow]`` section of ``memfun.toml``.  Drives
+    the auto-commit behaviour added in issue #37: when a
+    :class:`WorkflowEngine` run succeeds, the produced files can be
+    automatically staged and committed (and optionally pushed) on
+    behalf of the user so ``memfun swarm`` output lands in git
+    history rather than as a heap of untracked files.
+
+    Attributes:
+        auto_commit: Commit produced files after a successful workflow.
+            Defaults to ``True`` (auto-commit is opt-OUT, not opt-in).
+        auto_push: Push the auto-commit to ``origin`` after committing.
+            Defaults to ``False`` — pushing is always opt-in.
+        auto_branch: Branch strategy applied *before* the workflow
+            runs.  ``None`` (default) keeps the user on their current
+            branch.  ``"auto"`` creates a new
+            ``memfun/swarm-<timestamp>`` branch.  Any other string is
+            used verbatim as the new branch name.
+    """
+
+    auto_commit: bool = True
+    auto_push: bool = False
+    auto_branch: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class WebToolsConfig:
     fetch_timeout_seconds: int = 30
     fetch_max_size_bytes: int = 5_242_880  # 5 MiB
@@ -91,6 +119,7 @@ class MemfunConfig:
     backend: BackendConfig = field(default_factory=BackendConfig)
     sandbox: SandboxBackendConfig = field(default_factory=SandboxBackendConfig)
     web: WebToolsConfig = field(default_factory=WebToolsConfig)
+    workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
 
     @classmethod
     def from_toml(
@@ -135,6 +164,7 @@ class MemfunConfig:
         backend_raw = raw.get("backend", {})
         sandbox_raw = raw.get("sandbox", {})
         web_raw = raw.get("web", {})
+        workflow_raw = raw.get("workflow", {})
 
         def _pick(section: dict, dc: type) -> dict:
             fields = dc.__dataclass_fields__
@@ -155,5 +185,8 @@ class MemfunConfig:
             ),
             web=WebToolsConfig(
                 **_pick(web_raw, WebToolsConfig)
+            ),
+            workflow=WorkflowConfig(
+                **_pick(workflow_raw, WorkflowConfig)
             ),
         )

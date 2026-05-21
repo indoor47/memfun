@@ -157,9 +157,13 @@ async def _run_swarm(
     use_worktrees: bool,
     base_sha: str | None,
     timeout: float,
+    auto_commit: bool,
+    auto_push: bool,
+    auto_branch: str | None,
 ) -> int:
     """Execute the swarm workflow.  Returns the desired exit code."""
     # Lazy imports — keep CLI startup cheap when other commands run.
+    from memfun_agent.git_committer import create_swarm_branch
     from memfun_agent.workflow import WorkflowEngine
     from memfun_runtime.builder import RuntimeBuilder
     from memfun_runtime.lifecycle import AgentManager
@@ -192,6 +196,44 @@ async def _run_swarm(
     _configure_dspy(config)
 
     project_root = Path.cwd()
+
+    # Resolve auto-commit settings: CLI flags override memfun.toml.
+    # The CLI flag default for ``auto_commit`` is ``True`` so the
+    # user gets a commit by default — but we honour
+    # ``--no-commit`` to suppress it explicitly.
+    wf_cfg = config.workflow
+    effective_auto_commit = (
+        auto_commit if auto_commit is not None else wf_cfg.auto_commit
+    )
+    effective_auto_push = (
+        auto_push if auto_push is not None else wf_cfg.auto_push
+    )
+    effective_auto_branch = (
+        auto_branch if auto_branch is not None else wf_cfg.auto_branch
+    )
+
+    # ── Optional pre-workflow branch creation (issue #37) ────
+    if effective_auto_branch:
+        if not _project_is_git_repo(project_root):
+            console.print(
+                "[yellow]--branch ignored: not a git repository.[/yellow]"
+            )
+        else:
+            branch_name, branch_err = create_swarm_branch(
+                project_root, effective_auto_branch,
+            )
+            if branch_err:
+                console.print(Panel(
+                    f"[red]Could not create branch "
+                    f"'{branch_name}': {branch_err}[/red]",
+                    title="Branch error",
+                    border_style="red",
+                ))
+                return 1
+            console.print(
+                f"[dim]Branch:[/dim] [green]{branch_name}[/green] "
+                "[dim](created off HEAD)[/dim]"
+            )
 
     # Worktree manager (requires a git repo).
     worktree_manager: WorktreeManager | None = None
@@ -272,6 +314,9 @@ async def _run_swarm(
         manager=manager,
         on_sub_task_status=on_sub_task,
         worktree_manager=worktree_manager,
+        auto_commit=effective_auto_commit,
+        auto_push=effective_auto_push,
+        project_root=project_root,
     )
     # Expose the per-instance pool cap so _execute_group can read it.
     engine._max_pool = max_pool  # type: ignore[attr-defined]
@@ -367,6 +412,26 @@ def swarm_command(
         min=1,
         help="Per-task timeout in seconds.",
     ),
+    commit: bool = typer.Option(
+        True,
+        "--commit/--no-commit",
+        help="Auto-commit produced files after a successful swarm "
+        "(issue #37).  Default ON — pass --no-commit to suppress.",
+    ),
+    push: bool = typer.Option(
+        False,
+        "--push/--no-push",
+        help="After auto-commit, push the commit to ``origin``.  "
+        "Default OFF — opt-in only.",
+    ),
+    branch: str | None = typer.Option(
+        None,
+        "--branch",
+        help="Create a new branch off the current HEAD BEFORE the "
+        "swarm runs.  Pass 'auto' for a timestamped "
+        "``memfun/swarm-<ts>`` name, or any other string to use that "
+        "name verbatim.",
+    ),
 ) -> None:
     """Force the multi-agent WorkflowEngine path, bypassing triage.
 
@@ -382,6 +447,9 @@ def swarm_command(
             use_worktrees=use_worktrees,
             base_sha=base_sha,
             timeout=float(timeout),
+            auto_commit=commit,
+            auto_push=push,
+            auto_branch=branch,
         )
     )
     if exit_code != 0:
