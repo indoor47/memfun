@@ -686,7 +686,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 
   /* Stats tab */
   .stats-wrap { padding: 12px 16px; }
-  .stats-grid {
+  .stats-list {
     display: grid;
     grid-template-columns: 1fr auto;
     column-gap: 16px;
@@ -694,14 +694,72 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     font-size: 12px;
     margin-bottom: 16px;
   }
-  .stats-grid dt {
+  .stats-list dt {
     color: var(--muted);
   }
-  .stats-grid dd {
+  .stats-list dd {
     color: var(--text);
     font-weight: 600;
     text-align: right;
     font-variant-numeric: tabular-nums;
+  }
+
+  /* Stats: timeseries sparkline cards */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .metric-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 10px;
+    border-radius: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-height: 100px;
+    transition: border-color 0.15s ease;
+  }
+  .metric-card:hover { border-color: var(--accent); }
+  .metric-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  .metric-title {
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--muted);
+    line-height: 1.2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .metric-value {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }
+  .spark {
+    display: block;
+    width: 100%;
+    height: 60px;
+  }
+  .spark-empty {
+    height: 60px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 18px;
   }
   .stats-section-title {
     font-size: 10px;
@@ -827,6 +885,33 @@ let eventCounts = {};          // event_type -> count
 let workflowStart = null;      // first event ts (epoch seconds)
 let activeTab = 'events';
 
+// ── Timeseries state (Stats tab sparkline cards) ──────────
+// 10-second buckets, keep the last 30 buckets (5 minutes total).
+const SPARK_BUCKET_SEC = 10;
+const SPARK_BUCKETS = 30;
+const SPARK_WINDOW_SEC = SPARK_BUCKET_SEC * SPARK_BUCKETS;
+
+// Per-metric circular buffers.  Each entry is { ts, value }.
+// Counters accumulate per bucket; gauges/avgs use { sum, count }.
+const sparkSeries = {
+  llmCallsPerMin: [],
+  tokensInPerMin: [],
+  tokensOutPerMin: [],
+  tasksDonePerMin: [],
+  agentsBusy: [],
+  avgLatencySec: [],
+};
+// Per-metric "currently-accumulating" bucket state, keyed by bucket
+// start timestamp.  Reset when the bucket rolls over.
+const sparkAccum = {
+  llmCallsPerMin: { ts: 0, count: 0 },
+  tokensInPerMin: { ts: 0, sum: 0 },
+  tokensOutPerMin: { ts: 0, sum: 0 },
+  tasksDonePerMin: { ts: 0, count: 0 },
+  agentsBusy: { ts: 0, value: 0 },        // gauge — sampled
+  avgLatencySec: { ts: 0, sum: 0, count: 0 },
+};
+
 // ── WebSocket ─────────────────────────────────────────────
 ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
@@ -862,6 +947,288 @@ function ingestForTabs(ev) {
     logs.unshift(ev);
     if (logs.length > MAX_LOGS) logs.length = MAX_LOGS;
   }
+  ingestSpark(ev);
+}
+
+// ── Timeseries helpers ────────────────────────────────────
+// Compute the start timestamp (epoch seconds) of the bucket
+// containing ``ts`` for the configured bucket size.
+function bucketStart(ts) {
+  if (!ts) ts = Date.now() / 1000;
+  return Math.floor(ts / SPARK_BUCKET_SEC) * SPARK_BUCKET_SEC;
+}
+
+// Push a finalised bucket value into a series buffer, capping at
+// SPARK_BUCKETS most-recent entries.  ``ts`` is the bucket start.
+function pushBucket(name, ts, value) {
+  const arr = sparkSeries[name];
+  if (!arr) return;
+  arr.push({ ts: ts, value: value });
+  while (arr.length > SPARK_BUCKETS) arr.shift();
+}
+
+// Flush whatever's currently in ``sparkAccum[name]`` into the
+// series, then start a fresh accumulator at ``newTs``.
+function rollBucket(name, newTs) {
+  const acc = sparkAccum[name];
+  if (!acc) return;
+  if (acc.ts !== 0 && acc.ts !== newTs) {
+    let value = 0;
+    if (name === 'llmCallsPerMin' || name === 'tasksDonePerMin') {
+      // counter -> rate per minute
+      value = (acc.count || 0) * (60 / SPARK_BUCKET_SEC);
+    } else if (name === 'tokensInPerMin' || name === 'tokensOutPerMin') {
+      // sum -> rate per minute
+      value = (acc.sum || 0) * (60 / SPARK_BUCKET_SEC);
+    } else if (name === 'agentsBusy') {
+      // gauge — last sampled value
+      value = acc.value || 0;
+    } else if (name === 'avgLatencySec') {
+      value = acc.count > 0 ? (acc.sum / acc.count) : 0;
+    }
+    pushBucket(name, acc.ts, value);
+  }
+  // Reset accumulator for the new bucket.
+  if (name === 'llmCallsPerMin' || name === 'tasksDonePerMin') {
+    sparkAccum[name] = { ts: newTs, count: 0 };
+  } else if (name === 'tokensInPerMin' || name === 'tokensOutPerMin') {
+    sparkAccum[name] = { ts: newTs, sum: 0 };
+  } else if (name === 'agentsBusy') {
+    sparkAccum[name] = { ts: newTs, value: 0 };
+  } else if (name === 'avgLatencySec') {
+    sparkAccum[name] = { ts: newTs, sum: 0, count: 0 };
+  }
+}
+
+// Ensure every accumulator is rolled forward to the current bucket
+// so the sparklines refresh even when no event arrives.
+function advanceSparkBuckets() {
+  const now = bucketStart();
+  Object.keys(sparkAccum).forEach(name => {
+    if (sparkAccum[name].ts !== now) {
+      rollBucket(name, now);
+    }
+  });
+  // Re-sample the gauge (agents currently busy) every tick.
+  try {
+    const busy = Object.values(workers)
+      .filter(w => w && w.status === 'busy').length;
+    sparkAccum.agentsBusy.value = busy;
+  } catch (_e) { /* defensive — never crash the dashboard */ }
+}
+
+// Ingest a single event into the timeseries accumulators.  Best
+// effort — any malformed event is silently ignored so the dashboard
+// keeps working even with partial telemetry.
+function ingestSpark(ev) {
+  try {
+    if (!ev) return;
+    const ts = ev.ts || (Date.now() / 1000);
+    const b = bucketStart(ts);
+    const et = ev.event_type || '';
+
+    // LLM calls / min  (fallback: count ALL events when no llm.call
+    // events have ever been seen — useful before LLM telemetry lands).
+    const isLlm = et === 'llm.call' || et.startsWith('llm.');
+    const llmEverSeen = (eventCounts['llm.call'] || 0) > 0
+      || Object.keys(eventCounts).some(k => k.startsWith('llm.'));
+    if (isLlm || !llmEverSeen) {
+      if (sparkAccum.llmCallsPerMin.ts !== b) {
+        rollBucket('llmCallsPerMin', b);
+      }
+      sparkAccum.llmCallsPerMin.count += 1;
+    }
+
+    // Tokens in / out — pull from event.usage or top-level fields.
+    const usage = ev.usage || ev.detail_usage || {};
+    const pin = Number(
+      ev.prompt_tokens
+        ?? usage.prompt_tokens
+        ?? usage.input_tokens
+        ?? 0,
+    );
+    const pout = Number(
+      ev.completion_tokens
+        ?? usage.completion_tokens
+        ?? usage.output_tokens
+        ?? 0,
+    );
+    if (pin > 0) {
+      if (sparkAccum.tokensInPerMin.ts !== b) {
+        rollBucket('tokensInPerMin', b);
+      }
+      sparkAccum.tokensInPerMin.sum += pin;
+    }
+    if (pout > 0) {
+      if (sparkAccum.tokensOutPerMin.ts !== b) {
+        rollBucket('tokensOutPerMin', b);
+      }
+      sparkAccum.tokensOutPerMin.sum += pout;
+    }
+
+    // Tasks done / min — count successful task.completed only.
+    if (et === 'task.completed' && ev.success !== false) {
+      if (sparkAccum.tasksDonePerMin.ts !== b) {
+        rollBucket('tasksDonePerMin', b);
+      }
+      sparkAccum.tasksDonePerMin.count += 1;
+    }
+
+    // Avg call latency — only events that carry duration_ms.
+    const dur = Number(ev.duration_ms || 0);
+    if (dur > 0) {
+      if (sparkAccum.avgLatencySec.ts !== b) {
+        rollBucket('avgLatencySec', b);
+      }
+      sparkAccum.avgLatencySec.sum += dur / 1000;
+      sparkAccum.avgLatencySec.count += 1;
+    }
+  } catch (_e) {
+    // Best effort — keep the dashboard alive.
+  }
+}
+
+// Build a series snapshot suitable for rendering: finalised buckets
+// from sparkSeries PLUS the current accumulator's preliminary value.
+function snapshotSeries(name) {
+  const arr = (sparkSeries[name] || []).slice();
+  const acc = sparkAccum[name];
+  if (!acc || !acc.ts) return arr;
+  let v = 0;
+  if (name === 'llmCallsPerMin' || name === 'tasksDonePerMin') {
+    v = (acc.count || 0) * (60 / SPARK_BUCKET_SEC);
+  } else if (name === 'tokensInPerMin' || name === 'tokensOutPerMin') {
+    v = (acc.sum || 0) * (60 / SPARK_BUCKET_SEC);
+  } else if (name === 'agentsBusy') {
+    v = acc.value || 0;
+  } else if (name === 'avgLatencySec') {
+    v = acc.count > 0 ? (acc.sum / acc.count) : 0;
+  }
+  // Don't duplicate if the most recent finalised bucket has the same ts.
+  if (arr.length === 0 || arr[arr.length - 1].ts !== acc.ts) {
+    arr.push({ ts: acc.ts, value: v });
+  }
+  return arr;
+}
+
+// Render a single sparkline as inline SVG.  ``points`` is an array
+// of { ts, value }.  Returns an HTML string.  ``stroke`` is a CSS
+// variable name (e.g. ``--accent``).
+function renderSparkSVG(points, stroke) {
+  if (!points || points.length === 0) {
+    return '<div class="spark-empty">—</div>';
+  }
+  const w = 100, h = 30, pad = 2;
+  const values = points.map(p => p.value);
+  const maxV = Math.max.apply(null, values);
+  const minV = Math.min.apply(null, values);
+  // Avoid divide-by-zero when the series is flat.
+  const span = (maxV - minV) > 0 ? (maxV - minV) : 1;
+  const innerW = w - pad * 2;
+  const innerH = h - pad * 2;
+
+  // Distribute points across the full inner width even when the
+  // series is shorter than SPARK_BUCKETS — start from the right.
+  const xs = points.map((_p, i) => {
+    const slot = SPARK_BUCKETS - points.length + i;
+    return pad + (slot / (SPARK_BUCKETS - 1)) * innerW;
+  });
+  const ys = values.map(v => {
+    const norm = (v - minV) / span;
+    return pad + innerH - norm * innerH;
+  });
+  const path = xs.map((x, i) =>
+    (i === 0 ? 'M' : 'L') + x.toFixed(1) + ' ' + ys[i].toFixed(1),
+  ).join(' ');
+  // Area fill below the line for visual weight.
+  const fillPath = path + ' L' + xs[xs.length - 1].toFixed(1) +
+    ' ' + (h - pad).toFixed(1) +
+    ' L' + xs[0].toFixed(1) + ' ' + (h - pad).toFixed(1) + ' Z';
+  const last = points[points.length - 1];
+  const tip = 'value ' + formatSparkValue(last.value, false) +
+    ' @ ' + fmtTimeShort(last.ts);
+  return '<svg class="spark" viewBox="0 0 ' + w + ' ' + h +
+    '" preserveAspectRatio="none">' +
+    '<title>' + escHtml(tip) + '</title>' +
+    '<path d="' + fillPath + '" fill="var(' + stroke + ')" ' +
+      'fill-opacity="0.12" stroke="none"></path>' +
+    '<path d="' + path + '" fill="none" stroke="var(' + stroke +
+      ')" stroke-width="1.5" stroke-linejoin="round" ' +
+      'stroke-linecap="round"></path>' +
+    '<circle cx="' + xs[xs.length - 1].toFixed(1) + '" cy="' +
+      ys[ys.length - 1].toFixed(1) + '" r="1.6" fill="var(' +
+      stroke + ')"></circle>' +
+    '</svg>';
+}
+
+// Format a metric value for the card header.  ``isInt`` rounds.
+function formatSparkValue(v, isInt) {
+  if (v === null || v === undefined || Number.isNaN(v)) return '—';
+  if (!isFinite(v)) return '—';
+  if (isInt) return String(Math.round(v));
+  if (v >= 1000) return (v / 1000).toFixed(1) + 'k';
+  if (v >= 100) return v.toFixed(0);
+  if (v >= 10) return v.toFixed(1);
+  return v.toFixed(2);
+}
+
+// Compute the displayed "current value" for a metric — most recent
+// bucket (including the in-progress accumulator).  Returns null
+// when the series has no data.
+function currentValue(name) {
+  const snap = snapshotSeries(name);
+  if (snap.length === 0) return null;
+  return snap[snap.length - 1].value;
+}
+
+// Definition of the six cards shown in the Stats tab grid.
+const SPARK_CARDS = [
+  {
+    name: 'llmCallsPerMin', title: 'LLM calls / min',
+    color: '--accent', isInt: false,
+  },
+  {
+    name: 'tokensInPerMin', title: 'Tokens / min (in)',
+    color: '--accent', isInt: false,
+  },
+  {
+    name: 'tokensOutPerMin', title: 'Tokens / min (out)',
+    color: '--accent', isInt: false,
+  },
+  {
+    name: 'tasksDonePerMin', title: 'Tasks done / min',
+    color: '--green', isInt: false,
+  },
+  {
+    name: 'agentsBusy', title: 'Agents busy',
+    color: '--yellow', isInt: true,
+  },
+  {
+    name: 'avgLatencySec', title: 'Avg call latency (s)',
+    color: '--accent', isInt: false,
+  },
+];
+
+function renderSparkCards() {
+  return '<div class="stats-grid">' +
+    SPARK_CARDS.map(card => {
+      const snap = snapshotSeries(card.name);
+      const cur = currentValue(card.name);
+      const valStr = cur === null
+        ? '—'
+        : formatSparkValue(cur, card.isInt);
+      const svg = renderSparkSVG(snap, card.color);
+      return '<div class="metric-card">' +
+        '<div class="metric-header">' +
+          '<span class="metric-title">' + escHtml(card.title) +
+            '</span>' +
+          '<span class="metric-value">' + escHtml(valStr) +
+            '</span>' +
+        '</div>' +
+        svg +
+      '</div>';
+    }).join('') +
+  '</div>';
 }
 
 function escHtml(s) {
@@ -1239,7 +1606,7 @@ function renderStatsPane() {
     ['Time since start', sinceStart],
   ];
   const dl =
-    '<dl class="stats-grid">' +
+    '<dl class="stats-list">' +
     grid.map(([k, v]) =>
       '<dt>' + escHtml(k) + '</dt>' +
       '<dd>' + escHtml(v) + '</dd>',
@@ -1259,7 +1626,11 @@ function renderStatsPane() {
     ).join('') +
     '</tbody></table>';
 
-  statsEl.innerHTML = '<div class="stats-wrap">' + dl + table + '</div>';
+  // Timeseries cards on top, static counters below, event-type
+  // histogram at the bottom (kept from the original Stats tab).
+  const cards = renderSparkCards();
+  statsEl.innerHTML = '<div class="stats-wrap">' +
+    cards + dl + table + '</div>';
 }
 
 // ── Tab switching ─────────────────────────────────────────
@@ -1279,8 +1650,13 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 });
 
 // Refresh the active pane every second so wall-clock fields
-// (time-since-start) stay current even with no new events.
-setInterval(renderActivePane, 1000);
+// (time-since-start) stay current even with no new events.  Also
+// advance the timeseries bucket clock so sparklines decay/refresh
+// even during quiet periods.
+setInterval(() => {
+  try { advanceSparkBuckets(); } catch (_e) { /* defensive */ }
+  renderActivePane();
+}, 1000);
 
 // ── Show All button ───────────────────────────────────────
 showAllBtn.addEventListener('click', () => {

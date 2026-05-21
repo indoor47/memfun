@@ -177,6 +177,40 @@ def test_dashboard_html_contains_tab_markup() -> None:
     assert "renderStatsPane" in html
 
 
+def test_dashboard_html_contains_sparkline_cards() -> None:
+    """The Stats tab renders a grid of timeseries sparkline cards.
+
+    This smoke test asserts the card markup, sparkline plumbing, and
+    the six metric titles all ship in the served HTML.
+    """
+    from fastapi.testclient import TestClient
+    from memfun_cli.dashboard.server import create_app
+
+    app = create_app()
+    response = TestClient(app).get("/")
+    assert response.status_code == 200
+    html = response.text
+
+    # Card grid scaffolding.
+    assert "stats-grid" in html
+    assert "metric-card" in html
+    assert "spark" in html
+    assert "renderSparkCards" in html
+    assert "renderSparkSVG" in html
+
+    # All six metric titles the spec mandates must be present so the
+    # cards render with their intended labels.
+    for title in (
+        "LLM calls / min",
+        "Tokens / min (in)",
+        "Tokens / min (out)",
+        "Tasks done / min",
+        "Agents busy",
+        "Avg call latency (s)",
+    ):
+        assert title in html, f"Missing metric title: {title}"
+
+
 def test_dashboard_api_state_reflects_ingested_events(
     initialised_project: Path,
 ) -> None:
