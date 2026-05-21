@@ -495,7 +495,7 @@ class WorkflowEngine:
         # Only when the gh_pr flow ran and at least one PR was
         # approved by the pr-reviewer agent earlier.
         if self._gh_pr and state.pr_states:
-            await self._merge_approved_prs(
+            merged_count, merge_failures = await self._merge_approved_prs(
                 state=state,
                 groups=(
                     state.decomposition.parallelism_groups
@@ -503,6 +503,24 @@ class WorkflowEngine:
                     else []
                 ),
             )
+            # Surface merge failures as a workflow failure so the
+            # caller can exit non-zero — a silent `success=True` with
+            # un-merged PRs hides the most common real-world failure
+            # mode (the second PR conflicting with the first one's
+            # merge).  Approved PRs that conflict are left OPEN on
+            # GitHub for human inspection.
+            if merge_failures:
+                summary = ", ".join(
+                    f"#{pr} ({err})" for pr, err in merge_failures
+                )
+                result = dataclasses.replace(
+                    result,
+                    success=False,
+                    error=(
+                        f"{merged_count}/{merged_count + len(merge_failures)} "
+                        f"PRs merged; failures: {summary}"
+                    ),
+                )
         return result
 
     # ── Execution helpers ─────────────────────────────────────
@@ -1998,7 +2016,9 @@ class WorkflowEngine:
             "",
             f"- **ID**: `{tid}`",
             f"- **Agent**: `{sub_status.agent_name}`",
-            f"- **Branch**: `{worktree_path.name}` (worktree at `{worktree_path}`)",
+            # Only the basename — never leak the absolute filesystem
+            # path on the developer's machine into a public PR body.
+            f"- **Branch**: `{worktree_path.name}`",
             f"- **Inputs**: {', '.join(st.inputs) if st.inputs else '(none)'}",
             f"- **Outputs**: {', '.join(st.outputs) if st.outputs else '(none)'}",
         ]
@@ -2119,24 +2139,51 @@ class WorkflowEngine:
             return "comment"
 
         data = result.result or {}
-        answer = (data.get("answer", "") or "").lower()
-        # Look for the canonical verdict tokens emitted in the JSON
-        # block of the AGENT.md output.
-        if '"verdict": "approve"' in answer or "verdict: approve" in answer:
-            return "approve"
-        if (
-            '"verdict": "request-changes"' in answer
-            or "verdict: request-changes" in answer
-            or "request_changes" in answer
-        ):
-            return "request-changes"
-        if '"verdict": "comment"' in answer or "verdict: comment" in answer:
-            return "comment"
+        answer = data.get("answer", "") or ""
+        return self._parse_pr_verdict(answer)
 
-        # Loose fallbacks for less structured reviewer output.
-        if "lgtm" in answer or "approved" in answer:
+    @staticmethod
+    def _parse_pr_verdict(answer: str) -> str:
+        """Extract the verdict from the pr-reviewer's final answer.
+
+        The AGENT.md protocol asks the reviewer to emit a JSON block
+        with a ``verdict`` field as its final output.  We parse the
+        LAST valid JSON object containing a ``verdict`` key rather
+        than substring-matching the whole text — a substring match
+        can be fooled by a diff fragment containing the literal
+        ``"verdict": "approve"`` string (e.g. when reviewing tests
+        for this very function) and would lead to unsafe auto-approve.
+
+        Returns one of ``approve`` / ``request-changes`` / ``comment``.
+        Defaults to ``comment`` on parse failure — we never auto-merge
+        an ambiguous review.
+        """
+        import json
+        import re
+
+        # Match flat JSON objects containing a verdict key.  Non-
+        # recursive on purpose: the verdict block emitted by the
+        # AGENT.md protocol has no nested ``verdict`` objects, so a
+        # plain bracket-match is enough and avoids parsing the entire
+        # answer with a recursive descent grammar.
+        candidates = re.findall(
+            r'\{[^{}]*"verdict"[^{}]*\}', answer,
+        )
+        for blob in reversed(candidates):
+            try:
+                obj = json.loads(blob)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            verdict = obj.get("verdict")
+            if verdict in {"approve", "request-changes", "comment"}:
+                return verdict
+
+        # Loose fallback ONLY when no JSON block exists at all — so a
+        # diff fragment cannot win against a real reviewer verdict.
+        lower = answer.lower()
+        if "lgtm" in lower:
             return "approve"
-        if "changes-requested" in answer or "changes requested" in answer:
+        if "changes-requested" in lower or "changes requested" in lower:
             return "request-changes"
         return "comment"
 
@@ -2145,7 +2192,7 @@ class WorkflowEngine:
         *,
         state: WorkflowState,
         groups: list[list[str]],
-    ) -> None:
+    ) -> tuple[int, list[tuple[int, str]]]:
         """Merge approved PRs in dependency-group order.
 
         *groups* comes straight from
@@ -2156,10 +2203,18 @@ class WorkflowEngine:
         Within a single group merges run sequentially (one PR at a
         time) to avoid races where two PRs target ``main``
         simultaneously and the second one needs a rebase.
+
+        Returns:
+            A ``(merged_count, failed_list)`` tuple.  ``failed_list``
+            is ``[(pr_number, error), ...]`` for every approved PR
+            whose ``gh pr merge`` call did not succeed — typically a
+            merge conflict introduced by the previously-merged PR.
+            Caller MUST surface these so the workflow does not return
+            ``success=True`` with broken merges left behind.
         """
         repo = self._resolve_repo_slug()
         if not repo:
-            return
+            return 0, []
 
         # Build an ordered list of (group_idx, tid) honouring the
         # decomposer's groups.  Any PR not in groups (defensive) is
@@ -2175,6 +2230,8 @@ class WorkflowEngine:
             if tid not in seen:
                 ordered.append(tid)
 
+        merged = 0
+        failed: list[tuple[int, str]] = []
         for tid in ordered:
             pr_state = state.pr_states[tid]
             if not pr_state.approved or pr_state.pr_number is None:
@@ -2188,20 +2245,23 @@ class WorkflowEngine:
             )
             pr_state.merged = merge_res.merged
             if not merge_res.merged:
-                pr_state.error = f"merge failed: {merge_res.error or 'unknown'}"
+                err = merge_res.error or "unknown"
+                pr_state.error = f"merge failed: {err}"
+                failed.append((pr_state.pr_number, err))
                 logger.warning(
                     "gh_pr[%s]: merge PR #%d failed: %s",
                     tid,
                     pr_state.pr_number,
-                    merge_res.error,
+                    err,
                 )
                 await self._emit_dashboard(
                     "pr.merge_failed",
-                    detail=f"PR #{pr_state.pr_number}: {merge_res.error or '?'}",
+                    detail=f"PR #{pr_state.pr_number}: {err}",
                     workflow_id=state.workflow_id,
                     project=state.project,
                 )
                 continue
+            merged += 1
             logger.info(
                 "gh_pr[%s]: merged PR #%d (%s)",
                 tid,
@@ -2214,6 +2274,7 @@ class WorkflowEngine:
                 workflow_id=state.workflow_id,
                 project=state.project,
             )
+        return merged, failed
 
     # ── Agent management ──────────────────────────────────────
 
