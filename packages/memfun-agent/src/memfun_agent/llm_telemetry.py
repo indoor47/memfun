@@ -339,21 +339,62 @@ def make_dspy_callback() -> Any:
 
     Lazy-importing DSPy keeps this module usable in environments where
     DSPy is absent (eg. unit tests that mock the runtime).  If DSPy is
-    unavailable we return a plain :class:`MemfunDSPyCallback` — the
-    DSPy ``with_callbacks`` decorator only calls our handler methods
-    via ``_get_on_end_handler``, which uses ``getattr``, so the
-    inheritance is purely for ``isinstance`` checks DSPy doesn't
-    actually perform on callbacks.
+    unavailable we return a plain :class:`MemfunDSPyCallback`.
+
+    Critical MRO note
+    -----------------
+    The previous implementation used ``class _Bound(BaseCallback,
+    MemfunDSPyCallback)`` which produced MRO
+    ``[_Bound, BaseCallback, MemfunDSPyCallback]``.  DSPy's
+    ``_get_on_start_handler`` resolves ``callback.on_lm_start`` via
+    normal attribute lookup, which walked the MRO and found
+    ``BaseCallback.on_lm_start`` *first* — a no-op ``pass`` body — and
+    NEVER called our implementation.  Result: zero ``llm.call`` events
+    were ever published.
+
+    Fix: explicitly forward ``on_lm_start`` / ``on_lm_end`` to our
+    implementation in the wrapper class.  This makes the binding
+    independent of MRO ordering quirks and is bulletproof against
+    future DSPy ``BaseCallback`` changes that might add more no-op
+    defaults.
     """
     try:
         from dspy.utils.callback import BaseCallback as _BaseCallback
 
+        # Capture our implementation references *before* the class
+        # body runs so the inner methods can call them without going
+        # back through MRO lookup (which is exactly the bug we are
+        # fixing).
+        _memfun_on_lm_start = MemfunDSPyCallback.on_lm_start
+        _memfun_on_lm_end = MemfunDSPyCallback.on_lm_end
+
         class _Bound(_BaseCallback, MemfunDSPyCallback):  # type: ignore[misc, valid-type]
-            """Memfun callback that satisfies DSPy's BaseCallback type."""
+            """Memfun callback that satisfies DSPy's BaseCallback type.
+
+            Overrides ``on_lm_start`` / ``on_lm_end`` explicitly so
+            ``BaseCallback``'s no-op defaults never shadow our
+            implementation (the previous bug).
+            """
 
             def __init__(self) -> None:
                 _BaseCallback.__init__(self)
                 MemfunDSPyCallback.__init__(self)
+
+            def on_lm_start(
+                self,
+                call_id: str,
+                instance: Any,
+                inputs: dict[str, Any] | None,
+            ) -> None:
+                _memfun_on_lm_start(self, call_id, instance, inputs)
+
+            def on_lm_end(
+                self,
+                call_id: str,
+                outputs: Any,
+                exception: Exception | None = None,
+            ) -> None:
+                _memfun_on_lm_end(self, call_id, outputs, exception)
 
         return _Bound()
     except Exception:
