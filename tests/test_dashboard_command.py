@@ -8,6 +8,7 @@ started.  Coverage:
 3. The dashboard module's ``_dashboard_port`` global is set BEFORE
    ``create_app`` is called so the lifespan can write the lockfile.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -71,7 +72,8 @@ def test_dashboard_uses_provided_port(
         ),
     ):
         result = CliRunner().invoke(
-            _build_app(), ["--port", "9999"],
+            _build_app(),
+            ["--port", "9999"],
         )
 
     assert result.exit_code == 0, result.output
@@ -122,6 +124,7 @@ def test_dashboard_sets_module_port_before_create_app(
 
     def capture_port_at_create_app(*args: object, **kwargs: object) -> object:
         from memfun_cli.dashboard import server as _dashboard_mod
+
         observed["port_at_create_app"] = _dashboard_mod._dashboard_port
         return fake_app
 
@@ -136,7 +139,8 @@ def test_dashboard_sets_module_port_before_create_app(
         ),
     ):
         result = CliRunner().invoke(
-            _build_app(), ["--port", "9876"],
+            _build_app(),
+            ["--port", "9876"],
         )
 
     assert result.exit_code == 0, result.output
@@ -209,6 +213,91 @@ def test_dashboard_html_contains_sparkline_cards() -> None:
         "Avg call latency (s)",
     ):
         assert title in html, f"Missing metric title: {title}"
+
+
+def test_dashboard_logs_filter_checkboxes_present() -> None:
+    """The Logs tab toolbar exposes Lifecycle + LLM-calls filter checkboxes.
+
+    Added when per-agent ``llm.call`` events landed (user feedback
+    after the live swarm demo).  These let an operator hide the
+    high-frequency LLM stream when they only want to see lifecycle.
+    """
+    from fastapi.testclient import TestClient
+    from memfun_cli.dashboard.server import create_app
+
+    app = create_app()
+    html = TestClient(app).get("/").text
+
+    # Filter UI markup.
+    assert 'class="logs-toolbar"' in html
+    assert 'id="logs-filter-lifecycle"' in html
+    assert 'id="logs-filter-llm"' in html
+    assert 'data-filter="lifecycle"' in html
+    assert 'data-filter="llm"' in html
+
+    # JS state flags driving the filter.
+    assert "logsFilterLifecycle" in html
+    assert "logsFilterLlm" in html
+
+    # The new LLM-call renderer + stats aggregator.
+    assert "renderLlmLogRow" in html
+    assert "renderLlmStats" in html
+
+    # The LLM-call event type is recognised as a log-eligible type.
+    assert "LLM_LOG_TYPES" in html
+    assert "llm.call" in html
+
+
+def test_dashboard_ingests_llm_call_event(
+    initialised_project: Path,
+) -> None:
+    """``/api/event`` accepts an ``llm.call`` payload and surfaces it in
+    ``/api/state`` so the JS Logs tab can render it.
+    """
+    import time
+
+    from fastapi.testclient import TestClient
+    from memfun_cli.dashboard import server as _server
+
+    # Reset module state — these globals leak across tests.
+    _server._events.clear()
+    _server._tasks.clear()
+    _server._workers.clear()
+    _server._requests.clear()
+
+    app = _server.create_app()
+    client = TestClient(app)
+
+    llm_event = {
+        "event_type": "llm.call",
+        "agent_name": "coder-agent",
+        "worker_id": "w1",
+        "task_id": "t-abc123",
+        "workflow_id": "wf-1",
+        "model": "openai/qwen3-coder-30b-a3b",
+        "prompt_preview": "Implement clamp(x, lo, hi)",
+        "completion_preview": "def clamp(x, lo, hi): ...",
+        "prompt_tokens": 1466,
+        "completion_tokens": 412,
+        "duration_ms": 1234.5,
+        "success": True,
+        "ts": time.time(),
+    }
+
+    r = client.post("/api/event", json=llm_event)
+    assert r.status_code == 200
+
+    state = client.get("/api/state").json()
+    types = [e["event_type"] for e in state["events"]]
+    assert "llm.call" in types
+
+    # The full llm-call payload should be preserved end-to-end so
+    # the JS can render the prompt/completion preview.
+    captured = next(e for e in state["events"] if e["event_type"] == "llm.call")
+    assert captured["agent_name"] == "coder-agent"
+    assert captured["prompt_tokens"] == 1466
+    assert captured["completion_tokens"] == 412
+    assert "clamp" in captured["prompt_preview"]
 
 
 def test_dashboard_api_state_reflects_ingested_events(

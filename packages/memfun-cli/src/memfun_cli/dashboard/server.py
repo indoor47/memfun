@@ -55,7 +55,7 @@ _requests: dict[str, dict] = {}  # workflow_id -> {description, status, ts, ...}
 _event_bus: Any | None = None  # Shared event bus (set by create_app)
 _project_root: Path | None = None  # Project dir for state persistence
 
-MAX_EVENTS = 500
+MAX_EVENTS = 2000  # Sized for llm.call frequency (10-30x lifecycle events)
 _save_counter: int = 0  # debounce saves (every 3 events)
 
 
@@ -206,6 +206,13 @@ async def _event_listener(bus: Any) -> None:
                 "ts": event.ts,
                 "project": event.project,
                 "workflow_id": event.workflow_id,
+                # ── LLM-call telemetry (only set for event_type=llm.call) ──
+                "model": event.model,
+                "prompt_preview": event.prompt_preview,
+                "completion_preview": event.completion_preview,
+                "prompt_tokens": event.prompt_tokens,
+                "completion_tokens": event.completion_tokens,
+                "error": event.error,
             }
 
             _update_state(event_dict)
@@ -671,6 +678,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .log-type.type-task-failed { color: var(--red); }
   .log-type.type-workflow-started { color: var(--purple); }
   .log-type.type-workflow-completed { color: var(--purple); }
+  .log-type.type-llm-call { color: var(--accent); }
   .log-detail {
     color: var(--muted);
     overflow: hidden;
@@ -683,6 +691,55 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     line-height: 1.5;
     font-style: italic;
   }
+  /* Logs toolbar */
+  .logs-toolbar {
+    display: flex; gap: 12px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255,255,255,0.02);
+    font-size: 11px;
+    align-items: center;
+    flex-shrink: 0;
+  }
+  .logs-filter-label {
+    display: flex; align-items: center; gap: 4px;
+    cursor: pointer; color: var(--muted);
+    user-select: none;
+  }
+  .logs-filter-label input[type="checkbox"] {
+    cursor: pointer;
+    accent-color: var(--accent);
+  }
+  .logs-filter-label span {
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+  }
+  /* Two-line LLM-call log entry */
+  .log-line.llm {
+    display: block;
+    padding: 4px 10px;
+    white-space: normal;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .log-line.llm .log-header {
+    display: flex; gap: 8px;
+    align-items: baseline;
+    font-size: 11px;
+  }
+  .log-line.llm .log-llm-meta {
+    color: var(--muted);
+    font-size: 10px;
+    margin-left: 8px;
+  }
+  .log-line.llm .log-llm-text {
+    padding: 2px 0 0 22px;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .log-line.llm .log-llm-prompt { color: var(--muted); }
+  .log-line.llm .log-llm-completion { color: var(--text); }
+  .log-line.llm .log-arrow { color: var(--accent); }
 
   /* Stats tab */
   .stats-wrap { padding: 12px 16px; }
@@ -849,7 +906,21 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         <button class="tab-btn" data-tab="stats" type="button">Stats</button>
       </div>
       <div class="panel-content tab-pane active" id="events"></div>
-      <div class="panel-content tab-pane" id="logs"></div>
+      <div class="panel-content tab-pane" id="logs">
+        <div class="logs-toolbar">
+          <label class="logs-filter-label">
+            <input type="checkbox" id="logs-filter-lifecycle"
+              class="logs-filter" data-filter="lifecycle" checked>
+            <span>Lifecycle</span>
+          </label>
+          <label class="logs-filter-label">
+            <input type="checkbox" id="logs-filter-llm"
+              class="logs-filter" data-filter="llm" checked>
+            <span>LLM calls</span>
+          </label>
+        </div>
+        <div id="logs-body"></div>
+      </div>
       <div class="panel-content tab-pane" id="stats"></div>
     </div>
   </div>
@@ -875,15 +946,22 @@ let activeRequest = null;  // null = show all
 let resolved = 0;
 
 // Tabbed right-column state (shared across tabs).
-const LOG_EVENT_TYPES = new Set([
+const LIFECYCLE_LOG_TYPES = new Set([
   'task.picked_up', 'task.completed', 'task.failed',
   'workflow.started', 'workflow.completed',
 ]);
-const MAX_LOGS = 500;
+const LLM_LOG_TYPES = new Set(['llm.call']);
+// Buffer cap raised — llm.call events are 10-30x more frequent than
+// lifecycle events, so 500 fills up in seconds during a swarm run.
+const MAX_LOGS = 2000;
 let logs = [];                 // newest first
 let eventCounts = {};          // event_type -> count
 let workflowStart = null;      // first event ts (epoch seconds)
 let activeTab = 'events';
+// Logs tab filters (default both on).  Read directly off DOM in
+// renderLogs() so hot-reloading state isn't required.
+let logsFilterLifecycle = true;
+let logsFilterLlm = true;
 
 // ── Timeseries state (Stats tab sparkline cards) ──────────
 // 10-second buckets, keep the last 30 buckets (5 minutes total).
@@ -943,7 +1021,7 @@ function ingestForTabs(ev) {
   const et = ev.event_type || '';
   eventCounts[et] = (eventCounts[et] || 0) + 1;
   if (workflowStart === null && ev.ts) workflowStart = ev.ts;
-  if (LOG_EVENT_TYPES.has(et)) {
+  if (LIFECYCLE_LOG_TYPES.has(et) || LLM_LOG_TYPES.has(et)) {
     logs.unshift(ev);
     if (logs.length > MAX_LOGS) logs.length = MAX_LOGS;
   }
@@ -1521,31 +1599,92 @@ function logDetail(ev) {
 }
 
 function renderLogs() {
-  if (!logsEl) return;
-  const visible = activeRequest
-    ? logs.filter(ev => ev.workflow_id === activeRequest)
-    : logs;
+  const body = document.getElementById('logs-body');
+  if (!body) return;
+
+  // Apply request filter + checkbox filters.
+  const visible = logs.filter(ev => {
+    if (activeRequest && ev.workflow_id !== activeRequest) return false;
+    const et = ev.event_type || '';
+    if (LLM_LOG_TYPES.has(et)) return logsFilterLlm;
+    if (LIFECYCLE_LOG_TYPES.has(et)) return logsFilterLifecycle;
+    return false;
+  });
+
   if (visible.length === 0) {
-    logsEl.innerHTML =
+    body.innerHTML =
       '<div class="log-hint">' +
-      'Filtering for high-level lifecycle events ' +
-      '(picked_up, completed, failed). ' +
-      'Switch to Events for the full stream.' +
+      'Showing lifecycle events and per-agent LLM calls. ' +
+      'Toggle the filters above. Switch to Events for the full stream.' +
       '</div>';
     return;
   }
+
   const rows = visible.slice(0, MAX_LOGS).map(ev => {
     const et = ev.event_type || '';
-    const cls = 'type-' + et.split('.').join('-');
-    return '<div class="log-line">' +
-      '<span class="log-ts">[' + escHtml(fmtTimeShort(ev.ts)) + ']</span>' +
-      '<span class="log-task">' + escHtml(taskLabel(ev)) + '</span>' +
-      '<span class="log-type ' + cls + '">' +
-        escHtml(shortType(et)) + '</span>' +
-      '<span class="log-detail">' + escHtml(logDetail(ev)) + '</span>' +
-    '</div>';
+    if (et === 'llm.call') return renderLlmLogRow(ev);
+    return renderLifecycleLogRow(ev);
   });
-  logsEl.innerHTML = rows.join('');
+  body.innerHTML = rows.join('');
+}
+
+function renderLifecycleLogRow(ev) {
+  const et = ev.event_type || '';
+  const cls = 'type-' + et.split('.').join('-');
+  return '<div class="log-line">' +
+    '<span class="log-ts">[' + escHtml(fmtTimeShort(ev.ts)) + ']</span>' +
+    '<span class="log-task">' + escHtml(taskLabel(ev)) + '</span>' +
+    '<span class="log-type ' + cls + '">' +
+      escHtml(shortType(et)) + '</span>' +
+    '<span class="log-detail">' + escHtml(logDetail(ev)) + '</span>' +
+  '</div>';
+}
+
+function renderLlmLogRow(ev) {
+  // Header: [time] T-prefix agent-name#worker (call: 1.2s, 1466→412 tok)
+  const ts = escHtml(fmtTimeShort(ev.ts));
+  const tlbl = escHtml(taskLabel(ev));
+  const agent = escHtml(ev.agent_name || 'agent');
+  const worker = ev.worker_id
+    ? '#' + escHtml(String(ev.worker_id).substring(0, 6))
+    : '';
+  const durTxt = ev.duration_ms
+    ? (ev.duration_ms / 1000).toFixed(1) + 's'
+    : '?';
+  let tokTxt = '';
+  if (ev.prompt_tokens || ev.completion_tokens) {
+    const pt = ev.prompt_tokens || 0;
+    const ct = ev.completion_tokens || 0;
+    tokTxt = ', ' + pt + '→' + ct + ' tok';
+  }
+  const errTxt = (ev.success === false && ev.error)
+    ? ' <span class="log-llm-prompt">error: ' +
+      escHtml(String(ev.error).substring(0, 120)) + '</span>'
+    : '';
+
+  const promptText = ev.prompt_preview || '';
+  const compText = ev.completion_preview || '';
+  const promptLine = promptText
+    ? '<div class="log-llm-text log-llm-prompt">' +
+      '&ldquo;' + escHtml(promptText) + '&rdquo;</div>'
+    : '';
+  const compLine = compText
+    ? '<div class="log-llm-text log-llm-completion">' +
+      '<span class="log-arrow">&rarr;</span> &ldquo;' +
+      escHtml(compText) + '&rdquo;</div>'
+    : '';
+
+  return '<div class="log-line llm">' +
+    '<div class="log-header">' +
+      '<span class="log-ts">[' + ts + ']</span>' +
+      '<span class="log-task">' + tlbl + '</span>' +
+      '<span class="log-type type-llm-call">' + agent + worker + '</span>' +
+      '<span class="log-llm-meta">(call: ' + durTxt + tokTxt + ')</span>' +
+      errTxt +
+    '</div>' +
+    promptLine +
+    compLine +
+  '</div>';
 }
 
 // ── Stats tab ─────────────────────────────────────────────
@@ -1613,6 +1752,9 @@ function renderStatsPane() {
     ).join('') +
     '</dl>';
 
+  // ── LLM call stats (per-agent breakdown) ───────────────
+  const llmStatsBlock = renderLlmStats();
+
   const sortedCounts = Object.entries(eventCounts)
     .sort((a, b) => b[1] - a[1]);
   const table =
@@ -1626,12 +1768,100 @@ function renderStatsPane() {
     ).join('') +
     '</tbody></table>';
 
-  // Timeseries cards on top, static counters below, event-type
-  // histogram at the bottom (kept from the original Stats tab).
+  // Timeseries cards on top, static counters, per-agent LLM stats,
+  // event-type histogram at the bottom.
   const cards = renderSparkCards();
   statsEl.innerHTML = '<div class="stats-wrap">' +
-    cards + dl + table + '</div>';
+    cards + dl + llmStatsBlock + table + '</div>';
 }
+
+// Aggregate llm.call events into headline metrics + per-agent rows.
+function renderLlmStats() {
+  const llmEvents = logs.filter(ev => ev.event_type === 'llm.call');
+  if (llmEvents.length === 0) return '';
+
+  let totalDur = 0;
+  let durCount = 0;
+  let totalPrompt = 0;
+  let totalCompletion = 0;
+  // agent_name -> {calls, prompt_tok, completion_tok, ms}
+  const perAgent = {};
+
+  for (const ev of llmEvents) {
+    if (typeof ev.duration_ms === 'number') {
+      totalDur += ev.duration_ms;
+      durCount++;
+    }
+    if (typeof ev.prompt_tokens === 'number') {
+      totalPrompt += ev.prompt_tokens;
+    }
+    if (typeof ev.completion_tokens === 'number') {
+      totalCompletion += ev.completion_tokens;
+    }
+    const a = ev.agent_name || '(unknown)';
+    if (!perAgent[a]) {
+      perAgent[a] = {
+        calls: 0, prompt_tok: 0, completion_tok: 0, ms: 0,
+      };
+    }
+    perAgent[a].calls++;
+    if (typeof ev.prompt_tokens === 'number') {
+      perAgent[a].prompt_tok += ev.prompt_tokens;
+    }
+    if (typeof ev.completion_tokens === 'number') {
+      perAgent[a].completion_tok += ev.completion_tokens;
+    }
+    if (typeof ev.duration_ms === 'number') {
+      perAgent[a].ms += ev.duration_ms;
+    }
+  }
+
+  const avgMs = durCount ? Math.round(totalDur / durCount) : 0;
+  const headline = [
+    ['Total LLM calls', String(llmEvents.length)],
+    ['Avg call duration', avgMs + ' ms'],
+    ['Total prompt tokens', String(totalPrompt)],
+    ['Total completion tokens', String(totalCompletion)],
+  ];
+  const headlineDl =
+    '<dl class="stats-grid">' +
+    headline.map(([k, v]) =>
+      '<dt>' + escHtml(k) + '</dt>' +
+      '<dd>' + escHtml(v) + '</dd>',
+    ).join('') +
+    '</dl>';
+
+  // Per-agent breakdown — sort by call count desc.
+  const agents = Object.entries(perAgent)
+    .sort((a, b) => b[1].calls - a[1].calls);
+  const rows = agents.map(([name, s]) =>
+    '<tr>' +
+      '<td class="evtype-name">' + escHtml(name) + '</td>' +
+      '<td class="evtype-count">' +
+        s.calls + ' calls, ' +
+        (s.prompt_tok + s.completion_tok) + ' tok' +
+      '</td>' +
+    '</tr>'
+  ).join('');
+
+  return (
+    '<div class="stats-section-title">LLM calls</div>' +
+    headlineDl +
+    '<div class="stats-section-title">Per-agent breakdown</div>' +
+    '<table class="stats-evtypes"><tbody>' + rows +
+    '</tbody></table>'
+  );
+}
+
+// ── Logs filter checkboxes ────────────────────────────────
+document.querySelectorAll('.logs-filter').forEach(box => {
+  box.addEventListener('change', () => {
+    const which = box.dataset.filter;
+    if (which === 'lifecycle') logsFilterLifecycle = box.checked;
+    else if (which === 'llm') logsFilterLlm = box.checked;
+    if (activeTab === 'logs') renderLogs();
+  });
+});
 
 // ── Tab switching ─────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach(btn => {

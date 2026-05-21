@@ -95,10 +95,20 @@ def bytes_to_result(data: bytes) -> TaskResult:
 
 @dataclass(slots=True)
 class DistributedEvent:
-    """An event emitted to the dashboard stream."""
+    """An event emitted to the dashboard stream.
 
-    # task.published, task.picked_up, task.completed,
-    # worker.online, worker.offline, workflow.started
+    Known event_type values:
+
+    * Lifecycle: ``task.published``, ``task.picked_up``, ``task.completed``,
+      ``task.failed``, ``worker.online``, ``worker.offline``,
+      ``workflow.started``, ``workflow.completed``.
+    * Per-LLM-call telemetry: ``llm.call`` (published by
+      :class:`memfun_agent.llm_telemetry.MemfunDSPyCallback`).  The
+      extra ``model`` / ``prompt_preview`` / ``completion_preview`` /
+      ``prompt_tokens`` / ``completion_tokens`` / ``error`` fields are
+      LLM-call specific and ``None`` for lifecycle events.
+    """
+
     event_type: str
     task_id: str | None = None
     agent_name: str | None = None
@@ -109,6 +119,13 @@ class DistributedEvent:
     ts: float = 0.0
     project: str | None = None
     workflow_id: str | None = None
+    # ── LLM-call specific (only populated for event_type="llm.call") ──
+    model: str | None = None
+    prompt_preview: str | None = None
+    completion_preview: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    error: str | None = None
 
     def to_bytes(self) -> bytes:
         self.ts = self.ts or time.time()
@@ -123,6 +140,12 @@ class DistributedEvent:
             "ts": self.ts,
             "project": self.project,
             "workflow_id": self.workflow_id,
+            "model": self.model,
+            "prompt_preview": self.prompt_preview,
+            "completion_preview": self.completion_preview,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "error": self.error,
         }).encode()
 
     @classmethod
@@ -139,6 +162,12 @@ class DistributedEvent:
             ts=d.get("ts", 0.0),
             project=d.get("project"),
             workflow_id=d.get("workflow_id"),
+            model=d.get("model"),
+            prompt_preview=d.get("prompt_preview"),
+            completion_preview=d.get("completion_preview"),
+            prompt_tokens=d.get("prompt_tokens"),
+            completion_tokens=d.get("completion_tokens"),
+            error=d.get("error"),
         )
 
 

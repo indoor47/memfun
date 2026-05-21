@@ -235,6 +235,15 @@ async def _run_swarm(
 
     # Build runtime.
     runtime = await RuntimeBuilder(config).build()
+
+    # Bind the runtime for per-agent LLM telemetry (best-effort).
+    try:
+        from memfun_agent.llm_telemetry import set_active_runtime
+
+        set_active_runtime(runtime)
+    except Exception:
+        logger.debug("Failed to bind telemetry runtime", exc_info=True)
+
     manager = AgentManager(runtime)
 
     # Start rlm-coder as the single-task fallback path (matches chat.py).

@@ -337,6 +337,17 @@ class ChatSession:
         _configure_dspy(self._config)
 
         self._runtime = await RuntimeBuilder(self._config).build()
+
+        # Bind the runtime for per-agent LLM telemetry — must happen
+        # AFTER the runtime is built but BEFORE any DSPy call so the
+        # very first call is captured.
+        try:
+            from memfun_agent.llm_telemetry import set_active_runtime
+
+            set_active_runtime(self._runtime)
+        except Exception:
+            logger.debug("Failed to bind telemetry runtime", exc_info=True)
+
         self._agent = RLMCodingAgent(self._runtime)
         self._agent.on_step = self._on_step_callback
         self._agent.on_plan = self._on_plan_callback
@@ -2026,6 +2037,15 @@ def _configure_dspy(config: MemfunConfig) -> None:
         logger.info("DSPy configured with %s", lm_model)
     except Exception as exc:
         logger.warning("Failed to configure DSPy LM: %s", exc)
+        return
+
+    # Install per-agent LLM telemetry — best-effort, never blocks.
+    try:
+        from memfun_agent.llm_telemetry import install_dspy_callback
+
+        install_dspy_callback()
+    except Exception:
+        logger.debug("Failed to install DSPy telemetry callback", exc_info=True)
 
 
 async def _start_dashboard_background(
