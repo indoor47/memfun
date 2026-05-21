@@ -2013,7 +2013,7 @@ def _configure_dspy(config: MemfunConfig) -> None:
         # which kills calls long before the server completes them — wasting
         # all the compute already spent.  Bump to 1h so the agent stays
         # patient and self-heals through slow but progressing endpoints.
-        "request_timeout": 3600,
+        "timeout": 3600,
     }
     if api_key:
         kwargs["api_key"] = api_key
