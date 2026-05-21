@@ -2008,6 +2008,12 @@ def _configure_dspy(config: MemfunConfig) -> None:
     kwargs: dict[str, Any] = {
         "temperature": config.llm.temperature,
         "max_tokens": config.llm.max_tokens,
+        # Local CPU-served models (and queued multi-slot servers) can take
+        # 10-30+ minutes per call on large outputs.  LiteLLM defaults to 600s
+        # which kills calls long before the server completes them — wasting
+        # all the compute already spent.  Bump to 1h so the agent stays
+        # patient and self-heals through slow but progressing endpoints.
+        "request_timeout": 3600,
     }
     if api_key:
         kwargs["api_key"] = api_key
