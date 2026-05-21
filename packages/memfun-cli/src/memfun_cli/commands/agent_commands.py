@@ -148,9 +148,7 @@ def _configure_dspy(config: MemfunConfig) -> None:
 
     if provider == "anthropic":
         lm_model = f"anthropic/{model}"
-    elif provider == "openai":
-        lm_model = f"openai/{model}"
-    elif provider == "openai-compat":
+    elif provider == "openai" or provider == "openai-compat":
         lm_model = f"openai/{model}"
     elif provider == "ollama":
         lm_model = f"ollama_chat/{model}"
@@ -178,6 +176,15 @@ def _configure_dspy(config: MemfunConfig) -> None:
         dspy.configure(lm=lm)
     except Exception as exc:
         console.print(f"[yellow]Warning: Failed to configure DSPy: {exc}[/yellow]")
+        return
+
+    # Install per-agent LLM telemetry — best-effort, never blocks.
+    try:
+        from memfun_agent.llm_telemetry import install_dspy_callback
+
+        install_dspy_callback()
+    except Exception:
+        pass
 
 
 async def run_agent_task(

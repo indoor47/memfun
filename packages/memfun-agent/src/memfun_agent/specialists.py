@@ -106,6 +106,20 @@ class _SpecialistBase(BaseAgent):
         )
 
     async def handle(self, task: TaskMessage) -> TaskResult:
+        from memfun_agent.llm_telemetry import agent_context
+
+        # Attribute every nested LLM call (plan/code/verify/fix/polish)
+        # to this specialist + sub-task.  The contextvar is restored on
+        # exit so sibling tasks don't inherit attribution.
+        workflow_id = task.payload.get("workflow_id", "")
+        with agent_context(
+            agent_name=self.agent_id,
+            task_id=task.task_id,
+            workflow_id=workflow_id or None,
+        ):
+            return await self._handle_impl(task)
+
+    async def _handle_impl(self, task: TaskMessage) -> TaskResult:
         from memfun_core.types import TaskResult as TaskRes
 
         start = time.perf_counter()

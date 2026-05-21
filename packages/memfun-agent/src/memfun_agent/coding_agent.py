@@ -196,6 +196,17 @@ class RLMCodingAgent(BaseAgent):
         Returns:
             TaskResult with the agent's response.
         """
+        from memfun_agent.llm_telemetry import agent_context
+
+        workflow_id = task.payload.get("workflow_id", "") or None
+        with agent_context(
+            agent_name=self.agent_id,
+            task_id=task.task_id,
+            workflow_id=workflow_id,
+        ):
+            return await self._handle_impl(task)
+
+    async def _handle_impl(self, task: TaskMessage) -> TaskResult:
         from memfun_core.types import TaskResult as TaskRes
 
         start = time.perf_counter()
