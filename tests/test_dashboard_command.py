@@ -141,3 +141,104 @@ def test_dashboard_sets_module_port_before_create_app(
 
     assert result.exit_code == 0, result.output
     assert observed["port_at_create_app"] == 9876
+
+
+# ── Tabbed event panel (Events / Logs / Stats) ────────────────
+
+
+def test_dashboard_html_contains_tab_markup() -> None:
+    """The single-page dashboard exposes the three tab buttons + panes.
+
+    UI-only feature: tabbing the right column of the dashboard.  This
+    smoke test asserts the markup the JS depends on is actually in
+    the served HTML.
+    """
+    from fastapi.testclient import TestClient
+    from memfun_cli.dashboard.server import create_app
+
+    app = create_app()
+    response = TestClient(app).get("/")
+    assert response.status_code == 200
+    html = response.text
+
+    # Tab bar + per-tab buttons.
+    assert "tab-bar" in html
+    assert 'data-tab="events"' in html
+    assert 'data-tab="logs"' in html
+    assert 'data-tab="stats"' in html
+
+    # Tab panes the JS targets by id.
+    assert 'id="events"' in html
+    assert 'id="logs"' in html
+    assert 'id="stats"' in html
+
+    # The new render functions (proves the JS shipped).
+    assert "renderLogs" in html
+    assert "renderStatsPane" in html
+
+
+def test_dashboard_api_state_reflects_ingested_events(
+    initialised_project: Path,
+) -> None:
+    """After ingesting a few events via ``/api/event``, ``/api/state``
+    returns them — proving the JS will have data to render in the
+    Logs / Stats tabs.
+    """
+    import time
+
+    from fastapi.testclient import TestClient
+    from memfun_cli.dashboard import server as _server
+
+    # Reset module state — these globals leak across tests.
+    _server._events.clear()
+    _server._tasks.clear()
+    _server._workers.clear()
+    _server._requests.clear()
+
+    app = _server.create_app()
+    client = TestClient(app)
+
+    events = [
+        {
+            "event_type": "worker.online",
+            "worker_id": "w1",
+            "agent_name": "coder-agent",
+            "ts": time.time(),
+        },
+        {
+            "event_type": "task.published",
+            "task_id": "t-abc123",
+            "agent_name": "coder-agent",
+            "workflow_id": "wf-1",
+            "ts": time.time(),
+        },
+        {
+            "event_type": "task.picked_up",
+            "task_id": "t-abc123",
+            "worker_id": "w1",
+            "ts": time.time(),
+        },
+        {
+            "event_type": "task.completed",
+            "task_id": "t-abc123",
+            "worker_id": "w1",
+            "success": True,
+            "duration_ms": 1234,
+            "ts": time.time(),
+        },
+    ]
+    for ev in events:
+        r = client.post("/api/event", json=ev)
+        assert r.status_code == 200
+
+    state = client.get("/api/state").json()
+    assert state["type"] == "state"
+    received_types = {e["event_type"] for e in state["events"]}
+    # All event types should appear in the snapshot the page first
+    # loads — this is what the JS uses to populate logs/stats.
+    assert {
+        "worker.online",
+        "task.published",
+        "task.picked_up",
+        "task.completed",
+    } <= received_types
