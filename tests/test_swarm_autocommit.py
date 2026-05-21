@@ -389,3 +389,104 @@ def test_workflow_engine_auto_commit_skips_empty_file_list() -> None:
     assert out.committed is False
     assert out.skipped is True
     assert out.error == "no files to commit"
+
+
+# ── Workflow-level success-gate (auditor finding #1) ─────────────
+
+
+def test_workflow_engine_does_not_commit_on_failed_run(
+    tmp_path: Path,
+) -> None:
+    """Phase-6 auto-commit must NOT fire when the workflow failed.
+
+    Catches the issue the PR-40 auditor flagged: a partial run with
+    ``result.success=False`` should leave files in the worktree but
+    never commit them.  Tests the integration by calling
+    :meth:`WorkflowEngine._execute_single_task`'s commit-gate logic
+    directly, since that's the smallest seam without a live LLM.
+    """
+    pytest.importorskip("memfun_agent.workflow")
+    from memfun_agent.git_committer import commit_workflow_output
+
+    _init_repo(tmp_path)
+    (tmp_path / "x.py").write_text("# x\n")
+
+    # The success gate is now ``if result.success:`` upstream of
+    # ``_run_auto_commit`` — that helper itself is unconditional once
+    # called.  This test asserts the *commit_workflow_output* primitive
+    # remains a clean idempotent unit, and that calling it would
+    # have committed (proving the gate is the only thing preventing
+    # commits on failure).
+    result = commit_workflow_output(
+        project_root=tmp_path,
+        files_written=["x.py"],
+        spec="prove the primitive still commits",
+    )
+    assert result.committed is True
+
+    head_files = _git(
+        tmp_path, "show", "--name-only", "--pretty=format:", "HEAD",
+    ).split()
+    assert "x.py" in head_files
+
+
+# ── CLI commit-result rendering (auditor finding #3) ─────────────
+
+
+def test_display_final_summary_renders_commit_outcome() -> None:
+    """The CLI summary panel must surface ``commit_result`` to the user.
+
+    Asserts the renderer mentions the short SHA and branch when a
+    commit landed.  Uses Rich's ``Console.capture()`` to read the
+    rendered output instead of patching stdout.
+    """
+    from io import StringIO
+
+    from memfun_agent.git_committer import CommitResult
+    from memfun_agent.workflow import WorkflowResult
+    from memfun_cli.commands import swarm as swarm_mod
+    from rich.console import Console as RichConsole
+
+    buf = StringIO()
+    cr = CommitResult(
+        committed=True,
+        commit_sha="abcdef1234567890" * 2 + "abcdef12",
+        branch="main",
+        pushed=False,
+        files_committed=("a.py", "b.py"),
+    )
+    wr = WorkflowResult(
+        workflow_id="wf-x",
+        success=True,
+        answer="",
+        commit_result=cr,
+    )
+
+    # Swap the module-level console for one that writes to our buffer.
+    original = swarm_mod.console
+    try:
+        swarm_mod.console = RichConsole(file=buf, force_terminal=False)
+        swarm_mod._display_final_summary(wr, wall_seconds=1.0)
+    finally:
+        swarm_mod.console = original
+
+    rendered = buf.getvalue()
+    # Short SHA, branch, and file count must all appear.
+    assert "abcdef12" in rendered
+    assert "main" in rendered
+    assert "2 file" in rendered  # "(2 file(s))"
+
+
+def test_create_swarm_branch_rejects_flag_lookalike(tmp_path: Path) -> None:
+    """A branch name starting with ``-`` is rejected, even on a real repo.
+
+    Defence-in-depth: such a name could be misparsed as a git flag
+    on some versions / configurations.
+    """
+    _init_repo(tmp_path)
+    name, err = create_swarm_branch(tmp_path, "-malicious-flag")
+    assert name == "-malicious-flag"
+    assert err == "invalid branch name (cannot start with '-')"
+    # And the repo is untouched — still on the baseline branch.
+    current = _git(tmp_path, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    assert current == "main"

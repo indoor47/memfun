@@ -334,6 +334,13 @@ def create_swarm_branch(
     if not _is_git_repo(project_root):
         return branch_name, "not a git repository"
 
+    # Defensive: reject branch names that look like flags so a name
+    # starting with ``-`` can never be consumed as a git option.
+    # Real branch names never start with ``-`` (git itself rejects
+    # them on creation), so this is purely defence-in-depth.
+    if branch_name.startswith("-"):
+        return branch_name, "invalid branch name (cannot start with '-')"
+
     runner = _GitRunner(project_root)
     # ``git checkout -b <name>`` creates and switches in one step.
     # The branch is forked from the current HEAD, which is exactly

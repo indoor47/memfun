@@ -397,13 +397,17 @@ class WorkflowEngine:
         result = self._build_result(state, review, elapsed)
 
         # ── Phase 6: AUTO-COMMIT (issue #37) ─────────────────
-        # Only when explicitly enabled by the caller (CLI default).
-        # Skipped silently when no files were produced.
-        commit_result = self._run_auto_commit(
-            state=state,
-            spec=task_description,
-            files_written=result.files_created,
-            wall_seconds=elapsed / 1000.0,
+        # Only when explicitly enabled AND the workflow succeeded —
+        # we never commit partial/rejected output (spec requirement).
+        commit_result = (
+            self._run_auto_commit(
+                state=state,
+                spec=task_description,
+                files_written=result.files_created,
+                wall_seconds=elapsed / 1000.0,
+            )
+            if result.success
+            else None
         )
         if commit_result is not None:
             result = dataclasses.replace(
@@ -482,12 +486,18 @@ class WorkflowEngine:
             error=result.error,
             decomposition=state.decomposition,
         )
-        # Auto-commit single-task results too (issue #37).
-        commit_result = self._run_auto_commit(
-            state=state,
-            spec=task_description,
-            files_written=wf_result.files_created,
-            wall_seconds=elapsed / 1000.0,
+        # Auto-commit single-task results too (issue #37), but only
+        # when the task actually succeeded — never commit a failed
+        # run's partial output.
+        commit_result = (
+            self._run_auto_commit(
+                state=state,
+                spec=task_description,
+                files_written=wf_result.files_created,
+                wall_seconds=elapsed / 1000.0,
+            )
+            if wf_result.success
+            else None
         )
         if commit_result is not None:
             wf_result = dataclasses.replace(

@@ -46,8 +46,28 @@ console = Console()
 
 
 def _project_is_git_repo(project_root: Path) -> bool:
-    """Return ``True`` if *project_root* is a git working tree."""
-    return (project_root / ".git").exists()
+    """Return ``True`` if *project_root* is a git working tree.
+
+    Uses ``git rev-parse --is-inside-work-tree`` rather than just
+    looking for ``.git/`` because the latter is wrong for both
+    submodules (``.git`` is a file) and worktrees (``.git`` is a
+    file pointing at the real ``gitdir``).
+    """
+    import subprocess
+
+    if not project_root.exists():
+        return False
+    try:
+        proc = subprocess.run(
+            ("git", "rev-parse", "--is-inside-work-tree"),
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, FileNotFoundError):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
 
 
 def _format_duration(seconds: float) -> str:
@@ -126,6 +146,37 @@ def _display_final_summary(
     if result.error:
         table.add_row("error", f"[red]{result.error}[/red]")
 
+    # Auto-commit / auto-push outcome (issue #37).  Always shown
+    # when the engine returned a CommitResult so the user knows
+    # whether a commit landed without having to `git log`.
+    cr = result.commit_result
+    if cr is not None:
+        if cr.committed and cr.commit_sha:
+            short_sha = cr.commit_sha[:8]
+            table.add_row(
+                "commit",
+                f"[green]{short_sha}[/green] on "
+                f"[cyan]{cr.branch or '?'}[/cyan]"
+                f" ({len(cr.files_committed)} file(s))",
+            )
+            if cr.pushed:
+                table.add_row(
+                    "push", "[green]pushed to origin[/green]",
+                )
+            elif cr.push_error:
+                table.add_row(
+                    "push", f"[yellow]not pushed: {cr.push_error}[/yellow]",
+                )
+        elif cr.skipped:
+            table.add_row(
+                "commit",
+                f"[dim]skipped ({cr.error or 'unknown reason'})[/dim]",
+            )
+        elif cr.error:
+            table.add_row(
+                "commit", f"[red]failed: {cr.error}[/red]",
+            )
+
     border = "green" if result.success else "red"
     console.print()
     console.print(Panel(
@@ -157,8 +208,8 @@ async def _run_swarm(
     use_worktrees: bool,
     base_sha: str | None,
     timeout: float,
-    auto_commit: bool,
-    auto_push: bool,
+    auto_commit: bool | None,
+    auto_push: bool | None,
     auto_branch: str | None,
 ) -> int:
     """Execute the swarm workflow.  Returns the desired exit code."""
@@ -412,17 +463,19 @@ def swarm_command(
         min=1,
         help="Per-task timeout in seconds.",
     ),
-    commit: bool = typer.Option(
-        True,
+    commit: bool | None = typer.Option(
+        None,
         "--commit/--no-commit",
         help="Auto-commit produced files after a successful swarm "
-        "(issue #37).  Default ON — pass --no-commit to suppress.",
+        "(issue #37).  Unset → read [workflow] auto_commit from "
+        "memfun.toml (default ON).  Pass --no-commit to suppress.",
     ),
-    push: bool = typer.Option(
-        False,
+    push: bool | None = typer.Option(
+        None,
         "--push/--no-push",
         help="After auto-commit, push the commit to ``origin``.  "
-        "Default OFF — opt-in only.",
+        "Unset → read [workflow] auto_push from memfun.toml "
+        "(default OFF).",
     ),
     branch: str | None = typer.Option(
         None,
