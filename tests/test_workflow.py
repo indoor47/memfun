@@ -662,3 +662,196 @@ async def test_workflow_callbacks():
     assert WorkflowStatus.DECOMPOSING in workflow_statuses
     assert WorkflowStatus.RUNNING in workflow_statuses
     assert WorkflowStatus.COMPLETED in workflow_statuses
+
+
+# ── fan_out_to_pool integration ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_execute_group_uses_fan_out_to_pool_for_repeated_names():
+    """When the same agent name appears N times in a parallelism
+    group, ``_dispatch_group`` routes through
+    :meth:`AgentOrchestrator.fan_out_to_pool` so each task can land
+    on its own running instance.
+    """
+    mock_context = MagicMock()
+    mock_state_store = AsyncMock()
+    mock_state_store.get.return_value = None
+    mock_state_store.set = AsyncMock()
+    mock_context.state_store = mock_state_store
+    mock_orchestrator = AsyncMock()
+    mock_manager = MagicMock()
+    mock_manager.is_running.return_value = True
+
+    engine = WorkflowEngine(mock_context, mock_orchestrator, mock_manager)
+
+    # 5 sub-tasks all of agent_type="coder" in one parallel group —
+    # the canonical "swarm of N identical specialists" case.
+    decomp = DecompositionResult(
+        sub_tasks=[
+            SubTask(
+                id=f"T{i}",
+                description=f"Task {i}",
+                agent_type="coder",
+            )
+            for i in range(1, 6)
+        ],
+        shared_spec="",
+        parallelism_groups=[["T1", "T2", "T3", "T4", "T5"]],
+        is_single_task=False,
+    )
+
+    # fan_out_to_pool returns 5 successful results.
+    results = [
+        TaskResult(
+            task_id=f"wf_T{i}",
+            agent_id="coder-agent",
+            success=True,
+            result={
+                "answer": f"Done {i}",
+                "files_created": [],
+                "ops": [],
+            },
+        )
+        for i in range(1, 6)
+    ]
+    mock_orchestrator.fan_out_to_pool.return_value = results
+    mock_orchestrator.dispatch.return_value = TaskResult(
+        task_id="wf_review",
+        agent_id="review-agent",
+        success=True,
+        result={"answer": "approved: true\n\nLGTM"},
+    )
+
+    with patch.object(engine._decomposer, "adecompose", return_value=decomp):
+        result = await engine.execute_workflow(
+            "Build five things", "context", None,
+        )
+
+    assert result.success is True
+    # fan_out_to_pool MUST have been called (the new dispatch path).
+    assert mock_orchestrator.fan_out_to_pool.await_count == 1
+    pool_call = mock_orchestrator.fan_out_to_pool.await_args
+    # The pool_name positional arg.
+    assert pool_call.args[1] == "coder-agent"
+    # 5 tasks passed in.
+    assert len(pool_call.args[0]) == 5
+    # And the legacy fan_out should NOT have been called for this group.
+    # (It may still be called by other paths like review but the
+    # specific coder group should not use it.)
+    coder_fan_out_calls = [
+        c for c in mock_orchestrator.fan_out.await_args_list
+        if any(name == "coder-agent" for name in c.args[1])
+    ]
+    assert len(coder_fan_out_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_group_singleton_still_uses_fan_out():
+    """A group with one task per agent name keeps using the legacy
+    :meth:`AgentOrchestrator.fan_out` so existing test mocks remain
+    valid.
+    """
+    mock_context = MagicMock()
+    mock_state_store = AsyncMock()
+    mock_state_store.get.return_value = None
+    mock_state_store.set = AsyncMock()
+    mock_context.state_store = mock_state_store
+    mock_orchestrator = AsyncMock()
+    mock_manager = MagicMock()
+    mock_manager.is_running.return_value = True
+
+    engine = WorkflowEngine(mock_context, mock_orchestrator, mock_manager)
+
+    decomp = DecompositionResult(
+        sub_tasks=[
+            SubTask(id="T1", description="A", agent_type="file"),
+            SubTask(id="T2", description="B", agent_type="coder"),
+        ],
+        shared_spec="",
+        parallelism_groups=[["T1", "T2"]],
+        is_single_task=False,
+    )
+
+    t1 = TaskResult(
+        task_id="wf_T1", agent_id="file-agent", success=True,
+        result={"answer": "ok1", "files_created": [], "ops": []},
+    )
+    t2 = TaskResult(
+        task_id="wf_T2", agent_id="coder-agent", success=True,
+        result={"answer": "ok2", "files_created": [], "ops": []},
+    )
+
+    mock_orchestrator.fan_out.return_value = [t1, t2]
+    mock_orchestrator.dispatch.return_value = TaskResult(
+        task_id="wf_review", agent_id="review-agent", success=True,
+        result={"answer": "approved: true\n\nLGTM"},
+    )
+
+    with patch.object(engine._decomposer, "adecompose", return_value=decomp):
+        result = await engine.execute_workflow(
+            "Mixed types", "context", None,
+        )
+
+    assert result.success is True
+    # Singleton-per-name → original fan_out path.
+    assert mock_orchestrator.fan_out.await_count == 1
+    # And the pool path was NOT used (since each name appears once).
+    assert mock_orchestrator.fan_out_to_pool.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_pool_dispatch_distributes_to_distinct_instances():
+    """End-to-end through a real :class:`AgentOrchestrator`: a 5-way
+    fan_out_to_pool spins up 5 distinct ``BaseAgent`` instances so each
+    sub-task runs on its **own** Python object (no per-name serialisation).
+
+    Uses a stub agent that records ``id(self)`` so the test can verify
+    that all 5 tasks ran on 5 different instances.
+    """
+    from memfun_core.types import TaskMessage
+    from memfun_runtime.agent import BaseAgent, agent
+    from memfun_runtime.lifecycle import AgentManager
+    from memfun_runtime.orchestrator import AgentOrchestrator
+
+    # Instances that recorded handle() — keyed by id(self).
+    handled_by_instance: list[int] = []
+
+    @agent(name="pool-stub-agent")
+    class _StubAgent(BaseAgent):
+        async def handle(self, task: TaskMessage) -> TaskResult:
+            handled_by_instance.append(id(self))
+            return TaskResult(
+                task_id=task.task_id,
+                agent_id="pool-stub-agent",
+                success=True,
+                result={"answer": "done"},
+            )
+
+    # Real in-process runtime context (so AgentManager actually
+    # tracks instances).  We only need the bits AgentManager and
+    # AgentOrchestrator touch — a MagicMock event_bus is enough.
+    ctx = MagicMock()
+    ctx.event_bus.publish = AsyncMock(return_value=None)
+
+    manager = AgentManager(ctx)
+    orchestrator = AgentOrchestrator(ctx, manager)
+
+    tasks = [
+        TaskMessage(
+            task_id=f"task-{i}",
+            agent_id="pool-stub-agent",
+            payload={"i": i},
+        )
+        for i in range(5)
+    ]
+
+    results = await orchestrator.fan_out_to_pool(
+        tasks, "pool-stub-agent",
+    )
+
+    assert len(results) == 5
+    assert all(r.success for r in results)
+    # All 5 distinct id(self) — no instance serviced two tasks.
+    assert len(handled_by_instance) == 5
+    assert len(set(handled_by_instance)) == 5

@@ -14,11 +14,13 @@ from memfun_cli.commands.agent_commands import (
 from memfun_cli.commands.agent_mgmt import agent_app
 from memfun_cli.commands.chat import chat_command
 from memfun_cli.commands.config import config_app
+from memfun_cli.commands.dashboard import dashboard_command
 from memfun_cli.commands.doctor import doctor_command
 from memfun_cli.commands.init import init_command
 from memfun_cli.commands.invoke import invoke_skill
 from memfun_cli.commands.skill import skill_app
 from memfun_cli.commands.skill_mgmt import skill_create, skill_invoke, skill_search
+from memfun_cli.commands.swarm import swarm_command
 
 app = typer.Typer(
     name="memfun",
@@ -28,6 +30,8 @@ app = typer.Typer(
 
 app.command("init")(init_command)
 app.command("doctor")(doctor_command)
+app.command("swarm")(swarm_command)
+app.command("dashboard")(dashboard_command)
 app.add_typer(
     config_app,
     name="config",
