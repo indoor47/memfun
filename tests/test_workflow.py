@@ -451,7 +451,13 @@ async def test_execute_workflow_single_task_bypass():
 
 @pytest.mark.asyncio
 async def test_execute_workflow_with_revision():
-    """Workflow handles revision round on failed review."""
+    """Workflow handles revision round on failed review (legacy path).
+
+    Pins ``pair_with_reviewer=False`` so this test exercises the
+    Phase 3 batch-review/revision path explicitly. The per-task
+    pairing dyad is covered by tests in
+    ``test_per_task_auditor_pairing.py``.
+    """
     mock_context = MagicMock()
     mock_state_store = AsyncMock()
     mock_state_store.get.return_value = None
@@ -461,7 +467,12 @@ async def test_execute_workflow_with_revision():
     mock_manager = MagicMock()
     mock_manager.is_running.return_value = True
 
-    engine = WorkflowEngine(mock_context, mock_orchestrator, mock_manager)
+    engine = WorkflowEngine(
+        mock_context,
+        mock_orchestrator,
+        mock_manager,
+        pair_with_reviewer=False,
+    )
 
     # Mock decomposer
     decomp = DecompositionResult(
@@ -525,7 +536,12 @@ async def test_execute_workflow_with_revision():
 
 @pytest.mark.asyncio
 async def test_execute_workflow_max_revision_rounds():
-    """Workflow stops after max_review_rounds."""
+    """Workflow stops after max_review_rounds (legacy path).
+
+    Pins ``pair_with_reviewer=False`` to keep this test focused on
+    the Phase 3 batch-review cap. The per-task round cap is covered
+    by ``test_per_task_auditor_pairing.py``.
+    """
     mock_context = MagicMock()
     mock_state_store = AsyncMock()
     mock_state_store.get.return_value = None
@@ -535,7 +551,12 @@ async def test_execute_workflow_max_revision_rounds():
     mock_manager = MagicMock()
     mock_manager.is_running.return_value = True
 
-    engine = WorkflowEngine(mock_context, mock_orchestrator, mock_manager)
+    engine = WorkflowEngine(
+        mock_context,
+        mock_orchestrator,
+        mock_manager,
+        pair_with_reviewer=False,
+    )
 
     # Mock decomposer
     decomp = DecompositionResult(
