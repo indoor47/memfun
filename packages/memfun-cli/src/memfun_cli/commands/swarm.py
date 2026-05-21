@@ -46,8 +46,28 @@ console = Console()
 
 
 def _project_is_git_repo(project_root: Path) -> bool:
-    """Return ``True`` if *project_root* is a git working tree."""
-    return (project_root / ".git").exists()
+    """Return ``True`` if *project_root* is a git working tree.
+
+    Uses ``git rev-parse --is-inside-work-tree`` rather than just
+    looking for ``.git/`` because the latter is wrong for both
+    submodules (``.git`` is a file) and worktrees (``.git`` is a
+    file pointing at the real ``gitdir``).
+    """
+    import subprocess
+
+    if not project_root.exists():
+        return False
+    try:
+        proc = subprocess.run(
+            ("git", "rev-parse", "--is-inside-work-tree"),
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, FileNotFoundError):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
 
 
 def _format_duration(seconds: float) -> str:
@@ -126,6 +146,37 @@ def _display_final_summary(
     if result.error:
         table.add_row("error", f"[red]{result.error}[/red]")
 
+    # Auto-commit / auto-push outcome (issue #37).  Always shown
+    # when the engine returned a CommitResult so the user knows
+    # whether a commit landed without having to `git log`.
+    cr = result.commit_result
+    if cr is not None:
+        if cr.committed and cr.commit_sha:
+            short_sha = cr.commit_sha[:8]
+            table.add_row(
+                "commit",
+                f"[green]{short_sha}[/green] on "
+                f"[cyan]{cr.branch or '?'}[/cyan]"
+                f" ({len(cr.files_committed)} file(s))",
+            )
+            if cr.pushed:
+                table.add_row(
+                    "push", "[green]pushed to origin[/green]",
+                )
+            elif cr.push_error:
+                table.add_row(
+                    "push", f"[yellow]not pushed: {cr.push_error}[/yellow]",
+                )
+        elif cr.skipped:
+            table.add_row(
+                "commit",
+                f"[dim]skipped ({cr.error or 'unknown reason'})[/dim]",
+            )
+        elif cr.error:
+            table.add_row(
+                "commit", f"[red]failed: {cr.error}[/red]",
+            )
+
     border = "green" if result.success else "red"
     console.print()
     console.print(Panel(
@@ -157,9 +208,13 @@ async def _run_swarm(
     use_worktrees: bool,
     base_sha: str | None,
     timeout: float,
+    auto_commit: bool | None,
+    auto_push: bool | None,
+    auto_branch: str | None,
 ) -> int:
     """Execute the swarm workflow.  Returns the desired exit code."""
     # Lazy imports — keep CLI startup cheap when other commands run.
+    from memfun_agent.git_committer import create_swarm_branch
     from memfun_agent.workflow import WorkflowEngine
     from memfun_runtime.builder import RuntimeBuilder
     from memfun_runtime.lifecycle import AgentManager
@@ -192,6 +247,44 @@ async def _run_swarm(
     _configure_dspy(config)
 
     project_root = Path.cwd()
+
+    # Resolve auto-commit settings: CLI flags override memfun.toml.
+    # The CLI flag default for ``auto_commit`` is ``True`` so the
+    # user gets a commit by default — but we honour
+    # ``--no-commit`` to suppress it explicitly.
+    wf_cfg = config.workflow
+    effective_auto_commit = (
+        auto_commit if auto_commit is not None else wf_cfg.auto_commit
+    )
+    effective_auto_push = (
+        auto_push if auto_push is not None else wf_cfg.auto_push
+    )
+    effective_auto_branch = (
+        auto_branch if auto_branch is not None else wf_cfg.auto_branch
+    )
+
+    # ── Optional pre-workflow branch creation (issue #37) ────
+    if effective_auto_branch:
+        if not _project_is_git_repo(project_root):
+            console.print(
+                "[yellow]--branch ignored: not a git repository.[/yellow]"
+            )
+        else:
+            branch_name, branch_err = create_swarm_branch(
+                project_root, effective_auto_branch,
+            )
+            if branch_err:
+                console.print(Panel(
+                    f"[red]Could not create branch "
+                    f"'{branch_name}': {branch_err}[/red]",
+                    title="Branch error",
+                    border_style="red",
+                ))
+                return 1
+            console.print(
+                f"[dim]Branch:[/dim] [green]{branch_name}[/green] "
+                "[dim](created off HEAD)[/dim]"
+            )
 
     # Worktree manager (requires a git repo).
     worktree_manager: WorktreeManager | None = None
@@ -272,6 +365,9 @@ async def _run_swarm(
         manager=manager,
         on_sub_task_status=on_sub_task,
         worktree_manager=worktree_manager,
+        auto_commit=effective_auto_commit,
+        auto_push=effective_auto_push,
+        project_root=project_root,
     )
     # Expose the per-instance pool cap so _execute_group can read it.
     engine._max_pool = max_pool  # type: ignore[attr-defined]
@@ -367,6 +463,28 @@ def swarm_command(
         min=1,
         help="Per-task timeout in seconds.",
     ),
+    commit: bool | None = typer.Option(
+        None,
+        "--commit/--no-commit",
+        help="Auto-commit produced files after a successful swarm "
+        "(issue #37).  Unset → read [workflow] auto_commit from "
+        "memfun.toml (default ON).  Pass --no-commit to suppress.",
+    ),
+    push: bool | None = typer.Option(
+        None,
+        "--push/--no-push",
+        help="After auto-commit, push the commit to ``origin``.  "
+        "Unset → read [workflow] auto_push from memfun.toml "
+        "(default OFF).",
+    ),
+    branch: str | None = typer.Option(
+        None,
+        "--branch",
+        help="Create a new branch off the current HEAD BEFORE the "
+        "swarm runs.  Pass 'auto' for a timestamped "
+        "``memfun/swarm-<ts>`` name, or any other string to use that "
+        "name verbatim.",
+    ),
 ) -> None:
     """Force the multi-agent WorkflowEngine path, bypassing triage.
 
@@ -382,6 +500,9 @@ def swarm_command(
             use_worktrees=use_worktrees,
             base_sha=base_sha,
             timeout=float(timeout),
+            auto_commit=commit,
+            auto_push=push,
+            auto_branch=branch,
         )
     )
     if exit_code != 0:

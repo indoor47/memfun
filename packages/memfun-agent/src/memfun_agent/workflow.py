@@ -9,6 +9,7 @@ Uses the existing :class:`AgentOrchestrator` for dispatch/fan-out and
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import re
 import time
@@ -16,18 +17,22 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from memfun_core.logging import get_logger
 from memfun_core.types import TaskMessage, TaskResult
 
 from memfun_agent.decomposer import DecompositionResult, SubTask, TaskDecomposer
+from memfun_agent.git_committer import (
+    CommitResult,
+    SubTaskReview,
+    commit_workflow_output,
+)
 from memfun_agent.shared_spec import SharedSpec, SharedSpecStore
 from memfun_agent.specialists import agent_name_for_type
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from memfun_runtime.context import RuntimeContext
     from memfun_runtime.lifecycle import AgentManager
     from memfun_runtime.orchestrator import AgentOrchestrator
@@ -123,6 +128,11 @@ class WorkflowResult:
     ops: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
     decomposition: DecompositionResult | None = None
+    # Populated by :meth:`WorkflowEngine._run_auto_commit` when
+    # ``auto_commit=True`` and the workflow succeeded.  ``None`` when
+    # auto-commit was disabled or the workflow failed before the
+    # commit step ran.
+    commit_result: CommitResult | None = None
 
 
 # ── Callback type aliases ─────────────────────────────────────
@@ -157,6 +167,9 @@ class WorkflowEngine:
         pair_with_reviewer: bool = True,
         max_review_rounds_per_task: int = 2,
         dispatch_timeout_seconds: float = 600.0,
+        auto_commit: bool = False,
+        auto_push: bool = False,
+        project_root: Path | None = None,
     ) -> None:
         self._context = context
         self._orchestrator = orchestrator
@@ -165,6 +178,14 @@ class WorkflowEngine:
         self._spec_store = SharedSpecStore(context.state_store)
         self._on_workflow_status = on_workflow_status
         self._on_sub_task_status = on_sub_task_status
+        # Auto-commit / auto-push (issue #37).  Disabled by default at
+        # the engine level so unit tests don't unexpectedly touch git;
+        # the CLI explicitly flips this on (the CLI default is ON).
+        self._auto_commit = auto_commit
+        self._auto_push = auto_push
+        # Project root used as the cwd for the auto-commit step.
+        # Falls back to process cwd when not passed in.
+        self._project_root = project_root
         # Optional per-task git worktree provisioning.  When set, each
         # sub-task in a parallel group gets an isolated checkout under
         # ``.memfun/worktrees/<workflow_id>/<task_id>`` and its cwd is
@@ -373,7 +394,38 @@ class WorkflowEngine:
         self._emit_status(state)
 
         elapsed = (time.perf_counter() - start) * 1000.0
-        return self._build_result(state, review, elapsed)
+        result = self._build_result(state, review, elapsed)
+
+        # ── Phase 6: AUTO-COMMIT (issue #37) ─────────────────
+        # Only when explicitly enabled AND the workflow succeeded —
+        # we never commit partial/rejected output (spec requirement).
+        commit_result = (
+            self._run_auto_commit(
+                state=state,
+                spec=task_description,
+                files_written=result.files_created,
+                wall_seconds=elapsed / 1000.0,
+            )
+            if result.success
+            else None
+        )
+        if commit_result is not None:
+            result = dataclasses.replace(
+                result, commit_result=commit_result,
+            )
+            # A hard commit failure (eg. broken pre-commit hook) MUST
+            # propagate as a workflow failure so callers exit non-zero.
+            if (
+                not commit_result.committed
+                and not commit_result.skipped
+                and commit_result.error
+            ):
+                result = dataclasses.replace(
+                    result,
+                    success=False,
+                    error=f"auto-commit failed: {commit_result.error}",
+                )
+        return result
 
     # ── Execution helpers ─────────────────────────────────────
 
@@ -423,7 +475,7 @@ class WorkflowEngine:
 
         elapsed = (time.perf_counter() - start) * 1000.0
         data = result.result or {}
-        return WorkflowResult(
+        wf_result = WorkflowResult(
             workflow_id=state.workflow_id,
             success=result.success,
             answer=data.get("answer", ""),
@@ -434,6 +486,34 @@ class WorkflowEngine:
             error=result.error,
             decomposition=state.decomposition,
         )
+        # Auto-commit single-task results too (issue #37), but only
+        # when the task actually succeeded — never commit a failed
+        # run's partial output.
+        commit_result = (
+            self._run_auto_commit(
+                state=state,
+                spec=task_description,
+                files_written=wf_result.files_created,
+                wall_seconds=elapsed / 1000.0,
+            )
+            if wf_result.success
+            else None
+        )
+        if commit_result is not None:
+            wf_result = dataclasses.replace(
+                wf_result, commit_result=commit_result,
+            )
+            if (
+                not commit_result.committed
+                and not commit_result.skipped
+                and commit_result.error
+            ):
+                wf_result = dataclasses.replace(
+                    wf_result,
+                    success=False,
+                    error=f"auto-commit failed: {commit_result.error}",
+                )
+        return wf_result
 
     async def _execute_group(
         self,
@@ -1716,6 +1796,110 @@ class WorkflowEngine:
             ops=all_ops,
             decomposition=state.decomposition,
         )
+
+    # ── Auto-commit (issue #37) ──────────────────────────────
+
+    def _run_auto_commit(
+        self,
+        *,
+        state: WorkflowState,
+        spec: str,
+        files_written: list[str],
+        wall_seconds: float,
+    ) -> CommitResult | None:
+        """Commit produced files to the project root after a successful run.
+
+        Returns ``None`` when auto-commit is disabled at the engine
+        level — the dashboard / callers treat that as "feature off".
+        When auto-commit IS enabled, ALWAYS returns a CommitResult so
+        the caller can render exactly what happened (committed / clean
+        skip / hook failure).
+        """
+        if not self._auto_commit:
+            return None
+        if not files_written:
+            # Workflow ran but produced no file artifacts — nothing
+            # to commit.  Return a clean skip so the CLI can still
+            # show "no files to commit" in the summary.
+            return CommitResult(
+                committed=False,
+                skipped=True,
+                error="no files to commit",
+            )
+
+        project_root = self._project_root or Path.cwd()
+
+        sub_tasks = self._build_sub_task_reviews(state)
+        stats = self._build_llm_stats(state, wall_seconds)
+
+        return commit_workflow_output(
+            project_root=project_root,
+            files_written=files_written,
+            spec=spec,
+            sub_tasks=sub_tasks,
+            stats=stats,
+            push=self._auto_push,
+        )
+
+    @staticmethod
+    def _build_sub_task_reviews(
+        state: WorkflowState,
+    ) -> list[SubTaskReview]:
+        """Per-sub-task summaries for the commit message body."""
+        out: list[SubTaskReview] = []
+        for tid, sub_status in state.sub_task_statuses.items():
+            data = (sub_status.result.result or {}) if sub_status.result else {}
+            files = tuple(data.get("files_created", []))
+            review = state.per_task_reviews.get(tid)
+            approved = (
+                review.approved if review is not None
+                else bool(sub_status.result and sub_status.result.success)
+            )
+            out.append(
+                SubTaskReview(
+                    task_id=tid,
+                    files=files,
+                    agent_name=sub_status.agent_name,
+                    approved=approved,
+                )
+            )
+        return out
+
+    @staticmethod
+    def _build_llm_stats(
+        state: WorkflowState,
+        wall_seconds: float,
+    ) -> dict[str, object]:
+        """Aggregate LLM-call telemetry from per-sub-task results.
+
+        Sub-task results may expose a ``llm`` dict with ``calls``,
+        ``tokens_in`` and ``tokens_out`` (RLM-style agents do).
+        Missing keys are silently treated as zero so callers don't
+        need to special-case telemetry-off setups.
+        """
+        calls = 0
+        tokens_in = 0
+        tokens_out = 0
+        for sub_status in state.sub_task_statuses.values():
+            data = (sub_status.result.result or {}) if sub_status.result else {}
+            llm = data.get("llm") if isinstance(data, dict) else None
+            if not isinstance(llm, dict):
+                continue
+            c = llm.get("calls")
+            if isinstance(c, int) and c >= 0:
+                calls += c
+            ti = llm.get("tokens_in")
+            if isinstance(ti, int) and ti >= 0:
+                tokens_in += ti
+            to_ = llm.get("tokens_out")
+            if isinstance(to_, int) and to_ >= 0:
+                tokens_out += to_
+        return {
+            "calls": calls,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "wall_seconds": wall_seconds,
+        }
 
     # ── Callback helpers ──────────────────────────────────────
 
