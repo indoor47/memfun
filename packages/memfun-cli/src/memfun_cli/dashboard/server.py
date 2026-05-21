@@ -474,7 +474,60 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 
   .main-layout {
     display: flex; flex-direction: column;
-    height: calc(100vh - 48px);
+    height: calc(100vh - 48px - 36px);
+  }
+
+  /* ── Live counter banner ─────────────────────────────────── */
+  .live-banner {
+    height: 36px; flex-shrink: 0;
+    display: flex; align-items: center;
+    gap: 18px;
+    padding: 0 24px;
+    background: linear-gradient(
+      90deg,
+      rgba(63,185,80,0.08) 0%,
+      rgba(88,166,255,0.04) 60%,
+      rgba(63,185,80,0.06) 100%
+    );
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    position: sticky; top: 48px; z-index: 5;
+  }
+  .live-banner .pulse-group {
+    display: flex; align-items: center; gap: 6px;
+    color: var(--text); font-weight: 600;
+  }
+  .live-banner .pulse-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted);
+    box-shadow: 0 0 0 0 rgba(63,185,80, 0);
+    transition: background 0.15s ease, box-shadow 0.4s ease;
+  }
+  .live-banner .pulse-dot.active {
+    background: var(--green);
+    box-shadow: 0 0 8px rgba(63,185,80,0.85);
+    animation: live-pulse 2.0s ease-in-out;
+  }
+  @keyframes live-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(63,185,80,0.85); }
+    60%  { box-shadow: 0 0 0 8px rgba(63,185,80,0); }
+    100% { box-shadow: 0 0 0 0 rgba(63,185,80,0); }
+  }
+  .live-banner .sep {
+    color: var(--border); user-select: none;
+  }
+  .live-banner b {
+    color: var(--text); font-weight: 600;
+  }
+  .live-banner .last-call {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .live-banner .last-call .last-agent {
+    color: var(--accent); font-weight: 600;
   }
 
   /* 3-column grid: Requests | Task Flow + Events | Workers */
@@ -869,6 +922,24 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<!-- Live counter banner — updates on every llm.call event. -->
+<div class="live-banner" id="live-banner">
+  <div class="pulse-group">
+    <div class="pulse-dot" id="live-pulse-dot"></div>
+    <span id="live-status">LIVE</span>
+  </div>
+  <span class="sep">·</span>
+  <span><b id="live-llm-count">0</b> LLM calls</span>
+  <span class="sep">·</span>
+  <span><b id="live-tokens-in">0</b> in</span>
+  <span class="sep">·</span>
+  <span><b id="live-tokens-out">0</b> out</span>
+  <span class="last-call">last:
+    <span class="last-agent" id="live-last-agent">—</span>
+    <span id="live-last-ago"></span>
+  </span>
+</div>
+
 <div class="main-layout">
   <div class="top-area">
     <!-- Left: Requests (spans both rows) -->
@@ -945,6 +1016,26 @@ let allEvents = [];
 let activeRequest = null;  // null = show all
 let resolved = 0;
 
+// ── Live banner state ─────────────────────────────────────
+// Running totals over the full session (NOT bucketed) so the
+// banner shows lifetime counts.  Updated on every llm.call event.
+const liveBanner = {
+  llmCalls: 0,
+  tokensIn: 0,
+  tokensOut: 0,
+  lastAgent: null,
+  lastTs: null,            // epoch seconds of most recent llm.call
+  pulseTimer: null,        // pending pulse-clear timeout id
+};
+const liveBannerEls = {
+  pulseDot:   document.getElementById('live-pulse-dot'),
+  llmCount:   document.getElementById('live-llm-count'),
+  tokensIn:   document.getElementById('live-tokens-in'),
+  tokensOut:  document.getElementById('live-tokens-out'),
+  lastAgent:  document.getElementById('live-last-agent'),
+  lastAgo:    document.getElementById('live-last-ago'),
+};
+
 // Tabbed right-column state (shared across tabs).
 const LIFECYCLE_LOG_TYPES = new Set([
   'task.picked_up', 'task.completed', 'task.failed',
@@ -1006,11 +1097,19 @@ ws.onmessage = (e) => {
     logs = [];
     eventCounts = {};
     workflowStart = null;
+    // Reset live-banner counters — they're recomputed from
+    // ingestForTabs() during the state replay below.
+    liveBanner.llmCalls = 0;
+    liveBanner.tokensIn = 0;
+    liveBanner.tokensOut = 0;
+    liveBanner.lastAgent = null;
+    liveBanner.lastTs = null;
     (msg.events || []).forEach(ev => {
       allEvents.push(ev);
       ingestForTabs(ev);
     });
     renderAll();
+    renderLiveBanner();
   } else if (msg.type === 'event') {
     handleEvent(msg.data);
   }
@@ -1026,6 +1125,68 @@ function ingestForTabs(ev) {
     if (logs.length > MAX_LOGS) logs.length = MAX_LOGS;
   }
   ingestSpark(ev);
+  if (et === 'llm.call') recordLlmCallForBanner(ev);
+}
+
+// ── Live banner ───────────────────────────────────────────
+// Accumulate lifetime LLM-call totals + pulse the dot.  Called
+// from ingestForTabs (state snapshot + WS event paths).
+function recordLlmCallForBanner(ev) {
+  if (!ev) return;
+  liveBanner.llmCalls += 1;
+  const pin = Number(ev.prompt_tokens || 0);
+  const pout = Number(ev.completion_tokens || 0);
+  if (pin > 0) liveBanner.tokensIn += pin;
+  if (pout > 0) liveBanner.tokensOut += pout;
+  if (ev.agent_name) liveBanner.lastAgent = ev.agent_name;
+  else if (!liveBanner.lastAgent && ev.worker_id) {
+    liveBanner.lastAgent = String(ev.worker_id).substring(0, 12);
+  }
+  liveBanner.lastTs = ev.ts || (Date.now() / 1000);
+  pulseLiveBanner();
+  renderLiveBanner();
+}
+
+function pulseLiveBanner() {
+  const dot = liveBannerEls.pulseDot;
+  if (!dot) return;
+  dot.classList.remove('active');
+  // Force reflow so the animation restarts when many events arrive
+  // in quick succession.
+  void dot.offsetWidth;  // eslint-disable-line no-unused-expressions
+  dot.classList.add('active');
+  if (liveBanner.pulseTimer) clearTimeout(liveBanner.pulseTimer);
+  liveBanner.pulseTimer = setTimeout(() => {
+    dot.classList.remove('active');
+    liveBanner.pulseTimer = null;
+  }, 2000);
+}
+
+function fmtAgo(ts) {
+  if (!ts) return '';
+  const sec = Math.max(0, Math.floor((Date.now() / 1000) - ts));
+  if (sec < 1) return 'just now';
+  if (sec < 60) return sec + 's ago';
+  const m = Math.floor(sec / 60);
+  const rs = sec % 60;
+  if (m < 60) return m + 'm ' + rs + 's ago';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm ago';
+}
+
+function renderLiveBanner() {
+  if (!liveBannerEls.llmCount) return;
+  liveBannerEls.llmCount.textContent =
+    liveBanner.llmCalls.toLocaleString();
+  liveBannerEls.tokensIn.textContent =
+    liveBanner.tokensIn.toLocaleString();
+  liveBannerEls.tokensOut.textContent =
+    liveBanner.tokensOut.toLocaleString();
+  liveBannerEls.lastAgent.textContent =
+    liveBanner.lastAgent || '—';
+  liveBannerEls.lastAgo.textContent = liveBanner.lastTs
+    ? ' (' + fmtAgo(liveBanner.lastTs) + ')'
+    : '';
 }
 
 // ── Timeseries helpers ────────────────────────────────────
@@ -1420,6 +1581,7 @@ function renderAll() {
   renderLogs();
   renderStatsPane();
   renderHeaderStats();
+  renderLiveBanner();
 }
 
 // Cheap "render only the active right-column pane" used by the
@@ -1882,9 +2044,18 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 // Refresh the active pane every second so wall-clock fields
 // (time-since-start) stay current even with no new events.  Also
 // advance the timeseries bucket clock so sparklines decay/refresh
-// even during quiet periods.
+// even during quiet periods, and tick the banner's "last X ago".
 setInterval(() => {
   try { advanceSparkBuckets(); } catch (_e) { /* defensive */ }
+  try {
+    // Only touch the small "Xs ago" tail so we don't reflow the
+    // whole banner on every tick.
+    if (liveBannerEls.lastAgo) {
+      liveBannerEls.lastAgo.textContent = liveBanner.lastTs
+        ? ' (' + fmtAgo(liveBanner.lastTs) + ')'
+        : '';
+    }
+  } catch (_e) { /* defensive */ }
   renderActivePane();
 }, 1000);
 
