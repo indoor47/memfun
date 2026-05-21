@@ -454,7 +454,7 @@ class TaskDecomposition(dspy.Signature):
             "This ensures all agents produce compatible output."
         )
     )
-    parallelism_groups: list[str] = dspy.OutputField(
+    parallelism_groups: list[list[str]] = dspy.OutputField(
         desc=(
             "JSON array of arrays. Each inner array is a group of task IDs "
             "that can execute in parallel. Example: "
