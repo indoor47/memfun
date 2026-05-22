@@ -20,15 +20,16 @@ from typing import TYPE_CHECKING
 import pytest
 from memfun_tools.code import filesystem as fs
 
-# The FastMCP ``@fs_server.tool()`` decorator wraps the coroutine in
-# a ``FunctionTool`` object that is no longer directly callable, so
-# the tests reach for the underlying ``.fn`` callable instead.  This
-# exercises the exact same code path the MCP server invokes.
-read_file = fs.read_file.fn
-write_file = fs.write_file.fn
-edit_file = fs.edit_file.fn
-list_directory = fs.list_directory.fn
-glob_files = fs.glob_files.fn
+# FastMCP 3.x: the ``@fs_server.tool()`` decorator returns the raw
+# coroutine directly (a regression vs 2.x where it wrapped in a
+# ``FunctionTool`` object with a ``.fn`` attribute), so the tests
+# now call the function directly — same code path the MCP server
+# invokes either way.
+read_file = fs.read_file
+write_file = fs.write_file
+edit_file = fs.edit_file
+list_directory = fs.list_directory
+glob_files = fs.glob_files
 _check_in_root = fs._check_in_root
 
 if TYPE_CHECKING:
