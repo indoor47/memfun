@@ -28,11 +28,11 @@ class TestRuntimeBuilder:
         # The ``redis`` package is an optional dep (T2 backend) and is
         # not pinned by the dev environment.  Skip cleanly when it is
         # not installed rather than failing collection.
-        redis_exceptions = pytest.importorskip(
+        pytest.importorskip(
             "redis.exceptions",
             reason="redis package not installed (T2 backend optional)",
         )
-        RedisConnectionError = redis_exceptions.ConnectionError
+        from redis.exceptions import ConnectionError as RedisConnectionError
 
         config = MemfunConfig(backend=BackendConfig(tier="redis"))
         with pytest.raises(RedisConnectionError):
