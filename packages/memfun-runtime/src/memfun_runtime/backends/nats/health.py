@@ -52,16 +52,20 @@ class NATSHealthMonitor:
         ttl_ns = int(degraded_timeout * 2) * 1_000_000_000
         kv = await ensure_kv_bucket(js, bucket, ttl=ttl_ns)
         return cls(
-            nc, js, kv,
+            nc,
+            js,
+            kv,
             healthy_timeout=healthy_timeout,
             degraded_timeout=degraded_timeout,
         )
 
     async def heartbeat(self, agent_id: str, metrics: dict) -> None:
-        payload = json.dumps({
-            "last_heartbeat": time.time(),
-            "metrics": {k: float(v) for k, v in metrics.items()},
-        })
+        payload = json.dumps(
+            {
+                "last_heartbeat": time.time(),
+                "metrics": {k: float(v) for k, v in metrics.items()},
+            }
+        )
         await self._kv.put(agent_id, payload.encode())  # type: ignore[union-attr]
 
     async def check(self, agent_id: str) -> HealthStatus:
@@ -99,6 +103,7 @@ class NATSHealthMonitor:
         )
 
     async def subscribe_alerts(
-        self, callback: Callable[[HealthStatus], Awaitable[None]],
+        self,
+        callback: Callable[[HealthStatus], Awaitable[None]],
     ) -> None:
         self._callbacks.append(callback)

@@ -95,11 +95,13 @@ class RedisEventBus:
         config = config or TopicConfig()
         meta_key = self._topic_meta_key()
         existing = await self._r.hget(meta_key, topic)
-        config_json = json.dumps({
-            "retention_seconds": config.retention_seconds,
-            "max_consumers": config.max_consumers,
-            "max_message_bytes": config.max_message_bytes,
-        })
+        config_json = json.dumps(
+            {
+                "retention_seconds": config.retention_seconds,
+                "max_consumers": config.max_consumers,
+                "max_message_bytes": config.max_message_bytes,
+            }
+        )
         if existing is not None:
             if existing.decode() != config_json:
                 raise ValueError(f"Topic {topic!r} already exists with different config")

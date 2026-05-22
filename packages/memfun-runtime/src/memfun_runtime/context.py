@@ -23,6 +23,7 @@ class RuntimeContext:
     Provides access to all runtime adapters and project configuration.
     Created once at startup by the RuntimeBuilder.
     """
+
     event_bus: EventBusAdapter
     state_store: StateStoreAdapter
     sandbox: SandboxAdapter

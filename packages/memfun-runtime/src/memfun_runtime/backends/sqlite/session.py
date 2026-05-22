@@ -65,8 +65,11 @@ class SQLiteSessionManager:
                 await self.end_session(session_id)
                 return None
             return Session(
-                session_id=row[0], user_id=row[1], created_at=row[2],
-                data=json.loads(row[3]), history=json.loads(row[4]),
+                session_id=row[0],
+                user_id=row[1],
+                created_at=row[2],
+                data=json.loads(row[3]),
+                history=json.loads(row[4]),
             )
 
     async def update_session(self, session_id: str, data: dict) -> None:

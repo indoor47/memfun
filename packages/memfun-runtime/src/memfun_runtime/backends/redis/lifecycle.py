@@ -39,21 +39,25 @@ class RedisLifecycle:
                 raise AgentAlreadyRunningError(f"Agent {agent_id!r} is already running")
 
         now = time.time()
-        payload = json.dumps({
-            "status": "running",
-            "uptime_start": now,
-            "last_heartbeat": now,
-            "error": None,
-        })
+        payload = json.dumps(
+            {
+                "status": "running",
+                "uptime_start": now,
+                "last_heartbeat": now,
+                "error": None,
+            }
+        )
         await self._r.hset(self._hash_key(), agent_id, payload)
 
     async def stop(self, agent_id: str) -> None:
-        payload = json.dumps({
-            "status": "stopped",
-            "uptime_start": None,
-            "last_heartbeat": time.time(),
-            "error": None,
-        })
+        payload = json.dumps(
+            {
+                "status": "stopped",
+                "uptime_start": None,
+                "last_heartbeat": time.time(),
+                "error": None,
+            }
+        )
         await self._r.hset(self._hash_key(), agent_id, payload)
 
     async def restart(self, agent_id: str) -> None:

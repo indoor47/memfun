@@ -49,9 +49,15 @@ class SQLiteSkillRegistry:
                    model_invocable = excluded.model_invocable,
                    allowed_tools = excluded.allowed_tools,
                    metadata = excluded.metadata""",
-            (skill.name, skill.description, skill.source_path,
-             int(skill.user_invocable), int(skill.model_invocable),
-             json.dumps(skill.allowed_tools), json.dumps(skill.metadata)),
+            (
+                skill.name,
+                skill.description,
+                skill.source_path,
+                int(skill.user_invocable),
+                int(skill.model_invocable),
+                json.dumps(skill.allowed_tools),
+                json.dumps(skill.metadata),
+            ),
         )
         await self._conn.commit()
 
@@ -65,18 +71,26 @@ class SQLiteSkillRegistry:
             if not row:
                 return None
             return SkillInfo(
-                name=row[0], description=row[1], source_path=row[2],
-                user_invocable=bool(row[3]), model_invocable=bool(row[4]),
-                allowed_tools=json.loads(row[5]), metadata=json.loads(row[6]),
+                name=row[0],
+                description=row[1],
+                source_path=row[2],
+                user_invocable=bool(row[3]),
+                model_invocable=bool(row[4]),
+                allowed_tools=json.loads(row[5]),
+                metadata=json.loads(row[6]),
             )
 
     async def list_skills(self) -> list[SkillInfo]:
         async with self._conn.execute("SELECT * FROM skills") as cursor:
             return [
                 SkillInfo(
-                    name=row[0], description=row[1], source_path=row[2],
-                    user_invocable=bool(row[3]), model_invocable=bool(row[4]),
-                    allowed_tools=json.loads(row[5]), metadata=json.loads(row[6]),
+                    name=row[0],
+                    description=row[1],
+                    source_path=row[2],
+                    user_invocable=bool(row[3]),
+                    model_invocable=bool(row[4]),
+                    allowed_tools=json.loads(row[5]),
+                    metadata=json.loads(row[6]),
                 )
                 async for row in cursor
             ]
@@ -84,23 +98,20 @@ class SQLiteSkillRegistry:
     async def search_skills(self, query: str) -> list[SkillInfo]:
         # Escape LIKE wildcards so user input is treated as
         # literal text, not as pattern characters.
-        escaped = (
-            query
-            .replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         async with self._conn.execute(
-            "SELECT * FROM skills"
-            " WHERE name LIKE ? ESCAPE '\\'"
-            " OR description LIKE ? ESCAPE '\\'",
+            "SELECT * FROM skills WHERE name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\'",
             (f"%{escaped}%", f"%{escaped}%"),
         ) as cursor:
             return [
                 SkillInfo(
-                    name=row[0], description=row[1], source_path=row[2],
-                    user_invocable=bool(row[3]), model_invocable=bool(row[4]),
-                    allowed_tools=json.loads(row[5]), metadata=json.loads(row[6]),
+                    name=row[0],
+                    description=row[1],
+                    source_path=row[2],
+                    user_invocable=bool(row[3]),
+                    model_invocable=bool(row[4]),
+                    allowed_tools=json.loads(row[5]),
+                    metadata=json.loads(row[6]),
                 )
                 async for row in cursor
             ]

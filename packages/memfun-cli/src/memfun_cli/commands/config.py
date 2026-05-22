@@ -45,10 +45,7 @@ def config_command(
 
         # Show both files
         if global_path.exists():
-            console.print(
-                "[bold]Global[/bold]"
-                " (~/.memfun/config.toml):"
-            )
+            console.print("[bold]Global[/bold] (~/.memfun/config.toml):")
             content = global_path.read_text()
             console.print(
                 Syntax(
@@ -71,10 +68,7 @@ def config_command(
                 )
             )
         elif not global_path.exists():
-            console.print(
-                "[yellow]No config found."
-                " Run `memfun init`.[/yellow]"
-            )
+            console.print("[yellow]No config found. Run `memfun init`.[/yellow]")
             raise typer.Exit(1)
         return
 
@@ -107,15 +101,10 @@ def config_key(
     }.get(provider)
 
     if not env_var:
-        console.print(
-            f"[yellow]Provider '{provider}'"
-            " doesn't use an API key.[/yellow]"
-        )
+        console.print(f"[yellow]Provider '{provider}' doesn't use an API key.[/yellow]")
         return
 
-    console.print(
-        f"[bold]Provider:[/bold] {provider}" f" ({env_var})"
-    )
+    console.print(f"[bold]Provider:[/bold] {provider} ({env_var})")
 
     key = inquirer.secret(
         message="Paste your API key",
@@ -128,13 +117,9 @@ def config_key(
     key = key.strip()
 
     if use_global:
-        creds_path = (
-            Path.home() / ".memfun" / "credentials.json"
-        )
+        creds_path = Path.home() / ".memfun" / "credentials.json"
     else:
-        creds_path = (
-            Path.cwd() / ".memfun" / "credentials.json"
-        )
+        creds_path = Path.cwd() / ".memfun" / "credentials.json"
 
     # Load existing creds and merge
     existing = {}

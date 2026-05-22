@@ -1,4 +1,5 @@
 """Skill management commands: list, info, validate."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -71,9 +72,7 @@ def skill_info(
         console.print(f"[red]Skill not found:[/red] '{name}'")
         available = [s.name for s in skills]
         if available:
-            console.print(
-                f"[dim]Available skills: {', '.join(sorted(available))}[/dim]"
-            )
+            console.print(f"[dim]Available skills: {', '.join(sorted(available))}[/dim]")
         raise typer.Exit(1)
 
     # Metadata panel
@@ -90,9 +89,7 @@ def skill_info(
         meta_lines.append(f"[bold]Tags:[/bold]        {', '.join(match.tags)}")
 
     if match.allowed_tools:
-        meta_lines.append(
-            f"[bold]Allowed tools:[/bold]  {', '.join(match.allowed_tools)}"
-        )
+        meta_lines.append(f"[bold]Allowed tools:[/bold]  {', '.join(match.allowed_tools)}")
 
     if match.scripts_dir:
         meta_lines.append(f"[bold]Scripts dir:[/bold]  {match.scripts_dir}")
@@ -100,11 +97,13 @@ def skill_info(
     if match.references_dir:
         meta_lines.append(f"[bold]References dir:[/bold] {match.references_dir}")
 
-    console.print(Panel(
-        "\n".join(meta_lines),
-        title=f"Skill: {match.name}",
-        border_style="cyan",
-    ))
+    console.print(
+        Panel(
+            "\n".join(meta_lines),
+            title=f"Skill: {match.name}",
+            border_style="cyan",
+        )
+    )
 
     # Instructions preview
     if match.instructions:
@@ -112,11 +111,13 @@ def skill_info(
         if len(preview) > 2000:
             preview = preview[:2000] + "\n\n... (truncated)"
         console.print()
-        console.print(Panel(
-            Syntax(preview, "markdown", theme="monokai", word_wrap=True),
-            title="Instructions",
-            border_style="dim",
-        ))
+        console.print(
+            Panel(
+                Syntax(preview, "markdown", theme="monokai", word_wrap=True),
+                title="Instructions",
+                border_style="dim",
+            )
+        )
     else:
         console.print("\n[dim]No instructions body defined.[/dim]")
 
@@ -148,16 +149,11 @@ def _validate_single(path: Path, validator: SkillValidator) -> None:
     elif resolved.is_dir():
         skill_file = resolved / "SKILL.md"
     else:
-        console.print(
-            f"[red]Invalid path:[/red] '{path}' is not a directory "
-            "or a SKILL.md file."
-        )
+        console.print(f"[red]Invalid path:[/red] '{path}' is not a directory or a SKILL.md file.")
         raise typer.Exit(1)
 
     if not skill_file.exists():
-        console.print(
-            f"[red]SKILL.md not found at:[/red] {skill_file}"
-        )
+        console.print(f"[red]SKILL.md not found at:[/red] {skill_file}")
         raise typer.Exit(1)
 
     from memfun_skills import parse_skill_md
@@ -195,13 +191,9 @@ def _validate_all(validator: SkillValidator) -> None:
 
     console.print()
     if total_errors == 0:
-        console.print(
-            f"[green]All {len(skills)} skill(s) passed validation.[/green]"
-        )
+        console.print(f"[green]All {len(skills)} skill(s) passed validation.[/green]")
     else:
-        console.print(
-            f"[red]{total_errors} error(s) across {len(skills)} skill(s).[/red]"
-        )
+        console.print(f"[red]{total_errors} error(s) across {len(skills)} skill(s).[/red]")
         raise typer.Exit(1)
 
 

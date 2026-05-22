@@ -4,6 +4,7 @@ Provides a high-level interface to DSPy's MIPROv2 optimizer for refining
 synthesized agent modules. Converts execution traces to training examples
 and runs optimization to improve prompt strategies and few-shot examples.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
         duration_ms: float
         token_usage: Any
         trajectory: list[Any]
+
 
 logger = get_logger("optimizer.optimizer")
 
@@ -122,9 +124,7 @@ class AgentOptimizer:
             raise ValueError(msg)
 
         if not training_traces:
-            logger.warning(
-                "No training traces provided; returning original source"
-            )
+            logger.warning("No training traces provided; returning original source")
             return OptimizationResult(
                 original_source=module_source,
                 optimized_source=module_source,
@@ -151,10 +151,7 @@ class AgentOptimizer:
         examples = self._traces_to_examples(training_traces)
 
         if not examples:
-            logger.warning(
-                "No valid examples extracted from traces; "
-                "returning original source"
-            )
+            logger.warning("No valid examples extracted from traces; returning original source")
             return OptimizationResult(
                 original_source=module_source,
                 optimized_source=module_source,
@@ -169,9 +166,7 @@ class AgentOptimizer:
 
         # Attempt MIPROv2 optimization
         try:
-            _optimized_module, metrics = self._run_mipro(
-                module_obj, examples, metric
-            )
+            _optimized_module, metrics = self._run_mipro(module_obj, examples, metric)
             optimized_source = module_source  # TODO: Extract optimized params
             improvement = metrics.get("improvement_score", 0.0)
             best_idx = metrics.get("best_trial_idx", 0)
@@ -193,8 +188,7 @@ class AgentOptimizer:
 
         except Exception as exc:
             logger.warning(
-                "MIPROv2 optimization failed: %s. "
-                "Returning original source.",
+                "MIPROv2 optimization failed: %s. Returning original source.",
                 exc,
             )
             return OptimizationResult(
@@ -228,9 +222,7 @@ class AgentOptimizer:
         "shelve",
     )
 
-    def _load_module_from_source(
-        self, source: str
-    ) -> Any:
+    def _load_module_from_source(self, source: str) -> Any:
         """Dynamically load a DSPy module from Python source code.
 
         WARNING: This method executes arbitrary Python code. It should only
@@ -267,16 +259,12 @@ class AgentOptimizer:
         # Write source to a temporary module and import it
         import tempfile
 
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
             tmp.write(source)
             tmp_path = Path(tmp.name)
 
         try:
-            spec = importlib.util.spec_from_file_location(
-                "synthesized_module", tmp_path
-            )
+            spec = importlib.util.spec_from_file_location("synthesized_module", tmp_path)
             if spec is None or spec.loader is None:
                 msg = "Failed to create module spec from source"
                 raise ValueError(msg)
@@ -288,11 +276,7 @@ class AgentOptimizer:
             # Find the DSPy module class
             for name in dir(module):
                 obj = getattr(module, name)
-                if (
-                    isinstance(obj, type)
-                    and hasattr(obj, "forward")
-                    and name != "Module"
-                ):
+                if isinstance(obj, type) and hasattr(obj, "forward") and name != "Module":
                     logger.debug("Loaded module class: %s", name)
                     return obj
 
@@ -305,9 +289,7 @@ class AgentOptimizer:
             if "synthesized_module" in sys.modules:
                 del sys.modules["synthesized_module"]
 
-    def _traces_to_examples(
-        self, traces: list[Any]
-    ) -> list[Any]:
+    def _traces_to_examples(self, traces: list[Any]) -> list[Any]:
         """Convert ExecutionTrace objects to DSPy examples.
 
         Args:
@@ -455,12 +437,8 @@ class AgentOptimizer:
             )
 
             # Evaluate improvement
-            original_score = self._evaluate_module(
-                module_class(), dev_set, metric
-            )
-            optimized_score = self._evaluate_module(
-                optimized, dev_set, metric
-            )
+            original_score = self._evaluate_module(module_class(), dev_set, metric)
+            optimized_score = self._evaluate_module(optimized, dev_set, metric)
 
             improvement = (
                 (optimized_score - original_score) / max(original_score, 0.01)

@@ -3,6 +3,7 @@
 The StrategyExtractor classifies each TraceStep by analyzing its code field,
 producing a StrategySignature that fingerprints the entire execution.
 """
+
 from __future__ import annotations
 
 import re
@@ -105,9 +106,7 @@ class StrategyExtractor:
     """
 
     def __init__(self) -> None:
-        self._compiled_patterns: dict[
-            StepKind, list[tuple[re.Pattern[str], float]]
-        ] = {
+        self._compiled_patterns: dict[StepKind, list[tuple[re.Pattern[str], float]]] = {
             kind: [(re.compile(pat, re.IGNORECASE), conf) for pat, conf in pats]
             for kind, pats in _PATTERNS.items()
         }
@@ -133,9 +132,7 @@ class StrategyExtractor:
             token_cost=trace.token_usage.total_tokens,
         )
 
-    def extract_batch(
-        self, traces: list[ExecutionTrace]
-    ) -> list[StrategySignature]:
+    def extract_batch(self, traces: list[ExecutionTrace]) -> list[StrategySignature]:
         """Extract strategy signatures from multiple traces.
 
         Args:

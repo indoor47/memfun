@@ -4,6 +4,7 @@ The memory system stores facts, learned patterns, and optimized configurations
 across sessions. These types define the core data structures for memory entries,
 queries, and search results.
 """
+
 from __future__ import annotations
 
 import time

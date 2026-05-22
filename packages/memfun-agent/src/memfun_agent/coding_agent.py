@@ -5,6 +5,7 @@ the RLM module for complex/large-context tasks and direct DSPy
 predictors for simpler ones. Collects execution traces for later
 optimization via MIPROv2/GEPA.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -44,13 +45,15 @@ logger = get_logger("agent.coding")
 
 # ── Task type enumeration ──────────────────────────────────────
 
-_TASK_TYPES = frozenset({
-    "analyze",
-    "fix",
-    "review",
-    "ask",
-    "explain",
-})
+_TASK_TYPES = frozenset(
+    {
+        "analyze",
+        "fix",
+        "review",
+        "ask",
+        "explain",
+    }
+)
 
 
 # ── The agent ──────────────────────────────────────────────────
@@ -149,9 +152,7 @@ class RLMCodingAgent(BaseAgent):
                 on_dashboard=self.on_context_first_dashboard,
             )
         except Exception as exc:
-            logger.warning(
-                "Context-First Solver init failed: %s", exc
-            )
+            logger.warning("Context-First Solver init failed: %s", exc)
             self._context_solver = None
 
         # Set up direct predictors for simple tasks
@@ -234,7 +235,8 @@ class RLMCodingAgent(BaseAgent):
             if history and self._query_resolver:
                 try:
                     query, _ = await self._query_resolver.aresolve(
-                        query, history,
+                        query,
+                        history,
                     )
                 except Exception:
                     logger.debug("Query resolution failed", exc_info=True)
@@ -243,37 +245,33 @@ class RLMCodingAgent(BaseAgent):
             # triage if absent (backward-compatible).
             category = payload.get("triage_category", "")
             if not category or category not in (
-                "direct", "project", "task", "web",
+                "direct",
+                "project",
+                "task",
+                "web",
             ):
-                category = await self._triage_query(
-                    query, context
-                )
+                category = await self._triage_query(query, context)
 
             # Guard: very short queries with conversation history
             # are almost certainly follow-ups, not standalone questions
-            has_history = (
-                "=== LAST COMPLETED TASK ===" in context
-            )
-            if (
-                category == "direct"
-                and has_history
-                and len(query.strip()) < 20
-            ):
+            has_history = "=== LAST COMPLETED TASK ===" in context
+            if category == "direct" and has_history and len(query.strip()) < 20:
                 logger.info(
-                    "Overriding triage 'direct' -> 'project'"
-                    " (short follow-up with history)"
+                    "Overriding triage 'direct' -> 'project' (short follow-up with history)"
                 )
                 category = "project"
 
             logger.info("Query triage: %s", category)
 
             if category == "direct":
-                result_data = await self._handle_direct_answer(
-                    query
-                )
+                result_data = await self._handle_direct_answer(query)
             elif (
-                category in (
-                    "project", "task", "web", "workflow",
+                category
+                in (
+                    "project",
+                    "task",
+                    "web",
+                    "workflow",
                 )
                 and self._rlm is not None
             ):
@@ -299,13 +297,14 @@ class RLMCodingAgent(BaseAgent):
                         enable_planning=False,
                     )
                 result_data = await self._handle_rlm(
-                    task_type, query, context, payload,
+                    task_type,
+                    query,
+                    context,
+                    payload,
                     category=category,
                 )
             else:
-                result_data = await self._handle_direct(
-                    task_type, query, context, payload
-                )
+                result_data = await self._handle_direct(task_type, query, context, payload)
 
             elapsed_ms = (time.perf_counter() - start) * 1000.0
 
@@ -330,9 +329,7 @@ class RLMCodingAgent(BaseAgent):
 
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - start) * 1000.0
-            logger.error(
-                "Task %s failed: %s", task.task_id, exc
-            )
+            logger.error("Task %s failed: %s", task.task_id, exc)
             return TaskRes(
                 task_id=task.task_id,
                 agent_id=self.agent_id,
@@ -356,9 +353,7 @@ class RLMCodingAgent(BaseAgent):
         assert self._rlm is not None
 
         # Build a richer query incorporating the task type
-        full_query = self._build_rlm_query(
-            task_type, query, payload
-        )
+        full_query = self._build_rlm_query(task_type, query, payload)
 
         # Extract conversation history from payload
         history = payload.get("conversation_history")
@@ -386,8 +381,7 @@ class RLMCodingAgent(BaseAgent):
                 # tasks (gets stuck in read loops, no parallelism,
                 # no cross-agent review).
                 logger.info(
-                    "Context-first unsuccessful (%s) — "
-                    "signalling escalation to multi-agent",
+                    "Context-first unsuccessful (%s) — signalling escalation to multi-agent",
                     cf_result.method,
                 )
                 return {
@@ -404,8 +398,7 @@ class RLMCodingAgent(BaseAgent):
                 }
             except Exception as exc:
                 logger.warning(
-                    "Context-first solver failed: %s, "
-                    "signalling escalation to multi-agent",
+                    "Context-first solver failed: %s, signalling escalation to multi-agent",
                     exc,
                 )
                 return {
@@ -461,12 +454,8 @@ class RLMCodingAgent(BaseAgent):
 
         if predictor is None:
             # Fallback to generic ask via ChainOfThought
-            fallback = dspy.ChainOfThought(
-                "context, query -> answer"
-            )
-            result = await asyncio.to_thread(
-                fallback, context=context, query=query
-            )
+            fallback = dspy.ChainOfThought("context, query -> answer")
+            result = await asyncio.to_thread(fallback, context=context, query=query)
             return {
                 "answer": str(getattr(result, "answer", "")),
                 "task_type": task_type,
@@ -475,42 +464,26 @@ class RLMCodingAgent(BaseAgent):
 
         # Dispatch to the appropriate signature
         if task_type == "analyze":
-            result = await asyncio.to_thread(
-                predictor, code=context, query=query
-            )
+            result = await asyncio.to_thread(predictor, code=context, query=query)
             return {
-                "answer": str(
-                    getattr(result, "analysis", "")
-                ),
-                "issues": _to_str_list(
-                    getattr(result, "issues", [])
-                ),
-                "suggestions": _to_str_list(
-                    getattr(result, "suggestions", [])
-                ),
+                "answer": str(getattr(result, "analysis", "")),
+                "issues": _to_str_list(getattr(result, "issues", [])),
+                "suggestions": _to_str_list(getattr(result, "suggestions", [])),
                 "task_type": task_type,
                 "method": "direct",
             }
 
         if task_type == "fix":
-            bug_desc = payload.get(
-                "bug_description", query
-            )
+            bug_desc = payload.get("bug_description", query)
             result = await asyncio.to_thread(
                 predictor,
                 code=context,
                 bug_description=bug_desc,
             )
             return {
-                "root_cause": str(
-                    getattr(result, "root_cause", "")
-                ),
-                "fixed_code": str(
-                    getattr(result, "fixed_code", "")
-                ),
-                "explanation": str(
-                    getattr(result, "explanation", "")
-                ),
+                "root_cause": str(getattr(result, "root_cause", "")),
+                "fixed_code": str(getattr(result, "fixed_code", "")),
+                "explanation": str(getattr(result, "explanation", "")),
                 "task_type": task_type,
                 "method": "direct",
             }
@@ -523,31 +496,19 @@ class RLMCodingAgent(BaseAgent):
                 context=review_context,
             )
             return {
-                "summary": str(
-                    getattr(result, "summary", "")
-                ),
-                "findings": _to_str_list(
-                    getattr(result, "findings", [])
-                ),
-                "approved": bool(
-                    getattr(result, "approved", False)
-                ),
+                "summary": str(getattr(result, "summary", "")),
+                "findings": _to_str_list(getattr(result, "findings", [])),
+                "approved": bool(getattr(result, "approved", False)),
                 "task_type": task_type,
                 "method": "direct",
             }
 
         if task_type == "explain":
             audience = payload.get("audience", "intermediate")
-            result = await asyncio.to_thread(
-                predictor, code=context, audience=audience
-            )
+            result = await asyncio.to_thread(predictor, code=context, audience=audience)
             return {
-                "explanation": str(
-                    getattr(result, "explanation", "")
-                ),
-                "key_concepts": _to_str_list(
-                    getattr(result, "key_concepts", [])
-                ),
+                "explanation": str(getattr(result, "explanation", "")),
+                "key_concepts": _to_str_list(getattr(result, "key_concepts", [])),
                 "task_type": task_type,
                 "method": "direct",
             }
@@ -572,9 +533,7 @@ class RLMCodingAgent(BaseAgent):
         # Extract recent conversation from context
         recent_conv = ""
         if "=== LAST COMPLETED TASK ===" in context:
-            start = context.index(
-                "=== LAST COMPLETED TASK ==="
-            )
+            start = context.index("=== LAST COMPLETED TASK ===")
             # Find the next section or end
             end = context.find("=== ", start + 10)
             if end == -1:
@@ -589,17 +548,16 @@ class RLMCodingAgent(BaseAgent):
             result = await asyncio.to_thread(
                 self._triage,
                 query=query,
-                recent_conversation=recent_conv
-                or "(no prior conversation)",
-                project_summary=project_summary
-                or "(no project context)",
+                recent_conversation=recent_conv or "(no prior conversation)",
+                project_summary=project_summary or "(no project context)",
             )
-            category = str(
-                getattr(result, "category", "project")
-            ).strip().lower()
+            category = str(getattr(result, "category", "project")).strip().lower()
             # Normalize to valid categories
             if category not in (
-                "direct", "project", "task", "web",
+                "direct",
+                "project",
+                "task",
+                "web",
                 "workflow",
             ):
                 category = "project"
@@ -641,18 +599,12 @@ class RLMCodingAgent(BaseAgent):
                 end = context.find("\n---", start + len(marker))
                 if end == -1:
                     end = min(start + 500, len(context))
-                parts.append(
-                    context[start:end].strip()[:500]
-                )
+                parts.append(context[start:end].strip()[:500])
 
         if not parts:
             # Fallback: first few lines (old behaviour)
             ctx_lines = context.split("\n")[:5]
-            fallback = " | ".join(
-                line.strip()
-                for line in ctx_lines
-                if line.strip()
-            )[:200]
+            fallback = " | ".join(line.strip() for line in ctx_lines if line.strip())[:200]
             if fallback:
                 parts.append(fallback)
 
@@ -668,9 +620,7 @@ class RLMCodingAgent(BaseAgent):
         """
         try:
             predictor = dspy.ChainOfThought("query -> answer")
-            result = await asyncio.to_thread(
-                predictor, query=query
-            )
+            result = await asyncio.to_thread(predictor, query=query)
             answer = str(getattr(result, "answer", ""))
             return {
                 "answer": answer,
@@ -699,18 +649,14 @@ class RLMCodingAgent(BaseAgent):
                 "Focus on structure, quality, and potential issues."
             ),
             "fix": (
-                "Find and fix the bug described below. "
-                "Produce corrected code with an explanation."
+                "Find and fix the bug described below. Produce corrected code with an explanation."
             ),
             "review": (
                 "Review the following code. Provide structured "
                 "feedback with severity-tagged findings."
             ),
             "ask": "Answer the following question about the code.",
-            "explain": (
-                "Explain how the following code works in clear, "
-                "accessible language."
-            ),
+            "explain": ("Explain how the following code works in clear, accessible language."),
         }
         prefix = prefixes.get(task_type, "")
 
@@ -718,13 +664,9 @@ class RLMCodingAgent(BaseAgent):
 
         # Add extra context from payload
         if task_type == "fix" and "bug_description" in payload:
-            parts.append(
-                f"\nBug description: {payload['bug_description']}"
-            )
+            parts.append(f"\nBug description: {payload['bug_description']}")
         if task_type == "explain" and "audience" in payload:
-            parts.append(
-                f"\nTarget audience: {payload['audience']}"
-            )
+            parts.append(f"\nTarget audience: {payload['audience']}")
 
         # Extract memory/learnings from context and inject
         # directly so the LLM sees them upfront (not buried
@@ -738,28 +680,19 @@ class RLMCodingAgent(BaseAgent):
                 mem_end = len(context)
             memory_section = context[mem_start:mem_end].strip()
             if memory_section:
-                parts.append(
-                    f"\n{memory_section}"
-                )
+                parts.append(f"\n{memory_section}")
 
         # For short follow-up messages, inject the previous
         # turn's response directly so the LLM understands
         # what "this", "that", "it" refer to.
-        if (
-            len(query.strip()) < 150
-            and "=== LAST COMPLETED TASK ===" in context
-        ):
-            start = context.index(
-                "=== LAST COMPLETED TASK ==="
-            )
+        if len(query.strip()) < 150 and "=== LAST COMPLETED TASK ===" in context:
+            start = context.index("=== LAST COMPLETED TASK ===")
             end = context.find("\n=== ", start + 10)
             if end == -1:
                 end = len(context)
             prev_turn = context[start:end].strip()
             if prev_turn:
-                parts.append(
-                    f"\n{prev_turn[:3000]}"
-                )
+                parts.append(f"\n{prev_turn[:3000]}")
 
         # Add investigation rules for project queries
         parts.append(
@@ -798,9 +731,7 @@ class RLMCodingAgent(BaseAgent):
             trajectory.append(
                 TraceStep(
                     iteration=1,
-                    reasoning=result_data.get(
-                        "final_reasoning", ""
-                    ),
+                    reasoning=result_data.get("final_reasoning", ""),
                     code=f"(RLM loop: {traj_len} iterations)",
                     output=result_data.get("answer", "")[:500],
                 )

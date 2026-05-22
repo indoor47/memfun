@@ -13,6 +13,7 @@ def sandbox():
     for handle_id in list(sb._sandboxes):
         handle = SandboxHandle(id=handle_id, backend="local")
         import asyncio
+
         asyncio.get_event_loop().run_until_complete(sb.destroy_sandbox(handle))
 
 
@@ -28,7 +29,7 @@ class TestLocalSandboxConformance:
 
     async def test_execute_with_context(self, sandbox: LocalSandbox):
         result = await sandbox.execute(
-            'print(name, age)',
+            "print(name, age)",
             context={"name": "Alice", "age": 30},
         )
         assert result.exit_code == 0

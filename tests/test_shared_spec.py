@@ -2,6 +2,7 @@
 
 Tests shared specification management for multi-agent workflows.
 """
+
 from __future__ import annotations
 
 import json

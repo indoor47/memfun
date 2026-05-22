@@ -20,20 +20,28 @@ def setup_logging(level: str = "INFO", json_output: bool = False) -> logging.Log
 
         class JSONFormatter(logging.Formatter):
             def format(self, record: logging.LogRecord) -> str:
-                return json.dumps({
-                    "ts": record.created,
-                    "level": record.levelname,
-                    "logger": record.name,
-                    "msg": record.getMessage(),
-                    **({"exc": self.formatException(record.exc_info)} if record.exc_info else {}),
-                })
+                return json.dumps(
+                    {
+                        "ts": record.created,
+                        "level": record.levelname,
+                        "logger": record.name,
+                        "msg": record.getMessage(),
+                        **(
+                            {"exc": self.formatException(record.exc_info)}
+                            if record.exc_info
+                            else {}
+                        ),
+                    }
+                )
 
         handler.setFormatter(JSONFormatter())
     else:
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
-            datefmt="%H:%M:%S",
-        ))
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
 
     logger.addHandler(handler)
     return logger

@@ -3,6 +3,7 @@
 Tests cover: agent lifecycle, sandbox execution, skill discovery/validation/sync,
 runtime builder configuration, and trace collection round-trips.
 """
+
 from __future__ import annotations
 
 import json
@@ -51,9 +52,7 @@ def _make_mock_prediction(**fields: str) -> MagicMock:
 class TestAgentLifecycle:
     """Integration tests for creating, starting, handling, and stopping an agent."""
 
-    async def test_agent_start_handle_stop(
-        self, memory_runtime: RuntimeContext
-    ) -> None:
+    async def test_agent_start_handle_stop(self, memory_runtime: RuntimeContext) -> None:
         """Full lifecycle: on_start -> handle -> on_stop with mocked LLM."""
         from memfun_agent.coding_agent import RLMCodingAgent
 
@@ -99,9 +98,7 @@ class TestAgentLifecycle:
 
             await agent.on_stop()
 
-    async def test_agent_unknown_task_type(
-        self, memory_runtime: RuntimeContext
-    ) -> None:
+    async def test_agent_unknown_task_type(self, memory_runtime: RuntimeContext) -> None:
         """Sending an unknown task type returns success=False."""
         from memfun_agent.coding_agent import RLMCodingAgent
 
@@ -134,9 +131,7 @@ class TestAgentLifecycle:
         assert "rlm-coder" in registry
         assert registry["rlm-coder"] is RLMCodingAgent
 
-    async def test_agent_metadata(
-        self, memory_runtime: RuntimeContext
-    ) -> None:
+    async def test_agent_metadata(self, memory_runtime: RuntimeContext) -> None:
         """Agent exposes correct id and version from decorator metadata."""
         from memfun_agent.coding_agent import RLMCodingAgent
 
@@ -144,9 +139,7 @@ class TestAgentLifecycle:
         assert agent.agent_id == "rlm-coder"
         assert agent.version == "1.0"
 
-    async def test_agent_handle_explain_task(
-        self, memory_runtime: RuntimeContext
-    ) -> None:
+    async def test_agent_handle_explain_task(self, memory_runtime: RuntimeContext) -> None:
         """Handle an 'explain' task through the direct predictor path."""
         from memfun_agent.coding_agent import RLMCodingAgent
 
@@ -266,8 +259,14 @@ class TestSkillsIntegration:
         assert len(skills) == 8
         names = {s.name for s in skills}
         assert names == {
-            "analyze-code", "ask", "explain-code", "fix-bugs",
-            "generate-tests", "refactor", "review-code", "security-audit",
+            "analyze-code",
+            "ask",
+            "explain-code",
+            "fix-bugs",
+            "generate-tests",
+            "refactor",
+            "review-code",
+            "security-audit",
         }
 
     def test_parse_and_validate_all_skills(self) -> None:
@@ -283,9 +282,7 @@ class TestSkillsIntegration:
 
         for skill in skills:
             errors = validator.validate(skill)
-            assert errors == [], (
-                f"Skill '{skill.name}' has validation errors: {errors}"
-            )
+            assert errors == [], f"Skill '{skill.name}' has validation errors: {errors}"
 
     def test_all_builtin_skills_have_instructions(self) -> None:
         """Every built-in skill should have non-empty instructions."""
@@ -295,12 +292,8 @@ class TestSkillsIntegration:
         skills = loader.discover([SKILLS_DIR])
 
         for skill in skills:
-            assert skill.instructions.strip(), (
-                f"Skill '{skill.name}' has empty instructions"
-            )
-            assert skill.description.strip(), (
-                f"Skill '{skill.name}' has empty description"
-            )
+            assert skill.instructions.strip(), f"Skill '{skill.name}' has empty instructions"
+            assert skill.description.strip(), f"Skill '{skill.name}' has empty description"
 
     def test_all_builtin_skills_have_version(self) -> None:
         """Every built-in skill should have a valid version string."""
@@ -334,8 +327,14 @@ class TestSkillsIntegration:
         registered = await registry.list_skills()
         names = {s.name for s in registered}
         assert names == {
-            "analyze-code", "ask", "explain-code", "fix-bugs",
-            "generate-tests", "refactor", "review-code", "security-audit",
+            "analyze-code",
+            "ask",
+            "explain-code",
+            "fix-bugs",
+            "generate-tests",
+            "refactor",
+            "review-code",
+            "security-audit",
         }
 
     async def test_skill_registry_get_after_sync(self) -> None:
@@ -399,9 +398,7 @@ class TestConfigIntegration:
     async def test_runtime_builder_sqlite(self, tmp_path: Path) -> None:
         """Build RuntimeContext with sqlite backend; verify all 8 adapters."""
         db_path = str(tmp_path / "test_integration.db")
-        config = MemfunConfig(
-            backend=BackendConfig(tier="sqlite", sqlite_path=db_path)
-        )
+        config = MemfunConfig(backend=BackendConfig(tier="sqlite", sqlite_path=db_path))
         ctx = await RuntimeBuilder(config).build()
 
         assert isinstance(ctx, RuntimeContext)

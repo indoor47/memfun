@@ -4,6 +4,7 @@ The PatternAnalyzer clusters similar strategy signatures to identify
 recurring execution patterns, then ranks them by frequency, confidence,
 and success rate.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -45,9 +46,7 @@ class PatternAnalyzer:
         """
         self._threshold = similarity_threshold
 
-    def analyze(
-        self, signatures: list[StrategySignature]
-    ) -> list[StrategyPattern]:
+    def analyze(self, signatures: list[StrategySignature]) -> list[StrategyPattern]:
         """Analyze signatures to discover patterns.
 
         Args:
@@ -88,9 +87,7 @@ class PatternAnalyzer:
             Filtered list of dominant patterns
         """
         dominant = [
-            p
-            for p in patterns
-            if p.frequency >= min_frequency and p.confidence >= min_confidence
+            p for p in patterns if p.frequency >= min_frequency and p.confidence >= min_confidence
         ]
         logger.info(
             "Found %d dominant patterns (from %d total)",
@@ -131,9 +128,7 @@ class PatternAnalyzer:
         """
         return [step.kind for step in steps]
 
-    def _similarity(
-        self, seq1: list[StepKind], seq2: list[StepKind]
-    ) -> float:
+    def _similarity(self, seq1: list[StepKind], seq2: list[StepKind]) -> float:
         """Compute similarity between two step sequences.
 
         Uses longest common subsequence (LCS) ratio as similarity metric.
@@ -155,9 +150,7 @@ class PatternAnalyzer:
         max_len = max(len(seq1), len(seq2))
         return lcs_len / max_len if max_len > 0 else 0.0
 
-    def _lcs_length(
-        self, seq1: list[StepKind], seq2: list[StepKind]
-    ) -> int:
+    def _lcs_length(self, seq1: list[StepKind], seq2: list[StepKind]) -> int:
         """Compute the length of the longest common subsequence.
 
         Args:
@@ -223,9 +216,7 @@ class PatternAnalyzer:
 
         return clusters
 
-    def _cluster_to_pattern(
-        self, cluster: list[StrategySignature]
-    ) -> StrategyPattern:
+    def _cluster_to_pattern(self, cluster: list[StrategySignature]) -> StrategyPattern:
         """Convert a cluster of signatures to a pattern.
 
         Args:
@@ -239,10 +230,10 @@ class PatternAnalyzer:
 
         # Compute aggregate metrics
         frequency = len(cluster)
-        avg_confidence = sum(
-            sum(step.confidence for step in sig.steps) / len(sig.steps)
-            for sig in cluster
-        ) / frequency
+        avg_confidence = (
+            sum(sum(step.confidence for step in sig.steps) / len(sig.steps) for sig in cluster)
+            / frequency
+        )
         avg_duration_ms = sum(sig.duration_ms for sig in cluster) / frequency
         avg_token_cost = sum(sig.token_cost for sig in cluster) / frequency
         success_count = sum(1 for sig in cluster if sig.success)

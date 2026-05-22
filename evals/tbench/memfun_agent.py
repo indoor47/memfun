@@ -37,7 +37,8 @@ SUMMARY_THRESHOLD = 60_000  # summarize conversation at this char count
 DONE_MARKER = "<<MEMFUN_DONE>>"
 SUMMARY_MARKER = "<<MEMFUN_SUMMARY>>"
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT = (
+    """\
 You are Memfun, an autonomous terminal agent. You solve tasks by running \
 shell commands in a Linux terminal.
 
@@ -69,8 +70,12 @@ or running a long process. Consider using timeout, background (&), or Ctrl-C.
 - If you encounter an error, read it carefully and adapt your approach.
 - NEVER give up. If one approach fails, try another.
 - When you are CERTAIN the task is fully completed and verified, respond \
-with ONLY the text: """ + DONE_MARKER + """
-- Do NOT say """ + DONE_MARKER + """ until you have actually verified the solution.
+with ONLY the text: """
+    + DONE_MARKER
+    + """
+- Do NOT say """
+    + DONE_MARKER
+    + """ until you have actually verified the solution.
 
 ## Output Handling
 
@@ -78,6 +83,7 @@ with ONLY the text: """ + DONE_MARKER + """
 - Use grep, head, tail, or awk to filter output when useful.
 - Avoid commands that produce unbounded output (e.g., `find /` without limits).
 """
+)
 
 # ── Helpers ───────────────────────────────────────────────────────
 
@@ -106,18 +112,13 @@ def _truncate(text: str, max_chars: int = OUTPUT_TRUNCATE_CHARS) -> str:
         return text
     half = max_chars // 2
     return (
-        text[:half]
-        + f"\n\n... [{len(text) - max_chars} chars truncated] ...\n\n"
-        + text[-half:]
+        text[:half] + f"\n\n... [{len(text) - max_chars} chars truncated] ...\n\n" + text[-half:]
     )
 
 
 def _conversation_size(messages: list[dict]) -> int:
     """Approximate char count of the conversation."""
-    return sum(
-        len(str(m.get("content", "")))
-        for m in messages
-    )
+    return sum(len(str(m.get("content", ""))) for m in messages)
 
 
 # ── Tool definitions ──────────────────────────────────────────────
@@ -233,12 +234,8 @@ class MemfunAgent(BaseAgent):
             # Track tokens
             usage = getattr(response, "usage", None)
             if usage:
-                self._total_input_tokens += getattr(
-                    usage, "prompt_tokens", 0
-                )
-                self._total_output_tokens += getattr(
-                    usage, "completion_tokens", 0
-                )
+                self._total_input_tokens += getattr(usage, "prompt_tokens", 0)
+                self._total_output_tokens += getattr(usage, "completion_tokens", 0)
 
             # Process the response
             choice = response.choices[0]
@@ -251,21 +248,20 @@ class MemfunAgent(BaseAgent):
 
                 if DONE_MARKER in text:
                     done = True
-                    markers.append(
-                        (time.time() - t0, "agent_declared_done")
-                    )
+                    markers.append((time.time() - t0, "agent_declared_done"))
                     logger.info("Agent declared done at iteration %d", iteration)
                 else:
                     # Agent responded with text but no tool call and no DONE
                     # Nudge it to keep working or declare done
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "Continue working on the task. "
-                            "If you are done, respond with: "
-                            + DONE_MARKER
-                        ),
-                    })
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Continue working on the task. "
+                                "If you are done, respond with: " + DONE_MARKER
+                            ),
+                        }
+                    )
                 continue
 
             # Handle tool calls
@@ -276,11 +272,13 @@ class MemfunAgent(BaseAgent):
                 for tool_call in message.tool_calls:
                     fn = tool_call.function
                     if fn.name != "bash":
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": f"Unknown tool: {fn.name}",
-                        })
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": f"Unknown tool: {fn.name}",
+                            }
+                        )
                         continue
 
                     # Parse command
@@ -288,11 +286,13 @@ class MemfunAgent(BaseAgent):
                         args = json.loads(fn.arguments)
                         command = args["command"]
                     except (json.JSONDecodeError, KeyError):
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": "Error: invalid arguments",
-                        })
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": "Error: invalid arguments",
+                            }
+                        )
                         continue
 
                     # Execute via tmux
@@ -300,18 +300,18 @@ class MemfunAgent(BaseAgent):
                     output = self._execute_command(session, command)
                     output = _truncate(output)
 
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": output if output else "(no output)",
-                    })
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": output if output else "(no output)",
+                        }
+                    )
 
                     # Also check text content for DONE marker
                     if message.content and DONE_MARKER in message.content:
                         done = True
-                        markers.append(
-                            (time.time() - t0, "agent_declared_done")
-                        )
+                        markers.append((time.time() - t0, "agent_declared_done"))
                         break
 
         if iteration >= self._max_iterations and not done:
@@ -439,8 +439,7 @@ class MemfunAgent(BaseAgent):
             {
                 "role": "user",
                 "content": (
-                    f"Summary of previous work:\n{summary}\n\n"
-                    "Continue from where you left off."
+                    f"Summary of previous work:\n{summary}\n\nContinue from where you left off."
                 ),
             },
             *recent,

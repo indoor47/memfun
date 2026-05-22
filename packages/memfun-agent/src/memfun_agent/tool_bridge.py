@@ -9,6 +9,7 @@ The bridge provides:
 - Pre-built Python function wrappers for common tools (read_file, grep, etc.)
 - ``llm_query`` passthrough (provided by RLMModule, but re-exported for clarity)
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -83,11 +84,11 @@ class MCPToolBridge:
                 from memfun_tools.gateway import (  # type: ignore[import-untyped]
                     create_gateway,
                 )
+
                 self._gateway = create_gateway()
             except ImportError:
                 logger.warning(
-                    "memfun-tools not available; MCP tools "
-                    "will be unavailable in the REPL"
+                    "memfun-tools not available; MCP tools will be unavailable in the REPL"
                 )
                 self._initialized = True
                 return
@@ -95,18 +96,14 @@ class MCPToolBridge:
         # Discover available tools
         try:
             tools = await self._gateway.get_tools()
-            self._available_tools = [
-                t if isinstance(t, str) else t.name for t in tools
-            ]
+            self._available_tools = [t if isinstance(t, str) else t.name for t in tools]
             logger.info(
                 "MCP Tool Bridge initialized with %d tools: %s",
                 len(self._available_tools),
                 ", ".join(self._available_tools[:10]),
             )
         except Exception as exc:
-            logger.warning(
-                "Failed to discover MCP tools: %s", exc
-            )
+            logger.warning("Failed to discover MCP tools: %s", exc)
             self._available_tools = []
 
         self._initialized = True
@@ -134,9 +131,7 @@ class MCPToolBridge:
             )
 
         try:
-            result = await self._gateway.call_tool(
-                tool_name, kwargs
-            )
+            result = await self._gateway.call_tool(tool_name, kwargs)
             # FastMCP call_tool returns a list of content blocks
             content_parts: list[str] = []
             if isinstance(result, list):
@@ -177,18 +172,15 @@ class MCPToolBridge:
         # File system tools
         tools["read_file"] = self._make_sync_tool(
             "fs_read_file",
-            "Read a file. Args: path (str), offset (int)=0, "
-            "limit (int)=2000",
+            "Read a file. Args: path (str), offset (int)=0, limit (int)=2000",
         )
         tools["write_file"] = self._make_sync_tool(
             "fs_write_file",
-            "Write content to a file. Args: path (str), "
-            "content (str)",
+            "Write content to a file. Args: path (str), content (str)",
         )
         tools["list_directory"] = self._make_sync_tool(
             "fs_list_directory",
-            "List directory contents. Args: path (str), "
-            "recursive (bool)=False",
+            "List directory contents. Args: path (str), recursive (bool)=False",
         )
         tools["glob_files"] = self._make_sync_tool(
             "fs_glob",
@@ -210,8 +202,7 @@ class MCPToolBridge:
         )
         tools["git_diff"] = self._make_sync_tool(
             "git_git_diff",
-            "Git diff. Args: path (str)='.', staged (bool)=False, "
-            "file (str|None)=None",
+            "Git diff. Args: path (str)='.', staged (bool)=False, file (str|None)=None",
         )
         tools["git_log"] = self._make_sync_tool(
             "git_git_log",
@@ -257,9 +248,7 @@ class MCPToolBridge:
                     )
                     result = future.result(timeout=60)
             else:
-                result = asyncio.run(
-                    bridge.call_tool(tool_name, **kwargs)
-                )
+                result = asyncio.run(bridge.call_tool(tool_name, **kwargs))
 
             if result.success:
                 return result.content

@@ -22,7 +22,7 @@ class TestConfig:
 
     def test_from_toml(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
-            f.write('''
+            f.write("""
 [project]
 name = "test-project"
 
@@ -35,7 +35,7 @@ tier = "memory"
 
 [sandbox]
 backend = "docker"
-''')
+""")
             f.flush()
             config = MemfunConfig.from_toml(f.name)
 

@@ -49,14 +49,16 @@ class NATSRegistry:
             capabilities=capabilities,
             metadata={k: str(v) for k, v in metadata.items()},
         )
-        data = json.dumps({
-            "agent_id": info.agent_id,
-            "name": info.name,
-            "version": info.version,
-            "capabilities": info.capabilities,
-            "metadata": info.metadata,
-            "endpoint": info.endpoint,
-        })
+        data = json.dumps(
+            {
+                "agent_id": info.agent_id,
+                "name": info.name,
+                "version": info.version,
+                "capabilities": info.capabilities,
+                "metadata": info.metadata,
+                "endpoint": info.endpoint,
+            }
+        )
         await self._kv.put(agent_id, data.encode())  # type: ignore[union-attr]
 
     async def deregister(self, agent_id: str) -> None:

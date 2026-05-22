@@ -5,6 +5,7 @@ its output, the final answer, timing, and token usage. These traces are
 persisted via the StateStoreAdapter for later analysis, optimization
 (MIPROv2/GEPA), and agent synthesis.
 """
+
 from __future__ import annotations
 
 import json
@@ -83,12 +84,8 @@ class ExecutionTrace:
         """Deserialize a trace from a JSON string."""
         data = json.loads(raw)
         # Reconstruct nested dataclasses
-        data["trajectory"] = [
-            TraceStep(**step) for step in data.get("trajectory", [])
-        ]
-        data["token_usage"] = TokenUsage(
-            **data.get("token_usage", {})
-        )
+        data["trajectory"] = [TraceStep(**step) for step in data.get("trajectory", [])]
+        data["token_usage"] = TokenUsage(**data.get("token_usage", {}))
         return cls(**data)
 
 
@@ -130,9 +127,7 @@ class TraceCollector:
         serialized = trace.to_json()
 
         if self._state_store is not None:
-            await self._state_store.set(
-                key, serialized.encode("utf-8")
-            )
+            await self._state_store.set(key, serialized.encode("utf-8"))
             logger.debug(
                 "Saved trace %s (%d steps)",
                 trace.trace_id,
@@ -159,18 +154,14 @@ class TraceCollector:
 
         return self._in_memory.get(trace_id)
 
-    async def list_trace_ids(
-        self, limit: int = 100
-    ) -> list[str]:
+    async def list_trace_ids(self, limit: int = 100) -> list[str]:
         """List stored trace IDs (most recent first).
 
         Returns up to ``limit`` trace IDs.
         """
         if self._state_store is not None:
             ids: list[str] = []
-            async for key in self._state_store.list_keys(
-                _TRACE_PREFIX
-            ):
+            async for key in self._state_store.list_keys(_TRACE_PREFIX):
                 tid = key.removeprefix(_TRACE_PREFIX)
                 ids.append(tid)
                 if len(ids) >= limit:

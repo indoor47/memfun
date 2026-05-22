@@ -2,6 +2,7 @@
 
 Tests task decomposition into DAG of sub-tasks with dependency validation.
 """
+
 from __future__ import annotations
 
 import json

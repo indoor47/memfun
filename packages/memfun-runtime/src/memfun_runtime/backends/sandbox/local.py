@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 logger = get_logger("sandbox.local")
 
 _MAX_OUTPUT_BYTES = 100 * 1024  # 100 KB
-_MAX_TIMEOUT_SECONDS = 300     # 5 minutes hard cap
+_MAX_TIMEOUT_SECONDS = 300  # 5 minutes hard cap
 
 
 def _build_preamble(context: dict) -> str:
@@ -78,9 +78,7 @@ class LocalSandbox:
             backend="local",
         )
         self._sandboxes[handle.id] = (config, work_dir)
-        logger.info(
-            "Created local sandbox %s at %s", handle.id[:8], work_dir
-        )
+        logger.info("Created local sandbox %s at %s", handle.id[:8], work_dir)
         return handle
 
     async def execute(
@@ -170,14 +168,16 @@ class LocalSandbox:
         t0 = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, script_path,
+                sys.executable,
+                script_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=work_dir,
                 env=env,
             )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout,
+                proc.communicate(),
+                timeout=timeout,
             )
         except TimeoutError:
             duration_ms = (time.monotonic() - t0) * 1000

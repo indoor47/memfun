@@ -51,12 +51,14 @@ class TestEventBusConformance:
 
     async def test_create_topic_idempotent(self, event_bus):
         from memfun_core.types import TopicConfig
+
         config = TopicConfig()
         await event_bus.create_topic("my-topic", config)
         await event_bus.create_topic("my-topic", config)  # Should not raise
 
     async def test_create_topic_conflict_raises(self, event_bus):
         from memfun_core.types import TopicConfig
+
         await event_bus.create_topic("conflict-topic", TopicConfig(retention_seconds=100))
         with pytest.raises(ValueError):
             await event_bus.create_topic("conflict-topic", TopicConfig(retention_seconds=200))

@@ -61,13 +61,15 @@ class RedisStateStore:
         cursor: int | bytes = 0
         while True:
             cursor, keys = await self._r.scan(
-                cursor=cursor, match=f"{full_prefix}*", count=100,
+                cursor=cursor,
+                match=f"{full_prefix}*",
+                count=100,
             )
             state_prefix = f"{self._prefix}state:"
             for key in keys:
                 decoded = key.decode() if isinstance(key, bytes) else key
                 # Strip the internal prefix to return the logical key.
-                yield decoded[len(state_prefix):]
+                yield decoded[len(state_prefix) :]
             if cursor == 0:
                 break
 

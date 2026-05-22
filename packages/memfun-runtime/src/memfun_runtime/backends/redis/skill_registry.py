@@ -30,15 +30,17 @@ class RedisSkillRegistry:
         return f"{self._prefix}skills"
 
     async def register_skill(self, skill: SkillInfo) -> None:
-        data = json.dumps({
-            "name": skill.name,
-            "description": skill.description,
-            "source_path": skill.source_path,
-            "user_invocable": skill.user_invocable,
-            "model_invocable": skill.model_invocable,
-            "allowed_tools": skill.allowed_tools,
-            "metadata": skill.metadata,
-        })
+        data = json.dumps(
+            {
+                "name": skill.name,
+                "description": skill.description,
+                "source_path": skill.source_path,
+                "user_invocable": skill.user_invocable,
+                "model_invocable": skill.model_invocable,
+                "allowed_tools": skill.allowed_tools,
+                "metadata": skill.metadata,
+            }
+        )
         await self._r.hset(self._hash_key(), skill.name, data)
 
     async def deregister_skill(self, name: str) -> None:

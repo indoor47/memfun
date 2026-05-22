@@ -1,4 +1,5 @@
 """SKILL.md parser: extracts YAML frontmatter and markdown instructions."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
@@ -49,9 +50,7 @@ def parse_skill_md(path: Path) -> SkillDefinition:
 
     # Resolve optional directories
     scripts_dir = skill_dir / "scripts" if (skill_dir / "scripts").is_dir() else None
-    references_dir = (
-        skill_dir / "references" if (skill_dir / "references").is_dir() else None
-    )
+    references_dir = skill_dir / "references" if (skill_dir / "references").is_dir() else None
 
     return SkillDefinition(
         name=str(meta["name"]),

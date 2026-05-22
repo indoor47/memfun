@@ -16,6 +16,7 @@ machinery, which is what actually runs in the swarm.
 
 Skipped when no live endpoint is reachable.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -26,10 +27,12 @@ import socket
 import pytest
 
 LIVE_LM_BASE_URL = os.environ.get(
-    "LIVE_LM_BASE_URL", "http://127.0.0.1:8090/v1",
+    "LIVE_LM_BASE_URL",
+    "http://127.0.0.1:8090/v1",
 )
 LIVE_LM_MODEL = os.environ.get(
-    "LIVE_LM_MODEL", "qwen3-coder-30b-a3b",
+    "LIVE_LM_MODEL",
+    "qwen3-coder-30b-a3b",
 )
 LIVE_LM_API_KEY = os.environ.get("LIVE_LM_API_KEY", "sk-local")
 
@@ -103,18 +106,21 @@ async def test_real_dspy_lm_call_publishes_llm_call_event() -> None:
 
     # Verify the callback actually attached.
     cbs = list(getattr(dspy.settings, "callbacks", []) or [])
-    assert any(
-        c.__class__.__name__ == "_Bound" for c in cbs
-    ), f"_Bound callback not installed; saw {[c.__class__.__name__ for c in cbs]}"
+    assert any(c.__class__.__name__ == "_Bound" for c in cbs), (
+        f"_Bound callback not installed; saw {[c.__class__.__name__ for c in cbs]}"
+    )
 
     # Sync ``lm(...)`` would block the loop, so we run it in a worker
     # thread the same way the swarm does (DSPy LM call is sync).
     # Use ``dspy.context(...)`` so this test can coexist with others
     # that also configure DSPy on a different asyncio task.
-    with dspy.context(lm=lm), agent_context(
-        agent_name="live-test-agent",
-        task_id="live-T1",
-        worker_id="live-w1",
+    with (
+        dspy.context(lm=lm),
+        agent_context(
+            agent_name="live-test-agent",
+            task_id="live-T1",
+            worker_id="live-w1",
+        ),
     ):
         out = await asyncio.to_thread(lm, "Reply with exactly: ok.")
 
@@ -124,11 +130,7 @@ async def test_real_dspy_lm_call_publishes_llm_call_event() -> None:
     # The callback's publish goes through loop.create_task(), so yield
     # to let it run.  Also explicitly drain any pending tasks.
     await asyncio.sleep(0.3)
-    pending = [
-        t
-        for t in asyncio.all_tasks()
-        if not t.done() and t is not asyncio.current_task()
-    ]
+    pending = [t for t in asyncio.all_tasks() if not t.done() and t is not asyncio.current_task()]
     if pending:
         await asyncio.wait(pending, timeout=2.0)
 
@@ -191,18 +193,18 @@ async def test_real_dspy_predict_publishes_llm_call_event() -> None:
     install_dspy_callback()
 
     pred = dspy.Predict("question -> answer")
-    with dspy.context(lm=lm), agent_context(
-        agent_name="predict-test", task_id="P1",
+    with (
+        dspy.context(lm=lm),
+        agent_context(
+            agent_name="predict-test",
+            task_id="P1",
+        ),
     ):
         # Predict is sync — run in a thread so the loop stays responsive.
         await asyncio.to_thread(pred, question="What is 2 + 2?")
 
     await asyncio.sleep(0.3)
-    pending = [
-        t
-        for t in asyncio.all_tasks()
-        if not t.done() and t is not asyncio.current_task()
-    ]
+    pending = [t for t in asyncio.all_tasks() if not t.done() and t is not asyncio.current_task()]
     if pending:
         await asyncio.wait(pending, timeout=2.0)
 

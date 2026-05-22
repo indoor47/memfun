@@ -9,6 +9,7 @@ Key components:
 - ``LocalREPL`` -- In-process Python REPL for when no sandbox backend exists.
 - ``build_context_metadata`` -- Produces compact metadata for the LLM.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -62,9 +63,7 @@ def build_context_metadata(
 
     if isinstance(context, bytes):
         try:
-            preview = context[:preview_length].decode(
-                "utf-8", errors="replace"
-            )
+            preview = context[:preview_length].decode("utf-8", errors="replace")
         except Exception:
             preview = repr(context[:preview_length])
     else:
@@ -79,30 +78,17 @@ def build_context_metadata(
 
     lines.append("")
     lines.append("Available helper functions in the REPL:")
-    lines.append(
-        "  write_file(path: str, content: str) -> str"
-        "  # Write a file, returns abs path"
-    )
-    lines.append(
-        "  read_file(path: str) -> str"
-        "  # Read file contents as string"
-    )
-    lines.append(
-        "  run_cmd(cmd: str) -> str"
-        "  # Run shell command, returns stdout string"
-    )
-    lines.append(
-        "  edit_file(path: str, old: str, new: str) -> bool"
-        "  # Replace text in file"
-    )
+    lines.append("  write_file(path: str, content: str) -> str  # Write a file, returns abs path")
+    lines.append("  read_file(path: str) -> str  # Read file contents as string")
+    lines.append("  run_cmd(cmd: str) -> str  # Run shell command, returns stdout string")
+    lines.append("  edit_file(path: str, old: str, new: str) -> bool  # Replace text in file")
     lines.append(
         "  list_files(path: str = '.', with_times: bool = False)"
         " -> list[str]"
         "  # Returns LIST of file paths (with_times adds dates)"
     )
     lines.append(
-        "  llm_query(question: str, context: str) -> str"
-        "  # Ask sub-LM, returns answer string"
+        "  llm_query(question: str, context: str) -> str  # Ask sub-LM, returns answer string"
     )
     lines.append(
         "  web_search(query: str, max_results: int = 5)"
@@ -110,9 +96,7 @@ def build_context_metadata(
         "  # Search web, returns [{title, url, snippet}]"
     )
     lines.append(
-        "  web_fetch(url: str, max_length: int = 50000)"
-        " -> str"
-        "  # Fetch URL content as string"
+        "  web_fetch(url: str, max_length: int = 50000) -> str  # Fetch URL content as string"
     )
     if has_history:
         lines.append("")
@@ -138,44 +122,26 @@ def build_context_metadata(
     lines.append("")
     lines.append("CRITICAL RULES:")
     lines.append(
-        "- Output ONLY pure Python code. NO markdown, "
-        "NO ```python fences, NO explanatory text."
+        "- Output ONLY pure Python code. NO markdown, NO ```python fences, NO explanatory text."
     )
     lines.append(
-        "- list_files() returns a list[str]. "
-        "Iterate with for-loop, do NOT call .split() on it."
+        "- list_files() returns a list[str]. Iterate with for-loop, do NOT call .split() on it."
     )
-    lines.append(
-        "- read_file() returns a str. "
-        "Use .split('\\n') to get lines."
-    )
-    lines.append(
-        "- Always use write_file() instead of raw open()."
-    )
-    lines.append(
-        "- Always use run_cmd() instead of subprocess."
-    )
+    lines.append("- read_file() returns a str. Use .split('\\n') to get lines.")
+    lines.append("- Always use write_file() instead of raw open().")
+    lines.append("- Always use run_cmd() instead of subprocess.")
     lines.append(
         "- Use web_search() when you need current information "
         "from the internet (APIs, docs, prices, news, etc.)."
     )
-    lines.append(
-        "- Use web_fetch() to read full content from a URL."
-    )
+    lines.append("- Use web_fetch() to read full content from a URL.")
     lines.append(
         "- You are fully autonomous: install deps, create "
         "files, run commands, deploy, verify — do everything."
     )
-    lines.append(
-        "- Never tell the user to do something you can do."
-    )
-    lines.append(
-        "- Write production-quality code with proper "
-        "structure and styling."
-    )
-    lines.append(
-        "- Always verify: check files exist, test the app."
-    )
+    lines.append("- Never tell the user to do something you can do.")
+    lines.append("- Write production-quality code with proper structure and styling.")
+    lines.append("- Always verify: check files exist, test the app.")
 
     return "\n".join(lines)
 
@@ -352,15 +318,11 @@ class RLMModule(dspy.Module):
             with concurrent.futures.ThreadPoolExecutor(1) as pool:
                 future = pool.submit(
                     asyncio.run,
-                    self.aforward(
-                        query=query, context=context, **kwargs
-                    ),
+                    self.aforward(query=query, context=context, **kwargs),
                 )
                 return future.result()
 
-        return asyncio.run(
-            self.aforward(query=query, context=context, **kwargs)
-        )
+        return asyncio.run(self.aforward(query=query, context=context, **kwargs))
 
     async def aforward(
         self,
@@ -431,9 +393,7 @@ class RLMModule(dspy.Module):
                             )
 
                     # Inject plan into query so the LLM follows it
-                    plan_text = "\n".join(
-                        f"  {i + 1}. {s}" for i, s in enumerate(plan)
-                    )
+                    plan_text = "\n".join(f"  {i + 1}. {s}" for i, s in enumerate(plan))
                     query = (
                         f"{query}\n\n"
                         f"=== EXECUTION PLAN ===\n"
@@ -486,7 +446,7 @@ class RLMModule(dspy.Module):
                 if len(code_history) > self.config.max_history_chars:
                     code_history = (
                         "... (earlier history truncated) ...\n"
-                        + code_history[-self.config.max_history_chars:]
+                        + code_history[-self.config.max_history_chars :]
                     )
 
                 # Ask LLM for next exploration step
@@ -515,19 +475,11 @@ class RLMModule(dspy.Module):
                                 if resp and hasattr(resp, "usage"):
                                     usage = resp.usage or {}
                         if isinstance(usage, dict):
-                            total_prompt_tokens += usage.get(
-                                "prompt_tokens", 0
-                            )
-                            total_completion_tokens += usage.get(
-                                "completion_tokens", 0
-                            )
+                            total_prompt_tokens += usage.get("prompt_tokens", 0)
+                            total_completion_tokens += usage.get("completion_tokens", 0)
                         elif usage:
-                            total_prompt_tokens += getattr(
-                                usage, "prompt_tokens", 0
-                            )
-                            total_completion_tokens += getattr(
-                                usage, "completion_tokens", 0
-                            )
+                            total_prompt_tokens += getattr(usage, "prompt_tokens", 0)
+                            total_completion_tokens += getattr(usage, "completion_tokens", 0)
                 except Exception:
                     pass
 
@@ -540,20 +492,13 @@ class RLMModule(dspy.Module):
 
                 # Execute the code
                 step_start = time.perf_counter()
-                exec_result = await self._execute_code(
-                    repl, next_code
-                )
-                step_ms = (
-                    (time.perf_counter() - step_start) * 1000.0
-                )
+                exec_result = await self._execute_code(repl, next_code)
+                step_ms = (time.perf_counter() - step_start) * 1000.0
 
                 # Build output string
                 output = exec_result.stdout
                 output_truncated = False
-                if (
-                    self.config.max_output_chars > 0
-                    and len(output) > self.config.max_output_chars
-                ):
+                if self.config.max_output_chars > 0 and len(output) > self.config.max_output_chars:
                     output = (
                         output[: self.config.max_output_chars]
                         + f"\n... (truncated, total {len(exec_result.stdout)} chars)"
@@ -571,10 +516,7 @@ class RLMModule(dspy.Module):
                     output=output,
                     output_truncated=output_truncated,
                     duration_ms=step_ms,
-                    cumulative_tokens=(
-                        total_prompt_tokens
-                        + total_completion_tokens
-                    ),
+                    cumulative_tokens=(total_prompt_tokens + total_completion_tokens),
                 )
                 trajectory.append(step)
 
@@ -606,10 +548,7 @@ class RLMModule(dspy.Module):
 
                     if new_step != current_plan_step:
                         # Mark previous step completed
-                        if (
-                            current_plan_step >= 0
-                            and self._on_step_status is not None
-                        ):
+                        if current_plan_step >= 0 and self._on_step_status is not None:
                             try:
                                 self._on_step_status(
                                     current_plan_step,
@@ -618,19 +557,14 @@ class RLMModule(dspy.Module):
                                 )
                             except Exception:
                                 logger.debug(
-                                    "on_step_status callback"
-                                    " failed",
+                                    "on_step_status callback failed",
                                     exc_info=True,
                                 )
                         # Mark new step in-progress
                         current_plan_step = new_step
                         if self._on_step_status is not None:
                             try:
-                                detail = (
-                                    plan[new_step]
-                                    if new_step < len(plan)
-                                    else ""
-                                )
+                                detail = plan[new_step] if new_step < len(plan) else ""
                                 self._on_step_status(
                                     new_step,
                                     "in_progress",
@@ -638,8 +572,7 @@ class RLMModule(dspy.Module):
                                 )
                             except Exception:
                                 logger.debug(
-                                    "on_step_status callback"
-                                    " failed",
+                                    "on_step_status callback failed",
                                     exc_info=True,
                                 )
 
@@ -668,67 +601,29 @@ class RLMModule(dspy.Module):
                 state = repl.namespace.get("state", {})
                 ops_so_far = state.get("_ops", [])
                 if ops_so_far:
-                    writes = [
-                        o[1] for o in ops_so_far
-                        if o[0] == "write"
-                    ]
-                    edits = [
-                        o[1] for o in ops_so_far
-                        if o[0] == "edit"
-                    ]
-                    reads = [
-                        o[1] for o in ops_so_far
-                        if o[0] == "read"
-                    ]
-                    cmds = [
-                        o[1] for o in ops_so_far
-                        if o[0] == "cmd"
-                    ]
-                    web_searches = [
-                        o[1] for o in ops_so_far
-                        if o[0] == "web_search"
-                    ]
-                    web_fetches = [
-                        o[1] for o in ops_so_far
-                        if o[0] == "web_fetch"
-                    ]
+                    writes = [o[1] for o in ops_so_far if o[0] == "write"]
+                    edits = [o[1] for o in ops_so_far if o[0] == "edit"]
+                    reads = [o[1] for o in ops_so_far if o[0] == "read"]
+                    cmds = [o[1] for o in ops_so_far if o[0] == "cmd"]
+                    web_searches = [o[1] for o in ops_so_far if o[0] == "web_search"]
+                    web_fetches = [o[1] for o in ops_so_far if o[0] == "web_fetch"]
                     status_parts = []
                     if reads:
                         # Show unique files read.
                         unique_reads = list(dict.fromkeys(reads))
-                        status_parts.append(
-                            f"Files read: "
-                            f"{', '.join(unique_reads[-5:])}"
-                        )
+                        status_parts.append(f"Files read: {', '.join(unique_reads[-5:])}")
                     if writes:
-                        status_parts.append(
-                            f"Files written: "
-                            f"{', '.join(writes[-5:])}"
-                        )
+                        status_parts.append(f"Files written: {', '.join(writes[-5:])}")
                     if edits:
                         unique_edits = list(dict.fromkeys(edits))
-                        status_parts.append(
-                            f"Files edited: "
-                            f"{', '.join(unique_edits[-5:])}"
-                        )
+                        status_parts.append(f"Files edited: {', '.join(unique_edits[-5:])}")
                     if cmds:
-                        status_parts.append(
-                            f"Commands run: "
-                            f"{', '.join(cmds[-5:])}"
-                        )
+                        status_parts.append(f"Commands run: {', '.join(cmds[-5:])}")
                     if web_searches:
-                        status_parts.append(
-                            f"Web searches: "
-                            f"{', '.join(web_searches[-3:])}"
-                        )
+                        status_parts.append(f"Web searches: {', '.join(web_searches[-3:])}")
                     if web_fetches:
-                        status_parts.append(
-                            f"URLs fetched: "
-                            f"{len(web_fetches)}"
-                        )
-                    code_history += (
-                        f"[State: {'; '.join(status_parts)}]\n"
-                    )
+                        status_parts.append(f"URLs fetched: {len(web_fetches)}")
+                    code_history += f"[State: {'; '.join(status_parts)}]\n"
 
                 # ── Iteration budget + stall detection ──────
                 remaining = self.config.max_iterations - iteration
@@ -749,10 +644,7 @@ class RLMModule(dspy.Module):
                     # no writes/edits/commands
                     state = repl.namespace.get("state", {})
                     ops_so_far = state.get("_ops", [])
-                    action_ops = [
-                        o for o in ops_so_far
-                        if o[0] in ("write", "edit", "cmd")
-                    ]
+                    action_ops = [o for o in ops_so_far if o[0] in ("write", "edit", "cmd")]
                     if not action_ops:
                         code_history += (
                             "⚠ STALL DETECTED: You've been "
@@ -767,24 +659,15 @@ class RLMModule(dspy.Module):
                         # Check for re-read loop: if the agent
                         # has action ops but keeps re-reading
                         # the same files (common after edits)
-                        read_ops = [
-                            o[1] for o in ops_so_far
-                            if o[0] == "read"
-                        ]
+                        read_ops = [o[1] for o in ops_so_far if o[0] == "read"]
                         if len(read_ops) >= 4:
                             from collections import Counter
 
                             read_counts = Counter(read_ops)
-                            hot_files = [
-                                (f, c) for f, c in
-                                read_counts.most_common(3)
-                                if c >= 3
-                            ]
+                            hot_files = [(f, c) for f, c in read_counts.most_common(3) if c >= 3]
                             if hot_files:
                                 names = ", ".join(
-                                    f"{f.rsplit('/', 1)[-1]}"
-                                    f" ({c}x)"
-                                    for f, c in hot_files
+                                    f"{f.rsplit('/', 1)[-1]} ({c}x)" for f, c in hot_files
                                 )
                                 code_history += (
                                     f"⚠ RE-READ LOOP: You've "
@@ -814,15 +697,12 @@ class RLMModule(dspy.Module):
                 # Also check FINAL_VAR pattern
                 if "FINAL_VAR" in state:
                     var_name = state["FINAL_VAR"]
-                    answer = str(
-                        repl.namespace.get(var_name, "")
-                    )
+                    answer = str(repl.namespace.get(var_name, ""))
                     break
             else:
                 # Max iterations reached without FINAL
                 logger.warning(
-                    "RLM reached max iterations (%d) without "
-                    "FINAL answer",
+                    "RLM reached max iterations (%d) without FINAL answer",
                     self.config.max_iterations,
                 )
                 # Build auto-summary from tracked operations
@@ -832,70 +712,33 @@ class RLMModule(dspy.Module):
 
                 if ops or files:
                     summary_parts: list[str] = []
-                    writes = [
-                        o for o in ops if o[0] == "write"
-                    ]
-                    edits = [
-                        o for o in ops if o[0] == "edit"
-                    ]
-                    cmds = [
-                        o for o in ops if o[0] == "cmd"
-                    ]
-                    searches = [
-                        o for o in ops
-                        if o[0] == "web_search"
-                    ]
-                    fetches = [
-                        o for o in ops
-                        if o[0] == "web_fetch"
-                    ]
+                    writes = [o for o in ops if o[0] == "write"]
+                    edits = [o for o in ops if o[0] == "edit"]
+                    cmds = [o for o in ops if o[0] == "cmd"]
+                    searches = [o for o in ops if o[0] == "web_search"]
+                    fetches = [o for o in ops if o[0] == "web_fetch"]
 
                     if searches:
-                        summary_parts.append(
-                            "**Web searches:**"
-                        )
+                        summary_parts.append("**Web searches:**")
                         for _, query, count in searches:
-                            summary_parts.append(
-                                f"- `{query}` "
-                                f"({count} results)"
-                            )
+                            summary_parts.append(f"- `{query}` ({count} results)")
                     if fetches:
-                        summary_parts.append(
-                            "\n**URLs fetched:**"
-                        )
+                        summary_parts.append("\n**URLs fetched:**")
                         for _, url, size in fetches:
-                            summary_parts.append(
-                                f"- `{url}` ({size})"
-                            )
+                            summary_parts.append(f"- `{url}` ({size})")
                     if writes:
-                        summary_parts.append(
-                            "\n**Files created:**"
-                        )
+                        summary_parts.append("\n**Files created:**")
                         for _, path, size in writes:
-                            summary_parts.append(
-                                f"- `{path}` ({size} chars)"
-                            )
+                            summary_parts.append(f"- `{path}` ({size} chars)")
                     if edits:
-                        summary_parts.append(
-                            "\n**Files edited:**"
-                        )
+                        summary_parts.append("\n**Files edited:**")
                         for _, path, _ in edits:
-                            summary_parts.append(
-                                f"- `{path}`"
-                            )
+                            summary_parts.append(f"- `{path}`")
                     if cmds:
-                        summary_parts.append(
-                            "\n**Commands run:**"
-                        )
+                        summary_parts.append("\n**Commands run:**")
                         for _, cmd, rc in cmds:
-                            status = (
-                                "ok"
-                                if rc == 0
-                                else f"exit {rc}"
-                            )
-                            summary_parts.append(
-                                f"- `{cmd}` {status}"
-                            )
+                            status = "ok" if rc == 0 else f"exit {rc}"
+                            summary_parts.append(f"- `{cmd}` {status}")
 
                     answer = "\n".join(summary_parts)
                 else:
@@ -905,8 +748,7 @@ class RLMModule(dspy.Module):
                             "partial_answer",
                             state.get(
                                 "FINAL",
-                                "(max iterations reached "
-                                "without final answer)",
+                                "(max iterations reached without final answer)",
                             ),
                         )
                     )
@@ -924,9 +766,7 @@ class RLMModule(dspy.Module):
                             )
                 if current_plan_step >= 0:
                     try:
-                        self._on_step_status(
-                            current_plan_step, "completed", ""
-                        )
+                        self._on_step_status(current_plan_step, "completed", "")
                     except Exception:
                         logger.debug(
                             "on_step_status callback failed",
@@ -943,9 +783,7 @@ class RLMModule(dspy.Module):
         # Extract tracked operations from REPL state
         final_state = repl.namespace.get("state", {})
         final_ops = final_state.get("_ops", [])
-        final_files = list(
-            set(final_state.get("_files", []))
-        )
+        final_files = list(set(final_state.get("_files", [])))
 
         return RLMResult(
             answer=answer,
@@ -957,9 +795,7 @@ class RLMModule(dspy.Module):
             token_usage=TokenUsage(
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
-                total_tokens=(
-                    total_prompt_tokens + total_completion_tokens
-                ),
+                total_tokens=(total_prompt_tokens + total_completion_tokens),
                 sub_lm_calls=sub_lm_calls,
                 sub_lm_tokens=sub_lm_tokens,
             ),
@@ -986,50 +822,31 @@ class RLMModule(dspy.Module):
         # Inject conversation history as a searchable variable
         history = conversation_history or []
         repl.namespace["conversation_history"] = history
-        repl.namespace["search_history"] = (
-            _make_search_history(history)
-        )
+        repl.namespace["search_history"] = _make_search_history(history)
 
         # Inject llm_query for sub-LM calls
         repl.namespace["llm_query"] = self._make_llm_query()
-        repl.namespace["llm_query_batched"] = (
-            self._make_llm_query_batched()
-        )
+        repl.namespace["llm_query_batched"] = self._make_llm_query_batched()
 
         # Inject extra tools (e.g., MCP tool wrappers)
         for name, func in self._extra_tools.items():
             repl.namespace[name] = func
 
         # Standard library imports available in the REPL
-        repl.execute(
-            "import os, re, json, collections, "
-            "itertools, math, textwrap, subprocess"
-        )
+        repl.execute("import os, re, json, collections, itertools, math, textwrap, subprocess")
 
         # Initialize operations tracker
         repl.namespace["state"]["_ops"] = []
         repl.namespace["state"]["_files"] = []
 
         # Inject robust helper functions
-        repl.namespace["write_file"] = _make_write_file(
-            repl.namespace
-        )
-        repl.namespace["read_file"] = _make_read_file(
-            repl.namespace
-        )
-        repl.namespace["run_cmd"] = _make_run_cmd(
-            repl.namespace
-        )
-        repl.namespace["edit_file"] = _make_edit_file(
-            repl.namespace
-        )
+        repl.namespace["write_file"] = _make_write_file(repl.namespace)
+        repl.namespace["read_file"] = _make_read_file(repl.namespace)
+        repl.namespace["run_cmd"] = _make_run_cmd(repl.namespace)
+        repl.namespace["edit_file"] = _make_edit_file(repl.namespace)
         repl.namespace["list_files"] = _make_list_files()
-        repl.namespace["web_search"] = _make_web_search(
-            repl.namespace
-        )
-        repl.namespace["web_fetch"] = _make_web_fetch(
-            repl.namespace
-        )
+        repl.namespace["web_search"] = _make_web_search(repl.namespace)
+        repl.namespace["web_fetch"] = _make_web_fetch(repl.namespace)
 
         return repl
 
@@ -1091,9 +908,7 @@ class RLMModule(dspy.Module):
             Returns:
                 List of answer strings, one per query.
             """
-            return [
-                llm_query(q, c) for q, c in queries
-            ]
+            return [llm_query(q, c) for q, c in queries]
 
         return llm_query_batched
 
@@ -1108,12 +923,10 @@ class RLMModule(dspy.Module):
         """
         if self._sandbox is not None:
             try:
-                result: ExecutionResult = (
-                    await self._sandbox.execute(
-                        code,
-                        context=repl.namespace,
-                        timeout=30,
-                    )
+                result: ExecutionResult = await self._sandbox.execute(
+                    code,
+                    context=repl.namespace,
+                    timeout=30,
                 )
                 return _ExecOutput(
                     stdout=result.stdout,
@@ -1121,14 +934,10 @@ class RLMModule(dspy.Module):
                     success=result.exit_code == 0,
                 )
             except NotImplementedError:
-                logger.debug(
-                    "Sandbox not available, falling back to "
-                    "local REPL"
-                )
+                logger.debug("Sandbox not available, falling back to local REPL")
             except Exception as exc:
                 logger.warning(
-                    "Sandbox execution failed: %s, falling "
-                    "back to local REPL",
+                    "Sandbox execution failed: %s, falling back to local REPL",
                     exc,
                 )
 
@@ -1184,14 +993,10 @@ def _make_write_file(
                 )
                 return path
 
-        _os.makedirs(
-            _os.path.dirname(path) or ".", exist_ok=True
-        )
+        _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w") as fh:
             fh.write(content)
-        ns["state"]["_ops"].append(
-            ("write", path, len(content))
-        )
+        ns["state"]["_ops"].append(("write", path, len(content)))
         ns["state"]["_files"].append(path)
         print(f"Wrote {path} ({len(content)} chars)")
         return path
@@ -1227,13 +1032,9 @@ def _make_read_file(
         with open(path) as fh:
             content = fh.read()
 
-        content_hash = hashlib.md5(
-            content.encode("utf-8", errors="replace")
-        ).hexdigest()
+        content_hash = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()
 
-        ns["state"]["_ops"].append(
-            ("read", path, len(content))
-        )
+        ns["state"]["_ops"].append(("read", path, len(content)))
 
         # Check if content is identical to last read.
         prev_hash = _read_cache.get(path)
@@ -1281,9 +1082,7 @@ def _make_run_cmd(
             timeout=120,
             cwd=_os.getcwd(),
         )
-        ns["state"]["_ops"].append(
-            ("cmd", cmd, result.returncode)
-        )
+        ns["state"]["_ops"].append(("cmd", cmd, result.returncode))
         if result.stdout:
             print(result.stdout[:5000])
         if result.stderr:
@@ -1301,9 +1100,7 @@ def _make_edit_file(
 
     from memfun_agent.context_first import _fuzzy_find_and_replace
 
-    def edit_file(
-        path: str, old_text: str, new_text: str
-    ) -> bool:
+    def edit_file(path: str, old_text: str, new_text: str) -> bool:
         """Replace first occurrence of *old_text* in file.
 
         Uses fuzzy matching (whitespace normalization, then line-level
@@ -1320,25 +1117,17 @@ def _make_edit_file(
         )
 
         if new_content is None:
-            print(
-                f"Text not found in {path} "
-                f"(best ratio={ratio:.2f}, strategy={strategy})"
-            )
+            print(f"Text not found in {path} (best ratio={ratio:.2f}, strategy={strategy})")
             if snippet:
                 print(f"  Closest match: {snippet[:200]}")
             return False
 
         if strategy != "exact":
-            print(
-                f"Fuzzy match in {path} "
-                f"(ratio={ratio:.2f}, strategy={strategy})"
-            )
+            print(f"Fuzzy match in {path} (ratio={ratio:.2f}, strategy={strategy})")
 
         with open(path, "w") as fh:
             fh.write(new_content)
-        ns["state"]["_ops"].append(
-            ("edit", path, len(new_content))
-        )
+        ns["state"]["_ops"].append(("edit", path, len(new_content)))
         ns["state"]["_files"].append(path)
         print(f"Edited {path}")
         return True
@@ -1350,9 +1139,7 @@ def _make_list_files() -> Callable[[str], list[str]]:
     """Create a ``list_files`` helper."""
     import os as _os
 
-    def list_files(
-        path: str = ".", with_times: bool = False
-    ) -> list[str]:
+    def list_files(path: str = ".", with_times: bool = False) -> list[str]:
         """List all files recursively under *path*.
 
         Args:
@@ -1366,20 +1153,13 @@ def _make_list_files() -> Callable[[str], list[str]]:
 
         files: list[str] = []
         for root, dirs, filenames in _os.walk(path):
-            dirs[:] = [
-                d
-                for d in dirs
-                if not d.startswith(".")
-                and d != "__pycache__"
-            ]
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
             for fname in filenames:
                 fpath = _os.path.join(root, fname)
                 if with_times:
                     try:
                         mtime = _os.path.getmtime(fpath)
-                        dt = datetime.datetime.fromtimestamp(
-                            mtime
-                        ).strftime("%Y-%m-%d %H:%M")
+                        dt = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
                         fpath = f"{fpath} (modified: {dt})"
                     except OSError:
                         pass
@@ -1419,9 +1199,7 @@ def _make_search_history(
             if ops:
                 for op in ops:
                     if isinstance(op, dict):
-                        searchable += " " + str(
-                            op.get("target", "")
-                        ).lower()
+                        searchable += " " + str(op.get("target", "")).lower()
 
             if keyword_lower in searchable:
                 result = {
@@ -1434,14 +1212,9 @@ def _make_search_history(
                 results.append(result)
 
         if results:
-            print(
-                f"Found {len(results)} history entries "
-                f"matching '{keyword}'"
-            )
+            print(f"Found {len(results)} history entries matching '{keyword}'")
         else:
-            print(
-                f"No history entries matching '{keyword}'"
-            )
+            print(f"No history entries matching '{keyword}'")
         return results
 
     return search_history
@@ -1456,9 +1229,7 @@ def _make_web_search(
     error handling. Results are tracked in state['_ops'].
     """
 
-    def web_search(
-        query: str, max_results: int = 5
-    ) -> list[dict[str, str]]:
+    def web_search(query: str, max_results: int = 5) -> list[dict[str, str]]:
         """Search the web using DuckDuckGo.
 
         Args:
@@ -1473,9 +1244,7 @@ def _make_web_search(
             from ddgs import DDGS
 
             with DDGS() as ddgs:
-                raw = list(
-                    ddgs.text(query, max_results=max_results)
-                )
+                raw = list(ddgs.text(query, max_results=max_results))
             results = [
                 {
                     "title": r.get("title", ""),
@@ -1484,28 +1253,17 @@ def _make_web_search(
                 }
                 for r in raw
             ]
-            ns["state"]["_ops"].append(
-                ("web_search", query, len(results))
-            )
+            ns["state"]["_ops"].append(("web_search", query, len(results)))
             # Print summary for the LLM to see in output
             for i, r in enumerate(results, 1):
-                print(
-                    f"{i}. {r['title']}\n"
-                    f"   {r['url']}\n"
-                    f"   {r['snippet'][:150]}\n"
-                )
+                print(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet'][:150]}\n")
             return results
         except ImportError:
-            print(
-                "[web_search] ddgs not installed. "
-                "Run: pip install ddgs"
-            )
+            print("[web_search] ddgs not installed. Run: pip install ddgs")
             return []
         except Exception as exc:
             print(f"[web_search error]: {exc}")
-            ns["state"]["_ops"].append(
-                ("web_search", query, f"error: {exc}")
-            )
+            ns["state"]["_ops"].append(("web_search", query, f"error: {exc}"))
             return []
 
     return web_search
@@ -1520,9 +1278,7 @@ def _make_web_fetch(
     Uses httpx (sync) with markdownify for HTML conversion.
     """
 
-    def web_fetch(
-        url: str, max_length: int = 50_000
-    ) -> str:
+    def web_fetch(url: str, max_length: int = 50_000) -> str:
         """Fetch a URL and return its content as text.
 
         HTML is converted to markdown. Other content types
@@ -1542,17 +1298,10 @@ def _make_web_fetch(
                 url,
                 timeout=30,
                 follow_redirects=True,
-                headers={
-                    "User-Agent": (
-                        "Memfun-Agent/1.0 "
-                        "(autonomous coding agent)"
-                    )
-                },
+                headers={"User-Agent": ("Memfun-Agent/1.0 (autonomous coding agent)")},
             )
             resp.raise_for_status()
-            content_type = resp.headers.get(
-                "content-type", ""
-            )
+            content_type = resp.headers.get("content-type", "")
             text = resp.text
 
             # Convert HTML to markdown
@@ -1569,36 +1318,21 @@ def _make_web_fetch(
                     # Basic fallback: strip tags
                     import re
 
-                    text = re.sub(
-                        r"<[^>]+>", "", text
-                    )
+                    text = re.sub(r"<[^>]+>", "", text)
 
             # Truncate
             if len(text) > max_length:
-                text = (
-                    text[:max_length]
-                    + "\n... (truncated)"
-                )
+                text = text[:max_length] + "\n... (truncated)"
 
-            ns["state"]["_ops"].append(
-                ("web_fetch", url, len(text))
-            )
-            print(
-                f"Fetched {url} ({len(text)} chars,"
-                f" {content_type.split(';')[0]})"
-            )
+            ns["state"]["_ops"].append(("web_fetch", url, len(text)))
+            print(f"Fetched {url} ({len(text)} chars, {content_type.split(';')[0]})")
             return text
         except ImportError:
-            print(
-                "[web_fetch] httpx not installed."
-                " Run: pip install httpx"
-            )
+            print("[web_fetch] httpx not installed. Run: pip install httpx")
             return ""
         except Exception as exc:
             print(f"[web_fetch error]: {exc}")
-            ns["state"]["_ops"].append(
-                ("web_fetch", url, f"error: {exc}")
-            )
+            ns["state"]["_ops"].append(("web_fetch", url, f"error: {exc}"))
             return ""
 
     return web_fetch
@@ -1622,7 +1356,7 @@ def _clean_generated_code(code: str) -> str:
         if first_newline == -1:
             return ""
         # Remove opening fence
-        stripped = stripped[first_newline + 1:]
+        stripped = stripped[first_newline + 1 :]
         # Remove closing fence
         if stripped.rstrip().endswith("```"):
             stripped = stripped.rstrip()

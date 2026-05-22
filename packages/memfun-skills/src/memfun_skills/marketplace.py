@@ -3,6 +3,7 @@
 Provides utilities to package skills (SKILL.md + scripts + references)
 into portable bundles and import them into new environments.
 """
+
 from __future__ import annotations
 
 import json
@@ -204,9 +205,7 @@ class SkillPackager:
         logger.info("Exported skill package to %s", output_path)
         return output_path.resolve()
 
-    def _extract_metadata(
-        self, skill_md: str, skill_path: Path
-    ) -> tuple[str, str, str]:
+    def _extract_metadata(self, skill_md: str, skill_path: Path) -> tuple[str, str, str]:
         """Extract name, version, and description from SKILL.md frontmatter.
 
         Returns:

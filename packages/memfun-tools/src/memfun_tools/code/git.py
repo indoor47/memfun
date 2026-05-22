@@ -10,9 +10,7 @@ git_server = FastMCP("memfun-git-tools")
 # Pattern for safe git ref names (SHA hex, branch names, HEAD~N,
 # tags).  Rejects anything that could inject flags or shell
 # metacharacters.
-_SAFE_REF = re.compile(
-    r"^[a-zA-Z0-9_./@^~:][a-zA-Z0-9_./@^~:\-]{0,254}$"
-)
+_SAFE_REF = re.compile(r"^[a-zA-Z0-9_./@^~:][a-zA-Z0-9_./@^~:\-]{0,254}$")
 _MAX_LOG_COUNT = 500
 
 
@@ -23,10 +21,7 @@ def _validate_ref(ref: str) -> str:
     refs containing suspicious characters.
     """
     if ref.startswith("-"):
-        raise ValueError(
-            f"Invalid git ref: {ref!r} (must not start"
-            " with '-')"
-        )
+        raise ValueError(f"Invalid git ref: {ref!r} (must not start with '-')")
     if not _SAFE_REF.match(ref):
         raise ValueError(f"Invalid git ref: {ref!r}")
     return ref
@@ -39,27 +34,22 @@ def _validate_file_arg(file_path: str) -> str:
     injection.
     """
     if file_path.startswith("-"):
-        raise ValueError(
-            f"Invalid file path: {file_path!r}"
-            " (must not start with '-')"
-        )
+        raise ValueError(f"Invalid file path: {file_path!r} (must not start with '-')")
     return file_path
 
 
 async def _git(args: list[str], cwd: str = ".") -> str:
     """Run a git command and return stdout."""
     proc = await asyncio.create_subprocess_exec(
-        "git", *args,
+        "git",
+        *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"git {' '.join(args)} failed:"
-            f" {stderr.decode()}"
-        )
+        raise RuntimeError(f"git {' '.join(args)} failed: {stderr.decode()}")
     return stdout.decode("utf-8", errors="replace")
 
 
@@ -116,9 +106,7 @@ async def git_log(
 
 
 @git_server.tool()
-async def git_show(
-    commit: str = "HEAD", path: str = "."
-) -> str:
+async def git_show(commit: str = "HEAD", path: str = ".") -> str:
     """Show details of a specific commit.
 
     Args:
@@ -126,15 +114,11 @@ async def git_show(
         path: Repository path.
     """
     _validate_ref(commit)
-    return await _git(
-        ["show", "--stat", commit], cwd=path
-    )
+    return await _git(["show", "--stat", commit], cwd=path)
 
 
 @git_server.tool()
-async def git_blame(
-    file: str, path: str = "."
-) -> str:
+async def git_blame(file: str, path: str = ".") -> str:
     """Show who last modified each line of a file.
 
     Args:
@@ -143,6 +127,4 @@ async def git_blame(
     """
     _validate_file_arg(file)
     # Use -- separator to prevent flag injection
-    return await _git(
-        ["blame", "--line-porcelain", "--", file], cwd=path
-    )
+    return await _git(["blame", "--line-porcelain", "--", file], cwd=path)

@@ -147,8 +147,7 @@ class AgentManager:
         instance_ids = self._resolve_to_instance_ids(key)
         if not instance_ids:
             raise KeyError(
-                f"Agent {key!r} is not managed. "
-                f"Running: {', '.join(self._agents) or '(none)'}"
+                f"Agent {key!r} is not managed. Running: {', '.join(self._agents) or '(none)'}"
             )
         for instance_id in instance_ids:
             await self._stop_instance(instance_id)
@@ -202,9 +201,7 @@ class AgentManager:
             try:
                 await self._stop_instance(instance_id)
             except Exception:
-                logger.exception(
-                    "Error during stop_all for instance %s", instance_id
-                )
+                logger.exception("Error during stop_all for instance %s", instance_id)
 
     # ── Discovery ───────────────────────────────────────────────────
 
@@ -233,8 +230,7 @@ class AgentManager:
         managed = self._resolve_managed(key)
         if managed is None:
             raise KeyError(
-                f"Agent {key!r} is not managed. "
-                f"Running: {', '.join(self._agents) or '(none)'}"
+                f"Agent {key!r} is not managed. Running: {', '.join(self._agents) or '(none)'}"
             )
         return managed.instance
 
@@ -284,9 +280,7 @@ class AgentManager:
             logger.warning("Health monitor already running")
             return
         self._stopped.clear()
-        self._monitor_task = asyncio.get_event_loop().create_task(
-            self._health_loop()
-        )
+        self._monitor_task = asyncio.get_event_loop().create_task(self._health_loop())
         logger.info("Health monitor started")
 
     async def _health_loop(self) -> None:
@@ -307,9 +301,7 @@ class AgentManager:
                     await health.heartbeat(heartbeat_key, {"ts": time.time()})
                     status = await health.check(heartbeat_key)
                 except Exception:
-                    logger.exception(
-                        "Health check error for instance %s", instance_id
-                    )
+                    logger.exception("Health check error for instance %s", instance_id)
                     status = None
 
                 if status is not None and status.state.value == "healthy":
@@ -324,20 +316,13 @@ class AgentManager:
                         self._config.unhealthy_threshold,
                     )
 
-                if (
-                    managed.missed_heartbeats
-                    >= self._config.unhealthy_threshold
-                ):
+                if managed.missed_heartbeats >= self._config.unhealthy_threshold:
                     await self._handle_unhealthy(instance_id, managed)
 
             with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(
-                    self._stopped.wait(), timeout=interval
-                )
+                await asyncio.wait_for(self._stopped.wait(), timeout=interval)
 
-    async def _handle_unhealthy(
-        self, instance_id: str, managed: _ManagedAgent
-    ) -> None:
+    async def _handle_unhealthy(self, instance_id: str, managed: _ManagedAgent) -> None:
         """React to an unhealthy instance according to the restart policy."""
         policy = self._config.restart_policy
         logger.error(
@@ -368,9 +353,7 @@ class AgentManager:
             managed.running = False
             return
 
-        backoff = self._config.restart_backoff_seconds * (
-            2 ** managed.restart_count
-        )
+        backoff = self._config.restart_backoff_seconds * (2**managed.restart_count)
         logger.info(
             "Restarting instance %s (%s) (attempt %d, backoff %.1fs)",
             instance_id,
@@ -389,9 +372,7 @@ class AgentManager:
             if new_managed is not None:
                 new_managed.restart_count = old_count + 1
         except Exception:
-            logger.exception(
-                "Failed to restart instance %s (%s)", instance_id, managed.name
-            )
+            logger.exception("Failed to restart instance %s (%s)", instance_id, managed.name)
             managed.running = False
 
     # ── Internals ───────────────────────────────────────────────────
@@ -463,12 +444,8 @@ class AgentManager:
             if not ids:
                 self._instance_by_name.pop(managed.name, None)
 
-        await self._emit_event(
-            "agent.stopped", managed.name, instance_id=instance_id
-        )
-        logger.info(
-            "Agent %s stopped (instance %s)", managed.name, instance_id
-        )
+        await self._emit_event("agent.stopped", managed.name, instance_id=instance_id)
+        logger.info("Agent %s stopped (instance %s)", managed.name, instance_id)
 
     async def _emit_event(
         self,

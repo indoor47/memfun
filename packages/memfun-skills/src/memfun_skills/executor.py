@@ -1,4 +1,5 @@
 """Skill executor: assembles prompts and delegates to the LLM layer."""
+
 from __future__ import annotations
 
 import logging
@@ -64,9 +65,7 @@ class SkillExecutor:
             prompt = self._build_prompt(activated, task)
 
             if self._llm_callback is not None:
-                logger.debug(
-                    "Invoking LLM callback for skill %s", skill_name
-                )
+                logger.debug("Invoking LLM callback for skill %s", skill_name)
                 output = await self._llm_callback(prompt)
             else:
                 logger.debug(

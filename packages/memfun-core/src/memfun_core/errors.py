@@ -7,6 +7,7 @@ class MemfunError(Exception):
 
 # ── Runtime Errors ───────────────────────────────────────────────────
 
+
 class RuntimeBackendError(MemfunError):
     """Base for runtime/infrastructure errors."""
 
@@ -20,6 +21,7 @@ class BackendUnavailableError(BackendError):
 
 
 # ── Agent Errors ─────────────────────────────────────────────────────
+
 
 class AgentError(MemfunError):
     """Base for agent-related errors."""
@@ -35,6 +37,7 @@ class AgentAlreadyRunningError(AgentError):
 
 # ── Session Errors ───────────────────────────────────────────────────
 
+
 class SessionError(MemfunError):
     """Base for session-related errors."""
 
@@ -44,6 +47,7 @@ class SessionNotFoundError(SessionError):
 
 
 # ── Sandbox Errors ───────────────────────────────────────────────────
+
 
 class SandboxError(MemfunError):
     """Base for sandbox-related errors."""
@@ -59,11 +63,13 @@ class SandboxUnavailableError(SandboxError):
 
 # ── Config Errors ────────────────────────────────────────────────────
 
+
 class ConfigError(MemfunError):
     """Invalid or missing configuration."""
 
 
 # ── Skill Errors ─────────────────────────────────────────────────────
+
 
 class SkillError(MemfunError):
     """Base for skill-related errors."""
@@ -78,6 +84,7 @@ class SkillValidationError(SkillError):
 
 
 # ── Agent Definition Errors ─────────────────────────────────────────
+
 
 class AgentValidationError(AgentError):
     """Agent definition is invalid."""

@@ -68,7 +68,8 @@ def manager(repo: Path) -> WorktreeManager:
 
 
 def test_cleanup_managed_path_succeeds(
-    manager: WorktreeManager, repo: Path,
+    manager: WorktreeManager,
+    repo: Path,
 ) -> None:
     """Back-compat: cleanup of a real managed worktree still works."""
     path = manager.make_worktree("wf1", "T1")
@@ -83,7 +84,8 @@ def test_cleanup_managed_path_succeeds(
 
 
 def test_reject_external_dir(
-    manager: WorktreeManager, tmp_path: Path,
+    manager: WorktreeManager,
+    tmp_path: Path,
 ) -> None:
     """A path under ``/tmp`` (or any sibling of the repo) is rejected.
 
@@ -103,7 +105,8 @@ def test_reject_external_dir(
 
 
 def test_reject_parent_of_managed(
-    manager: WorktreeManager, repo: Path,
+    manager: WorktreeManager,
+    repo: Path,
 ) -> None:
     """``<project_root>/.memfun`` is the *parent* of the managed root.
 
@@ -123,7 +126,8 @@ def test_reject_parent_of_managed(
 
 
 def test_reject_sibling_of_managed(
-    manager: WorktreeManager, repo: Path,
+    manager: WorktreeManager,
+    repo: Path,
 ) -> None:
     """A directory at ``<project_root>/sibling`` is outside the gate."""
     sibling = repo / "sibling"
@@ -138,7 +142,9 @@ def test_reject_sibling_of_managed(
 
 
 def test_reject_relative_dotdot_escape(
-    manager: WorktreeManager, repo: Path, tmp_path: Path,
+    manager: WorktreeManager,
+    repo: Path,
+    tmp_path: Path,
 ) -> None:
     """Relative ``..`` paths that resolve outside the managed root are rejected."""
     escape = tmp_path / "escape"
@@ -164,7 +170,9 @@ def test_reject_relative_dotdot_escape(
     reason="Symlink creation requires admin on Windows",
 )
 def test_reject_symlink_to_outside(
-    manager: WorktreeManager, repo: Path, tmp_path: Path,
+    manager: WorktreeManager,
+    repo: Path,
+    tmp_path: Path,
 ) -> None:
     """A symlink inside the managed root pointing outside is rejected.
 
@@ -197,7 +205,9 @@ def test_reject_symlink_to_outside(
 
 
 def test_cleanup_worktrees_rejects_traversal_workflow_id(
-    manager: WorktreeManager, repo: Path, tmp_path: Path,
+    manager: WorktreeManager,
+    repo: Path,
+    tmp_path: Path,
 ) -> None:
     """``cleanup_worktrees("../../etc")`` raises BEFORE any I/O happens."""
     # Sentinel directory at the path the bogus workflow_id would resolve to.
@@ -219,7 +229,8 @@ def test_cleanup_worktrees_rejects_traversal_workflow_id(
 
 
 def test_cleanup_worktrees_managed_workflow_id_succeeds(
-    manager: WorktreeManager, repo: Path,
+    manager: WorktreeManager,
+    repo: Path,
 ) -> None:
     """Back-compat: a normal ``workflow_id`` cleans up its worktrees."""
     p1 = manager.make_worktree("wf-good", "T1")
@@ -245,7 +256,9 @@ def test_cleanup_worktrees_missing_workflow_id_is_noop(
 
 
 def test_rejection_runs_no_git_command(
-    manager: WorktreeManager, repo: Path, tmp_path: Path,
+    manager: WorktreeManager,
+    repo: Path,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Confirm the gate fires BEFORE ``subprocess.run``.

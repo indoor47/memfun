@@ -2,6 +2,7 @@
 
 Tests multi-agent workflow orchestration without full integration.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -113,11 +114,7 @@ def test_parse_review_result_failed_review():
 def test_parse_review_result_summary_extraction():
     """Summary is first paragraph."""
     answer = (
-        "First paragraph line 1.\n"
-        "First paragraph line 2.\n"
-        "\n"
-        "Second paragraph.\n"
-        "[T1] major: issue"
+        "First paragraph line 1.\nFirst paragraph line 2.\n\nSecond paragraph.\n[T1] major: issue"
     )
     result = TaskResult(
         task_id="review1",
@@ -288,11 +285,15 @@ async def test_execute_workflow_expanded_pipeline():
         sub_tasks=[
             SubTask(id="T1", description="Analyze code", agent_type="file"),
             SubTask(
-                id="T2", description="Implement changes", agent_type="coder",
+                id="T2",
+                description="Implement changes",
+                agent_type="coder",
                 depends_on=["T1"],
             ),
             SubTask(
-                id="T3", description="Review implementation", agent_type="review",
+                id="T3",
+                description="Review implementation",
+                agent_type="review",
                 depends_on=["T2"],
             ),
         ],
@@ -302,11 +303,15 @@ async def test_execute_workflow_expanded_pipeline():
     )
 
     t1_result = TaskResult(
-        task_id="wf_T1", agent_id="file-agent", success=True,
+        task_id="wf_T1",
+        agent_id="file-agent",
+        success=True,
         result={"answer": "Analysis done", "files_created": [], "ops": []},
     )
     t2_result = TaskResult(
-        task_id="wf_T2", agent_id="coder-agent", success=True,
+        task_id="wf_T2",
+        agent_id="coder-agent",
+        success=True,
         result={
             "answer": "Code written",
             "files_created": ["output.py"],
@@ -314,11 +319,15 @@ async def test_execute_workflow_expanded_pipeline():
         },
     )
     t3_result = TaskResult(
-        task_id="wf_T3", agent_id="review-agent", success=True,
+        task_id="wf_T3",
+        agent_id="review-agent",
+        success=True,
         result={"answer": "Looks good", "files_created": [], "ops": []},
     )
     review_result = TaskResult(
-        task_id="wf_review", agent_id="review-agent", success=True,
+        task_id="wf_review",
+        agent_id="review-agent",
+        success=True,
         result={"answer": "approved: true\n\nAll good"},
     )
 
@@ -356,8 +365,12 @@ async def test_execute_workflow_multi_task_path():
         sub_tasks=[
             SubTask(id="T1", description="Analyze", agent_type="file", inputs=[], outputs=[]),
             SubTask(
-                id="T2", description="Implement", agent_type="coder",
-                depends_on=["T1"], inputs=[], outputs=[],
+                id="T2",
+                description="Implement",
+                agent_type="coder",
+                depends_on=["T1"],
+                inputs=[],
+                outputs=[],
             ),
         ],
         shared_spec="Use snake_case",
@@ -429,7 +442,9 @@ async def test_execute_workflow_single_task_bypass():
     )
 
     coder_result = TaskResult(
-        task_id="wf_single", agent_id="rlm-coder", success=True,
+        task_id="wf_single",
+        agent_id="rlm-coder",
+        success=True,
         result={
             "answer": "Fixed the bug",
             "files_created": ["src/main.js"],
@@ -643,7 +658,9 @@ async def test_workflow_callbacks():
         sub_tasks=[
             SubTask(id="T1", description="Analyze", agent_type="file"),
             SubTask(
-                id="T2", description="Implement", agent_type="coder",
+                id="T2",
+                description="Implement",
+                agent_type="coder",
                 depends_on=["T1"],
             ),
         ],
@@ -653,15 +670,21 @@ async def test_workflow_callbacks():
     )
 
     t1_result = TaskResult(
-        task_id="wf_T1", agent_id="file-agent", success=True,
+        task_id="wf_T1",
+        agent_id="file-agent",
+        success=True,
         result={"answer": "Done", "files_created": [], "ops": []},
     )
     t2_result = TaskResult(
-        task_id="wf_T2", agent_id="coder-agent", success=True,
+        task_id="wf_T2",
+        agent_id="coder-agent",
+        success=True,
         result={"answer": "Done", "files_created": [], "ops": []},
     )
     review_result = TaskResult(
-        task_id="wf_review", agent_id="review-agent", success=True,
+        task_id="wf_review",
+        agent_id="review-agent",
+        success=True,
         result={"answer": "approved: true\n\nLooks good"},
     )
 
@@ -746,7 +769,9 @@ async def test_execute_group_uses_fan_out_to_pool_for_repeated_names():
 
     with patch.object(engine._decomposer, "adecompose", return_value=decomp):
         result = await engine.execute_workflow(
-            "Build five things", "context", None,
+            "Build five things",
+            "context",
+            None,
         )
 
     assert result.success is True
@@ -761,7 +786,8 @@ async def test_execute_group_uses_fan_out_to_pool_for_repeated_names():
     # (It may still be called by other paths like review but the
     # specific coder group should not use it.)
     coder_fan_out_calls = [
-        c for c in mock_orchestrator.fan_out.await_args_list
+        c
+        for c in mock_orchestrator.fan_out.await_args_list
         if any(name == "coder-agent" for name in c.args[1])
     ]
     assert len(coder_fan_out_calls) == 0
@@ -795,23 +821,31 @@ async def test_execute_group_singleton_still_uses_fan_out():
     )
 
     t1 = TaskResult(
-        task_id="wf_T1", agent_id="file-agent", success=True,
+        task_id="wf_T1",
+        agent_id="file-agent",
+        success=True,
         result={"answer": "ok1", "files_created": [], "ops": []},
     )
     t2 = TaskResult(
-        task_id="wf_T2", agent_id="coder-agent", success=True,
+        task_id="wf_T2",
+        agent_id="coder-agent",
+        success=True,
         result={"answer": "ok2", "files_created": [], "ops": []},
     )
 
     mock_orchestrator.fan_out.return_value = [t1, t2]
     mock_orchestrator.dispatch.return_value = TaskResult(
-        task_id="wf_review", agent_id="review-agent", success=True,
+        task_id="wf_review",
+        agent_id="review-agent",
+        success=True,
         result={"answer": "approved: true\n\nLGTM"},
     )
 
     with patch.object(engine._decomposer, "adecompose", return_value=decomp):
         result = await engine.execute_workflow(
-            "Mixed types", "context", None,
+            "Mixed types",
+            "context",
+            None,
         )
 
     assert result.success is True
@@ -868,7 +902,8 @@ async def test_pool_dispatch_distributes_to_distinct_instances():
     ]
 
     results = await orchestrator.fan_out_to_pool(
-        tasks, "pool-stub-agent",
+        tasks,
+        "pool-stub-agent",
     )
 
     assert len(results) == 5

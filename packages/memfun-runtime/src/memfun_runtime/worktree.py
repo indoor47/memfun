@@ -286,8 +286,7 @@ class WorktreeManager:
         # Refuse the bare managed root — that would wipe everyone.
         if wf_dir == self._managed_root:
             raise WorktreeError(
-                f"refusing to operate on worktree outside managed root: "
-                f"{wf_dir_unresolved}"
+                f"refusing to operate on worktree outside managed root: {wf_dir_unresolved}"
             )
         if not wf_dir.is_dir():
             logger.debug("workflow worktree dir %s missing; nothing to do", wf_dir)
@@ -299,7 +298,9 @@ class WorktreeManager:
                 self.cleanup_worktree(entry)
             except WorktreeError as exc:
                 logger.warning(
-                    "cleanup_worktree(%s) failed: %s", entry, exc,
+                    "cleanup_worktree(%s) failed: %s",
+                    entry,
+                    exc,
                 )
         # Best-effort remove of the now-empty workflow dir.
         with contextlib.suppress(OSError):

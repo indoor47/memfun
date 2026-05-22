@@ -14,15 +14,11 @@ class OrchestratorAdapter(Protocol):
         """Send a task directly to a named agent and return the result."""
         ...
 
-    async def fan_out(
-        self, tasks: list[TaskMessage], agent_names: list[str]
-    ) -> list[TaskResult]:
+    async def fan_out(self, tasks: list[TaskMessage], agent_names: list[str]) -> list[TaskResult]:
         """Execute tasks in parallel across the given agents."""
         ...
 
-    async def pipeline(
-        self, task: TaskMessage, agent_names: list[str]
-    ) -> TaskResult:
+    async def pipeline(self, task: TaskMessage, agent_names: list[str]) -> TaskResult:
         """Execute a task through a sequential pipeline of agents.
 
         Each agent's result payload is fed as the next agent's task payload.

@@ -79,8 +79,10 @@ class SQLiteLifecycle:
             row = await cursor.fetchone()
             if not row:
                 return AgentStatus(
-                    agent_id=agent_id, status=AgentStatusKind.UNKNOWN,
-                    uptime_seconds=0.0, last_heartbeat=0.0,
+                    agent_id=agent_id,
+                    status=AgentStatusKind.UNKNOWN,
+                    uptime_seconds=0.0,
+                    last_heartbeat=0.0,
                 )
             uptime = time.time() - row[1] if row[1] and row[0] == "running" else 0.0
             return AgentStatus(

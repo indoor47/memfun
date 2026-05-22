@@ -33,35 +33,46 @@ def _init_repo(root: Path) -> None:
     ``commit_workflow_output`` call.
     """
     subprocess.run(
-        ("git", "init", "-q", "-b", "main"), cwd=str(root), check=True,
+        ("git", "init", "-q", "-b", "main"),
+        cwd=str(root),
+        check=True,
     )
     subprocess.run(
         ("git", "config", "user.email", "ci@example.com"),
-        cwd=str(root), check=True,
+        cwd=str(root),
+        check=True,
     )
     subprocess.run(
         ("git", "config", "user.name", "ci"),
-        cwd=str(root), check=True,
+        cwd=str(root),
+        check=True,
     )
     subprocess.run(
         ("git", "config", "commit.gpgsign", "false"),
-        cwd=str(root), check=True,
+        cwd=str(root),
+        check=True,
     )
     (root / "README.md").write_text("baseline\n")
     subprocess.run(
-        ("git", "add", "README.md"), cwd=str(root), check=True,
+        ("git", "add", "README.md"),
+        cwd=str(root),
+        check=True,
     )
     subprocess.run(
         ("git", "commit", "-q", "-m", "baseline"),
-        cwd=str(root), check=True,
+        cwd=str(root),
+        check=True,
     )
 
 
 def _git(root: Path, *args: str) -> str:
     """Run ``git`` and return stdout, raising on non-zero exit."""
     proc = subprocess.run(
-        ("git", *args), cwd=str(root),
-        capture_output=True, text=True, check=True,
+        ("git", *args),
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return proc.stdout
 
@@ -93,12 +104,18 @@ def test_commit_workflow_output_stages_and_commits_new_files(
     assert result.branch == "main"
     assert result.pushed is False
     assert set(result.files_committed) == {
-        "pkg/a.py", "pkg/b.py", "pkg/c.py",
+        "pkg/a.py",
+        "pkg/b.py",
+        "pkg/c.py",
     }
 
     # The file changes must actually be in HEAD now.
     log_files = _git(
-        tmp_path, "show", "--name-only", "--pretty=format:", "HEAD",
+        tmp_path,
+        "show",
+        "--name-only",
+        "--pretty=format:",
+        "HEAD",
     ).split()
     assert set(log_files) == {"pkg/a.py", "pkg/b.py", "pkg/c.py"}
 
@@ -243,7 +260,8 @@ def test_push_succeeds_against_local_bare_remote(tmp_path: Path) -> None:
     _init_repo(work)
     subprocess.run(
         ("git", "remote", "add", "origin", str(remote)),
-        cwd=str(work), check=True,
+        cwd=str(work),
+        check=True,
     )
 
     (work / "x.py").write_text("# x\n")
@@ -258,10 +276,17 @@ def test_push_succeeds_against_local_bare_remote(tmp_path: Path) -> None:
     assert result.push_error is None
 
     # The remote now has main with two commits (baseline + ours).
-    remote_log = subprocess.run(
-        ("git", "log", "--oneline", "main"),
-        cwd=str(remote), capture_output=True, text=True, check=True,
-    ).stdout.strip().splitlines()
+    remote_log = (
+        subprocess.run(
+            ("git", "log", "--oneline", "main"),
+            cwd=str(remote),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        .stdout.strip()
+        .splitlines()
+    )
     assert len(remote_log) == 2
 
 
@@ -365,7 +390,10 @@ def test_workflow_engine_auto_commit_disabled_returns_none() -> None:
     engine._auto_commit = False
     state = WorkflowState(workflow_id="wf-1", status=WorkflowStatus.COMPLETED)
     out = engine._run_auto_commit(
-        state=state, spec="x", files_written=["x.py"], wall_seconds=1.0,
+        state=state,
+        spec="x",
+        files_written=["x.py"],
+        wall_seconds=1.0,
     )
     assert out is None
 
@@ -383,7 +411,10 @@ def test_workflow_engine_auto_commit_skips_empty_file_list() -> None:
     engine._auto_commit = True
     state = WorkflowState(workflow_id="wf-1", status=WorkflowStatus.COMPLETED)
     out = engine._run_auto_commit(
-        state=state, spec="x", files_written=[], wall_seconds=1.0,
+        state=state,
+        spec="x",
+        files_written=[],
+        wall_seconds=1.0,
     )
     assert out is not None
     assert out.committed is False
@@ -425,7 +456,11 @@ def test_workflow_engine_does_not_commit_on_failed_run(
     assert result.committed is True
 
     head_files = _git(
-        tmp_path, "show", "--name-only", "--pretty=format:", "HEAD",
+        tmp_path,
+        "show",
+        "--name-only",
+        "--pretty=format:",
+        "HEAD",
     ).split()
     assert "x.py" in head_files
 

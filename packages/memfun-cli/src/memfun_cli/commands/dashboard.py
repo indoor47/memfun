@@ -14,6 +14,7 @@ Example::
     # then in another terminal:
     memfun swarm "..."
 """
+
 from __future__ import annotations
 
 import logging
@@ -48,26 +49,30 @@ def dashboard_command(
     project_root = Path.cwd()
     memfun_dir = project_root / ".memfun"
     if not memfun_dir.exists():
-        console.print(Panel(
-            f"[red]No [bold].memfun/[/bold] directory in "
-            f"{project_root}.[/red]\n\n"
-            "Run [bold]memfun init[/bold] first, or [bold]cd[/bold] "
-            "into a project that has already been initialised.",
-            title="Dashboard error",
-            border_style="red",
-        ))
+        console.print(
+            Panel(
+                f"[red]No [bold].memfun/[/bold] directory in "
+                f"{project_root}.[/red]\n\n"
+                "Run [bold]memfun init[/bold] first, or [bold]cd[/bold] "
+                "into a project that has already been initialised.",
+                title="Dashboard error",
+                border_style="red",
+            )
+        )
         raise typer.Exit(code=2)
 
     try:
         from memfun_cli.dashboard import server as _dashboard_mod
         from memfun_cli.dashboard.server import create_app
     except ImportError as exc:
-        console.print(Panel(
-            f"[red]Missing dependency: {exc}[/red]\n\n"
-            "Install with: [bold]pip install fastapi uvicorn[/bold]",
-            title="Dashboard error",
-            border_style="red",
-        ))
+        console.print(
+            Panel(
+                f"[red]Missing dependency: {exc}[/red]\n\n"
+                "Install with: [bold]pip install fastapi uvicorn[/bold]",
+                title="Dashboard error",
+                border_style="red",
+            )
+        )
         raise typer.Exit(code=2) from exc
 
     # Set the port BEFORE create_app() so the lifespan can write the
@@ -80,14 +85,16 @@ def dashboard_command(
     )
 
     url = f"http://{host}:{port}"
-    console.print(Panel(
-        f"[bold]Dashboard URL:[/bold] {url}\n"
-        f"[dim]project:[/dim] {project_root.name}\n"
-        f"[dim]state file:[/dim] {memfun_dir / 'dashboard.json'}\n\n"
-        "Press [bold]Ctrl-C[/bold] to stop.",
-        title="memfun dashboard",
-        border_style="cyan",
-    ))
+    console.print(
+        Panel(
+            f"[bold]Dashboard URL:[/bold] {url}\n"
+            f"[dim]project:[/dim] {project_root.name}\n"
+            f"[dim]state file:[/dim] {memfun_dir / 'dashboard.json'}\n\n"
+            "Press [bold]Ctrl-C[/bold] to stop.",
+            title="memfun dashboard",
+            border_style="cyan",
+        )
+    )
 
     # Block on uvicorn — Ctrl-C cleanly stops the server via uvicorn's
     # signal handler.

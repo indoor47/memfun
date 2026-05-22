@@ -22,10 +22,7 @@ class InProcessRegistry:
         self._agents.pop(agent_id, None)
 
     async def discover(self, capability: str) -> list[AgentInfo]:
-        return [
-            info for info in self._agents.values()
-            if capability in info.capabilities
-        ]
+        return [info for info in self._agents.values() if capability in info.capabilities]
 
     async def get(self, agent_id: str) -> AgentInfo | None:
         return self._agents.get(agent_id)

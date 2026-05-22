@@ -8,6 +8,7 @@ produce textually-divergent edits 6/10 times.  Fixing the merge
 problem is unreliable; preventing it at decomposition time is a
 deterministic, model-agnostic structural fix.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch

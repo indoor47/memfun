@@ -1,4 +1,5 @@
 """Skill routing: matches a query to the best-fitting skill(s)."""
+
 from __future__ import annotations
 
 import logging

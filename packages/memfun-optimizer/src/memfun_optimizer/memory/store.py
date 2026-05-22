@@ -4,6 +4,7 @@ This module provides the MemoryStore class, which manages persistent storage
 of memory entries via the StateStoreAdapter protocol. It supports CRUD operations,
 search, and daily summary generation.
 """
+
 from __future__ import annotations
 
 import json

@@ -11,6 +11,7 @@ These tests do **not** spin up an LLM or a real runtime — they mock
 4. Errors cleanly when ``--use-worktrees`` is requested on a non-git
    project.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
@@ -43,7 +44,9 @@ def git_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     import subprocess
 
     subprocess.run(
-        ("git", "init", "-q", "-b", "main"), cwd=str(tmp_path), check=True,
+        ("git", "init", "-q", "-b", "main"),
+        cwd=str(tmp_path),
+        check=True,
     )
     monkeypatch.chdir(tmp_path)
     return tmp_path
@@ -104,7 +107,8 @@ def test_swarm_invokes_workflow_engine_directly(
     with (
         patch("memfun_agent.workflow.WorkflowEngine", engine_cls),
         patch(
-            "memfun_runtime.builder.RuntimeBuilder", builder,
+            "memfun_runtime.builder.RuntimeBuilder",
+            builder,
         ),
         patch(
             "memfun_runtime.lifecycle.AgentManager",
@@ -154,10 +158,12 @@ def test_swarm_constructs_worktree_manager_when_enabled(
     with (
         patch("memfun_agent.workflow.WorkflowEngine", engine_cls),
         patch(
-            "memfun_runtime.worktree.WorktreeManager", worktree_cls,
+            "memfun_runtime.worktree.WorktreeManager",
+            worktree_cls,
         ),
         patch(
-            "memfun_runtime.builder.RuntimeBuilder", builder,
+            "memfun_runtime.builder.RuntimeBuilder",
+            builder,
         ),
         patch(
             "memfun_runtime.lifecycle.AgentManager",
@@ -183,9 +189,7 @@ def test_swarm_constructs_worktree_manager_when_enabled(
     assert worktree_cls.call_count == 1
     kwargs = worktree_cls.call_args.kwargs
     args = worktree_cls.call_args.args
-    project_root_arg = kwargs.get("project_root") or (
-        args[0] if args else None
-    )
+    project_root_arg = kwargs.get("project_root") or (args[0] if args else None)
     assert project_root_arg is not None
     # The engine receives the same worktree manager instance.
     engine_kwargs = engine_cls.call_args.kwargs
@@ -215,10 +219,12 @@ def test_swarm_no_worktrees_when_disabled(
     with (
         patch("memfun_agent.workflow.WorkflowEngine", engine_cls),
         patch(
-            "memfun_runtime.worktree.WorktreeManager", worktree_cls,
+            "memfun_runtime.worktree.WorktreeManager",
+            worktree_cls,
         ),
         patch(
-            "memfun_runtime.builder.RuntimeBuilder", builder,
+            "memfun_runtime.builder.RuntimeBuilder",
+            builder,
         ),
         patch(
             "memfun_runtime.lifecycle.AgentManager",
@@ -271,7 +277,8 @@ def test_swarm_plumbs_max_pool_into_orchestrator(
     with (
         patch("memfun_agent.workflow.WorkflowEngine", engine_cls),
         patch(
-            "memfun_runtime.builder.RuntimeBuilder", builder,
+            "memfun_runtime.builder.RuntimeBuilder",
+            builder,
         ),
         patch(
             "memfun_runtime.lifecycle.AgentManager",
@@ -290,7 +297,8 @@ def test_swarm_plumbs_max_pool_into_orchestrator(
             _build_app(),
             [
                 "build a thing",
-                "--no-use-worktrees", "--max-pool=3",
+                "--no-use-worktrees",
+                "--max-pool=3",
             ],
         )
 
@@ -324,7 +332,8 @@ def test_swarm_rejects_use_worktrees_outside_git_repo(
     with (
         patch("memfun_agent.workflow.WorkflowEngine", engine_cls),
         patch(
-            "memfun_runtime.builder.RuntimeBuilder", builder,
+            "memfun_runtime.builder.RuntimeBuilder",
+            builder,
         ),
         patch(
             "memfun_cli.commands.agent_commands._configure_dspy",

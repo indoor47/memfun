@@ -1,4 +1,5 @@
 """DefinedAgent: wraps an AgentDefinition into a runnable agent."""
+
 from __future__ import annotations
 
 import time
@@ -110,10 +111,7 @@ class DefinedAgent(BaseAgent):
         from memfun_core.types import TaskMessage as TaskMsg
 
         if self._orchestrator is None:
-            msg = (
-                f"Agent '{self._definition.name}' cannot delegate: "
-                f"no orchestrator configured"
-            )
+            msg = f"Agent '{self._definition.name}' cannot delegate: no orchestrator configured"
             raise RuntimeError(msg)
 
         if agent_name not in self._definition.delegates_to:

@@ -20,42 +20,49 @@ def event_loop():
 @pytest_asyncio.fixture
 async def memory_event_bus():
     from memfun_runtime.backends.memory import InProcessEventBus
+
     return InProcessEventBus()
 
 
 @pytest_asyncio.fixture
 async def memory_state_store():
     from memfun_runtime.backends.memory import InProcessStateStore
+
     return InProcessStateStore()
 
 
 @pytest_asyncio.fixture
 async def memory_registry():
     from memfun_runtime.backends.memory import InProcessRegistry
+
     return InProcessRegistry()
 
 
 @pytest_asyncio.fixture
 async def memory_session_manager():
     from memfun_runtime.backends.memory import InProcessSessionManager
+
     return InProcessSessionManager()
 
 
 @pytest_asyncio.fixture
 async def memory_health_monitor():
     from memfun_runtime.backends.memory import InProcessHealthMonitor
+
     return InProcessHealthMonitor()
 
 
 @pytest_asyncio.fixture
 async def memory_lifecycle():
     from memfun_runtime.backends.memory import InProcessLifecycle
+
     return InProcessLifecycle()
 
 
 @pytest_asyncio.fixture
 async def memory_skill_registry():
     from memfun_runtime.backends.memory import InProcessSkillRegistry
+
     return InProcessSkillRegistry()
 
 
@@ -68,48 +75,56 @@ async def sqlite_db_path():
 @pytest_asyncio.fixture
 async def sqlite_event_bus(sqlite_db_path):
     from memfun_runtime.backends.sqlite import SQLiteEventBus
+
     return await SQLiteEventBus.create(sqlite_db_path, poll_interval=0.02)
 
 
 @pytest_asyncio.fixture
 async def sqlite_state_store(sqlite_db_path):
     from memfun_runtime.backends.sqlite import SQLiteStateStore
+
     return await SQLiteStateStore.create(sqlite_db_path)
 
 
 @pytest_asyncio.fixture
 async def sqlite_registry(sqlite_db_path):
     from memfun_runtime.backends.sqlite import SQLiteRegistry
+
     return await SQLiteRegistry.create(sqlite_db_path)
 
 
 @pytest_asyncio.fixture
 async def sqlite_session_manager(sqlite_db_path):
     from memfun_runtime.backends.sqlite import SQLiteSessionManager
+
     return await SQLiteSessionManager.create(sqlite_db_path)
 
 
 @pytest_asyncio.fixture
 async def sqlite_health_monitor(sqlite_db_path):
     from memfun_runtime.backends.sqlite import SQLiteHealthMonitor
+
     return SQLiteHealthMonitor(sqlite_db_path)
 
 
 @pytest_asyncio.fixture
 async def sqlite_lifecycle(sqlite_db_path):
     from memfun_runtime.backends.sqlite import SQLiteLifecycle
+
     return SQLiteLifecycle(sqlite_db_path)
 
 
 @pytest_asyncio.fixture
 async def sqlite_skill_registry(sqlite_db_path):
     from memfun_runtime.backends.sqlite import SQLiteSkillRegistry
+
     return await SQLiteSkillRegistry.create(sqlite_db_path)
 
 
 # ---------------------------------------------------------------------------
 # T2 Redis fixtures
 # ---------------------------------------------------------------------------
+
 
 def _redis_prefix() -> str:
     return f"test_{uuid4().hex[:8]}:"
@@ -119,6 +134,7 @@ def _redis_prefix() -> str:
 async def redis_event_bus():
     pytest.importorskip("redis")
     from memfun_runtime.backends.redis import RedisEventBus
+
     prefix = _redis_prefix()
     try:
         bus = await RedisEventBus.create("redis://localhost:6379", prefix=prefix)
@@ -138,6 +154,7 @@ async def redis_event_bus():
 async def redis_state_store():
     pytest.importorskip("redis")
     from memfun_runtime.backends.redis import RedisStateStore
+
     prefix = _redis_prefix()
     try:
         store = await RedisStateStore.create("redis://localhost:6379", prefix=prefix)
@@ -156,6 +173,7 @@ async def redis_state_store():
 async def redis_registry():
     pytest.importorskip("redis")
     from memfun_runtime.backends.redis import RedisRegistry
+
     prefix = _redis_prefix()
     try:
         reg = await RedisRegistry.create("redis://localhost:6379", prefix=prefix)
@@ -174,6 +192,7 @@ async def redis_registry():
 async def redis_session_manager():
     pytest.importorskip("redis")
     from memfun_runtime.backends.redis import RedisSessionManager
+
     prefix = _redis_prefix()
     try:
         mgr = await RedisSessionManager.create("redis://localhost:6379", prefix=prefix)
@@ -192,6 +211,7 @@ async def redis_session_manager():
 async def redis_health_monitor():
     pytest.importorskip("redis")
     from memfun_runtime.backends.redis import RedisHealthMonitor
+
     prefix = _redis_prefix()
     try:
         mon = await RedisHealthMonitor.create("redis://localhost:6379", prefix=prefix)
@@ -210,6 +230,7 @@ async def redis_health_monitor():
 async def redis_lifecycle():
     pytest.importorskip("redis")
     from memfun_runtime.backends.redis import RedisLifecycle
+
     prefix = _redis_prefix()
     try:
         lc = await RedisLifecycle.create("redis://localhost:6379", prefix=prefix)
@@ -228,6 +249,7 @@ async def redis_lifecycle():
 async def redis_skill_registry():
     pytest.importorskip("redis")
     from memfun_runtime.backends.redis import RedisSkillRegistry
+
     prefix = _redis_prefix()
     try:
         reg = await RedisSkillRegistry.create("redis://localhost:6379", prefix=prefix)
@@ -246,6 +268,7 @@ async def redis_skill_registry():
 # T3 NATS fixtures
 # ---------------------------------------------------------------------------
 
+
 def _nats_bucket_suffix() -> str:
     return uuid4().hex[:8]
 
@@ -254,6 +277,7 @@ def _nats_bucket_suffix() -> str:
 async def nats_event_bus():
     pytest.importorskip("nats")
     from memfun_runtime.backends.nats import NATSEventBus
+
     stream_prefix = f"test_{_nats_bucket_suffix()}"
     try:
         bus = await NATSEventBus.create("nats://localhost:4222", stream_prefix=stream_prefix)
@@ -269,6 +293,7 @@ async def nats_event_bus():
 async def nats_state_store():
     pytest.importorskip("nats")
     from memfun_runtime.backends.nats import NATSStateStore
+
     bucket = f"test_state_{_nats_bucket_suffix()}"
     try:
         store = await NATSStateStore.create("nats://localhost:4222", bucket=bucket)
@@ -285,6 +310,7 @@ async def nats_state_store():
 async def nats_registry():
     pytest.importorskip("nats")
     from memfun_runtime.backends.nats import NATSRegistry
+
     bucket = f"test_registry_{_nats_bucket_suffix()}"
     try:
         reg = await NATSRegistry.create("nats://localhost:4222", bucket=bucket)
@@ -301,6 +327,7 @@ async def nats_registry():
 async def nats_session_manager():
     pytest.importorskip("nats")
     from memfun_runtime.backends.nats import NATSSessionManager
+
     bucket = f"test_sessions_{_nats_bucket_suffix()}"
     try:
         mgr = await NATSSessionManager.create("nats://localhost:4222", bucket=bucket)
@@ -317,6 +344,7 @@ async def nats_session_manager():
 async def nats_health_monitor():
     pytest.importorskip("nats")
     from memfun_runtime.backends.nats import NATSHealthMonitor
+
     bucket = f"test_health_{_nats_bucket_suffix()}"
     try:
         mon = await NATSHealthMonitor.create("nats://localhost:4222", bucket=bucket)
@@ -333,6 +361,7 @@ async def nats_health_monitor():
 async def nats_lifecycle():
     pytest.importorskip("nats")
     from memfun_runtime.backends.nats import NATSLifecycle
+
     bucket = f"test_lifecycle_{_nats_bucket_suffix()}"
     try:
         lc = await NATSLifecycle.create("nats://localhost:4222", bucket=bucket)
@@ -349,6 +378,7 @@ async def nats_lifecycle():
 async def nats_skill_registry():
     pytest.importorskip("nats")
     from memfun_runtime.backends.nats import NATSSkillRegistry
+
     bucket = f"test_skills_{_nats_bucket_suffix()}"
     try:
         reg = await NATSSkillRegistry.create("nats://localhost:4222", bucket=bucket)

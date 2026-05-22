@@ -48,6 +48,7 @@ class RuntimeBuilder:
             InProcessSkillRegistry,
             InProcessStateStore,
         )
+
         sandbox = self._build_sandbox()
         return RuntimeContext(
             event_bus=InProcessEventBus(),
@@ -71,6 +72,7 @@ class RuntimeBuilder:
             SQLiteSkillRegistry,
             SQLiteStateStore,
         )
+
         db_path = self._config.backend.sqlite_path
         sandbox = self._build_sandbox()
         return RuntimeContext(
@@ -95,6 +97,7 @@ class RuntimeBuilder:
             RedisSkillRegistry,
             RedisStateStore,
         )
+
         url = self._config.backend.redis_url
         prefix = self._config.backend.redis_prefix
         sandbox = self._build_sandbox()
@@ -120,13 +123,16 @@ class RuntimeBuilder:
             NATSSkillRegistry,
             NATSStateStore,
         )
+
         url = self._config.backend.nats_url
         creds = self._config.backend.nats_creds_file
         stream_prefix = self._config.backend.nats_stream_prefix
         sandbox = self._build_sandbox()
         return RuntimeContext(
             event_bus=await NATSEventBus.create(
-                url, creds_file=creds, stream_prefix=stream_prefix,
+                url,
+                creds_file=creds,
+                stream_prefix=stream_prefix,
             ),
             state_store=await NATSStateStore.create(url, creds_file=creds),
             sandbox=sandbox,
@@ -151,23 +157,22 @@ class RuntimeBuilder:
     def _build_local_sandbox(self):
         try:
             from memfun_runtime.backends.sandbox.local import LocalSandbox
+
             return LocalSandbox()
         except Exception:
-            logger.warning(
-                "Failed to create LocalSandbox, falling back to StubSandbox"
-            )
+            logger.warning("Failed to create LocalSandbox, falling back to StubSandbox")
             from memfun_runtime.backends.sandbox.stub import StubSandbox
+
             return StubSandbox()
 
     def _build_docker_sandbox(self):
         try:
             from memfun_runtime.backends.sandbox.docker import DockerSandbox
+
             image = self._config.sandbox.docker_image
             return DockerSandbox(default_image=image)
         except Exception:
-            logger.warning(
-                "Failed to create DockerSandbox, falling back to LocalSandbox"
-            )
+            logger.warning("Failed to create DockerSandbox, falling back to LocalSandbox")
             return self._build_local_sandbox()
 
     def _build_modal_sandbox(self):
@@ -175,10 +180,9 @@ class RuntimeBuilder:
             from memfun_runtime.backends.sandbox.modal_sandbox import (
                 ModalSandbox,
             )
+
             app_name = self._config.sandbox.modal_app_name
             return ModalSandbox(app_name=app_name)
         except Exception:
-            logger.warning(
-                "Failed to create ModalSandbox, falling back to LocalSandbox"
-            )
+            logger.warning("Failed to create ModalSandbox, falling back to LocalSandbox")
             return self._build_local_sandbox()

@@ -98,11 +98,13 @@ class SQLiteEventBus:
 
     async def create_topic(self, topic: str, config: TopicConfig | None = None) -> None:
         config = config or TopicConfig()
-        config_json = json.dumps({
-            "retention_seconds": config.retention_seconds,
-            "max_consumers": config.max_consumers,
-            "max_message_bytes": config.max_message_bytes,
-        })
+        config_json = json.dumps(
+            {
+                "retention_seconds": config.retention_seconds,
+                "max_consumers": config.max_consumers,
+                "max_message_bytes": config.max_message_bytes,
+            }
+        )
         try:
             await self._conn.execute(
                 "INSERT INTO topics (name, config) VALUES (?, ?)",
@@ -116,8 +118,7 @@ class SQLiteEventBus:
                 row = await cursor.fetchone()
                 if row and row[0] != config_json:
                     raise ValueError(
-                        f"Topic {topic!r} already exists with"
-                        " different config"
+                        f"Topic {topic!r} already exists with different config"
                     ) from err
 
     async def delete_topic(self, topic: str) -> None:

@@ -14,13 +14,15 @@ _BLOCKED_PATH_PREFIXES: tuple[str, ...] = (
     "/etc/sudoers",
 )
 
-_BLOCKED_PATH_NAMES: frozenset[str] = frozenset({
-    ".env",
-    ".env.local",
-    ".env.production",
-    "credentials.json",
-    "service-account.json",
-})
+_BLOCKED_PATH_NAMES: frozenset[str] = frozenset(
+    {
+        ".env",
+        ".env.local",
+        ".env.production",
+        "credentials.json",
+        "service-account.json",
+    }
+)
 
 
 def _project_root_guard() -> Path | None:
@@ -66,28 +68,18 @@ def _check_in_root(path: Path) -> Path:
     candidates = (str(path), str(resolved))
     for prefix in _BLOCKED_PATH_PREFIXES:
         if any(c.startswith(prefix) for c in candidates):
-            raise PermissionError(
-                f"Access denied: {resolved} is a protected"
-                " system file"
-            )
+            raise PermissionError(f"Access denied: {resolved} is a protected system file")
     if resolved.name in _BLOCKED_PATH_NAMES or path.name in _BLOCKED_PATH_NAMES:
-        raise PermissionError(
-            f"Access denied: {resolved.name} may contain secrets"
-        )
+        raise PermissionError(f"Access denied: {resolved.name} may contain secrets")
 
     root = _project_root_guard()
     if root is not None and not resolved.is_relative_to(root):
-        raise ValueError(
-            f"path outside project root: {resolved}"
-            f" (MEMFUN_PROJECT_ROOT={root})"
-        )
+        raise ValueError(f"path outside project root: {resolved} (MEMFUN_PROJECT_ROOT={root})")
     return resolved
 
 
 @fs_server.tool()
-async def read_file(
-    path: str, offset: int = 0, limit: int = 2000
-) -> str:
+async def read_file(path: str, offset: int = 0, limit: int = 2000) -> str:
     """Read a file and return its contents with line numbers.
 
     Args:
@@ -99,14 +91,9 @@ async def read_file(
     if not p.is_file():
         raise FileNotFoundError(f"File not found: {path}")
 
-    lines = p.read_text(
-        encoding="utf-8", errors="replace"
-    ).splitlines()
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
     selected = lines[offset : offset + limit]
-    numbered = [
-        f"{i + offset + 1:>6}\t{line}"
-        for i, line in enumerate(selected)
-    ]
+    numbered = [f"{i + offset + 1:>6}\t{line}" for i, line in enumerate(selected)]
     return "\n".join(numbered)
 
 
@@ -157,27 +144,19 @@ async def edit_file(path: str, old: str, new: str) -> str:
     text = p.read_text(encoding="utf-8", errors="replace")
     occurrences = text.count(old)
     if occurrences == 0:
-        raise ValueError(
-            f"edit_file: 'old' not found in {path}"
-        )
+        raise ValueError(f"edit_file: 'old' not found in {path}")
     if occurrences > 1:
         raise ValueError(
-            f"edit_file: 'old' is ambiguous in {path}"
-            f" ({occurrences} matches); add more context"
+            f"edit_file: 'old' is ambiguous in {path} ({occurrences} matches); add more context"
         )
 
     new_text = text.replace(old, new, 1)
     p.write_text(new_text, encoding="utf-8")
-    return (
-        f"Edited {path}: replaced {len(old)} chars"
-        f" with {len(new)} chars"
-    )
+    return f"Edited {path}: replaced {len(old)} chars with {len(new)} chars"
 
 
 @fs_server.tool()
-async def list_directory(
-    path: str, recursive: bool = False
-) -> str:
+async def list_directory(path: str, recursive: bool = False) -> str:
     """List files and directories at a path.
 
     Args:
@@ -199,21 +178,15 @@ async def list_directory(
             prefix = "d " if item.is_dir() else "f "
             if item.is_file():
                 size = item.stat().st_size
-                entries.append(
-                    f"{prefix}{item.name}  ({size} bytes)"
-                )
+                entries.append(f"{prefix}{item.name}  ({size} bytes)")
             else:
                 entries.append(f"{prefix}{item.name}/")
 
-    return (
-        "\n".join(entries) if entries else "(empty directory)"
-    )
+    return "\n".join(entries) if entries else "(empty directory)"
 
 
 @fs_server.tool()
-async def glob_files(
-    pattern: str, path: str = "."
-) -> str:
+async def glob_files(pattern: str, path: str = ".") -> str:
     """Find files matching a glob pattern.
 
     Args:

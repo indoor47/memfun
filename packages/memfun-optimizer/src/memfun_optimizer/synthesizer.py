@@ -4,6 +4,7 @@ Converts DiscoveredAgent specifications into executable DSPy modules and
 AGENT.md definition files. Each discovered pattern becomes a multi-stage
 module where each stage corresponds to one step in the strategy pattern.
 """
+
 from __future__ import annotations
 
 import re
@@ -37,16 +38,24 @@ if TYPE_CHECKING:
         estimated_speedup: float
         estimated_cost_reduction: float
 
+
 logger = get_logger("optimizer.synthesizer")
 
 # Validation patterns
 _SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*$")
 _MAX_NAME_LENGTH = 64
 _MAX_DESCRIPTION_LENGTH = 1024
-_ALLOWED_STAGE_KINDS = frozenset({
-    "PEEK", "GREP", "QUERY", "ANALYZE",
-    "TRANSFORM", "VALIDATE", "FORMAT",
-})
+_ALLOWED_STAGE_KINDS = frozenset(
+    {
+        "PEEK",
+        "GREP",
+        "QUERY",
+        "ANALYZE",
+        "TRANSFORM",
+        "VALIDATE",
+        "FORMAT",
+    }
+)
 
 
 def _sanitize_for_string_literal(value: str) -> str:
@@ -57,8 +66,7 @@ def _sanitize_for_string_literal(value: str) -> str:
     sequences.
     """
     return (
-        value
-        .replace("\\", "\\\\")
+        value.replace("\\", "\\\\")
         .replace('"', '\\"')
         .replace("'", "\\'")
         .replace("\n", "\\n")
@@ -219,12 +227,11 @@ class AgentSynthesizer:
             Complete Python module source code.
         """
         stages_code = "\n\n".join(
-            self._stage_to_code(stage, idx)
-            for idx, stage in enumerate(agent.stages, start=1)
+            self._stage_to_code(stage, idx) for idx, stage in enumerate(agent.stages, start=1)
         )
 
         forward_calls = "\n        ".join(
-            f"stage_{idx}_out = self._stage_{idx}(context, query, prev_output=stage_{idx-1}_out)"
+            f"stage_{idx}_out = self._stage_{idx}(context, query, prev_output=stage_{idx - 1}_out)"
             if idx > 1
             else f"stage_{idx}_out = self._stage_{idx}(context, query)"
             for idx in range(1, len(agent.stages) + 1)
@@ -403,9 +410,7 @@ class {class_name}(dspy.Module):
             "stage": {index},
         }}'''
 
-    def _generate_generic_stage(
-        self, index: int, description: str, stage_kind: str
-    ) -> str:
+    def _generate_generic_stage(self, index: int, description: str, stage_kind: str) -> str:
         """Generate a generic processing stage."""
         return f'''    def _stage_{index}(
         self,
@@ -469,7 +474,7 @@ tags:
 ---"""
 
         instructions = f"""
-# {agent.name.replace('-', ' ').title()}
+# {agent.name.replace("-", " ").title()}
 
 You are a specialized agent synthesized from observed execution patterns.
 
@@ -527,9 +532,7 @@ For tasks outside this profile, delegate to the general-purpose RLM agent.
         Returns:
             PascalCase class name like 'CodeAnalyzer'.
         """
-        return "".join(
-            word.capitalize() for word in agent_name.split("-")
-        )
+        return "".join(word.capitalize() for word in agent_name.split("-"))
 
     @staticmethod
     def _yaml_list(items: list[str], indent: int = 2) -> str:

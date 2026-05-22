@@ -1,4 +1,5 @@
 """Agent definition validation: checks agent definitions against the spec."""
+
 from __future__ import annotations
 
 import re
@@ -42,8 +43,7 @@ class AgentValidator:
                 )
             if not _NAME_PATTERN.match(agent.name):
                 errors.append(
-                    f"Agent name must be lowercase alphanumeric with hyphens: "
-                    f"'{agent.name}'."
+                    f"Agent name must be lowercase alphanumeric with hyphens: '{agent.name}'."
                 )
 
         # Description checks
@@ -57,23 +57,16 @@ class AgentValidator:
 
         # Version check (semver)
         if agent.version and not _SEMVER_PATTERN.match(agent.version):
-            errors.append(
-                f"Agent version is not valid SemVer: '{agent.version}'."
-            )
+            errors.append(f"Agent version is not valid SemVer: '{agent.version}'.")
 
         # Capabilities check
         for cap in agent.capabilities:
             if not _CAPABILITY_PATTERN.match(cap):
-                errors.append(
-                    f"Capability must be lowercase alphanumeric with hyphens: "
-                    f"'{cap}'."
-                )
+                errors.append(f"Capability must be lowercase alphanumeric with hyphens: '{cap}'.")
 
         # max_turns check
         if agent.max_turns < 1:
-            errors.append(
-                f"Agent max_turns must be at least 1, got {agent.max_turns}."
-            )
+            errors.append(f"Agent max_turns must be at least 1, got {agent.max_turns}.")
 
         return errors
 

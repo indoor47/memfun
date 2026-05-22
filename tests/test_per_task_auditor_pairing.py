@@ -6,6 +6,7 @@ dispatch inside :meth:`WorkflowEngine._execute_group`, and the coder
 is re-dispatched (up to ``max_review_rounds_per_task`` rounds) when
 the reviewer requests changes.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -63,7 +64,9 @@ def _phase3_review(approved: bool = True) -> TaskResult:
 
 
 def _make_engine(
-    *, pair: bool = True, max_rounds: int = 2,
+    *,
+    pair: bool = True,
+    max_rounds: int = 2,
 ) -> tuple[WorkflowEngine, AsyncMock, MagicMock]:
     mock_context = MagicMock()
     mock_state_store = AsyncMock()
@@ -122,8 +125,7 @@ async def test_approved_on_first_round_no_redispatch():
     # check that the test ran the per-task review on a coder task
     # and didn't dispatch any "rev" tasks (no re-dispatch).
     rev_dispatch_calls = [
-        c for c in orchestrator.dispatch.await_args_list
-        if "_pair" in c.args[0].task_id
+        c for c in orchestrator.dispatch.await_args_list if "_pair" in c.args[0].task_id
     ]
     assert len(rev_dispatch_calls) == 0
 
@@ -170,8 +172,7 @@ async def test_changes_requested_then_approved_redispatches_coder():
 
     # Verify the re-dispatched coder task carried the feedback.
     coder_redispatch_calls = [
-        c for c in orchestrator.dispatch.await_args_list
-        if c.args[1] == "coder-agent"
+        c for c in orchestrator.dispatch.await_args_list if c.args[1] == "coder-agent"
     ]
     assert len(coder_redispatch_calls) == 1
     redispatch_task = coder_redispatch_calls[0].args[0]
@@ -230,8 +231,7 @@ async def test_max_rounds_exhausted_keeps_last_result():
 
     # Verify the cap was respected — exactly 2 coder re-dispatches.
     coder_redispatches = [
-        c for c in orchestrator.dispatch.await_args_list
-        if c.args[1] == "coder-agent"
+        c for c in orchestrator.dispatch.await_args_list if c.args[1] == "coder-agent"
     ]
     assert len(coder_redispatches) == 2
 
@@ -309,21 +309,15 @@ async def test_three_tasks_all_approved_round_one():
 
     # Verify all 3 reviews were dispatched against review-agent.
     review_calls = [
-        c for c in orchestrator.dispatch.await_args_list
-        if c.args[1] == "review-agent"
+        c for c in orchestrator.dispatch.await_args_list if c.args[1] == "review-agent"
     ]
     assert len(review_calls) == 4
 
     # The per-task review tasks carry the sub_task_id in their
     # payload (the Phase 3 cross-task review doesn't).
-    per_task_review_calls = [
-        c for c in review_calls
-        if "sub_task_id" in c.args[0].payload
-    ]
+    per_task_review_calls = [c for c in review_calls if "sub_task_id" in c.args[0].payload]
     assert len(per_task_review_calls) == 3
-    sub_task_ids = {
-        c.args[0].payload["sub_task_id"] for c in per_task_review_calls
-    }
+    sub_task_ids = {c.args[0].payload["sub_task_id"] for c in per_task_review_calls}
     assert sub_task_ids == {"T1", "T2", "T3"}
 
 
@@ -458,9 +452,7 @@ def test_parse_per_task_review_approved_token():
 def test_parse_per_task_review_changes_requested():
     """Reviewer answer with CHANGES_REQUESTED parses unapproved."""
     answer = (
-        "CHANGES_REQUESTED: there are several issues.\n"
-        "- Missing null check\n"
-        "- Wrong return type\n"
+        "CHANGES_REQUESTED: there are several issues.\n- Missing null check\n- Wrong return type\n"
     )
     result = TaskResult(
         task_id="r",

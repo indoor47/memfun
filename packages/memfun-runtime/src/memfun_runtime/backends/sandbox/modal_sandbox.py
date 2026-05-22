@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 logger = get_logger("sandbox.modal")
 
 _MAX_OUTPUT_BYTES = 100 * 1024  # 100 KB
-_MAX_TIMEOUT_SECONDS = 300      # 5 minutes hard cap
+_MAX_TIMEOUT_SECONDS = 300  # 5 minutes hard cap
 
 
 def _build_preamble(context: dict) -> str:
@@ -36,6 +36,7 @@ def _modal_available() -> bool:
     """Check whether the ``modal`` package is importable."""
     try:
         import modal  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -129,7 +130,8 @@ class ModalSandbox:
 
         sb = await asyncio.to_thread(
             modal.Sandbox.create,
-            "sleep", "infinity",
+            "sleep",
+            "infinity",
             image=image,
             timeout=config.timeout_seconds,
             **({"cpu": 1.0} if config.memory_limit_mb <= 512 else {"cpu": 2.0}),
@@ -168,7 +170,9 @@ class ModalSandbox:
         try:
             process = await asyncio.to_thread(
                 sb.exec,  # type: ignore[union-attr]
-                "python", "-c", script,
+                "python",
+                "-c",
+                script,
             )
 
             # Wait for the process to complete with a timeout.
@@ -185,7 +189,8 @@ class ModalSandbox:
                 return process.returncode
 
             exit_code = await asyncio.wait_for(
-                _collect(), timeout=timeout,
+                _collect(),
+                timeout=timeout,
             )
         except TimeoutError:
             duration_ms = (time.monotonic() - t0) * 1000

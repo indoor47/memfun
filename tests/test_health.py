@@ -30,7 +30,9 @@ class TestHealthConformance:
 
     async def test_subscribe_alerts(self, health):
         alerts = []
+
         async def on_alert(status):
             alerts.append(status)
+
         await health.subscribe_alerts(on_alert)
         # Just verify it doesn't raise

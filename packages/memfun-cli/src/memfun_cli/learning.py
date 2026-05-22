@@ -10,6 +10,7 @@ Before each turn, retrieves relevant learnings from MEMORY.md
 (always loaded in full) plus TF-IDF search from the database,
 and injects them as highest-priority context.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -69,9 +70,7 @@ class LearningManager:
 
     # ── Retrieval ──────────────────────────────────────
 
-    async def get_relevant_learnings(
-        self, query: str
-    ) -> str:
+    async def get_relevant_learnings(self, query: str) -> str:
         """Retrieve learnings relevant to the current query.
 
         Uses a dual strategy:
@@ -105,30 +104,21 @@ class LearningManager:
                 min_confidence=0.3,
                 limit=_MAX_LEARNINGS_IN_CONTEXT,
             )
-            results = await self._memory.search(
-                search_query
-            )
+            results = await self._memory.search(search_query)
 
             for result in results:
                 if result.entry.id not in seen_ids:
                     seen_ids.add(result.entry.id)
-                    db_lines.append(
-                        f"- {result.entry.content}"
-                    )
+                    db_lines.append(f"- {result.entry.content}")
 
             prefs = await self._memory.list_entries(
                 topic="learning:preference",
                 limit=20,
             )
             for entry in prefs:
-                if (
-                    entry.confidence >= 0.9
-                    and entry.id not in seen_ids
-                ):
+                if entry.confidence >= 0.9 and entry.id not in seen_ids:
                     seen_ids.add(entry.id)
-                    db_lines.append(
-                        f"- {entry.content}"
-                    )
+                    db_lines.append(f"- {entry.content}")
         except Exception:
             logger.debug(
                 "Failed to search database learnings",
@@ -137,18 +127,13 @@ class LearningManager:
 
         # Combine: file memory first, then database extras
         if file_memory and db_lines:
-            return (
-                file_memory
-                + "\n\n=== DATABASE LEARNINGS ===\n"
-                + "\n".join(db_lines)
-            )
+            return file_memory + "\n\n=== DATABASE LEARNINGS ===\n" + "\n".join(db_lines)
         if file_memory:
             return file_memory
         if db_lines:
             return (
                 "=== LEARNED PREFERENCES & PATTERNS ===\n"
-                "Apply these to your response:\n"
-                + "\n".join(db_lines)
+                "Apply these to your response:\n" + "\n".join(db_lines)
             )
         return ""
 
@@ -174,44 +159,27 @@ class LearningManager:
             return []
 
         try:
-            truncated = agent_response[
-                :_MAX_RESPONSE_FOR_EXTRACTION
-            ]
+            truncated = agent_response[:_MAX_RESPONSE_FOR_EXTRACTION]
 
             # Load existing learnings for conflict detection
             # from both MEMORY.md and database
             from memfun_cli.memory import load_memory_context
 
-            file_context = (
-                load_memory_context()
-                or "(no file learnings)"
-            )
+            file_context = load_memory_context() or "(no file learnings)"
 
             existing = await self._memory.list_entries(
                 limit=_MAX_EXISTING_FOR_CONFLICT,
             )
-            existing = [
-                e
-                for e in existing
-                if e.topic.startswith("learning:")
-            ]
+            existing = [e for e in existing if e.topic.startswith("learning:")]
 
-            db_text = (
-                "\n".join(
-                    f"- [{e.topic}] {e.content}"
-                    for e in existing
-                )
-                if existing
-                else ""
-            )
+            db_text = "\n".join(f"- [{e.topic}] {e.content}" for e in existing) if existing else ""
 
             existing_text = file_context
             if db_text:
                 existing_text += "\n" + db_text
 
             logger.info(
-                "Starting learning extraction"
-                " (input: %d chars, response: %d chars)",
+                "Starting learning extraction (input: %d chars, response: %d chars)",
                 len(user_input),
                 len(truncated),
             )
@@ -224,14 +192,11 @@ class LearningManager:
                 existing_learnings=existing_text,
             )
 
-            raw_learnings = getattr(
-                result, "learnings", []
-            )
+            raw_learnings = getattr(result, "learnings", [])
             raw_updates = getattr(result, "updates", [])
 
             logger.info(
-                "Extraction result: learnings=%r,"
-                " updates=%r",
+                "Extraction result: learnings=%r, updates=%r",
                 raw_learnings,
                 raw_updates,
             )
@@ -256,9 +221,7 @@ class LearningManager:
                 topic, content = _parse_learning(text)
 
                 # Store in MemoryStore (database)
-                updated = await self._try_update_existing(
-                    content, topic, existing, updates
-                )
+                updated = await self._try_update_existing(content, topic, existing, updates)
                 if not updated:
                     await self._memory.add(
                         topic=f"learning:{topic}",
@@ -315,10 +278,7 @@ class LearningManager:
                 continue
             for entry in existing:
                 entry_lower = entry.content.lower()
-                if (
-                    lowered in entry_lower
-                    or entry_lower in lowered
-                ):
+                if lowered in entry_lower or entry_lower in lowered:
                     await self._memory.update(
                         entry.id,
                         content=new_content,
@@ -377,19 +337,13 @@ def _normalize_list(value: Any) -> list[str]:
             try:
                 parsed = json.loads(value)
                 if isinstance(parsed, list):
-                    return [
-                        str(v).strip()
-                        for v in parsed
-                        if v
-                    ]
+                    return [str(v).strip() for v in parsed if v]
             except (json.JSONDecodeError, ValueError):
                 pass
         # Try splitting by newlines
         if "\n" in value:
             lines = [
-                line.strip().lstrip("- ").strip()
-                for line in value.split("\n")
-                if line.strip()
+                line.strip().lstrip("- ").strip() for line in value.split("\n") if line.strip()
             ]
             if lines:
                 return lines

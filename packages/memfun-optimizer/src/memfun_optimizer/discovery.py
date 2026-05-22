@@ -6,6 +6,7 @@ The DiscoveryPipeline coordinates the full trace analysis workflow:
 3. Analyze patterns
 4. Discover agents from dominant patterns
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -68,13 +69,9 @@ class DiscoveryPipeline:
         self._min_confidence = min_confidence
 
         self._extractor = StrategyExtractor()
-        self._analyzer = PatternAnalyzer(
-            similarity_threshold=similarity_threshold
-        )
+        self._analyzer = PatternAnalyzer(similarity_threshold=similarity_threshold)
 
-    async def run(
-        self, task_type: str | None = None
-    ) -> list[DiscoveredAgent]:
+    async def run(self, task_type: str | None = None) -> list[DiscoveredAgent]:
         """Run the full discovery pipeline.
 
         Args:
@@ -83,9 +80,7 @@ class DiscoveryPipeline:
         Returns:
             List of discovered agent specifications
         """
-        logger.info(
-            "Starting discovery pipeline (task_type=%s)", task_type or "all"
-        )
+        logger.info("Starting discovery pipeline (task_type=%s)", task_type or "all")
 
         # 1. Load traces
         traces = await self._load_traces(task_type)
@@ -119,8 +114,7 @@ class DiscoveryPipeline:
 
         # 6. Convert patterns to agent specs
         discovered = [
-            self._pattern_to_agent(pattern, task_type or "general")
-            for pattern in ranked
+            self._pattern_to_agent(pattern, task_type or "general") for pattern in ranked
         ]
 
         logger.info("Discovered %d agents", len(discovered))
@@ -128,9 +122,7 @@ class DiscoveryPipeline:
 
     # ── Internal Methods ───────────────────────────────────────────
 
-    async def _load_traces(
-        self, task_type: str | None
-    ) -> list[ExecutionTrace]:
+    async def _load_traces(self, task_type: str | None) -> list[ExecutionTrace]:
         """Load traces from the collector, optionally filtered by task type.
 
         Args:
@@ -158,9 +150,7 @@ class DiscoveryPipeline:
         logger.info("Loaded %d traces", len(traces))
         return traces
 
-    def _pattern_to_agent(
-        self, pattern: StrategyPattern, task_type: str
-    ) -> DiscoveredAgent:
+    def _pattern_to_agent(self, pattern: StrategyPattern, task_type: str) -> DiscoveredAgent:
         """Convert a pattern to a discovered agent specification.
 
         Args:
@@ -224,9 +214,7 @@ class DiscoveryPipeline:
         }
         return names.get(kind, "Unknown")
 
-    def _sequence_to_stages(
-        self, sequence: list[StepKind]
-    ) -> list[dict]:
+    def _sequence_to_stages(self, sequence: list[StepKind]) -> list[dict]:
         """Convert a step sequence to logical stages.
 
         Groups consecutive similar steps into stages.
@@ -249,20 +237,24 @@ class DiscoveryPipeline:
                 current_steps.append(kind)
             else:
                 # Finish current stage
-                stages.append({
-                    "name": self._step_name(current_kind),
-                    "steps": current_steps.copy(),
-                    "count": len(current_steps),
-                })
+                stages.append(
+                    {
+                        "name": self._step_name(current_kind),
+                        "steps": current_steps.copy(),
+                        "count": len(current_steps),
+                    }
+                )
                 # Start new stage
                 current_kind = kind
                 current_steps = [kind]
 
         # Add final stage
-        stages.append({
-            "name": self._step_name(current_kind),
-            "steps": current_steps,
-            "count": len(current_steps),
-        })
+        stages.append(
+            {
+                "name": self._step_name(current_kind),
+                "steps": current_steps,
+                "count": len(current_steps),
+            }
+        )
 
         return stages

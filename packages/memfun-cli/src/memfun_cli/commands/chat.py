@@ -12,6 +12,7 @@ REPL namespace.  The LLM only sees metadata — it explores history by
 writing code.  This means history can grow indefinitely with zero
 information loss.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -55,15 +56,47 @@ _MAX_HISTORY_FILE_BYTES = 50 * 1024 * 1024  # 50 MB
 _MAX_SINGLE_MESSAGE_LENGTH = 100_000  # 100 KB per message
 
 _MAX_FILE_READ_BYTES = 256_000
-_SOURCE_EXTENSIONS = frozenset({
-    ".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".go", ".java",
-    ".c", ".cpp", ".h", ".hpp", ".rb", ".ex", ".exs", ".kt",
-    ".swift", ".toml", ".yaml", ".yml", ".json", ".md", ".sh",
-})
-_SKIP_DIRS = frozenset({
-    "node_modules", "__pycache__", ".git", "dist", "build", ".venv",
-    ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-})
+_SOURCE_EXTENSIONS = frozenset(
+    {
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".rs",
+        ".go",
+        ".java",
+        ".c",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".rb",
+        ".ex",
+        ".exs",
+        ".kt",
+        ".swift",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".md",
+        ".sh",
+    }
+)
+_SKIP_DIRS = frozenset(
+    {
+        "node_modules",
+        "__pycache__",
+        ".git",
+        "dist",
+        "build",
+        ".venv",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+    }
+)
 
 
 # ── History persistence ───────────────────────────────────────────
@@ -124,11 +157,7 @@ def _load_history() -> list[dict[str, Any]]:
         # Preserve extra metadata (ops, files, plan, etc.)
         validated: list[dict[str, Any]] = []
         for entry in data:
-            if (
-                isinstance(entry, dict)
-                and "role" in entry
-                and "content" in entry
-            ):
+            if isinstance(entry, dict) and "role" in entry and "content" in entry:
                 role = str(entry["role"])
                 if role not in ("user", "assistant"):
                     continue
@@ -139,8 +168,11 @@ def _load_history() -> list[dict[str, Any]]:
                 # Preserve rich metadata for assistant turns
                 if role == "assistant":
                     for key in (
-                        "method", "iterations", "plan",
-                        "ops", "files_created",
+                        "method",
+                        "iterations",
+                        "plan",
+                        "ops",
+                        "files_created",
                         "trajectory_length",
                         "final_reasoning",
                     ):
@@ -162,9 +194,7 @@ def _save_history(history: list[dict[str, Any]]) -> None:
     path = _history_file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(history, ensure_ascii=False, indent=2)
-        )
+        path.write_text(json.dumps(history, ensure_ascii=False, indent=2))
     except Exception:
         logger.debug("Failed to save history", exc_info=True)
 
@@ -277,10 +307,20 @@ _AVAILABLE_MODELS: dict[str, list[tuple[str, str]]] = {
 
 _SLASH_COMPLETER = WordCompleter(
     [
-        "/help", "/exit", "/quit", "/clear",
-        "/context", "/history", "/model", "/traces",
-        "/remember", "/memory", "/forget",
-        "/debug-learning", "/agents", "/workflow",
+        "/help",
+        "/exit",
+        "/quit",
+        "/clear",
+        "/context",
+        "/history",
+        "/model",
+        "/traces",
+        "/remember",
+        "/memory",
+        "/forget",
+        "/debug-learning",
+        "/agents",
+        "/workflow",
     ],
     sentence=True,
 )
@@ -352,18 +392,12 @@ class ChatSession:
         self._agent.on_step = self._on_step_callback
         self._agent.on_plan = self._on_plan_callback
         self._agent.on_step_status = self._on_step_status_callback
-        self._agent.on_context_first_status = (
-            self._on_context_first_status_callback
-        )
-        self._agent.on_context_first_dashboard = (
-            self._on_context_first_dashboard_callback
-        )
+        self._agent.on_context_first_status = self._on_context_first_status_callback
+        self._agent.on_context_first_dashboard = self._on_context_first_dashboard_callback
         await self._agent.on_start()
 
         # Initialize persistent learning memory
-        self._learning_manager = LearningManager(
-            self._runtime.state_store
-        )
+        self._learning_manager = LearningManager(self._runtime.state_store)
 
         # Register specialist agents for multi-agent workflows
         try:
@@ -375,9 +409,7 @@ class ChatSession:
         self._history = _load_history()
 
         self._cwd_context = _scan_cwd_context(Path.cwd())
-        logger.info(
-            "Chat session started (history: %d turns)", len(self._history) // 2
-        )
+        logger.info("Chat session started (history: %d turns)", len(self._history) // 2)
 
     def _on_step_callback(self, step: TraceStep) -> None:
         """Called by RLM after each iteration — stored for live display."""
@@ -392,9 +424,7 @@ class ChatSession:
         self._plan_status = {i: "pending" for i in range(len(steps))}
         self._plan_detail = {}
 
-    def _on_step_status_callback(
-        self, step_num: int, status: str, detail: str
-    ) -> None:
+    def _on_step_status_callback(self, step_num: int, status: str, detail: str) -> None:
         """Called when a plan step changes status."""
         self._plan_status[step_num] = status
         if detail:
@@ -404,9 +434,7 @@ class ChatSession:
         elif status == "completed":
             start = self._plan_step_start.get(step_num)
             if start is not None:
-                self._plan_step_duration[step_num] = (
-                    time.monotonic() - start
-                )
+                self._plan_step_duration[step_num] = time.monotonic() - start
 
     # ── Context-first status callback ────────────────────
 
@@ -415,13 +443,12 @@ class ChatSession:
         # Move previous status to the completed list so it gets
         # printed permanently above the spinner.
         if self._context_first_status:
-            self._context_first_completed.append(
-                self._context_first_status
-            )
+            self._context_first_completed.append(self._context_first_status)
         self._context_first_status = msg
 
     def _on_context_first_dashboard_callback(
-        self, event: dict,
+        self,
+        event: dict,
     ) -> None:
         """Publish a dashboard event from the context-first solver."""
         try:
@@ -448,13 +475,15 @@ class ChatSession:
             loop = asyncio.get_event_loop()
             task = loop.create_task(
                 self._runtime.event_bus.publish(
-                    EVENT_TOPIC, de.to_bytes(),
+                    EVENT_TOPIC,
+                    de.to_bytes(),
                 ),
             )
             task.add_done_callback(lambda _t: None)
         except Exception:
             logger.debug(
-                "Failed to emit CF dashboard event", exc_info=True,
+                "Failed to emit CF dashboard event",
+                exc_info=True,
             )
 
     # ── Multi-agent workflow support ──────────────────────
@@ -483,7 +512,9 @@ class ChatSession:
             max_retries=1,
         )
         orchestrator = AgentOrchestrator(
-            self._runtime, manager, config=config,
+            self._runtime,
+            manager,
+            config=config,
         )
         self._workflow_engine = WorkflowEngine(
             context=self._runtime,
@@ -537,7 +568,8 @@ class ChatSession:
                 detail=detail,
             )
             await self._runtime.event_bus.publish(
-                EVENT_TOPIC, event.to_bytes(),
+                EVENT_TOPIC,
+                event.to_bytes(),
             )
         except Exception:
             logger.debug("Dashboard event publish failed", exc_info=True)
@@ -560,10 +592,7 @@ class ChatSession:
         # 0. LEARNED PREFERENCES (highest priority)
         if self._learning_manager is not None:
             try:
-                learnings_section = (
-                    await self._learning_manager
-                    .get_relevant_learnings(user_input)
-                )
+                learnings_section = await self._learning_manager.get_relevant_learnings(user_input)
                 if learnings_section:
                     context_parts.append(learnings_section)
             except Exception:
@@ -573,10 +602,7 @@ class ChatSession:
                 )
 
         # 1. CURRENT PROJECT STATE
-        context_parts.append(
-            f"=== CURRENT PROJECT STATE ===\n"
-            f"{self._cwd_context}"
-        )
+        context_parts.append(f"=== CURRENT PROJECT STATE ===\n{self._cwd_context}")
 
         # 2. MOST RECENT TURN (what was just done)
         if len(self._history) >= 2:
@@ -590,28 +616,14 @@ class ChatSession:
                 )
                 files = last_asst.get("files_created", [])
                 if files:
-                    recent_summary += (
-                        f"\nFiles created: "
-                        f"{', '.join(files[:15])}"
-                    )
+                    recent_summary += f"\nFiles created: {', '.join(files[:15])}"
                 ops = last_asst.get("ops", [])
-                cmds = [
-                    o["target"]
-                    for o in ops
-                    if o.get("type") == "cmd"
-                ]
+                cmds = [o["target"] for o in ops if o.get("type") == "cmd"]
                 if cmds:
-                    recent_summary += (
-                        f"\nCommands run: "
-                        f"{', '.join(cmds[:10])}"
-                    )
-                content = str(
-                    last_asst.get("content", "")
-                )
+                    recent_summary += f"\nCommands run: {', '.join(cmds[:10])}"
+                content = str(last_asst.get("content", ""))
                 if content:
-                    recent_summary += (
-                        f"\nAgent response: {content[:8000]}"
-                    )
+                    recent_summary += f"\nAgent response: {content[:8000]}"
                 context_parts.append(recent_summary)
 
         # 3. OLDER HISTORY (reference only, lower priority)
@@ -626,24 +638,16 @@ class ChatSession:
                     role = entry.get("role", "user")
                     content = str(entry.get("content", ""))
                     tag = "User" if role == "user" else "Agent"
-                    older_lines.append(
-                        f"  {tag}: {content[:200]}"
-                    )
+                    older_lines.append(f"  {tag}: {content[:200]}")
                     if role == "assistant":
-                        files = entry.get(
-                            "files_created", []
-                        )
+                        files = entry.get("files_created", [])
                         if files:
-                            older_lines.append(
-                                f"    [files: "
-                                f"{', '.join(files[:5])}]"
-                            )
+                            older_lines.append(f"    [files: {', '.join(files[:5])}]")
                 context_parts.append(
                     f"=== EARLIER CONTEXT "
                     f"(reference only) ===\n"
                     f"{n_turns} total turns. "
-                    f"Recent:\n"
-                    + "\n".join(older_lines)
+                    f"Recent:\n" + "\n".join(older_lines)
                 )
 
         # 4. History variable pointer
@@ -672,7 +676,8 @@ class ChatSession:
 
         # Try multi-agent path for "task" queries
         result = await self._try_workflow_or_single(
-            user_input, context,
+            user_input,
+            context,
         )
 
         # Append to persistent history with rich metadata
@@ -680,9 +685,7 @@ class ChatSession:
         answer = data.get("answer", data.get("explanation", ""))
         truncated_input = user_input[:_MAX_SINGLE_MESSAGE_LENGTH]
         truncated_answer = answer[:_MAX_SINGLE_MESSAGE_LENGTH]
-        self._history.append(
-            {"role": "user", "content": truncated_input}
-        )
+        self._history.append({"role": "user", "content": truncated_input})
 
         # Store full turn data so RLM can reference prior work
         assistant_entry: dict[str, Any] = {
@@ -707,9 +710,7 @@ class ChatSession:
             assistant_entry["trajectory_length"] = traj_len
         reasoning = data.get("final_reasoning", "")
         if reasoning:
-            assistant_entry["final_reasoning"] = (
-                reasoning[:500]
-            )
+            assistant_entry["final_reasoning"] = reasoning[:500]
 
         self._history.append(assistant_entry)
 
@@ -719,19 +720,14 @@ class ChatSession:
         # Extract learnings from this turn
         if self._learning_manager is not None:
             try:
-                stored = (
-                    await self._learning_manager
-                    .extract_and_store(
-                        user_input, truncated_answer
-                    )
+                stored = await self._learning_manager.extract_and_store(
+                    user_input, truncated_answer
                 )
                 if stored:
                     logger.info(
                         "Learned %d items: %s",
                         len(stored),
-                        ", ".join(
-                            s[:40] for s in stored
-                        ),
+                        ", ".join(s[:40] for s in stored),
                     )
             except Exception as exc:
                 logger.warning(
@@ -767,7 +763,8 @@ class ChatSession:
             category = ""
             try:
                 category = await self._agent._triage_query(
-                    user_input, context,
+                    user_input,
+                    context,
                 )
                 logger.info("Triage: %s", category)
             except Exception:
@@ -795,8 +792,7 @@ class ChatSession:
                 return self._workflow_to_task_result(wf_result)
             except Exception as exc:
                 logger.warning(
-                    "Workflow failed for 'workflow' category, "
-                    "falling back to single-agent: %s",
+                    "Workflow failed for 'workflow' category, falling back to single-agent: %s",
                     exc,
                 )
                 # Fall through to single-agent path
@@ -805,13 +801,13 @@ class ChatSession:
             # PHASE 1: Try fast path (context-first, 1-2 LLM calls)
             try:
                 fast_result = await self._try_fast_path(
-                    user_input, context, category,
+                    user_input,
+                    context,
+                    category,
                 )
                 if fast_result is not None and fast_result.success:
                     return fast_result
-                logger.info(
-                    "Fast path returned no useful result, escalating"
-                )
+                logger.info("Fast path returned no useful result, escalating")
             except Exception:
                 logger.info(
                     "Fast path failed, escalating to multi-agent",
@@ -886,9 +882,7 @@ class ChatSession:
         # Explicit escalation signal from context-first truncation:
         # the task is too complex for single-agent, must go to workflow.
         if data.get("_escalate"):
-            logger.info(
-                "Fast path requests escalation to workflow"
-            )
+            logger.info("Fast path requests escalation to workflow")
             return None
 
         answer = data.get("answer", "")
@@ -906,40 +900,30 @@ class ChatSession:
         # Build per-agent breakdown for transparency.
         agent_breakdown: list[dict[str, Any]] = []
         total_ops_count = 0
-        for tid, sub_result in (
-            wf_result.sub_task_results or {}
-        ).items():
+        for tid, sub_result in (wf_result.sub_task_results or {}).items():
             data = sub_result.result or {}
             ops = data.get("ops", [])
-            reads = sum(
-                1 for o in ops if o.get("type") == "read"
-            )
-            writes = sum(
-                1 for o in ops if o.get("type") == "write"
-            )
-            edits = sum(
-                1 for o in ops if o.get("type") == "edit"
-            )
-            cmds = sum(
-                1 for o in ops if o.get("type") == "cmd"
-            )
+            reads = sum(1 for o in ops if o.get("type") == "read")
+            writes = sum(1 for o in ops if o.get("type") == "write")
+            edits = sum(1 for o in ops if o.get("type") == "edit")
+            cmds = sum(1 for o in ops if o.get("type") == "cmd")
             total_ops_count += len(ops)
-            agent_breakdown.append({
-                "task_id": tid,
-                "agent": sub_result.agent_id,
-                "method": data.get("method", ""),
-                "iterations": data.get("iterations", 0),
-                "ops_count": len(ops),
-                "reads": reads,
-                "writes": writes,
-                "edits": edits,
-                "cmds": cmds,
-                "files_count": len(
-                    data.get("files_created", [])
-                ),
-                "duration_ms": sub_result.duration_ms,
-                "success": sub_result.success,
-            })
+            agent_breakdown.append(
+                {
+                    "task_id": tid,
+                    "agent": sub_result.agent_id,
+                    "method": data.get("method", ""),
+                    "iterations": data.get("iterations", 0),
+                    "ops_count": len(ops),
+                    "reads": reads,
+                    "writes": writes,
+                    "edits": edits,
+                    "cmds": cmds,
+                    "files_count": len(data.get("files_created", [])),
+                    "duration_ms": sub_result.duration_ms,
+                    "success": sub_result.success,
+                }
+            )
 
         num_agents = len(agent_breakdown)
         return TaskRes(
@@ -1065,9 +1049,7 @@ def _format_tokens(tokens: int) -> str:
     return f"{tokens / 1000:.1f}k"
 
 
-def _display_ops_summary(
-    ops: list[dict], files_created: list[str]
-) -> None:
+def _display_ops_summary(ops: list[dict], files_created: list[str]) -> None:
     """Show a summary of file and shell operations performed.
 
     Each item gets an empty line after it for vertical breathing room.
@@ -1078,12 +1060,8 @@ def _display_ops_summary(
     writes = [o for o in ops if o.get("type") == "write"]
     edits = [o for o in ops if o.get("type") == "edit"]
     cmds = [o for o in ops if o.get("type") == "cmd"]
-    searches = [
-        o for o in ops if o.get("type") == "web_search"
-    ]
-    fetches = [
-        o for o in ops if o.get("type") == "web_fetch"
-    ]
+    searches = [o for o in ops if o.get("type") == "web_search"]
+    fetches = [o for o in ops if o.get("type") == "web_fetch"]
 
     if searches or fetches:
         console.print()
@@ -1092,20 +1070,12 @@ def _display_ops_summary(
         for op in searches:
             query = op.get("target", "")
             count = op.get("detail", 0)
-            console.print(
-                f"    [magenta]?[/magenta] "
-                f"search: {query}"
-                f" [dim]({count} results)[/dim]"
-            )
+            console.print(f"    [magenta]?[/magenta] search: {query} [dim]({count} results)[/dim]")
             console.print()
         for op in fetches:
             url = op.get("target", "")
             size = op.get("detail", 0)
-            console.print(
-                f"    [magenta]>[/magenta] "
-                f"fetch: {url}"
-                f" [dim]({size})[/dim]"
-            )
+            console.print(f"    [magenta]>[/magenta] fetch: {url} [dim]({size})[/dim]")
             console.print()
 
     if writes or edits:
@@ -1118,19 +1088,13 @@ def _display_ops_summary(
             if path and path not in seen:
                 seen.add(path)
                 size = op.get("detail", 0)
-                console.print(
-                    f"    [green]✓[/green] {path}"
-                    f" [dim]({size} chars)[/dim]"
-                )
+                console.print(f"    [green]✓[/green] {path} [dim]({size} chars)[/dim]")
                 console.print()
         for op in edits:
             path = op.get("target", "")
             if path and path not in seen:
                 seen.add(path)
-                console.print(
-                    f"    [cyan]~[/cyan] {path}"
-                    f" [dim](edited)[/dim]"
-                )
+                console.print(f"    [cyan]~[/cyan] {path} [dim](edited)[/dim]")
                 console.print()
 
     if cmds:
@@ -1141,14 +1105,9 @@ def _display_ops_summary(
             cmd = op.get("target", "")
             rc = op.get("detail", 0)
             if rc == 0:
-                console.print(
-                    f"    [green]✓[/green] $ {cmd}"
-                )
+                console.print(f"    [green]✓[/green] $ {cmd}")
             else:
-                console.print(
-                    f"    [red]✗[/red] $ {cmd}"
-                    f" [dim](exit {rc})[/dim]"
-                )
+                console.print(f"    [red]✗[/red] $ {cmd} [dim](exit {rc})[/dim]")
             console.print()
 
     # Suggest next steps if files were created
@@ -1157,54 +1116,37 @@ def _display_ops_summary(
         console.print("  [bold]Next steps:[/bold]")
         console.print()
         # Check for common patterns
-        has_py = any(
-            f.endswith(".py") for f in files_created
-        )
-        has_html = any(
-            f.endswith(".html") for f in files_created
-        )
-        has_requirements = any(
-            "requirements" in f for f in files_created
-        )
-        has_package_json = any(
-            "package.json" in f for f in files_created
-        )
+        has_py = any(f.endswith(".py") for f in files_created)
+        has_html = any(f.endswith(".html") for f in files_created)
+        has_requirements = any("requirements" in f for f in files_created)
+        has_package_json = any("package.json" in f for f in files_created)
 
         if has_requirements:
-            console.print(
-                "    [dim]→[/dim]"
-                " pip install -r requirements.txt"
-            )
+            console.print("    [dim]→[/dim] pip install -r requirements.txt")
             console.print()
         if has_package_json:
-            console.print(
-                "    [dim]→[/dim] npm install"
-            )
+            console.print("    [dim]→[/dim] npm install")
             console.print()
         if has_py:
             mains = [
-                f for f in files_created
+                f
+                for f in files_created
                 if any(
                     n in f
                     for n in (
-                        "app.py", "main.py", "server.py",
+                        "app.py",
+                        "main.py",
+                        "server.py",
                     )
                 )
             ]
             for m in mains:
-                console.print(
-                    f"    [dim]→[/dim] python {m}"
-                )
+                console.print(f"    [dim]→[/dim] python {m}")
                 console.print()
         if has_html:
-            htmls = [
-                f for f in files_created
-                if f.endswith(".html")
-            ]
+            htmls = [f for f in files_created if f.endswith(".html")]
             if htmls:
-                console.print(
-                    f"    [dim]→[/dim] open {htmls[0]}"
-                )
+                console.print(f"    [dim]→[/dim] open {htmls[0]}")
                 console.print()
 
 
@@ -1219,11 +1161,7 @@ def _display_answer(result: TaskResult) -> None:
     answer = data.get("answer", data.get("explanation", ""))
     method = data.get("method", "")
     iterations = data.get("iterations", 0)
-    duration = (
-        _format_elapsed(result.duration_ms / 1000)
-        if result.duration_ms
-        else ""
-    )
+    duration = _format_elapsed(result.duration_ms / 1000) if result.duration_ms else ""
     ops = data.get("ops", [])
     files_created = data.get("files_created", [])
     total_tokens = data.get("total_tokens", 0)
@@ -1235,43 +1173,27 @@ def _display_answer(result: TaskResult) -> None:
 
     num_agents = data.get("num_agents", 0)
     if num_agents:
-        meta_parts.append(
-            f"{num_agents} agent{'s' if num_agents != 1 else ''}"
-        )
+        meta_parts.append(f"{num_agents} agent{'s' if num_agents != 1 else ''}")
 
     total_ops_val = data.get("total_ops", 0)
     if total_ops_val:
-        meta_parts.append(
-            f"{total_ops_val} op{'s' if total_ops_val != 1 else ''}"
-        )
+        meta_parts.append(f"{total_ops_val} op{'s' if total_ops_val != 1 else ''}")
 
     if iterations:
         meta_parts.append(f"{iterations} iter")
 
     # Tool usage breakdown for single-agent results
     if not num_agents and ops:
-        write_n = sum(
-            1 for o in ops if o.get("type") == "write"
-        )
-        edit_n = sum(
-            1 for o in ops if o.get("type") == "edit"
-        )
-        cmd_n = sum(
-            1 for o in ops if o.get("type") == "cmd"
-        )
+        write_n = sum(1 for o in ops if o.get("type") == "write")
+        edit_n = sum(1 for o in ops if o.get("type") == "edit")
+        cmd_n = sum(1 for o in ops if o.get("type") == "cmd")
         tool_parts = []
         if write_n:
-            tool_parts.append(
-                f"{write_n} write{'s' if write_n != 1 else ''}"
-            )
+            tool_parts.append(f"{write_n} write{'s' if write_n != 1 else ''}")
         if edit_n:
-            tool_parts.append(
-                f"{edit_n} edit{'s' if edit_n != 1 else ''}"
-            )
+            tool_parts.append(f"{edit_n} edit{'s' if edit_n != 1 else ''}")
         if cmd_n:
-            tool_parts.append(
-                f"{cmd_n} cmd{'s' if cmd_n != 1 else ''}"
-            )
+            tool_parts.append(f"{cmd_n} cmd{'s' if cmd_n != 1 else ''}")
         if tool_parts:
             meta_parts.append(", ".join(tool_parts))
 
@@ -1287,32 +1209,22 @@ def _display_answer(result: TaskResult) -> None:
 
     if answer and not is_max_iter:
         console.print()
-        console.print(
-            f"  [green]✓[/green] [dim]({meta})[/dim]"
-        )
+        console.print(f"  [green]✓[/green] [dim]({meta})[/dim]")
         console.print()
         console.print(Markdown(answer))
         console.print()
     else:
         # No final answer or max iterations reached
         console.print()
-        console.print(
-            f"  [yellow]⚠[/yellow] Task completed"
-            f" [dim]({meta})[/dim]"
-        )
+        console.print(f"  [yellow]⚠[/yellow] Task completed [dim]({meta})[/dim]")
         console.print()
         traj_len = data.get("trajectory_length", 0)
         if traj_len:
-            console.print(
-                f"  [dim]{traj_len} iterations"
-                f" executed.[/dim]"
-            )
+            console.print(f"  [dim]{traj_len} iterations executed.[/dim]")
             console.print()
         final_reasoning = data.get("final_reasoning", "")
         if final_reasoning:
-            console.print(
-                f"  [dim]Last: {final_reasoning}[/dim]"
-            )
+            console.print(f"  [dim]Last: {final_reasoning}[/dim]")
             console.print()
 
     # Show multi-agent breakdown if available.
@@ -1322,16 +1234,8 @@ def _display_answer(result: TaskResult) -> None:
         console.print("  [bold]Agents:[/bold]")
         console.print()
         for ab in agent_breakdown:
-            icon = (
-                "[green]✓[/green]"
-                if ab.get("success")
-                else "[red]✗[/red]"
-            )
-            dur = (
-                _format_elapsed(ab["duration_ms"] / 1000)
-                if ab.get("duration_ms")
-                else ""
-            )
+            icon = "[green]✓[/green]" if ab.get("success") else "[red]✗[/red]"
+            dur = _format_elapsed(ab["duration_ms"] / 1000) if ab.get("duration_ms") else ""
             parts = []
             iters = ab.get("iterations", 0)
             if iters:
@@ -1342,48 +1246,28 @@ def _display_answer(result: TaskResult) -> None:
             edits_n = ab.get("edits", 0)
             cmds_n = ab.get("cmds", 0)
             if reads_n:
-                parts.append(
-                    f"{reads_n} read"
-                    f"{'s' if reads_n != 1 else ''}"
-                )
+                parts.append(f"{reads_n} read{'s' if reads_n != 1 else ''}")
             if writes_n:
-                parts.append(
-                    f"{writes_n} write"
-                    f"{'s' if writes_n != 1 else ''}"
-                )
+                parts.append(f"{writes_n} write{'s' if writes_n != 1 else ''}")
             if edits_n:
-                parts.append(
-                    f"{edits_n} edit"
-                    f"{'s' if edits_n != 1 else ''}"
-                )
+                parts.append(f"{edits_n} edit{'s' if edits_n != 1 else ''}")
             if cmds_n:
-                parts.append(
-                    f"{cmds_n} cmd"
-                    f"{'s' if cmds_n != 1 else ''}"
-                )
+                parts.append(f"{cmds_n} cmd{'s' if cmds_n != 1 else ''}")
             # Fallback to total ops if no breakdown
             if not any([reads_n, writes_n, edits_n, cmds_n]):
                 ops_n = ab.get("ops_count", 0)
                 if ops_n:
-                    parts.append(
-                        f"{ops_n} op"
-                        f"{'s' if ops_n != 1 else ''}"
-                    )
+                    parts.append(f"{ops_n} op{'s' if ops_n != 1 else ''}")
             if dur:
                 parts.append(dur)
             detail = ", ".join(parts)
-            console.print(
-                f"    {icon} {ab.get('agent', '?')}"
-                f" [dim]({detail})[/dim]"
-            )
+            console.print(f"    {icon} {ab.get('agent', '?')} [dim]({detail})[/dim]")
         console.print()
 
     # Show review summary if present.
     review_summary = data.get("review_summary", "")
     if review_summary:
-        console.print(
-            f"  [bold]Review:[/bold] {review_summary}"
-        )
+        console.print(f"  [bold]Review:[/bold] {review_summary}")
         console.print()
 
     # Show operations summary
@@ -1421,16 +1305,11 @@ def _make_workflow_progress(
     lines: list[str] = [""]
 
     status_name = (
-        wf_state.status.value
-        if hasattr(wf_state.status, "value")
-        else str(wf_state.status)
+        wf_state.status.value if hasattr(wf_state.status, "value") else str(wf_state.status)
     )
     label = _WF_STATUS_LABELS.get(status_name, status_name)
 
-    lines.append(
-        f"  {frame} {label}"
-        f"  [dim]({_format_elapsed(elapsed)})[/dim]"
-    )
+    lines.append(f"  {frame} {label}  [dim]({_format_elapsed(elapsed)})[/dim]")
     lines.append("")
 
     # Show sub-task statuses if available
@@ -1446,15 +1325,8 @@ def _make_workflow_progress(
                 dur_s = 0.0
                 if ss.completed_at and ss.started_at:
                     dur_s = ss.completed_at - ss.started_at
-                dur_str = (
-                    f" [dim]({dur_s:.1f}s)[/dim]"
-                    if dur_s > 0
-                    else ""
-                )
-                lines.append(
-                    f"    [green]✓[/green] {tid}: {agent}"
-                    f"{dur_str}"
-                )
+                dur_str = f" [dim]({dur_s:.1f}s)[/dim]" if dur_s > 0 else ""
+                lines.append(f"    [green]✓[/green] {tid}: {agent}{dur_str}")
             elif st_status == "running":
                 run_s = 0.0
                 if ss.started_at:
@@ -1470,8 +1342,7 @@ def _make_workflow_progress(
                         iter_label = f" [cyan]iter {it}/{mx}[/cyan]"
 
                 lines.append(
-                    f"    {frame} {tid}: {agent}{iter_label}"
-                    f" [dim]({_format_elapsed(run_s)})[/dim]"
+                    f"    {frame} {tid}: {agent}{iter_label} [dim]({_format_elapsed(run_s)})[/dim]"
                 )
 
                 # Show current operation (truncated).
@@ -1479,30 +1350,19 @@ def _make_workflow_progress(
                     op_text = activity["last_op"]
                     if len(op_text) > 60:
                         op_text = op_text[:57] + "..."
-                    lines.append(
-                        f"        [dim]{op_text}[/dim]"
-                    )
+                    lines.append(f"        [dim]{op_text}[/dim]")
                 elif desc:
-                    lines.append(
-                        f"        [dim]{desc}[/dim]"
-                    )
+                    lines.append(f"        [dim]{desc}[/dim]")
             elif st_status == "failed":
-                lines.append(
-                    f"    [red]✗[/red] {tid}: {agent}"
-                )
+                lines.append(f"    [red]✗[/red] {tid}: {agent}")
             else:
-                lines.append(
-                    f"    [dim]○[/dim] {tid}: {agent}"
-                    f" [dim]({st_status})[/dim]"
-                )
+                lines.append(f"    [dim]○[/dim] {tid}: {agent} [dim]({st_status})[/dim]")
         lines.append("")
 
     return Text.from_markup("\n".join(lines))
 
 
-def _make_progress_renderable(
-    session: ChatSession, elapsed: float
-) -> Text:
+def _make_progress_renderable(session: ChatSession, elapsed: float) -> Text:
     """Build a minimal live-updating spinner for the current step.
 
     Completed plan steps are printed permanently via
@@ -1520,14 +1380,14 @@ def _make_progress_renderable(
         wf_state = session._current_workflow
         if wf_state is not None:
             return _make_workflow_progress(
-                session, wf_state, elapsed, frame,
+                session,
+                wf_state,
+                elapsed,
+                frame,
             )
         # Show context-first solver status if available
         label = session._context_first_status or "Thinking..."
-        lines.append(
-            f"  {frame} {label}"
-            f"  [dim]({_format_elapsed(elapsed)})[/dim]"
-        )
+        lines.append(f"  {frame} {label}  [dim]({_format_elapsed(elapsed)})[/dim]")
         lines.append("")
         return Text.from_markup("\n".join(lines))
 
@@ -1550,43 +1410,35 @@ def _make_progress_renderable(
                 continue
 
             file_ops = (
-                "write_file(", "read_file(",
-                "edit_file(", "open(",
+                "write_file(",
+                "read_file(",
+                "edit_file(",
+                "open(",
             )
             shell_ops = (
-                "run_cmd(", "subprocess",
+                "run_cmd(",
+                "subprocess",
                 "os.system",
             )
             web_ops = (
-                "web_search(", "web_fetch(",
+                "web_search(",
+                "web_fetch(",
             )
 
             if any(op in stripped for op in file_ops):
-                lines.append(
-                    f"    [dim]│ >[/dim]"
-                    f" [cyan]{stripped}[/cyan]"
-                )
+                lines.append(f"    [dim]│ >[/dim] [cyan]{stripped}[/cyan]")
                 lines.append("")
                 shown += 1
             elif any(op in stripped for op in shell_ops):
-                lines.append(
-                    f"    [dim]│ $[/dim]"
-                    f" [yellow]{stripped}[/yellow]"
-                )
+                lines.append(f"    [dim]│ $[/dim] [yellow]{stripped}[/yellow]")
                 lines.append("")
                 shown += 1
             elif any(op in stripped for op in web_ops):
-                lines.append(
-                    f"    [dim]│ ?[/dim]"
-                    f" [magenta]{stripped}[/magenta]"
-                )
+                lines.append(f"    [dim]│ ?[/dim] [magenta]{stripped}[/magenta]")
                 lines.append("")
                 shown += 1
             elif "state[" in stripped:
-                lines.append(
-                    f"    [dim]│ =[/dim]"
-                    f" [green]{stripped}[/green]"
-                )
+                lines.append(f"    [dim]│ =[/dim] [green]{stripped}[/green]")
                 lines.append("")
                 shown += 1
 
@@ -1599,26 +1451,18 @@ def _make_progress_renderable(
             for ol in out_lines[-4:]:
                 ol = ol.strip()
                 if ol:
-                    lines.append(
-                        f"    [dim]│[/dim]"
-                        f" [red]{ol}[/red]"
-                    )
+                    lines.append(f"    [dim]│[/dim] [red]{ol}[/red]")
             lines.append("")
         else:
             for ol in out_lines[:3]:
                 ol = ol.strip()
                 if ol:
-                    lines.append(
-                        f"    [dim]│ →[/dim] {ol}"
-                    )
+                    lines.append(f"    [dim]│ →[/dim] {ol}")
             lines.append("")
 
     # Timer + iteration + tokens always at the bottom
     lines.append("")
-    timer_line = (
-        f"  {frame} Iteration {step.iteration}"
-        f"  [dim]({_format_elapsed(elapsed)})[/dim]"
-    )
+    timer_line = f"  {frame} Iteration {step.iteration}  [dim]({_format_elapsed(elapsed)})[/dim]"
     tok_str = _format_tokens(step.cumulative_tokens)
     if tok_str:
         timer_line += f"  [dim]{tok_str} tokens[/dim]"
@@ -1666,22 +1510,12 @@ def _print_completed_steps(
         status = session.plan_status.get(i, "pending")
         if status == "completed":
             dur = session.plan_step_duration.get(i)
-            dur_str = (
-                f"  [dim]thought for"
-                f" {_format_elapsed(dur)}[/dim]"
-                if dur
-                else ""
-            )
-            out.print(
-                f"    [green]✓[/green] {i + 1}."
-                f" {step_desc}{dur_str}"
-            )
+            dur_str = f"  [dim]thought for {_format_elapsed(dur)}[/dim]" if dur else ""
+            out.print(f"    [green]✓[/green] {i + 1}. {step_desc}{dur_str}")
             out.print()
             printed.add(i)
         elif status == "in_progress" and i not in printed:
-            out.print(
-                f"    [cyan]⠋[/cyan] {i + 1}. {step_desc}"
-            )
+            out.print(f"    [cyan]⠋[/cyan] {i + 1}. {step_desc}")
             out.print()
             printed.add(i)
 
@@ -1706,16 +1540,9 @@ def _print_completed_cf_statuses(
 
     for msg in completed[already:]:
         # Distinguish file operations from other statuses
-        if (
-            msg.startswith("Wrote ")
-            or msg.startswith("Edited ")
-            or msg.startswith("Ran: ")
-        ):
+        if msg.startswith("Wrote ") or msg.startswith("Edited ") or msg.startswith("Ran: "):
             out.print(f"    [green]✓[/green] {msg}")
-        elif (
-            msg.startswith("Edit failed")
-            or msg.startswith("Command failed")
-        ):
+        elif msg.startswith("Edit failed") or msg.startswith("Command failed"):
             out.print(f"    [red]✗[/red] {msg}")
         elif msg.startswith("Reading "):
             out.print(f"    [dim]↓[/dim] {msg}")
@@ -1750,13 +1577,8 @@ def _print_completed_iterations(
         dur_ms = step.duration_ms
         dur_str = ""
         if dur_ms > 0:
-            dur_str = (
-                f"  [dim]({dur_ms / 1000:.1f}s)[/dim]"
-            )
-        out.print(
-            f"  [dim]Iteration {step.iteration}[/dim]"
-            f"{dur_str}"
-        )
+            dur_str = f"  [dim]({dur_ms / 1000:.1f}s)[/dim]"
+        out.print(f"  [dim]Iteration {step.iteration}[/dim]{dur_str}")
 
         # Show reasoning snippet (first 2 sentences)
         if step.reasoning:
@@ -1776,36 +1598,31 @@ def _print_completed_iterations(
                 if not stripped or stripped.startswith("#"):
                     continue
                 ops = (
-                    "write_file(", "read_file(",
-                    "edit_file(", "run_cmd(",
-                    "web_search(", "web_fetch(",
-                    "list_files(", "llm_query(",
+                    "write_file(",
+                    "read_file(",
+                    "edit_file(",
+                    "run_cmd(",
+                    "web_search(",
+                    "web_fetch(",
+                    "list_files(",
+                    "llm_query(",
                 )
                 if any(op in stripped for op in ops):
-                    out.print(
-                        f"    [dim]│ >[/dim]"
-                        f" [cyan]{stripped[:80]}[/cyan]"
-                    )
+                    out.print(f"    [dim]│ >[/dim] [cyan]{stripped[:80]}[/cyan]")
                     shown += 1
 
         # Show output snippet (errors are highlighted)
         if step.output:
             output_preview = step.output.strip()[:200]
-            if "error" in output_preview.lower() or \
-               "Traceback" in output_preview:
+            if "error" in output_preview.lower() or "Traceback" in output_preview:
                 # Show error output in red
                 for oline in output_preview.split("\n")[:3]:
                     oline = oline.strip()
                     if oline:
-                        out.print(
-                            f"    [dim]│[/dim]"
-                            f" [red]{oline}[/red]"
-                        )
+                        out.print(f"    [dim]│[/dim] [red]{oline}[/red]")
             elif output_preview and len(output_preview) > 5:
                 first_line = output_preview.split("\n")[0][:80]
-                out.print(
-                    f"    [dim]│ → {first_line}[/dim]"
-                )
+                out.print(f"    [dim]│ → {first_line}[/dim]")
 
         out.print()  # spacing between iterations
         printed_count[0] += 1
@@ -1833,10 +1650,7 @@ def _print_completed_workflow_events(
 
         if status_str == "running" and f"{tid}:running" not in printed_tids:
             desc = ss.sub_task.description[:70] if ss.sub_task else ""
-            out.print(
-                f"  [cyan]▸[/cyan] {tid}: {agent}"
-                f" [dim]started[/dim]"
-            )
+            out.print(f"  [cyan]▸[/cyan] {tid}: {agent} [dim]started[/dim]")
             if desc:
                 out.print(f"    [dim]{desc}[/dim]")
             out.print()
@@ -1846,11 +1660,7 @@ def _print_completed_workflow_events(
             dur_s = 0.0
             if ss.completed_at and ss.started_at:
                 dur_s = ss.completed_at - ss.started_at
-            dur_str = (
-                f" [dim]({dur_s:.1f}s)[/dim]"
-                if dur_s > 0
-                else ""
-            )
+            dur_str = f" [dim]({dur_s:.1f}s)[/dim]" if dur_s > 0 else ""
             # Show result summary
             data = ss.result.result if ss.result else {}
             iters = data.get("iterations", 0) if data else 0
@@ -1860,31 +1670,17 @@ def _print_completed_workflow_events(
             if iters:
                 detail_parts.append(f"{iters} iter")
             if ops:
-                detail_parts.append(
-                    f"{len(ops)} op{'s' if len(ops) != 1 else ''}"
-                )
+                detail_parts.append(f"{len(ops)} op{'s' if len(ops) != 1 else ''}")
             if files:
-                detail_parts.append(
-                    f"{len(files)} file{'s' if len(files) != 1 else ''}"
-                )
-            detail = (
-                f" ({', '.join(detail_parts)})"
-                if detail_parts
-                else ""
-            )
-            out.print(
-                f"  [green]✓[/green] {tid}: {agent}"
-                f"{detail}{dur_str}"
-            )
+                detail_parts.append(f"{len(files)} file{'s' if len(files) != 1 else ''}")
+            detail = f" ({', '.join(detail_parts)})" if detail_parts else ""
+            out.print(f"  [green]✓[/green] {tid}: {agent}{detail}{dur_str}")
             out.print()
             printed_tids.add(key)
 
         elif status_str == "failed":
             err = ss.result.error if ss.result else "unknown"
-            out.print(
-                f"  [red]✗[/red] {tid}: {agent}"
-                f" [dim]({err})[/dim]"
-            )
+            out.print(f"  [red]✗[/red] {tid}: {agent} [dim]({err})[/dim]")
             out.print()
             printed_tids.add(key)
 
@@ -1896,10 +1692,7 @@ def _print_plan_final(session: ChatSession) -> None:
     for i, step_desc in enumerate(session.plan):
         status = session.plan_status.get(i, "pending")
         if status == "skipped":
-            console.print(
-                f"    [dim]-[/dim] {i + 1}."
-                f" [dim]{step_desc}[/dim]"
-            )
+            console.print(f"    [dim]-[/dim] {i + 1}. [dim]{step_desc}[/dim]")
             console.print()
 
 
@@ -1910,6 +1703,7 @@ def _get_version() -> str:
     """Get the memfun version from source (live with editable installs)."""
     try:
         from memfun_core._version import __version__
+
         return __version__
     except Exception:
         return "dev"
@@ -1922,6 +1716,7 @@ def _get_build() -> str:
     falls back to the memfun source tree.
     """
     import subprocess
+
     for cwd in (Path.cwd(), Path(__file__).resolve().parent):
         try:
             result = subprocess.run(
@@ -1958,11 +1753,7 @@ def _load_creds_file(creds_path: Path) -> None:
         creds = json.loads(creds_path.read_text())
         if isinstance(creds, dict):
             for key, value in creds.items():
-                if (
-                    isinstance(key, str)
-                    and isinstance(value, str)
-                    and value
-                ):
+                if isinstance(key, str) and isinstance(value, str) and value:
                     os.environ[key] = value
     except Exception:
         logger.debug(
@@ -1996,6 +1787,7 @@ def _configure_dspy(config: MemfunConfig) -> None:
             config.llm.api_key_env,
         )
         from rich.console import Console
+
         Console().print(
             f"\n  [yellow]Warning: No API key found for {provider}. "
             f"Set {config.llm.api_key_env} or run 'memfun init'.[/yellow]\n"
@@ -2074,7 +1866,8 @@ async def _start_dashboard_background(
                     )
                     if resp.status_code == 200:
                         logger.info(
-                            "Reusing existing dashboard on port %d", port,
+                            "Reusing existing dashboard on port %d",
+                            port,
                         )
                         return port, False
             except Exception:
@@ -2107,7 +1900,9 @@ async def _start_dashboard_background(
             project_name=Path.cwd().name,
         )
         config = uvicorn.Config(
-            app, host="0.0.0.0", port=port,
+            app,
+            host="0.0.0.0",
+            port=port,
             log_level="warning",
         )
         server = uvicorn.Server(config)
@@ -2120,7 +1915,8 @@ async def _start_dashboard_background(
 
 
 async def _start_event_forwarder(
-    event_bus: Any, dashboard_port: int,
+    event_bus: Any,
+    dashboard_port: int,
 ) -> None:
     """Forward local event bus events to an external dashboard via HTTP."""
     import httpx
@@ -2161,9 +1957,7 @@ async def _async_chat_loop() -> None:
 
     session = ChatSession()
 
-    with console.status(
-        "[bold cyan]Starting agent...[/bold cyan]", spinner="dots"
-    ):
+    with console.status("[bold cyan]Starting agent...[/bold cyan]", spinner="dots"):
         try:
             await session.start()
         except Exception as exc:
@@ -2178,7 +1972,8 @@ async def _async_chat_loop() -> None:
         # Forward our events to the existing dashboard
         fwd_task = asyncio.create_task(
             _start_event_forwarder(
-                session._runtime.event_bus, dashboard_port,
+                session._runtime.event_bus,
+                dashboard_port,
             ),
         )
         fwd_task.add_done_callback(lambda _t: None)
@@ -2191,10 +1986,7 @@ async def _async_chat_loop() -> None:
         f"[dim]│[/dim] {Path.cwd().name}/ [dim]│[/dim] {session.history_stats}"
     )
     if dashboard_port:
-        banner += (
-            f"\n  [dim]Dashboard:[/dim] "
-            f"[cyan]http://localhost:{dashboard_port}[/cyan]"
-        )
+        banner += f"\n  [dim]Dashboard:[/dim] [cyan]http://localhost:{dashboard_port}[/cyan]"
     console.print(banner)
     console.print("  [dim]Type a message or /help. Ctrl+C to cancel. Ctrl+D to exit.[/dim]")
     console.print()
@@ -2249,16 +2041,16 @@ async def _async_chat_loop() -> None:
         cols = shutil.get_terminal_size().columns
         dash = "\u2500" * cols
         hint = mode_hints.get(session._mode, "")
-        return HTML(
-            f'<style fg="ansigray">{dash}\n{hint}</style>'
-        )
+        return HTML(f'<style fg="ansigray">{dash}\n{hint}</style>')
 
     from prompt_toolkit.styles import Style as PTStyle
 
-    _toolbar_style = PTStyle.from_dict({
-        "bottom-toolbar": "ansigray bg:default noreverse",
-        "bottom-toolbar.text": "ansigray bg:default noreverse",
-    })
+    _toolbar_style = PTStyle.from_dict(
+        {
+            "bottom-toolbar": "ansigray bg:default noreverse",
+            "bottom-toolbar.text": "ansigray bg:default noreverse",
+        }
+    )
 
     prompt_session: PromptSession[str] = PromptSession(
         history=FileHistory(str(history_path)),
@@ -2318,45 +2110,24 @@ async def _async_chat_loop() -> None:
                     console.print("[dim]Project context rescanned.[/dim]")
                     continue
                 if cmd == "/history":
-                    console.print(
-                        f"[dim]History: {session.history_stats}[/dim]"
-                    )
+                    console.print(f"[dim]History: {session.history_stats}[/dim]")
                     continue
                 if cmd == "/model":
                     provider = session.provider
-                    models = _AVAILABLE_MODELS.get(
-                        provider, []
-                    )
+                    models = _AVAILABLE_MODELS.get(provider, [])
                     current = session.model_name
-                    console.print(
-                        f"  [bold]Model:[/bold] {current}"
-                        f" [dim]({provider})[/dim]"
-                    )
+                    console.print(f"  [bold]Model:[/bold] {current} [dim]({provider})[/dim]")
                     if models:
                         console.print()
-                        for i, (mid, desc) in enumerate(
-                            models, 1
-                        ):
-                            marker = (
-                                "[green]●[/green]"
-                                if mid == current
-                                else "[dim]○[/dim]"
-                            )
-                            console.print(
-                                f"    {marker} {i}. {desc}"
-                                f" [dim]({mid})[/dim]"
-                            )
-                        console.print(
-                            "    [dim]○[/dim] 0."
-                            " Custom model ID"
-                        )
+                        for i, (mid, desc) in enumerate(models, 1):
+                            marker = "[green]●[/green]" if mid == current else "[dim]○[/dim]"
+                            console.print(f"    {marker} {i}. {desc} [dim]({mid})[/dim]")
+                        console.print("    [dim]○[/dim] 0. Custom model ID")
                         console.print()
                         try:
                             choice = (
                                 await prompt_session.prompt_async(
-                                    "  Pick [1-"
-                                    f"{len(models)}"
-                                    ", 0=custom, Enter=cancel]: ",
+                                    f"  Pick [1-{len(models)}, 0=custom, Enter=cancel]: ",
                                 )
                             ).strip()
                         except (EOFError, KeyboardInterrupt):
@@ -2366,9 +2137,7 @@ async def _async_chat_loop() -> None:
                         try:
                             n = int(choice)
                         except ValueError:
-                            console.print(
-                                "[yellow]Invalid.[/yellow]"
-                            )
+                            console.print("[yellow]Invalid.[/yellow]")
                             continue
                         if n == 0:
                             try:
@@ -2384,21 +2153,13 @@ async def _async_chat_loop() -> None:
                                 custom = ""
                             if custom:
                                 session.switch_model(custom)
-                                console.print(
-                                    f"  [green]✓[/green]"
-                                    f" Switched to {custom}"
-                                )
+                                console.print(f"  [green]✓[/green] Switched to {custom}")
                         elif 1 <= n <= len(models):
                             mid = models[n - 1][0]
                             session.switch_model(mid)
-                            console.print(
-                                f"  [green]✓[/green]"
-                                f" Switched to {mid}"
-                            )
+                            console.print(f"  [green]✓[/green] Switched to {mid}")
                         else:
-                            console.print(
-                                "[yellow]Invalid.[/yellow]"
-                            )
+                            console.print("[yellow]Invalid.[/yellow]")
                     continue
                 if cmd == "/traces":
                     traces = await session.list_traces()
@@ -2426,9 +2187,7 @@ async def _async_chat_loop() -> None:
                     is_global = text.startswith("--global ")
                     if is_global:
                         text = text[len("--global ") :].strip()
-                    msg = remember(
-                        text, project=not is_global
-                    )
+                    msg = remember(text, project=not is_global)
                     console.print(f"  [green]{msg}[/green]")
                     continue
                 if cmd == "/memory":
@@ -2454,146 +2213,76 @@ async def _async_chat_loop() -> None:
                         continue
                     is_global = target.startswith("--global ")
                     if is_global:
-                        target = target[
-                            len("--global ") :
-                        ].strip()
-                    msg = forget(
-                        target, project=not is_global
-                    )
+                        target = target[len("--global ") :].strip()
+                    msg = forget(target, project=not is_global)
                     console.print(f"  [dim]{msg}[/dim]")
                     continue
                 if cmd == "/debug-learning":
-                    console.print(
-                        "\n  [bold]Learning Pipeline"
-                        " Diagnostic[/bold]\n"
-                    )
+                    console.print("\n  [bold]Learning Pipeline Diagnostic[/bold]\n")
                     if session._learning_manager is None:
-                        console.print(
-                            "  [red]LearningManager not"
-                            " initialized[/red]"
-                        )
+                        console.print("  [red]LearningManager not initialized[/red]")
                         continue
                     # Step 1: Check DSPy LM
-                    console.print(
-                        "  [cyan]1.[/cyan] Checking"
-                        " DSPy LM..."
-                    )
+                    console.print("  [cyan]1.[/cyan] Checking DSPy LM...")
                     try:
                         import dspy
+
                         lm = dspy.settings.lm
                         if lm is None:
-                            console.print(
-                                "    [red]No LM configured"
-                                " in DSPy![/red]"
-                            )
+                            console.print("    [red]No LM configured in DSPy![/red]")
                             continue
-                        console.print(
-                            f"    [green]OK[/green]"
-                            f" LM: {lm.model}"
-                        )
+                        console.print(f"    [green]OK[/green] LM: {lm.model}")
                     except Exception as exc:
-                        console.print(
-                            f"    [red]Error: {exc}[/red]"
-                        )
+                        console.print(f"    [red]Error: {exc}[/red]")
                         continue
                     # Step 2: Test extraction
-                    console.print(
-                        "  [cyan]2.[/cyan] Running test"
-                        " extraction..."
-                    )
-                    test_user = (
-                        "I prefer using port 8080"
-                        " for all dev servers"
-                    )
+                    console.print("  [cyan]2.[/cyan] Running test extraction...")
+                    test_user = "I prefer using port 8080 for all dev servers"
                     test_response = (
-                        "I've configured the Flask app"
-                        " to run on port 8080 as you"
-                        " prefer."
+                        "I've configured the Flask app to run on port 8080 as you prefer."
                     )
                     try:
-                        stored = await (
-                            session._learning_manager
-                            .extract_and_store(
-                                test_user, test_response
-                            )
+                        stored = await session._learning_manager.extract_and_store(
+                            test_user, test_response
                         )
                         if stored:
                             console.print(
-                                f"    [green]OK[/green]"
-                                f" Extracted {len(stored)}"
-                                f" learnings:"
+                                f"    [green]OK[/green] Extracted {len(stored)} learnings:"
                             )
                             for s in stored:
-                                console.print(
-                                    f"      - {s}"
-                                )
+                                console.print(f"      - {s}")
                         else:
                             console.print(
-                                "    [yellow]No learnings"
-                                " extracted (empty"
-                                " result)[/yellow]"
+                                "    [yellow]No learnings extracted (empty result)[/yellow]"
                             )
                     except Exception as exc:
-                        console.print(
-                            f"    [red]Extraction"
-                            f" failed: {exc}[/red]"
-                        )
+                        console.print(f"    [red]Extraction failed: {exc}[/red]")
                         import traceback
-                        console.print(
-                            f"    [dim]{traceback.format_exc()}"
-                            f"[/dim]"
-                        )
+
+                        console.print(f"    [dim]{traceback.format_exc()}[/dim]")
                     # Step 3: Check DB entries
-                    console.print(
-                        "  [cyan]3.[/cyan] Checking"
-                        " MemoryStore..."
-                    )
+                    console.print("  [cyan]3.[/cyan] Checking MemoryStore...")
                     try:
-                        entries = await (
-                            session._learning_manager
-                            ._memory.list_entries(limit=10)
-                        )
-                        console.print(
-                            f"    [green]OK[/green]"
-                            f" {len(entries)} entries"
-                            f" in database"
-                        )
+                        entries = await session._learning_manager._memory.list_entries(limit=10)
+                        console.print(f"    [green]OK[/green] {len(entries)} entries in database")
                         for e in entries[:5]:
-                            console.print(
-                                f"      [{e.topic}]"
-                                f" {e.content[:60]}"
-                            )
+                            console.print(f"      [{e.topic}] {e.content[:60]}")
                     except Exception as exc:
-                        console.print(
-                            f"    [red]DB error:"
-                            f" {exc}[/red]"
-                        )
+                        console.print(f"    [red]DB error: {exc}[/red]")
                     # Step 4: Check MEMORY.md
-                    console.print(
-                        "  [cyan]4.[/cyan] Checking"
-                        " MEMORY.md..."
-                    )
+                    console.print("  [cyan]4.[/cyan] Checking MEMORY.md...")
                     from memfun_cli.memory import (
                         load_memory_context,
                         project_memory_path,
                     )
+
                     ppath = project_memory_path()
                     if ppath.exists():
                         ctx = load_memory_context()
-                        lines = [
-                            ln for ln in ctx.split("\n")
-                            if ln.strip().startswith("- ")
-                        ]
-                        console.print(
-                            f"    [green]OK[/green]"
-                            f" {ppath} ({len(lines)}"
-                            f" entries)"
-                        )
+                        lines = [ln for ln in ctx.split("\n") if ln.strip().startswith("- ")]
+                        console.print(f"    [green]OK[/green] {ppath} ({len(lines)} entries)")
                     else:
-                        console.print(
-                            f"    [dim]No file:"
-                            f" {ppath}[/dim]"
-                        )
+                        console.print(f"    [dim]No file: {ppath}[/dim]")
                     console.print()
                     continue
                 if cmd == "/agents":
@@ -2608,26 +2297,14 @@ async def _async_chat_loop() -> None:
                         mgr = session._workflow_engine._manager
                         running = mgr.list_running()
                         if not running:
-                            console.print(
-                                "  [dim]No agents running"
-                                "[/dim]"
-                            )
+                            console.print("  [dim]No agents running[/dim]")
                         else:
-                            console.print(
-                                f"\n  [bold]Running Agents"
-                                f" ({len(running)})"
-                                f"[/bold]\n"
-                            )
+                            console.print(f"\n  [bold]Running Agents ({len(running)})[/bold]\n")
                             for name in sorted(running):
-                                console.print(
-                                    f"  [green]\u2022[/green]"
-                                    f" {name}"
-                                )
+                                console.print(f"  [green]\u2022[/green] {name}")
                             console.print()
                     except Exception as exc:
-                        console.print(
-                            f"  [red]Error: {exc}[/red]"
-                        )
+                        console.print(f"  [red]Error: {exc}[/red]")
                     continue
                 if cmd == "/workflow":
                     wf = session._current_workflow
@@ -2639,29 +2316,17 @@ async def _async_chat_loop() -> None:
                             " decomposition.[/dim]"
                         )
                         continue
-                    console.print(
-                        f"\n  [bold]Workflow"
-                        f" {wf.workflow_id[:12]}..."
-                        f"[/bold]"
-                    )
-                    console.print(
-                        f"  Status: [cyan]"
-                        f"{wf.status.value}[/cyan]"
-                    )
+                    console.print(f"\n  [bold]Workflow {wf.workflow_id[:12]}...[/bold]")
+                    console.print(f"  Status: [cyan]{wf.status.value}[/cyan]")
                     if wf.decomposition:
                         d = wf.decomposition
                         console.print(
-                            f"  Sub-tasks: {len(d.sub_tasks)}"
-                            f"  Groups: {len(d.parallelism_groups)}"
+                            f"  Sub-tasks: {len(d.sub_tasks)}  Groups: {len(d.parallelism_groups)}"
                         )
-                        console.print(
-                            f"  Single-task: {d.is_single_task}"
-                        )
+                        console.print(f"  Single-task: {d.is_single_task}")
                         console.print()
                         for st in d.sub_tasks:
-                            sts = session._sub_task_statuses.get(
-                                st.id
-                            )
+                            sts = session._sub_task_statuses.get(st.id)
                             status = sts.status if sts else "pending"
                             icons = {
                                 "pending": "[dim]\u25cb[/dim]",
@@ -2670,35 +2335,21 @@ async def _async_chat_loop() -> None:
                                 "failed": "[red]\u2717[/red]",
                                 "revision": "[yellow]\u21bb[/yellow]",
                             }
-                            icon = icons.get(
-                                status, "[dim]?[/dim]"
-                            )
+                            icon = icons.get(status, "[dim]?[/dim]")
                             deps = ""
                             if st.depends_on:
-                                deps = (
-                                    f" [dim](after "
-                                    f"{','.join(st.depends_on)})"
-                                    f"[/dim]"
-                                )
+                                deps = f" [dim](after {','.join(st.depends_on)})[/dim]"
                             desc = st.description[:60]
                             console.print(
-                                f"  {icon} [{st.id}]"
-                                f" {desc}"
-                                f" [dim]({st.agent_type})[/dim]"
-                                f"{deps}"
+                                f"  {icon} [{st.id}] {desc} [dim]({st.agent_type})[/dim]{deps}"
                             )
                     if wf.review_rounds > 0:
                         console.print(
-                            f"\n  Review rounds:"
-                            f" {wf.review_rounds}"
-                            f"/{wf.max_review_rounds}"
+                            f"\n  Review rounds: {wf.review_rounds}/{wf.max_review_rounds}"
                         )
                     console.print()
                     continue
-                console.print(
-                    f"[yellow]Unknown command: {cmd}. "
-                    f"Type /help for options.[/yellow]"
-                )
+                console.print(f"[yellow]Unknown command: {cmd}. Type /help for options.[/yellow]")
                 continue
 
             # Process message with streaming output
@@ -2725,14 +2376,10 @@ async def _async_chat_loop() -> None:
                     refresh_per_second=4,
                     transient=True,
                 ) as live:
-                    task = asyncio.create_task(
-                        session.chat_turn(user_input)
-                    )
+                    task = asyncio.create_task(session.chat_turn(user_input))
                     while not task.done():
                         # Non-blocking key check
-                        if select.select(
-                            [sys.stdin], [], [], 0
-                        )[0]:
+                        if select.select([sys.stdin], [], [], 0)[0]:
                             ch = sys.stdin.read(1)
                             if ch == "\x1b":
                                 task.cancel()
@@ -2772,11 +2419,7 @@ async def _async_chat_loop() -> None:
                         )
 
                         elapsed = time.monotonic() - t0
-                        live.update(
-                            _make_progress_renderable(
-                                session, elapsed
-                            )
-                        )
+                        live.update(_make_progress_renderable(session, elapsed))
                         await asyncio.sleep(0.15)
 
                     if not cancelled and task.done():
@@ -2788,21 +2431,14 @@ async def _async_chat_loop() -> None:
                         await task
                 cancelled = True
             except Exception as exc:
-                console.print(
-                    f"\n  [red]✗ {type(exc).__name__}:"
-                    f" {exc}[/red]\n"
-                )
+                console.print(f"\n  [red]✗ {type(exc).__name__}: {exc}[/red]\n")
                 continue
             finally:
-                termios.tcsetattr(
-                    fd, termios.TCSADRAIN, old_term
-                )
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
 
             if cancelled:
                 typed_ahead = ""
-                console.print(
-                    "\n  [yellow]Cancelled.[/yellow]\n"
-                )
+                console.print("\n  [yellow]Cancelled.[/yellow]\n")
                 continue
 
             # Print any remaining plan steps (skipped, etc.)
@@ -2820,9 +2456,7 @@ async def _async_chat_loop() -> None:
             console.print()
 
     finally:
-        with console.status(
-            "[dim]Shutting down...[/dim]", spinner="dots"
-        ):
+        with console.status("[dim]Shutting down...[/dim]", spinner="dots"):
             await session.stop()
         console.print("[dim]Goodbye.[/dim]")
 

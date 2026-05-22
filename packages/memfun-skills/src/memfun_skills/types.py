@@ -1,4 +1,5 @@
 """Skill types for the memfun-skills package."""
+
 from __future__ import annotations
 
 import time

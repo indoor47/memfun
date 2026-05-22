@@ -45,6 +45,7 @@ class SQLiteHealthMonitor:
 
     async def heartbeat(self, agent_id: str, metrics: dict) -> None:
         import json
+
         conn = await self._ensure_conn()
         await conn.execute(
             """INSERT INTO health (agent_id, last_heartbeat, metrics) VALUES (?, ?, ?)
@@ -56,6 +57,7 @@ class SQLiteHealthMonitor:
 
     async def check(self, agent_id: str) -> HealthStatus:
         import json
+
         conn = await self._ensure_conn()
         async with conn.execute(
             "SELECT last_heartbeat, metrics FROM health WHERE agent_id = ?", (agent_id,)
@@ -75,7 +77,9 @@ class SQLiteHealthMonitor:
             else:
                 state = HealthState.UNHEALTHY
             return HealthStatus(
-                agent_id=agent_id, state=state, last_heartbeat=row[0],
+                agent_id=agent_id,
+                state=state,
+                last_heartbeat=row[0],
                 metrics=json.loads(row[1]),
             )
 

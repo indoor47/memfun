@@ -13,7 +13,6 @@ from memfun_core.logging import get_logger
 from memfun_core.types import TaskMessage, TaskResult
 
 if TYPE_CHECKING:
-
     from memfun_runtime.context import RuntimeContext
     from memfun_runtime.lifecycle import AgentManager
 
@@ -109,9 +108,7 @@ class AgentOrchestrator:
         Higher *priority* values are preferred when multiple agents can
         handle the same type.
         """
-        entry = _RouteEntry(
-            task_type=task_type, agent_name=agent_name, priority=priority
-        )
+        entry = _RouteEntry(task_type=task_type, agent_name=agent_name, priority=priority)
         self._routes.setdefault(task_type, []).append(entry)
         self._routes[task_type].sort(key=lambda e: e.priority, reverse=True)
         logger.debug(
@@ -125,9 +122,7 @@ class AgentOrchestrator:
         """Index an agent under a capability tag for capability-based routing."""
         self._capability_index.setdefault(capability, set()).add(agent_name)
 
-    def register_round_robin_group(
-        self, group: str, agent_names: list[str]
-    ) -> None:
+    def register_round_robin_group(self, group: str, agent_names: list[str]) -> None:
         """Create a named round-robin group from the given agents."""
         if not agent_names:
             raise ValueError("Round-robin group must contain at least one agent")
@@ -179,9 +174,7 @@ class AgentOrchestrator:
         ]
         results = await asyncio.gather(*coros, return_exceptions=True)
         return [
-            self._exception_to_result(r, tasks[i])
-            if isinstance(r, BaseException)
-            else r
+            self._exception_to_result(r, tasks[i]) if isinstance(r, BaseException) else r
             for i, r in enumerate(results)
         ]
 
@@ -240,9 +233,7 @@ class AgentOrchestrator:
         current_task = task
 
         for idx, name in enumerate(agent_names):
-            result = await self._execute_with_retry(
-                current_task, name, timeout
-            )
+            result = await self._execute_with_retry(current_task, name, timeout)
             if not result.success:
                 logger.error(
                     "Pipeline stage %d (%s) failed: %s",
@@ -310,9 +301,7 @@ class AgentOrchestrator:
             agent_name = next(rr)
             attempts += 1
             if attempts > 100:
-                raise RuntimeError(
-                    f"No running agents found in round-robin group {group!r}"
-                )
+                raise RuntimeError(f"No running agents found in round-robin group {group!r}")
 
         timeout = timeout or self._config.default_timeout_seconds
         return await self._execute_with_retry(task, agent_name, timeout)
@@ -353,9 +342,7 @@ class AgentOrchestrator:
             await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError:
             self._pending.pop(task.task_id, None)
-            logger.error(
-                "Task %s timed out waiting for dependencies", task.task_id
-            )
+            logger.error("Task %s timed out waiting for dependencies", task.task_id)
             return self._timeout_result(task, agent_name)
 
         self._pending.pop(task.task_id, None)
@@ -399,9 +386,7 @@ class AgentOrchestrator:
                 await asyncio.sleep(delay)
 
             try:
-                result = await self._execute_single(
-                    task, agent_name, timeout
-                )
+                result = await self._execute_single(task, agent_name, timeout)
                 if result.success:
                     return result
                 last_error = result.error
@@ -492,9 +477,7 @@ class AgentOrchestrator:
     # ── Result helpers ──────────────────────────────────────────────
 
     @staticmethod
-    def _failure_result(
-        task: TaskMessage, agent_name: str, error: str | None
-    ) -> TaskResult:
+    def _failure_result(task: TaskMessage, agent_name: str, error: str | None) -> TaskResult:
         return TaskResult(
             task_id=task.task_id,
             agent_id=agent_name,
@@ -512,9 +495,7 @@ class AgentOrchestrator:
         )
 
     @staticmethod
-    def _exception_to_result(
-        exc: BaseException, task: TaskMessage
-    ) -> TaskResult:
+    def _exception_to_result(exc: BaseException, task: TaskMessage) -> TaskResult:
         return TaskResult(
             task_id=task.task_id,
             agent_id=task.agent_id,

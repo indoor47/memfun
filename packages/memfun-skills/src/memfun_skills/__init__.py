@@ -1,4 +1,5 @@
 """Memfun Skills: discovery, loading, validation, and registry for Agent Skills."""
+
 from __future__ import annotations
 
 from memfun_skills.activator import SkillActivator

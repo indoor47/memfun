@@ -1,4 +1,5 @@
 """T1 SQLite Backend: persistent, zero external infrastructure."""
+
 from __future__ import annotations
 
 from memfun_runtime.backends.sqlite.event_bus import SQLiteEventBus

@@ -4,6 +4,7 @@ Tests the mechanical components (gatherer, executor, manifest, parsing)
 without requiring an LLM.  DSPy-dependent components (planner, solver)
 are tested with mocks.
 """
+
 from __future__ import annotations
 
 import textwrap
@@ -65,9 +66,7 @@ def test_normalize_list_from_empty():
 
 
 def test_parse_operations_json_array():
-    ops = _parse_operations(
-        '[{"op":"write_file","path":"a.py","content":"x"}]'
-    )
+    ops = _parse_operations('[{"op":"write_file","path":"a.py","content":"x"}]')
     assert len(ops) == 1
     assert ops[0]["op"] == "write_file"
     assert ops[0]["path"] == "a.py"
@@ -86,10 +85,7 @@ def test_parse_operations_markdown_block():
 
 
 def test_parse_operations_line_by_line():
-    raw = (
-        '{"op":"write_file","path":"a.py","content":"x"}\n'
-        '{"op":"run_cmd","cmd":"ls"}\n'
-    )
+    raw = '{"op":"write_file","path":"a.py","content":"x"}\n{"op":"run_cmd","cmd":"ls"}\n'
     ops = _parse_operations(raw)
     assert len(ops) == 2
 
@@ -127,9 +123,7 @@ def test_build_manifest_basic(tmp_path: Path):
 def test_build_manifest_skips_pycache(tmp_path: Path):
     """Skips __pycache__ directories."""
     (tmp_path / "__pycache__").mkdir()
-    (tmp_path / "__pycache__" / "mod.cpython-312.pyc").write_bytes(
-        b"\x00"
-    )
+    (tmp_path / "__pycache__" / "mod.cpython-312.pyc").write_bytes(b"\x00")
     (tmp_path / "main.py").write_text("pass")
 
     manifest = build_file_manifest(tmp_path)
@@ -247,13 +241,15 @@ def test_gatherer_read_all_files(tmp_path: Path):
 async def test_executor_write_file(tmp_path: Path):
     """Executes write_file operations."""
     executor = OperationExecutor(tmp_path)
-    await executor.execute([
-        {
-            "op": "write_file",
-            "path": str(tmp_path / "new.py"),
-            "content": "print('new')",
-        }
-    ])
+    await executor.execute(
+        [
+            {
+                "op": "write_file",
+                "path": str(tmp_path / "new.py"),
+                "content": "print('new')",
+            }
+        ]
+    )
 
     assert (tmp_path / "new.py").read_text() == "print('new')"
     assert len(executor.ops) == 1
@@ -268,14 +264,16 @@ async def test_executor_edit_file(tmp_path: Path):
     target.write_text("old_value = 1")
 
     executor = OperationExecutor(tmp_path)
-    await executor.execute([
-        {
-            "op": "edit_file",
-            "path": str(target),
-            "old": "old_value = 1",
-            "new": "new_value = 2",
-        }
-    ])
+    await executor.execute(
+        [
+            {
+                "op": "edit_file",
+                "path": str(target),
+                "old": "old_value = 1",
+                "new": "new_value = 2",
+            }
+        ]
+    )
 
     assert target.read_text() == "new_value = 2"
     assert len(executor.ops) == 1
@@ -289,14 +287,16 @@ async def test_executor_edit_file_missing_text(tmp_path: Path):
     target.write_text("something else")
 
     executor = OperationExecutor(tmp_path)
-    await executor.execute([
-        {
-            "op": "edit_file",
-            "path": str(target),
-            "old": "not_found",
-            "new": "replacement",
-        }
-    ])
+    await executor.execute(
+        [
+            {
+                "op": "edit_file",
+                "path": str(target),
+                "old": "not_found",
+                "new": "replacement",
+            }
+        ]
+    )
 
     # File unchanged, no ops recorded, failure tracked.
     assert target.read_text() == "something else"
@@ -309,9 +309,7 @@ async def test_executor_edit_file_missing_text(tmp_path: Path):
 async def test_executor_run_cmd(tmp_path: Path):
     """Executes run_cmd operations."""
     executor = OperationExecutor(tmp_path)
-    await executor.execute([
-        {"op": "run_cmd", "cmd": "echo hello"}
-    ])
+    await executor.execute([{"op": "run_cmd", "cmd": "echo hello"}])
 
     assert len(executor.ops) == 1
     assert executor.ops[0][0] == "cmd"
@@ -323,9 +321,7 @@ async def test_executor_run_cmd(tmp_path: Path):
 async def test_executor_unknown_op(tmp_path: Path):
     """Unknown operations are skipped."""
     executor = OperationExecutor(tmp_path)
-    await executor.execute([
-        {"op": "unknown_op", "data": "test"}
-    ])
+    await executor.execute([{"op": "unknown_op", "data": "test"}])
     assert len(executor.ops) == 0
 
 
@@ -350,9 +346,7 @@ def test_result_to_dict():
     assert d["iterations"] == 1
     assert d["total_tokens"] == 5000
     assert d["files_created"] == ["/path/to/file.py"]
-    assert d["ops"] == [
-        {"type": "write", "target": "/path/to/file.py", "detail": 100}
-    ]
+    assert d["ops"] == [{"type": "write", "target": "/path/to/file.py", "detail": 100}]
 
 
 def test_result_to_dict_empty_ops():
@@ -427,9 +421,7 @@ async def test_solver_fast_path(tmp_path: Path):
     )
 
     # Mock the SingleShotSolver.asolve to bypass DSPy LM requirement.
-    with patch.object(
-        solver.solver, "asolve", side_effect=_mock_asolve
-    ):
+    with patch.object(solver.solver, "asolve", side_effect=_mock_asolve):
         result = await solver.asolve(
             query="Fix the bug",
             context="=== CURRENT PROJECT STATE ===",
@@ -467,9 +459,7 @@ async def test_solver_exception_returns_failure(tmp_path: Path):
     async def _raise(*_a, **_kw):
         raise RuntimeError("LLM down")
 
-    with patch.object(
-        solver.solver, "asolve", side_effect=_raise
-    ):
+    with patch.object(solver.solver, "asolve", side_effect=_raise):
         result = await solver.asolve(query="Fix bug")
 
     assert result.success is False
@@ -494,17 +484,17 @@ async def test_solver_with_operations(tmp_path: Path):
         return SolveResult(
             reasoning="Replaced old_code with new_code",
             answer="Fixed the function call",
-            operations=[{
-                "op": "edit_file",
-                "path": target_path,
-                "old": "old_code()",
-                "new": "new_code()",
-            }],
+            operations=[
+                {
+                    "op": "edit_file",
+                    "path": target_path,
+                    "old": "old_code()",
+                    "new": "new_code()",
+                }
+            ],
         )
 
-    with patch.object(
-        solver.solver, "asolve", side_effect=_mock_solve_with_ops
-    ):
+    with patch.object(solver.solver, "asolve", side_effect=_mock_solve_with_ops):
         result = await solver.asolve(query="Fix the function")
 
     assert result.success is True
@@ -527,9 +517,7 @@ async def test_solver_status_callback(tmp_path: Path):
         on_status=statuses.append,
     )
 
-    with patch.object(
-        solver.solver, "asolve", side_effect=_mock_asolve
-    ):
+    with patch.object(solver.solver, "asolve", side_effect=_mock_asolve):
         await solver.asolve(query="Do something")
 
     assert len(statuses) >= 2  # "Scanning...", "Reading...", "Solving..."
@@ -636,16 +624,16 @@ async def test_solver_verify_passes(tmp_path: Path):
         return SolveResult(
             reasoning="Added greeting",
             answer="Created file",
-            operations=[{
-                "op": "write_file",
-                "path": str(tmp_path / "out.py"),
-                "content": "print('done')",
-            }],
+            operations=[
+                {
+                    "op": "write_file",
+                    "path": str(tmp_path / "out.py"),
+                    "content": "print('done')",
+                }
+            ],
         )
 
-    with patch.object(
-        solver.solver, "asolve", side_effect=_mock_solve_with_write
-    ):
+    with patch.object(solver.solver, "asolve", side_effect=_mock_solve_with_write):
         result = await solver.asolve(query="Create a file")
 
     assert result.success is True
@@ -675,30 +663,30 @@ async def test_solver_verify_fails_and_fixes(tmp_path: Path):
         return SolveResult(
             reasoning="Wrote file",
             answer="Created output",
-            operations=[{
-                "op": "write_file",
-                "path": str(tmp_path / "out.py"),
-                "content": "print('out')",
-            }],
+            operations=[
+                {
+                    "op": "write_file",
+                    "path": str(tmp_path / "out.py"),
+                    "content": "print('out')",
+                }
+            ],
         )
 
     async def _mock_fix(query, full_context, verification_errors):
         nonlocal fix_call_count
         fix_call_count += 1
         # The fix creates the missing file so next verify passes
-        return [{
-            "op": "write_file",
-            "path": str(tmp_path / "fixed.txt"),
-            "content": "fixed",
-        }]
+        return [
+            {
+                "op": "write_file",
+                "path": str(tmp_path / "fixed.txt"),
+                "content": "fixed",
+            }
+        ]
 
     with (
-        patch.object(
-            solver.solver, "asolve", side_effect=_mock_solve
-        ),
-        patch.object(
-            solver.fix_solver, "afix", side_effect=_mock_fix
-        ),
+        patch.object(solver.solver, "asolve", side_effect=_mock_solve),
+        patch.object(solver.fix_solver, "afix", side_effect=_mock_fix),
     ):
         result = await solver.asolve(query="Create output")
 
@@ -729,11 +717,13 @@ async def test_solver_verify_max_attempts_exceeded(tmp_path: Path):
         return SolveResult(
             reasoning="Done",
             answer="Done",
-            operations=[{
-                "op": "write_file",
-                "path": str(tmp_path / "out.py"),
-                "content": "out",
-            }],
+            operations=[
+                {
+                    "op": "write_file",
+                    "path": str(tmp_path / "out.py"),
+                    "content": "out",
+                }
+            ],
         )
 
     async def _mock_fix(query, full_context, verification_errors):
@@ -742,12 +732,8 @@ async def test_solver_verify_max_attempts_exceeded(tmp_path: Path):
         return []  # No fix ops
 
     with (
-        patch.object(
-            solver.solver, "asolve", side_effect=_mock_solve
-        ),
-        patch.object(
-            solver.fix_solver, "afix", side_effect=_mock_fix
-        ),
+        patch.object(solver.solver, "asolve", side_effect=_mock_solve),
+        patch.object(solver.fix_solver, "afix", side_effect=_mock_fix),
     ):
         result = await solver.asolve(query="Create output")
 
@@ -774,9 +760,7 @@ async def test_solver_no_verify_when_no_files_created(tmp_path: Path):
     )
 
     # Return no operations (answer-only query).
-    with patch.object(
-        solver.solver, "asolve", side_effect=_mock_asolve
-    ):
+    with patch.object(solver.solver, "asolve", side_effect=_mock_asolve):
         result = await solver.asolve(query="What does this code do?")
 
     assert result.success is True
@@ -855,11 +839,13 @@ def test_build_intended_changes_write():
     sr = SolveResult(
         reasoning="Created new file",
         answer="Added greeting module",
-        operations=[{
-            "op": "write_file",
-            "path": "hello.py",
-            "content": "print('hello world')",
-        }],
+        operations=[
+            {
+                "op": "write_file",
+                "path": "hello.py",
+                "content": "print('hello world')",
+            }
+        ],
     )
     text = ContextFirstSolver._build_intended_changes(sr)
     assert "Added greeting module" in text
@@ -872,12 +858,14 @@ def test_build_intended_changes_edit():
     sr = SolveResult(
         reasoning="Fixed bug",
         answer="Replaced old function call",
-        operations=[{
-            "op": "edit_file",
-            "path": "app.py",
-            "old": "old_func()",
-            "new": "new_func()",
-        }],
+        operations=[
+            {
+                "op": "edit_file",
+                "path": "app.py",
+                "old": "old_func()",
+                "new": "new_func()",
+            }
+        ],
     )
     text = ContextFirstSolver._build_intended_changes(sr)
     assert "edit_file app.py" in text
@@ -917,9 +905,7 @@ async def test_solver_consistency_review_skipped_no_ops(tmp_path: Path):
         on_status=statuses.append,
     )
 
-    with patch.object(
-        solver.solver, "asolve", side_effect=_mock_asolve
-    ):
+    with patch.object(solver.solver, "asolve", side_effect=_mock_asolve):
         result = await solver.asolve(query="Explain this code")
 
     assert result.success is True
@@ -942,23 +928,21 @@ async def test_solver_consistency_review_passes(tmp_path: Path):
         return SolveResult(
             reasoning="Wrote file",
             answer="Created output",
-            operations=[{
-                "op": "write_file",
-                "path": str(tmp_path / "out.py"),
-                "content": "print('done')",
-            }],
+            operations=[
+                {
+                    "op": "write_file",
+                    "path": str(tmp_path / "out.py"),
+                    "content": "print('done')",
+                }
+            ],
         )
 
     async def _mock_review(user_request, intended_changes, actual_file_contents):
-        return ConsistencyResult(
-            has_issues=False, issues=[], reasoning="All good"
-        )
+        return ConsistencyResult(has_issues=False, issues=[], reasoning="All good")
 
     with (
         patch.object(solver.solver, "asolve", side_effect=_mock_solve_write),
-        patch.object(
-            solver.consistency_reviewer, "areview", side_effect=_mock_review
-        ),
+        patch.object(solver.consistency_reviewer, "areview", side_effect=_mock_review),
     ):
         result = await solver.asolve(query="Create output")
 
@@ -982,11 +966,13 @@ async def test_solver_consistency_review_triggers_polish(tmp_path: Path):
         return SolveResult(
             reasoning="Wrote file",
             answer="Created output",
-            operations=[{
-                "op": "write_file",
-                "path": str(tmp_path / "out.py"),
-                "content": "incomplete",
-            }],
+            operations=[
+                {
+                    "op": "write_file",
+                    "path": str(tmp_path / "out.py"),
+                    "content": "incomplete",
+                }
+            ],
         )
 
     async def _mock_review(user_request, intended_changes, actual_file_contents):
@@ -1000,18 +986,18 @@ async def test_solver_consistency_review_triggers_polish(tmp_path: Path):
         nonlocal polish_called
         polish_called = True
         # Polish runs in edit_only mode, so must use edit_file (not write_file).
-        return [{
-            "op": "edit_file",
-            "path": str(tmp_path / "out.py"),
-            "old": "incomplete",
-            "new": "complete_implementation()",
-        }]
+        return [
+            {
+                "op": "edit_file",
+                "path": str(tmp_path / "out.py"),
+                "old": "incomplete",
+                "new": "complete_implementation()",
+            }
+        ]
 
     with (
         patch.object(solver.solver, "asolve", side_effect=_mock_solve_write),
-        patch.object(
-            solver.consistency_reviewer, "areview", side_effect=_mock_review
-        ),
+        patch.object(solver.consistency_reviewer, "areview", side_effect=_mock_review),
         patch.object(solver.fix_solver, "afix", side_effect=_mock_fix),
     ):
         result = await solver.asolve(query="Create output")
@@ -1035,16 +1021,16 @@ async def test_solver_consistency_review_exception_handled(tmp_path: Path):
         return SolveResult(
             reasoning="Wrote file",
             answer="Created output",
-            operations=[{
-                "op": "write_file",
-                "path": str(tmp_path / "out.py"),
-                "content": "good code",
-            }],
+            operations=[
+                {
+                    "op": "write_file",
+                    "path": str(tmp_path / "out.py"),
+                    "content": "good code",
+                }
+            ],
         )
 
-    async def _mock_review_explode(
-        user_request, intended_changes, actual_file_contents
-    ):
+    async def _mock_review_explode(user_request, intended_changes, actual_file_contents):
         raise RuntimeError("LLM timeout")
 
     with (
@@ -1081,24 +1067,22 @@ async def test_solver_consistency_review_disabled(tmp_path: Path):
         return SolveResult(
             reasoning="Wrote file",
             answer="Created output",
-            operations=[{
-                "op": "write_file",
-                "path": str(tmp_path / "out.py"),
-                "content": "print('done')",
-            }],
+            operations=[
+                {
+                    "op": "write_file",
+                    "path": str(tmp_path / "out.py"),
+                    "content": "print('done')",
+                }
+            ],
         )
 
-    with patch.object(
-        solver.solver, "asolve", side_effect=_mock_solve_write
-    ):
+    with patch.object(solver.solver, "asolve", side_effect=_mock_solve_write):
         result = await solver.asolve(query="Create output")
 
     assert result.success is True
     # No consistency review status messages (ignore file paths that
     # may contain the test name).
-    assert not any(
-        s.startswith("Reviewing consistency") for s in statuses
-    )
+    assert not any(s.startswith("Reviewing consistency") for s in statuses)
 
 
 # ── Fuzzy edit matching tests ─────────────────────────────────
@@ -1109,9 +1093,7 @@ def test_fuzzy_exact_match():
     content = "def foo():\n    return 1\n"
     old = "return 1"
     new = "return 2"
-    result, ratio, _snippet, strategy = _fuzzy_find_and_replace(
-        content, old, new
-    )
+    result, ratio, _snippet, strategy = _fuzzy_find_and_replace(content, old, new)
     assert result is not None
     assert "return 2" in result
     assert "return 1" not in result
@@ -1124,9 +1106,7 @@ def test_fuzzy_trailing_whitespace():
     content = "def foo():  \n    return 1  \n"
     old = "def foo():\n    return 1\n"
     new = "def bar():\n    return 2\n"
-    result, _ratio, _snippet, strategy = _fuzzy_find_and_replace(
-        content, old, new
-    )
+    result, _ratio, _snippet, strategy = _fuzzy_find_and_replace(content, old, new)
     assert result is not None
     assert "def bar():" in result
     assert "return 2" in result
@@ -1139,9 +1119,7 @@ def test_fuzzy_line_matching():
     # LLM produced slightly different text (extra space before colon)
     old = "class Foo :\n    def bar(self) :\n        return 42\n"
     new = "class Baz:\n    def bar(self):\n        return 99\n"
-    result, ratio, _snippet, strategy = _fuzzy_find_and_replace(
-        content, old, new
-    )
+    result, ratio, _snippet, strategy = _fuzzy_find_and_replace(content, old, new)
     assert result is not None
     assert "class Baz:" in result
     assert "return 99" in result
@@ -1154,9 +1132,7 @@ def test_fuzzy_no_match_below_threshold():
     content = "completely different content here\n"
     old = "nothing like this at all and also much longer text to ensure low ratio\n"
     new = "replacement\n"
-    result, _ratio, _snippet, strategy = _fuzzy_find_and_replace(
-        content, old, new
-    )
+    result, _ratio, _snippet, strategy = _fuzzy_find_and_replace(content, old, new)
     assert result is None
     assert strategy == "none"
 
@@ -1166,9 +1142,7 @@ def test_fuzzy_indentation_preservation():
     content = "    if True:\n        x = 1\n"
     old = "    if True:\n        x = 1\n"
     new = "    if True:\n        x = 2\n"
-    result, _ratio, _snippet, strategy = _fuzzy_find_and_replace(
-        content, old, new
-    )
+    result, _ratio, _snippet, strategy = _fuzzy_find_and_replace(content, old, new)
     assert result is not None
     assert result == "    if True:\n        x = 2\n"
     assert strategy == "exact"
@@ -1180,9 +1154,7 @@ def test_fuzzy_window_off_by_one():
     # LLM produced 3 lines but actual target is only 2 lines
     old = "line2\nline3\nline4"
     new = "lineA\nlineB"
-    result, _ratio, _snippet, _strategy = _fuzzy_find_and_replace(
-        content, old, new
-    )
+    result, _ratio, _snippet, _strategy = _fuzzy_find_and_replace(content, old, new)
     assert result is not None
     assert "lineA" in result
     assert "lineB" in result
@@ -1205,12 +1177,16 @@ async def test_executor_edit_fuzzy_whitespace(tmp_path: Path):
     target.write_text("def foo():  \n    return 1  \n")
 
     executor = OperationExecutor(tmp_path)
-    await executor.execute([{
-        "op": "edit_file",
-        "path": str(target),
-        "old": "def foo():\n    return 1\n",
-        "new": "def bar():\n    return 2\n",
-    }])
+    await executor.execute(
+        [
+            {
+                "op": "edit_file",
+                "path": str(target),
+                "old": "def foo():\n    return 1\n",
+                "new": "def bar():\n    return 2\n",
+            }
+        ]
+    )
 
     content = target.read_text()
     assert "def bar():" in content
@@ -1226,12 +1202,16 @@ async def test_executor_edit_collects_diagnostics(tmp_path: Path):
     target.write_text("totally different content\n")
 
     executor = OperationExecutor(tmp_path)
-    await executor.execute([{
-        "op": "edit_file",
-        "path": str(target),
-        "old": "nothing like the file content at all and much longer\n",
-        "new": "replacement\n",
-    }])
+    await executor.execute(
+        [
+            {
+                "op": "edit_file",
+                "path": str(target),
+                "old": "nothing like the file content at all and much longer\n",
+                "new": "replacement\n",
+            }
+        ]
+    )
 
     assert executor.failed == 1
     assert len(executor.edit_diagnostics) == 1
@@ -1302,13 +1282,15 @@ async def test_solver_retries_failed_edits(tmp_path: Path):
         return SolveResult(
             reasoning="Edit the code",
             answer="Fixed it",
-            operations=[{
-                "op": "edit_file",
-                "path": target_path,
-                # Deliberately wrong old text to trigger diagnostic.
-                "old": "wrong_old_text_not_in_file_at_all_completely_different",
-                "new": "new_code()",
-            }],
+            operations=[
+                {
+                    "op": "edit_file",
+                    "path": target_path,
+                    # Deliberately wrong old text to trigger diagnostic.
+                    "old": "wrong_old_text_not_in_file_at_all_completely_different",
+                    "new": "new_code()",
+                }
+            ],
         )
 
     async def _mock_fix(query, full_context, verification_errors):
@@ -1317,12 +1299,14 @@ async def test_solver_retries_failed_edits(tmp_path: Path):
         assert "FAILED EDIT" in verification_errors
         assert "wrong_old_text" in verification_errors
         # Return corrected operation with actual content.
-        return [{
-            "op": "edit_file",
-            "path": target_path,
-            "old": "actual_code_here()",
-            "new": "new_code()",
-        }]
+        return [
+            {
+                "op": "edit_file",
+                "path": target_path,
+                "old": "actual_code_here()",
+                "new": "new_code()",
+            }
+        ]
 
     with (
         patch.object(solver.solver, "asolve", side_effect=_mock_solve),
@@ -1357,12 +1341,14 @@ async def test_solver_retry_disabled(tmp_path: Path):
         return SolveResult(
             reasoning="Edit the code",
             answer="Fixed it",
-            operations=[{
-                "op": "edit_file",
-                "path": target_path,
-                "old": "wrong_old_text_not_found_anywhere_at_all",
-                "new": "new_code()",
-            }],
+            operations=[
+                {
+                    "op": "edit_file",
+                    "path": target_path,
+                    "old": "wrong_old_text_not_found_anywhere_at_all",
+                    "new": "new_code()",
+                }
+            ],
         )
 
     async def _mock_fix(query, full_context, verification_errors):
@@ -1398,11 +1384,15 @@ async def test_write_guard_blocks_destructive_overwrite(
     new_content = "\n".join(f"new line {i}" for i in range(50))
 
     executor = OperationExecutor(tmp_path)
-    await executor.execute([{
-        "op": "write_file",
-        "path": str(target),
-        "content": new_content,
-    }])
+    await executor.execute(
+        [
+            {
+                "op": "write_file",
+                "path": str(target),
+                "content": new_content,
+            }
+        ]
+    )
 
     assert executor.failed == 1
     # File should NOT have been overwritten.
@@ -1425,11 +1415,15 @@ async def test_write_guard_allows_small_change(
     new_content = "\n".join(f"updated line {i}" for i in range(80))
 
     executor = OperationExecutor(tmp_path)
-    await executor.execute([{
-        "op": "write_file",
-        "path": str(target),
-        "content": new_content,
-    }])
+    await executor.execute(
+        [
+            {
+                "op": "write_file",
+                "path": str(target),
+                "content": new_content,
+            }
+        ]
+    )
 
     assert executor.failed == 0
     assert target.read_text("utf-8") == new_content
@@ -1444,11 +1438,15 @@ async def test_write_guard_allows_new_file(
     content = "\n".join(f"line {i}" for i in range(50))
 
     executor = OperationExecutor(tmp_path)
-    await executor.execute([{
-        "op": "write_file",
-        "path": str(target),
-        "content": content,
-    }])
+    await executor.execute(
+        [
+            {
+                "op": "write_file",
+                "path": str(target),
+                "content": content,
+            }
+        ]
+    )
 
     assert executor.failed == 0
     assert target.read_text("utf-8") == content
@@ -1468,11 +1466,15 @@ async def test_write_guard_creates_diagnostic(
     new_content = "\n".join(f"new f{i}()" for i in range(50))
 
     executor = OperationExecutor(tmp_path)
-    await executor.execute([{
-        "op": "write_file",
-        "path": str(target),
-        "content": new_content,
-    }])
+    await executor.execute(
+        [
+            {
+                "op": "write_file",
+                "path": str(target),
+                "content": new_content,
+            }
+        ]
+    )
 
     assert len(executor.edit_diagnostics) == 1
     diag = executor.edit_diagnostics[0]
@@ -1498,11 +1500,15 @@ async def test_write_guard_small_file_exempt(
     new_content = "a\nb\nc"
 
     executor = OperationExecutor(tmp_path)
-    await executor.execute([{
-        "op": "write_file",
-        "path": str(target),
-        "content": new_content,
-    }])
+    await executor.execute(
+        [
+            {
+                "op": "write_file",
+                "path": str(target),
+                "content": new_content,
+            }
+        ]
+    )
 
     # Should be allowed because old_lines <= 10.
     assert executor.failed == 0
@@ -1671,7 +1677,8 @@ async def test_web_context_in_solver(tmp_path: Path):
         patch.object(solver.planner, "aplan", side_effect=_mock_plan),
         patch.object(solver.solver, "asolve", side_effect=_mock_solve),
         patch.object(
-            solver.gatherer, "_web_search",
+            solver.gatherer,
+            "_web_search",
             return_value="**Web Result**\nhttps://example.com\nAnswer here",
         ),
     ):
@@ -1708,7 +1715,8 @@ async def test_web_category_forces_planner(tmp_path: Path):
         patch.object(solver.planner, "aplan", side_effect=_mock_plan),
         patch.object(solver.solver, "asolve", side_effect=_mock_asolve),
         patch.object(
-            solver.gatherer, "_web_search",
+            solver.gatherer,
+            "_web_search",
             return_value="web result",
         ),
     ):

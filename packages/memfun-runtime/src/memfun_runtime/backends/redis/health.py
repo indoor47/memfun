@@ -55,10 +55,12 @@ class RedisHealthMonitor:
         return f"{self._prefix}health:{agent_id}"
 
     async def heartbeat(self, agent_id: str, metrics: dict) -> None:
-        payload = json.dumps({
-            "last_heartbeat": time.time(),
-            "metrics": {k: float(v) for k, v in metrics.items()},
-        })
+        payload = json.dumps(
+            {
+                "last_heartbeat": time.time(),
+                "metrics": {k: float(v) for k, v in metrics.items()},
+            }
+        )
         # Set with TTL slightly beyond the degraded timeout so stale keys
         # are automatically cleaned up.
         ttl = int(self._degraded_timeout * 2)
@@ -92,6 +94,7 @@ class RedisHealthMonitor:
         )
 
     async def subscribe_alerts(
-        self, callback: Callable[[HealthStatus], Awaitable[None]],
+        self,
+        callback: Callable[[HealthStatus], Awaitable[None]],
     ) -> None:
         self._callbacks.append(callback)

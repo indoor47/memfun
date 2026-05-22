@@ -10,6 +10,7 @@ Each filesystem tool must:
 * preserve pre-#13 behaviour when ``MEMFUN_PROJECT_ROOT`` is unset
   (backward compatible).
 """
+
 from __future__ import annotations
 
 import os
@@ -19,15 +20,16 @@ from typing import TYPE_CHECKING
 import pytest
 from memfun_tools.code import filesystem as fs
 
-# The FastMCP ``@fs_server.tool()`` decorator wraps the coroutine in
-# a ``FunctionTool`` object that is no longer directly callable, so
-# the tests reach for the underlying ``.fn`` callable instead.  This
-# exercises the exact same code path the MCP server invokes.
-read_file = fs.read_file.fn
-write_file = fs.write_file.fn
-edit_file = fs.edit_file.fn
-list_directory = fs.list_directory.fn
-glob_files = fs.glob_files.fn
+# FastMCP 3.x: the ``@fs_server.tool()`` decorator returns the raw
+# coroutine directly (a regression vs 2.x where it wrapped in a
+# ``FunctionTool`` object with a ``.fn`` attribute), so the tests
+# now call the function directly — same code path the MCP server
+# invokes either way.
+read_file = fs.read_file
+write_file = fs.write_file
+edit_file = fs.edit_file
+list_directory = fs.list_directory
+glob_files = fs.glob_files
 _check_in_root = fs._check_in_root
 
 if TYPE_CHECKING:
@@ -123,9 +125,7 @@ class TestCheckInRoot:
         resolved = _check_in_root(link)
         assert resolved == real.resolve()
 
-    def test_unset_root_allows_anything(
-        self, unset_root: None, tmp_path: Path
-    ) -> None:
+    def test_unset_root_allows_anything(self, unset_root: None, tmp_path: Path) -> None:
         # Even an absolute path far from any project root works
         # (preserving pre-#13 behaviour).
         target = tmp_path / "anywhere.txt"
@@ -176,9 +176,7 @@ class TestReadFile:
         with pytest.raises(ValueError, match="path outside project root"):
             await read_file(str(link))
 
-    async def test_unset_root_backward_compat(
-        self, unset_root: None, tmp_path: Path
-    ) -> None:
+    async def test_unset_root_backward_compat(self, unset_root: None, tmp_path: Path) -> None:
         f = tmp_path / "any.txt"
         f.write_text("hi")
         # No project root set; this should still work.
@@ -200,9 +198,7 @@ class TestWriteFile:
 
     async def test_dotdot_escape_rejected(self, project_root: Path) -> None:
         with pytest.raises(ValueError, match="path outside project root"):
-            await write_file(
-                str(project_root / ".." / "escape.txt"), "x"
-            )
+            await write_file(str(project_root / ".." / "escape.txt"), "x")
 
     async def test_absolute_outside_rejected(
         self, project_root: Path, tmp_path_factory: pytest.TempPathFactory
@@ -226,9 +222,7 @@ class TestWriteFile:
         # The outside file must NOT have been overwritten.
         assert outside_target.read_text() == "original"
 
-    async def test_unset_root_backward_compat(
-        self, unset_root: None, tmp_path: Path
-    ) -> None:
+    async def test_unset_root_backward_compat(self, unset_root: None, tmp_path: Path) -> None:
         target = tmp_path / "any.py"
         msg = await write_file(str(target), "x = 1\n")
         assert "Written" in msg
@@ -267,9 +261,7 @@ class TestEditFile:
 
     async def test_dotdot_escape_rejected(self, project_root: Path) -> None:
         with pytest.raises(ValueError, match="path outside project root"):
-            await edit_file(
-                str(project_root / ".." / "escape.txt"), "a", "b"
-            )
+            await edit_file(str(project_root / ".." / "escape.txt"), "a", "b")
 
     async def test_absolute_outside_rejected(
         self, project_root: Path, tmp_path_factory: pytest.TempPathFactory
@@ -297,9 +289,7 @@ class TestEditFile:
         # Outside file untouched.
         assert outside_target.read_text() == "hello world"
 
-    async def test_unset_root_backward_compat(
-        self, unset_root: None, tmp_path: Path
-    ) -> None:
+    async def test_unset_root_backward_compat(self, unset_root: None, tmp_path: Path) -> None:
         f = tmp_path / "any.txt"
         f.write_text("alpha")
         msg = await edit_file(str(f), "alpha", "beta")
@@ -341,9 +331,7 @@ class TestListDirectory:
         with pytest.raises(ValueError, match="path outside project root"):
             await list_directory(str(link))
 
-    async def test_unset_root_backward_compat(
-        self, unset_root: None, tmp_path: Path
-    ) -> None:
+    async def test_unset_root_backward_compat(self, unset_root: None, tmp_path: Path) -> None:
         (tmp_path / "x.txt").write_text("x")
         out = await list_directory(str(tmp_path))
         assert "x.txt" in out
@@ -396,15 +384,11 @@ class TestGlobFiles:
         outside_file.write_text("leaked")
 
         # Pattern attempts to climb out using ../
-        out = await glob_files(
-            f"../{outside.name}/*.py", str(project_root)
-        )
+        out = await glob_files(f"../{outside.name}/*.py", str(project_root))
         # Either "(no matches)" or at least no entry resolving outside.
         assert "leak.py" not in out
 
-    async def test_unset_root_backward_compat(
-        self, unset_root: None, tmp_path: Path
-    ) -> None:
+    async def test_unset_root_backward_compat(self, unset_root: None, tmp_path: Path) -> None:
         (tmp_path / "z.py").write_text("z")
         out = await glob_files("*.py", str(tmp_path))
         assert "z.py" in out
@@ -415,9 +399,7 @@ class TestGlobFiles:
 # ---------------------------------------------------------------------------
 
 
-async def test_unset_env_var_completely_pre13_compat(
-    unset_root: None, tmp_path: Path
-) -> None:
+async def test_unset_env_var_completely_pre13_compat(unset_root: None, tmp_path: Path) -> None:
     """End-to-end sanity: with no ``MEMFUN_PROJECT_ROOT``, we behave
     exactly like the pre-#13 tools — all of read/write/list/glob/edit
     work on absolute paths anywhere on disk (modulo blocked

@@ -5,6 +5,7 @@ instances, each addressable by a distinct ``instance_id``, while
 backward-compatible name-based lookup still picks the first running
 instance.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -63,9 +64,7 @@ async def manager() -> AgentManager:
 
 
 class TestPerInstancePool:
-    async def test_start_agent_returns_distinct_ids(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_start_agent_returns_distinct_ids(self, manager: AgentManager) -> None:
         """Five start_agent calls -> five distinct instance ids."""
         ids = [await manager.start_agent("pool-counter") for _ in range(5)]
         assert len(set(ids)) == 5
@@ -77,9 +76,7 @@ class TestPerInstancePool:
 
         await manager.stop_all()
 
-    async def test_get_agent_by_name_returns_first_instance(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_get_agent_by_name_returns_first_instance(self, manager: AgentManager) -> None:
         """Backward compat: get_agent('name') returns the first running instance."""
         first_id = await manager.start_agent("pool-counter")
         second_id = await manager.start_agent("pool-counter")
@@ -94,9 +91,7 @@ class TestPerInstancePool:
 
         await manager.stop_all()
 
-    async def test_get_agent_by_instance_id(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_get_agent_by_instance_id(self, manager: AgentManager) -> None:
         """get_agent(instance_id) hits the exact instance directly."""
         ids = [await manager.start_agent("pool-counter") for _ in range(3)]
 
@@ -111,9 +106,7 @@ class TestPerInstancePool:
 
         await manager.stop_all()
 
-    async def test_start_pool_returns_n_distinct_ids(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_start_pool_returns_n_distinct_ids(self, manager: AgentManager) -> None:
         """start_pool(name, 5) -> five fresh instances of the same name."""
         ids = await manager.start_pool("pool-counter", 5)
         assert len(ids) == 5
@@ -132,17 +125,13 @@ class TestPerInstancePool:
 
         await manager.stop_all()
 
-    async def test_start_pool_rejects_non_positive(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_start_pool_rejects_non_positive(self, manager: AgentManager) -> None:
         with pytest.raises(ValueError, match="count must be positive"):
             await manager.start_pool("pool-counter", 0)
         with pytest.raises(ValueError, match="count must be positive"):
             await manager.start_pool("pool-counter", -1)
 
-    async def test_stop_agent_by_name_stops_all_instances(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_stop_agent_by_name_stops_all_instances(self, manager: AgentManager) -> None:
         """stop_agent('name') tears down every running instance of that name."""
         ids = await manager.start_pool("pool-counter", 4)
         # Spin up an unrelated agent that should NOT be touched
@@ -158,9 +147,7 @@ class TestPerInstancePool:
 
         await manager.stop_all()
 
-    async def test_stop_agent_by_instance_id_only_stops_one(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_stop_agent_by_instance_id_only_stops_one(self, manager: AgentManager) -> None:
         """stop_agent(instance_id) leaves siblings of the same name alive."""
         ids = await manager.start_pool("pool-counter", 3)
         await manager.stop_agent(ids[1])
@@ -176,9 +163,7 @@ class TestPerInstancePool:
 
         await manager.stop_all()
 
-    async def test_legacy_start_then_get_by_name_still_works(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_legacy_start_then_get_by_name_still_works(self, manager: AgentManager) -> None:
         """The pre-#12 pattern: start once, look up by name, must keep working."""
         instance_id = await manager.start_agent("pool-counter")
         assert isinstance(instance_id, str) and len(instance_id) > 0
@@ -201,15 +186,11 @@ class TestPerInstancePool:
         with pytest.raises(KeyError):
             await manager.stop_agent("never-started")
 
-    async def test_unregistered_agent_raises_keyerror(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_unregistered_agent_raises_keyerror(self, manager: AgentManager) -> None:
         with pytest.raises(KeyError):
             await manager.start_agent("not-in-registry")
 
-    async def test_list_running_reports_per_instance(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_list_running_reports_per_instance(self, manager: AgentManager) -> None:
         """list_running returns the *name* of every instance (with duplicates)."""
         await manager.start_pool("pool-counter", 3)
         await manager.start_agent("pool-other")
@@ -224,9 +205,7 @@ class TestPerInstancePool:
 
         await manager.stop_all()
 
-    async def test_restart_by_instance_id(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_restart_by_instance_id(self, manager: AgentManager) -> None:
         """Restarting by id stops that one and starts a fresh one."""
         ids = await manager.start_pool("pool-counter", 2)
         new_id = await manager.restart_agent(ids[0])
@@ -240,9 +219,7 @@ class TestPerInstancePool:
 
         await manager.stop_all()
 
-    async def test_restart_by_name_replaces_all_instances(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_restart_by_name_replaces_all_instances(self, manager: AgentManager) -> None:
         """Restart by name stops every running instance and starts the same count back."""
         ids = await manager.start_pool("pool-counter", 3)
         await manager.restart_agent("pool-counter")
@@ -296,17 +273,14 @@ class TestOrchestratorFanOutToPool:
 
         await manager.stop_all()
 
-    async def test_fan_out_to_pool_reuses_existing_instances(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_fan_out_to_pool_reuses_existing_instances(self, manager: AgentManager) -> None:
         """If 3 instances already exist and 5 tasks come in, only 2 new ones are spawned."""
         from memfun_runtime.orchestrator import AgentOrchestrator
 
         orchestrator = AgentOrchestrator(manager._context, manager)
         existing = await manager.start_pool("pool-counter", 3)
         tasks = [
-            TaskMessage(task_id=f"t-{i}", agent_id="pool-counter", payload={})
-            for i in range(5)
+            TaskMessage(task_id=f"t-{i}", agent_id="pool-counter", payload={}) for i in range(5)
         ]
 
         await orchestrator.fan_out_to_pool(tasks, "pool-counter")
@@ -319,9 +293,7 @@ class TestOrchestratorFanOutToPool:
 
         await manager.stop_all()
 
-    async def test_fan_out_to_pool_empty_tasks_is_noop(
-        self, manager: AgentManager
-    ) -> None:
+    async def test_fan_out_to_pool_empty_tasks_is_noop(self, manager: AgentManager) -> None:
         from memfun_runtime.orchestrator import AgentOrchestrator
 
         orchestrator = AgentOrchestrator(manager._context, manager)

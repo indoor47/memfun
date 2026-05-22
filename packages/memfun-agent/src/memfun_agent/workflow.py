@@ -510,9 +510,7 @@ class WorkflowEngine:
             # merge).  Approved PRs that conflict are left OPEN on
             # GitHub for human inspection.
             if merge_failures:
-                summary = ", ".join(
-                    f"#{pr} ({err})" for pr, err in merge_failures
-                )
+                summary = ", ".join(f"#{pr} ({err})" for pr, err in merge_failures)
                 result = dataclasses.replace(
                     result,
                     success=False,
@@ -2167,7 +2165,8 @@ class WorkflowEngine:
         # plain bracket-match is enough and avoids parsing the entire
         # answer with a recursive descent grammar.
         candidates = re.findall(
-            r'\{[^{}]*"verdict"[^{}]*\}', answer,
+            r'\{[^{}]*"verdict"[^{}]*\}',
+            answer,
         )
         for blob in reversed(candidates):
             try:

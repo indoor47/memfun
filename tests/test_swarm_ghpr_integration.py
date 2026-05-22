@@ -592,11 +592,7 @@ def test_parse_pr_verdict_takes_last_json_block() -> None:
     """When multiple verdict blocks exist, the LAST one wins."""
     from memfun_agent.workflow import WorkflowEngine
 
-    answer = (
-        '{"verdict": "comment"}\n'
-        "...then on re-review...\n"
-        '{"verdict": "approve"}\n'
-    )
+    answer = '{"verdict": "comment"}\n...then on re-review...\n{"verdict": "approve"}\n'
     assert WorkflowEngine._parse_pr_verdict(answer) == "approve"
 
 
@@ -611,9 +607,7 @@ def test_parse_pr_verdict_lgtm_fallback() -> None:
     """`lgtm` in unstructured text still resolves to approve."""
     from memfun_agent.workflow import WorkflowEngine
 
-    assert (
-        WorkflowEngine._parse_pr_verdict("Looks fine. lgtm.") == "approve"
-    )
+    assert WorkflowEngine._parse_pr_verdict("Looks fine. lgtm.") == "approve"
 
 
 def test_pr_body_does_not_leak_absolute_path() -> None:
@@ -690,18 +684,22 @@ async def test_merge_failure_makes_workflow_result_unsuccessful(
     state.pr_states["T1"] = SubTaskPRState(
         task_id="T1",
         approved=True,
-        pr_number=101, branch="memfun/wf/T1",
+        pr_number=101,
+        branch="memfun/wf/T1",
     )
     state.pr_states["T2"] = SubTaskPRState(
         task_id="T2",
         approved=True,
-        pr_number=102, branch="memfun/wf/T2",
+        pr_number=102,
+        branch="memfun/wf/T2",
     )
 
     def fake_merge(repo: str, pr_number: int, strategy: str) -> MergeResult:
         if pr_number == 101:
             return MergeResult(
-                merged=True, pr_number=pr_number, strategy=strategy,
+                merged=True,
+                pr_number=pr_number,
+                strategy=strategy,
             )
         return MergeResult(
             merged=False,
@@ -711,7 +709,8 @@ async def test_merge_failure_makes_workflow_result_unsuccessful(
         )
 
     monkeypatch.setattr(
-        "memfun_agent.workflow.merge_pr", fake_merge,
+        "memfun_agent.workflow.merge_pr",
+        fake_merge,
     )
 
     merged, failed = await engine._merge_approved_prs(

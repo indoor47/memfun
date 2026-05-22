@@ -38,13 +38,15 @@ class RedisSessionManager:
         now = time.time()
         session = Session(session_id=session_id, user_id=user_id, created_at=now)
 
-        payload = json.dumps({
-            "session_id": session_id,
-            "user_id": user_id,
-            "created_at": now,
-            "data": {},
-            "history": [],
-        })
+        payload = json.dumps(
+            {
+                "session_id": session_id,
+                "user_id": user_id,
+                "created_at": now,
+                "data": {},
+                "history": [],
+            }
+        )
         key = self._session_key(session_id)
         await self._r.set(key, payload.encode(), ex=config.ttl_seconds)
         return session

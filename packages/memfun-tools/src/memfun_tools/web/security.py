@@ -16,10 +16,7 @@ def _is_ip_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     to prevent bypass via IPv6 encoding of private IPv4 addresses.
     """
     # Unwrap IPv4-mapped IPv6 addresses before checking
-    if (
-        isinstance(ip, ipaddress.IPv6Address)
-        and ip.ipv4_mapped is not None
-    ):
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
 
     return (
@@ -51,10 +48,7 @@ def validate_url(
 
     # Scheme check
     if parsed.scheme not in ("http", "https"):
-        raise URLValidationError(
-            f"Invalid scheme: {parsed.scheme!r}."
-            " Only http/https allowed."
-        )
+        raise URLValidationError(f"Invalid scheme: {parsed.scheme!r}. Only http/https allowed.")
 
     hostname = parsed.hostname
     if not hostname:
@@ -62,9 +56,7 @@ def validate_url(
 
     # Block credentials in URL (often used in SSRF bypass)
     if parsed.username or parsed.password:
-        raise URLValidationError(
-            "URLs with embedded credentials are not allowed"
-        )
+        raise URLValidationError("URLs with embedded credentials are not allowed")
 
     # Block bare IP addresses to reduce SSRF surface
     # (the DNS resolution check below also catches them, but
@@ -73,8 +65,7 @@ def validate_url(
         literal_ip = ipaddress.ip_address(hostname)
         if _is_ip_blocked(literal_ip):
             raise URLValidationError(
-                f"URL points to blocked IP {literal_ip}."
-                " This may be an SSRF attempt."
+                f"URL points to blocked IP {literal_ip}. This may be an SSRF attempt."
             )
     except ValueError:
         pass  # Not a literal IP -- expected for hostnames
@@ -82,47 +73,32 @@ def validate_url(
     # Domain allowlist/blocklist
     if blocked_domains:
         for domain in blocked_domains:
-            if (
-                hostname == domain
-                or hostname.endswith(f".{domain}")
-            ):
-                raise URLValidationError(
-                    f"Domain {hostname!r} is blocked"
-                )
+            if hostname == domain or hostname.endswith(f".{domain}"):
+                raise URLValidationError(f"Domain {hostname!r} is blocked")
 
     if allowed_domains:
         allowed = False
         for domain in allowed_domains:
-            if (
-                hostname == domain
-                or hostname.endswith(f".{domain}")
-            ):
+            if hostname == domain or hostname.endswith(f".{domain}"):
                 allowed = True
                 break
         if not allowed:
-            raise URLValidationError(
-                f"Domain {hostname!r} is not in the allowed list"
-            )
+            raise URLValidationError(f"Domain {hostname!r} is not in the allowed list")
 
     # DNS resolution + private IP check (SSRF prevention)
     try:
         addrs = socket.getaddrinfo(hostname, None)
     except socket.gaierror as err:
-        raise URLValidationError(
-            f"Cannot resolve hostname: {hostname!r}"
-        ) from err
+        raise URLValidationError(f"Cannot resolve hostname: {hostname!r}") from err
 
     if not addrs:
-        raise URLValidationError(
-            f"Hostname {hostname!r} resolved to no addresses"
-        )
+        raise URLValidationError(f"Hostname {hostname!r} resolved to no addresses")
 
     for _, _, _, _, sockaddr in addrs:
         ip = ipaddress.ip_address(sockaddr[0])
         if _is_ip_blocked(ip):
             raise URLValidationError(
-                f"URL resolves to blocked IP {ip}."
-                " This may be an SSRF attempt."
+                f"URL resolves to blocked IP {ip}. This may be an SSRF attempt."
             )
 
     return url
@@ -142,8 +118,7 @@ def validate_resolved_ip(
     ip = ipaddress.ip_address(ip_str)
     if _is_ip_blocked(ip):
         raise URLValidationError(
-            f"Connection to blocked IP {ip} denied."
-            " Possible SSRF via redirect or DNS rebinding."
+            f"Connection to blocked IP {ip} denied. Possible SSRF via redirect or DNS rebinding."
         )
 
 
@@ -152,6 +127,7 @@ class RateLimiter:
 
     def __init__(self, rate_per_minute: int = 30, burst: int = 5) -> None:
         import time
+
         self._rate = rate_per_minute / 60.0
         self._burst = burst
         self._tokens = float(burst)
@@ -160,6 +136,7 @@ class RateLimiter:
     def acquire(self) -> bool:
         """Try to acquire a token. Returns True if allowed, False if rate limited."""
         import time
+
         now = time.time()
         elapsed = now - self._last_refill
         self._tokens = min(self._burst, self._tokens + elapsed * self._rate)

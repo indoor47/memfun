@@ -4,6 +4,7 @@ Tracks execution outcomes, success rates, durations, and user ratings
 for each skill to identify underperforming skills and opportunities
 for optimization or synthesis.
 """
+
 from __future__ import annotations
 
 import json
@@ -131,9 +132,7 @@ class SkillEffectivenessTracker:
             # Save updated records
             serialized = json.dumps(records)
             await self._state_store.set(key, serialized.encode("utf-8"))
-            logger.debug(
-                "Recorded execution for skill %s (success=%s)", skill_name, success
-            )
+            logger.debug("Recorded execution for skill %s (success=%s)", skill_name, success)
         else:
             # Guard against unbounded in-memory growth
             if skill_name not in self._in_memory:
@@ -216,8 +215,7 @@ class SkillEffectivenessTracker:
         underperforming = [
             stats
             for stats in all_stats
-            if stats.total_executions >= min_executions
-            and stats.success_rate <= max_success_rate
+            if stats.total_executions >= min_executions and stats.success_rate <= max_success_rate
         ]
 
         # Sort by success rate (worst first)
@@ -243,9 +241,7 @@ class SkillEffectivenessTracker:
 
         return self._in_memory.get(skill_name, [])
 
-    def _aggregate_stats(
-        self, skill_name: str, records: list[dict[str, Any]]
-    ) -> SkillStats:
+    def _aggregate_stats(self, skill_name: str, records: list[dict[str, Any]]) -> SkillStats:
         """Aggregate raw execution records into SkillStats."""
         total = len(records)
         successful = sum(1 for r in records if r["success"])

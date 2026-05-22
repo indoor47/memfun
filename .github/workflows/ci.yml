@@ -64,4 +64,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-packages --python 3.12
-      - run: uv run pip-audit
+      # CVE-2025-69872 (diskcache 5.6.3): no upstream fix available.
+      # Transitive dep via dspy → gepa → diskcache. Re-evaluate on
+      # every dep bump; drop the ignore once an upstream patch ships.
+      - run: uv run pip-audit --ignore-vuln CVE-2025-69872

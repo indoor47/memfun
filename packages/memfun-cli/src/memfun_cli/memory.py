@@ -9,6 +9,7 @@ Two files provide layered memory:
 Both are always loaded every turn as highest-priority context.
 User-editable, human-readable markdown.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -70,19 +71,12 @@ def load_memory_context() -> str:
     # Global first
     global_content = _read_memory_file(global_memory_path())
     if global_content:
-        parts.append(
-            "=== GLOBAL MEMORY (always apply) ===\n"
-            + global_content
-        )
+        parts.append("=== GLOBAL MEMORY (always apply) ===\n" + global_content)
 
     # Project overrides
     project_content = _read_memory_file(project_memory_path())
     if project_content:
-        parts.append(
-            "=== PROJECT MEMORY (always apply,"
-            " overrides global) ===\n"
-            + project_content
-        )
+        parts.append("=== PROJECT MEMORY (always apply, overrides global) ===\n" + project_content)
 
     if not parts:
         return ""
@@ -106,8 +100,7 @@ def _read_memory_file(path: Path) -> str:
         lines = [
             line
             for line in content.split("\n")
-            if line.strip()
-            and not line.strip().startswith("<!--")
+            if line.strip() and not line.strip().startswith("<!--")
         ]
         lines = lines[:_MAX_MEMORY_LINES]
         result = "\n".join(lines)
@@ -115,9 +108,7 @@ def _read_memory_file(path: Path) -> str:
             result = result[:_MAX_MEMORY_CHARS] + "\n..."
         return result
     except Exception:
-        logger.debug(
-            "Failed to read memory %s", path, exc_info=True
-        )
+        logger.debug("Failed to read memory %s", path, exc_info=True)
         return ""
 
 
@@ -131,35 +122,25 @@ def get_memory_display() -> str:
 
     gpath = global_memory_path()
     if gpath.exists():
-        parts.append(
-            f"[bold]Global memory[/bold] ({gpath}):\n"
-        )
+        parts.append(f"[bold]Global memory[/bold] ({gpath}):\n")
         try:
             parts.append(gpath.read_text())
         except Exception:
             parts.append("[red]Error reading file[/red]")
     else:
-        parts.append(
-            "[dim]No global memory"
-            " (~/.memfun/MEMORY.md)[/dim]"
-        )
+        parts.append("[dim]No global memory (~/.memfun/MEMORY.md)[/dim]")
 
     parts.append("")
 
     ppath = project_memory_path()
     if ppath.exists():
-        parts.append(
-            f"[bold]Project memory[/bold] ({ppath}):\n"
-        )
+        parts.append(f"[bold]Project memory[/bold] ({ppath}):\n")
         try:
             parts.append(ppath.read_text())
         except Exception:
             parts.append("[red]Error reading file[/red]")
     else:
-        parts.append(
-            "[dim]No project memory"
-            " (.memfun/MEMORY.md)[/dim]"
-        )
+        parts.append("[dim]No project memory (.memfun/MEMORY.md)[/dim]")
 
     return "\n".join(parts)
 
@@ -167,9 +148,7 @@ def get_memory_display() -> str:
 # ── Writing ──────────────────────────────────────────────────
 
 
-def remember(
-    text: str, *, project: bool = True
-) -> str:
+def remember(text: str, *, project: bool = True) -> str:
     """Add a line to MEMORY.md under the appropriate section.
 
     Args:
@@ -187,10 +166,7 @@ def remember(
     lines = content.split("\n")
 
     if _is_duplicate(text, lines):
-        return (
-            f"Already remembered (similar entry exists):"
-            f" {text}"
-        )
+        return f"Already remembered (similar entry exists): {text}"
 
     non_empty = [
         line
@@ -217,9 +193,7 @@ def remember(
     return f"Remembered ({scope}, {section}): {text}"
 
 
-def forget(
-    target: str, *, project: bool = True
-) -> str:
+def forget(target: str, *, project: bool = True) -> str:
     """Remove a line from MEMORY.md.
 
     Args:
@@ -240,27 +214,19 @@ def forget(
     with contextlib.suppress(ValueError):
         line_num = int(target)
         content_lines = [
-            (i, line)
-            for i, line in enumerate(lines)
-            if line.strip().startswith("- ")
+            (i, line) for i, line in enumerate(lines) if line.strip().startswith("- ")
         ]
         if 1 <= line_num <= len(content_lines):
             idx, removed_line = content_lines[line_num - 1]
             lines.pop(idx)
             path.write_text("\n".join(lines))
             return f"Forgot: {removed_line.strip()}"
-        return (
-            f"Line number {line_num} out of range"
-            f" (1-{len(content_lines)})."
-        )
+        return f"Line number {line_num} out of range (1-{len(content_lines)})."
 
     # Try as text substring match
     target_lower = target.lower()
     for i, line in enumerate(lines):
-        if (
-            line.strip().startswith("- ")
-            and target_lower in line.lower()
-        ):
+        if line.strip().startswith("- ") and target_lower in line.lower():
             removed = lines.pop(i)
             path.write_text("\n".join(lines))
             return f"Forgot: {removed.strip()}"
@@ -268,9 +234,7 @@ def forget(
     return f"No matching memory entry found for: {target}"
 
 
-def append_learning(
-    text: str, *, project: bool = True
-) -> bool:
+def append_learning(text: str, *, project: bool = True) -> bool:
     """Append a learning extracted by the LLM to MEMORY.md.
 
     Called by LearningManager after each turn. Includes
@@ -369,22 +333,59 @@ def _insert_under_section(
     return False
 
 
-_PREFERENCE_WORDS: frozenset[str] = frozenset({
-    "prefer", "use", "always", "never", "port",
-    "default", "style", "like", "want", "should",
-})
-_PATTERN_WORDS: frozenset[str] = frozenset({
-    "structure", "directory", "naming", "convention",
-    "organize", "layout", "component", "module",
-})
-_TECHNICAL_WORDS: frozenset[str] = frozenset({
-    "api", "endpoint", "version", "database", "config",
-    "url", "key", "library", "framework", "dependency",
-})
-_WORKFLOW_WORDS: frozenset[str] = frozenset({
-    "test", "deploy", "build", "run", "ci",
-    "commit", "review", "process", "step",
-})
+_PREFERENCE_WORDS: frozenset[str] = frozenset(
+    {
+        "prefer",
+        "use",
+        "always",
+        "never",
+        "port",
+        "default",
+        "style",
+        "like",
+        "want",
+        "should",
+    }
+)
+_PATTERN_WORDS: frozenset[str] = frozenset(
+    {
+        "structure",
+        "directory",
+        "naming",
+        "convention",
+        "organize",
+        "layout",
+        "component",
+        "module",
+    }
+)
+_TECHNICAL_WORDS: frozenset[str] = frozenset(
+    {
+        "api",
+        "endpoint",
+        "version",
+        "database",
+        "config",
+        "url",
+        "key",
+        "library",
+        "framework",
+        "dependency",
+    }
+)
+_WORKFLOW_WORDS: frozenset[str] = frozenset(
+    {
+        "test",
+        "deploy",
+        "build",
+        "run",
+        "ci",
+        "commit",
+        "review",
+        "process",
+        "step",
+    }
+)
 
 
 def _classify_section(text: str) -> str:
@@ -400,9 +401,7 @@ def _classify_section(text: str) -> str:
     return best if scores[best] > 0 else "Preferences"
 
 
-def _is_duplicate(
-    new_text: str, existing_lines: list[str]
-) -> bool:
+def _is_duplicate(new_text: str, existing_lines: list[str]) -> bool:
     """Check if *new_text* is too similar to any existing line."""
     new_lower = new_text.lower().strip()
     for line in existing_lines:
@@ -412,9 +411,7 @@ def _is_duplicate(
         existing = stripped[2:].lower().strip()
         if new_lower == existing:
             return True
-        ratio = SequenceMatcher(
-            None, new_lower, existing
-        ).ratio()
+        ratio = SequenceMatcher(None, new_lower, existing).ratio()
         if ratio >= _SIMILARITY_THRESHOLD:
             return True
     return False

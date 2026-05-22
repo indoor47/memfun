@@ -1,4 +1,5 @@
 """Skill activation: resolves references, maps tools, and prepares execution."""
+
 from __future__ import annotations
 
 import logging
@@ -57,9 +58,7 @@ class SkillActivator:
         )
 
         # 3. Assemble resolved instructions
-        resolved_instructions = self._build_instructions(
-            skill, reference_contents, context
-        )
+        resolved_instructions = self._build_instructions(skill, reference_contents, context)
 
         activated = ActivatedSkill(
             skill=skill,

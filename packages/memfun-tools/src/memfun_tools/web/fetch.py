@@ -45,10 +45,7 @@ async def web_fetch(
 
     # Rate limiting
     if not _rate_limiter.acquire():
-        raise RuntimeError(
-            "Rate limited. Please wait before making"
-            " more web requests."
-        )
+        raise RuntimeError("Rate limited. Please wait before making more web requests.")
 
     # URL validation (SSRF prevention)
     try:
@@ -69,19 +66,11 @@ async def web_fetch(
     content_type = response.headers.get("content-type", "")
 
     if "text/html" in content_type:
-        result = html_to_markdown(
-            response.text, max_length=max_length
-        )
-    elif any(
-        ct in content_type
-        for ct in ("text/plain", "application/json", "text/")
-    ):
+        result = html_to_markdown(response.text, max_length=max_length)
+    elif any(ct in content_type for ct in ("text/plain", "application/json", "text/")):
         result = response.text[:max_length]
     else:
-        result = (
-            f"(Binary content: {content_type},"
-            f" {len(response.content)} bytes)"
-        )
+        result = f"(Binary content: {content_type}, {len(response.content)} bytes)"
 
     _cache.set(cache_key, result)
     return result
@@ -111,21 +100,15 @@ async def _safe_fetch(
         if response.is_redirect:
             location = response.headers.get("location", "")
             if not location:
-                raise ValueError(
-                    "Redirect with no Location header"
-                )
+                raise ValueError("Redirect with no Location header")
             # Validate the redirect target
             try:
                 current_url = validate_url(location)
             except URLValidationError as e:
-                raise ValueError(
-                    f"Redirect blocked (SSRF): {e}"
-                ) from e
+                raise ValueError(f"Redirect blocked (SSRF): {e}") from e
             continue
 
         response.raise_for_status()
         return response
 
-    raise ValueError(
-        f"Too many redirects (>{_MAX_REDIRECTS})"
-    )
+    raise ValueError(f"Too many redirects (>{_MAX_REDIRECTS})")

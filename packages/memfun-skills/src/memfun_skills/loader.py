@@ -1,4 +1,5 @@
 """Skill discovery and loading from the filesystem."""
+
 from __future__ import annotations
 
 import logging
