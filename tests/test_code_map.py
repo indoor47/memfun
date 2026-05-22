@@ -1,4 +1,5 @@
 """Tests for the code_map module."""
+
 from __future__ import annotations
 
 import textwrap
@@ -306,14 +307,16 @@ class TestCodeMapToString:
         # Create many files that exceed the token budget
         maps: list[FileMap] = []
         for i in range(100):
-            maps.append(FileMap(
-                path=f"pkg/module_{i:03d}.py",
-                definitions=(
-                    Definition(f"Class{i}", "class", f"class Class{i}", 1),
-                    Definition(f"func_{i}", "function", f"def func_{i}(x: int) -> str", 10),
-                ),
-                size=500,
-            ))
+            maps.append(
+                FileMap(
+                    path=f"pkg/module_{i:03d}.py",
+                    definitions=(
+                        Definition(f"Class{i}", "class", f"class Class{i}", 1),
+                        Definition(f"func_{i}", "function", f"def func_{i}(x: int) -> str", 10),
+                    ),
+                    size=500,
+                )
+            )
 
         # Very small budget
         result = code_map_to_string(maps, max_tokens=200)
@@ -324,9 +327,7 @@ class TestCodeMapToString:
         maps = [
             FileMap(
                 path="main.py",
-                definitions=(
-                    Definition("main", "function", "def main()", 1),
-                ),
+                definitions=(Definition("main", "function", "def main()", 1),),
                 size=100,
             ),
             FileMap(path="data.csv", definitions=(), size=5000),
@@ -343,16 +344,12 @@ class TestCodeMapToString:
         maps = [
             FileMap(
                 path="funcs.py",
-                definitions=(
-                    Definition("helper", "function", "def helper()", 1),
-                ),
+                definitions=(Definition("helper", "function", "def helper()", 1),),
                 size=100,
             ),
             FileMap(
                 path="classes.py",
-                definitions=(
-                    Definition("Engine", "class", "class Engine", 1),
-                ),
+                definitions=(Definition("Engine", "class", "class Engine", 1),),
                 size=100,
             ),
         ]

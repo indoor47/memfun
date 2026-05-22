@@ -4,6 +4,7 @@ Each signature defines the input/output contract for a specific coding task.
 These are used both by the RLM module (for complex tasks) and by direct
 dspy.Predict / dspy.ChainOfThought calls (for simpler tasks).
 """
+
 from __future__ import annotations
 
 import dspy
@@ -22,18 +23,10 @@ class CodeAnalysis(dspy.Signature):
     code: str = dspy.InputField(
         desc="Source code to analyze (may be a single file or concatenated files)"
     )
-    query: str = dspy.InputField(
-        desc="Specific analysis question or focus area"
-    )
-    analysis: str = dspy.OutputField(
-        desc="Structured analysis of the code addressing the query"
-    )
-    issues: list[str] = dspy.OutputField(
-        desc="List of identified issues or concerns"
-    )
-    suggestions: list[str] = dspy.OutputField(
-        desc="List of actionable improvement suggestions"
-    )
+    query: str = dspy.InputField(desc="Specific analysis question or focus area")
+    analysis: str = dspy.OutputField(desc="Structured analysis of the code addressing the query")
+    issues: list[str] = dspy.OutputField(desc="List of identified issues or concerns")
+    suggestions: list[str] = dspy.OutputField(desc="List of actionable improvement suggestions")
 
 
 # ── Bug Fix ────────────────────────────────────────────────────
@@ -46,21 +39,13 @@ class BugFix(dspy.Signature):
     produce corrected code, and explain the fix.
     """
 
-    code: str = dspy.InputField(
-        desc="Source code containing the bug"
-    )
+    code: str = dspy.InputField(desc="Source code containing the bug")
     bug_description: str = dspy.InputField(
         desc="Description of the bug, including symptoms and reproduction steps"
     )
-    root_cause: str = dspy.OutputField(
-        desc="Explanation of the root cause of the bug"
-    )
-    fixed_code: str = dspy.OutputField(
-        desc="Corrected source code with the bug fixed"
-    )
-    explanation: str = dspy.OutputField(
-        desc="Explanation of what was changed and why"
-    )
+    root_cause: str = dspy.OutputField(desc="Explanation of the root cause of the bug")
+    fixed_code: str = dspy.OutputField(desc="Corrected source code with the bug fixed")
+    explanation: str = dspy.OutputField(desc="Explanation of what was changed and why")
 
 
 # ── Code Review ────────────────────────────────────────────────
@@ -73,27 +58,15 @@ class CodeReview(dspy.Signature):
     code review with categorized findings and an overall assessment.
     """
 
-    code: str = dspy.InputField(
-        desc="Source code or diff to review"
-    )
+    code: str = dspy.InputField(desc="Source code or diff to review")
     context: str = dspy.InputField(
-        desc=(
-            "Additional context: PR description, related files, "
-            "coding standards"
-        )
+        desc=("Additional context: PR description, related files, coding standards")
     )
-    summary: str = dspy.OutputField(
-        desc="Brief overall assessment of the code quality"
-    )
+    summary: str = dspy.OutputField(desc="Brief overall assessment of the code quality")
     findings: list[str] = dspy.OutputField(
-        desc=(
-            "List of findings, each prefixed with severity "
-            "[critical/major/minor/nit]"
-        )
+        desc=("List of findings, each prefixed with severity [critical/major/minor/nit]")
     )
-    approved: bool = dspy.OutputField(
-        desc="Whether the code is approved for merge"
-    )
+    approved: bool = dspy.OutputField(desc="Whether the code is approved for merge")
 
 
 # ── Code Explanation ───────────────────────────────────────────
@@ -106,21 +79,12 @@ class CodeExplanation(dspy.Signature):
     explanation covering purpose, logic flow, and key concepts.
     """
 
-    code: str = dspy.InputField(
-        desc="Source code to explain"
-    )
+    code: str = dspy.InputField(desc="Source code to explain")
     audience: str = dspy.InputField(
-        desc=(
-            "Target audience level: beginner, intermediate, "
-            "or expert"
-        ),
+        desc=("Target audience level: beginner, intermediate, or expert"),
     )
-    explanation: str = dspy.OutputField(
-        desc="Clear explanation of what the code does and how"
-    )
-    key_concepts: list[str] = dspy.OutputField(
-        desc="Key concepts or patterns used in the code"
-    )
+    explanation: str = dspy.OutputField(desc="Clear explanation of what the code does and how")
+    key_concepts: list[str] = dspy.OutputField(desc="Key concepts or patterns used in the code")
 
 
 # ── RLM Exploration (used internally by the RLM loop) ──────────────
@@ -170,19 +134,11 @@ class RLMExploration(dspy.Signature):
     """
 
     context_metadata: str = dspy.InputField(
-        desc=(
-            "Metadata about the context: type, length, preview, "
-            "and available helper functions"
-        )
+        desc=("Metadata about the context: type, length, preview, and available helper functions")
     )
-    query: str = dspy.InputField(
-        desc="The user's question or task to accomplish"
-    )
+    query: str = dspy.InputField(desc="The user's question or task to accomplish")
     code_history: str = dspy.InputField(
-        desc=(
-            "History of previously executed code and their "
-            "outputs (truncated)"
-        )
+        desc=("History of previously executed code and their outputs (truncated)")
     )
     reasoning: str = dspy.OutputField(
         desc=(
@@ -243,9 +199,7 @@ class QueryTriage(dspy.Signature):
     explicitly asks to search, fetch, or look something up online.
     """
 
-    query: str = dspy.InputField(
-        desc="The user's question or request"
-    )
+    query: str = dspy.InputField(desc="The user's question or request")
     recent_conversation: str = dspy.InputField(
         desc=(
             "Recent conversation history (last 1-2 turns). "
@@ -278,9 +232,7 @@ class QueryTriage(dspy.Signature):
             "ALMOST ALWAYS use 'task'. When in doubt, use 'task'."
         )
     )
-    reasoning: str = dspy.OutputField(
-        desc="Brief reasoning for the classification"
-    )
+    reasoning: str = dspy.OutputField(desc="Brief reasoning for the classification")
 
 
 # ── Task Planning ──────────────────────────────────────────────
@@ -300,12 +252,8 @@ class TaskPlanning(dspy.Signature):
     configuration, and deployment if requested.
     """
 
-    query: str = dspy.InputField(
-        desc="The user's request or question"
-    )
-    context_metadata: str = dspy.InputField(
-        desc="Project context summary and available tools"
-    )
+    query: str = dspy.InputField(desc="The user's request or question")
+    context_metadata: str = dspy.InputField(desc="Project context summary and available tools")
     steps: list[str] = dspy.OutputField(
         desc=(
             "Ordered list of 3-7 concrete action steps. "
@@ -410,14 +358,9 @@ class TaskDecomposition(dspy.Signature):
         T4 (security): Security review of auth implementation
     """
 
-    task_description: str = dspy.InputField(
-        desc="The fully resolved task description"
-    )
+    task_description: str = dspy.InputField(desc="The fully resolved task description")
     project_context: str = dspy.InputField(
-        desc=(
-            "Project structure, existing files, conventions, "
-            "and any relevant code snippets"
-        )
+        desc=("Project structure, existing files, conventions, and any relevant code snippets")
     )
     sub_tasks: list[str] = dspy.OutputField(
         desc=(
@@ -490,9 +433,7 @@ class LearningExtraction(dspy.Signature):
     - Temporary state or in-progress details
     """
 
-    user_message: str = dspy.InputField(
-        desc="The user's message or request in this turn"
-    )
+    user_message: str = dspy.InputField(desc="The user's message or request in this turn")
     agent_response: str = dspy.InputField(
         desc=(
             "The agent's response (may be truncated). "
@@ -543,9 +484,7 @@ class ContextPlanning(dspy.Signature):
     is always included.
     """
 
-    query: str = dspy.InputField(
-        desc="The user's task or question"
-    )
+    query: str = dspy.InputField(desc="The user's task or question")
     file_manifest: str = dspy.InputField(
         desc=(
             "Newline-separated list of project files with code structure. "
@@ -582,9 +521,7 @@ class ContextPlanning(dspy.Signature):
             'Example: ["python requests library timeout", "FastAPI websocket docs"]'
         )
     )
-    reasoning: str = dspy.OutputField(
-        desc="Brief explanation of why these files are needed"
-    )
+    reasoning: str = dspy.OutputField(desc="Brief explanation of why these files are needed")
 
 
 class SingleShotSolving(dspy.Signature):
@@ -622,9 +559,7 @@ class SingleShotSolving(dspy.Signature):
       small edit_file ops over one large write_file.
     """
 
-    query: str = dspy.InputField(
-        desc="The user's task or question"
-    )
+    query: str = dspy.InputField(desc="The user's task or question")
     full_context: str = dspy.InputField(
         desc=(
             "All relevant source code, concatenated with file headers "
@@ -653,19 +588,19 @@ class SingleShotSolving(dspy.Signature):
     )
     operations: str = dspy.OutputField(
         desc=(
-            'JSON array of operations. Supported ops:\n'
+            "JSON array of operations. Supported ops:\n"
             '{"op":"edit_file","path":"...","old":"exact text",'
             '"new":"replacement"} '
-            '— targeted replacement in an EXISTING file. '
-            'ALWAYS prefer this.\n'
+            "— targeted replacement in an EXISTING file. "
+            "ALWAYS prefer this.\n"
             '{"op":"write_file","path":"...","content":"..."} '
-            '— create a NEW file only. '
-            'NEVER use on files shown in context.\n'
+            "— create a NEW file only. "
+            "NEVER use on files shown in context.\n"
             '{"op":"run_cmd","cmd":"..."} — run a shell command.\n'
-            'Return [] for answer-only queries.\n'
-            'RULE: Use edit_file for ALL modifications to existing '
-            'files. Use write_file ONLY to create files that do not '
-            'exist yet.'
+            "Return [] for answer-only queries.\n"
+            "RULE: Use edit_file for ALL modifications to existing "
+            "files. Use write_file ONLY to create files that do not "
+            "exist yet."
         )
     )
 
@@ -680,14 +615,9 @@ class VerificationFix(dspy.Signature):
     edit_file operations to make targeted fixes.
     """
 
-    query: str = dspy.InputField(
-        desc="The original user task (for context)"
-    )
+    query: str = dspy.InputField(desc="The original user task (for context)")
     full_context: str = dspy.InputField(
-        desc=(
-            "Current source code of all affected files, "
-            "concatenated with file headers"
-        )
+        desc=("Current source code of all affected files, concatenated with file headers")
     )
     verification_errors: str = dspy.InputField(
         desc=(
@@ -696,19 +626,17 @@ class VerificationFix(dspy.Signature):
         )
     )
 
-    reasoning: str = dspy.OutputField(
-        desc="Analysis of each error and how to fix it"
-    )
+    reasoning: str = dspy.OutputField(desc="Analysis of each error and how to fix it")
     operations: str = dspy.OutputField(
         desc=(
-            'JSON array of fix operations. Supported ops:\n'
+            "JSON array of fix operations. Supported ops:\n"
             '{"op":"edit_file","path":"...","old":"exact text",'
             '"new":"replacement"} — ALWAYS use for existing files.\n'
             '{"op":"write_file","path":"...","content":"..."} — '
-            'ONLY for creating new files.\n'
+            "ONLY for creating new files.\n"
             '{"op":"run_cmd","cmd":"..."} — run a shell command.\n'
-            'RULE: NEVER rewrite entire existing files. Use targeted '
-            'edit_file ops to fix specific errors.'
+            "RULE: NEVER rewrite entire existing files. Use targeted "
+            "edit_file ops to fix specific errors."
         )
     )
 
@@ -762,10 +690,7 @@ class ConsistencyReview(dspy.Signature):
     )
 
     has_issues: bool = dspy.OutputField(
-        desc=(
-            "True if any consistency issues were found, "
-            "False if everything looks correct"
-        )
+        desc=("True if any consistency issues were found, False if everything looks correct")
     )
     issues: list[str] = dspy.OutputField(
         desc=(
@@ -775,8 +700,5 @@ class ConsistencyReview(dspy.Signature):
         )
     )
     reasoning: str = dspy.OutputField(
-        desc=(
-            "Brief analysis of how the actual output compares "
-            "to the intended changes"
-        )
+        desc=("Brief analysis of how the actual output compares to the intended changes")
     )

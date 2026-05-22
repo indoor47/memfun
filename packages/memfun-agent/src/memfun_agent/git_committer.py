@@ -187,9 +187,7 @@ def _current_branch(runner: _GitRunner) -> str | None:
     return name
 
 
-def _normalise_paths(
-    project_root: Path, files_written: Iterable[Path | str]
-) -> list[str]:
+def _normalise_paths(project_root: Path, files_written: Iterable[Path | str]) -> list[str]:
     """Convert mixed absolute/relative paths into repo-relative strings.
 
     Drops:
@@ -218,9 +216,7 @@ def _normalise_paths(
         try:
             rel = resolved.relative_to(root)
         except ValueError:
-            logger.debug(
-                "git_committer: skip path outside repo: %s", resolved
-            )
+            logger.debug("git_committer: skip path outside repo: %s", resolved)
             continue
         rel_str = rel.as_posix()
         if rel_str in seen:
@@ -265,10 +261,7 @@ def _build_commit_message(
         for st in sub_tasks:
             files_label = ", ".join(st.files) if st.files else "(no files)"
             status_label = "approved" if st.approved else "changes_requested"
-            body_lines.append(
-                f"  {st.task_id}: {files_label} "
-                f"({st.agent_name}, {status_label})"
-            )
+            body_lines.append(f"  {st.task_id}: {files_label} ({st.agent_name}, {status_label})")
 
     if stats:
         # Render LLM stats in the same shape the issue showed.
@@ -447,12 +440,16 @@ def commit_workflow_output(
     # or already up-to-date), bail with a clean skip rather than
     # creating an empty commit.
     diff_proc = runner.run(
-        "diff", "--cached", "--quiet", "--", *paths,
+        "diff",
+        "--cached",
+        "--quiet",
+        "--",
+        *paths,
     )
     if diff_proc.returncode == 0:
         logger.info(
-            "git_committer: nothing to commit (paths were already "
-            "tracked or ignored): %s", paths,
+            "git_committer: nothing to commit (paths were already tracked or ignored): %s",
+            paths,
         )
         return CommitResult(
             committed=False,
@@ -475,8 +472,7 @@ def commit_workflow_output(
         if post_diff.returncode != 0:
             # Files were modified by the hook — re-stage + retry.
             logger.info(
-                "git_committer: pre-commit hook modified files; "
-                "re-staging and retrying commit",
+                "git_committer: pre-commit hook modified files; re-staging and retrying commit",
             )
             runner.run("add", "--", *paths)
             commit_proc = runner.run("commit", "-m", message)
@@ -515,7 +511,8 @@ def commit_workflow_output(
 
 
 def _try_push(
-    runner: _GitRunner, branch: str | None,
+    runner: _GitRunner,
+    branch: str | None,
 ) -> tuple[bool, str | None]:
     """Attempt to push *branch* to ``origin``.
 

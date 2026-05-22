@@ -42,15 +42,17 @@ class NATSSkillRegistry:
         return cls(nc, js, kv)
 
     async def register_skill(self, skill: SkillInfo) -> None:
-        data = json.dumps({
-            "name": skill.name,
-            "description": skill.description,
-            "source_path": skill.source_path,
-            "user_invocable": skill.user_invocable,
-            "model_invocable": skill.model_invocable,
-            "allowed_tools": skill.allowed_tools,
-            "metadata": skill.metadata,
-        })
+        data = json.dumps(
+            {
+                "name": skill.name,
+                "description": skill.description,
+                "source_path": skill.source_path,
+                "user_invocable": skill.user_invocable,
+                "model_invocable": skill.model_invocable,
+                "allowed_tools": skill.allowed_tools,
+                "metadata": skill.metadata,
+            }
+        )
         await self._kv.put(skill.name, data.encode())  # type: ignore[union-attr]
 
     async def deregister_skill(self, name: str) -> None:
@@ -87,7 +89,8 @@ class NATSSkillRegistry:
         query_lower = query.lower()
         all_skills = await self.list_skills()
         return [
-            skill for skill in all_skills
+            skill
+            for skill in all_skills
             if query_lower in skill.name.lower() or query_lower in skill.description.lower()
         ]
 

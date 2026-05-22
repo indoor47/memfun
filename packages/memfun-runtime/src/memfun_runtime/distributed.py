@@ -10,6 +10,7 @@ This enables true multi-process, multi-machine agent coordination
 while keeping the same :class:`TaskMessage` / :class:`TaskResult` API
 that the in-process :class:`AgentOrchestrator` uses.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -39,16 +40,19 @@ def _result_topic(task_id: str) -> str:
 
 # ── Serialization helpers ────────────────────────────────────────────
 
+
 def task_to_bytes(task: TaskMessage) -> bytes:
     """Serialize a TaskMessage to JSON bytes for the event bus."""
-    return json.dumps({
-        "task_id": task.task_id,
-        "agent_id": task.agent_id,
-        "payload": task.payload,
-        "correlation_id": task.correlation_id,
-        "parent_task_id": task.parent_task_id,
-        "timestamp": task.timestamp,
-    }).encode()
+    return json.dumps(
+        {
+            "task_id": task.task_id,
+            "agent_id": task.agent_id,
+            "payload": task.payload,
+            "correlation_id": task.correlation_id,
+            "parent_task_id": task.parent_task_id,
+            "timestamp": task.timestamp,
+        }
+    ).encode()
 
 
 def bytes_to_task(data: bytes) -> TaskMessage:
@@ -66,15 +70,17 @@ def bytes_to_task(data: bytes) -> TaskMessage:
 
 def result_to_bytes(result: TaskResult) -> bytes:
     """Serialize a TaskResult to JSON bytes for the event bus."""
-    return json.dumps({
-        "task_id": result.task_id,
-        "agent_id": result.agent_id,
-        "success": result.success,
-        "result": result.result,
-        "error": result.error,
-        "duration_ms": result.duration_ms,
-        "timestamp": result.timestamp,
-    }).encode()
+    return json.dumps(
+        {
+            "task_id": result.task_id,
+            "agent_id": result.agent_id,
+            "success": result.success,
+            "result": result.result,
+            "error": result.error,
+            "duration_ms": result.duration_ms,
+            "timestamp": result.timestamp,
+        }
+    ).encode()
 
 
 def bytes_to_result(data: bytes) -> TaskResult:
@@ -92,6 +98,7 @@ def bytes_to_result(data: bytes) -> TaskResult:
 
 
 # ── Event types for the dashboard ────────────────────────────────────
+
 
 @dataclass(slots=True)
 class DistributedEvent:
@@ -129,24 +136,26 @@ class DistributedEvent:
 
     def to_bytes(self) -> bytes:
         self.ts = self.ts or time.time()
-        return json.dumps({
-            "event_type": self.event_type,
-            "task_id": self.task_id,
-            "agent_name": self.agent_name,
-            "worker_id": self.worker_id,
-            "success": self.success,
-            "duration_ms": self.duration_ms,
-            "detail": self.detail,
-            "ts": self.ts,
-            "project": self.project,
-            "workflow_id": self.workflow_id,
-            "model": self.model,
-            "prompt_preview": self.prompt_preview,
-            "completion_preview": self.completion_preview,
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
-            "error": self.error,
-        }).encode()
+        return json.dumps(
+            {
+                "event_type": self.event_type,
+                "task_id": self.task_id,
+                "agent_name": self.agent_name,
+                "worker_id": self.worker_id,
+                "success": self.success,
+                "duration_ms": self.duration_ms,
+                "detail": self.detail,
+                "ts": self.ts,
+                "project": self.project,
+                "workflow_id": self.workflow_id,
+                "model": self.model,
+                "prompt_preview": self.prompt_preview,
+                "completion_preview": self.completion_preview,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "error": self.error,
+            }
+        ).encode()
 
     @classmethod
     def from_bytes(cls, data: bytes) -> DistributedEvent:
@@ -235,12 +244,14 @@ class DistributedOrchestrator:
 
         async with self._semaphore:
             # Emit dashboard event
-            await self._emit(DistributedEvent(
-                event_type="task.published",
-                task_id=task.task_id,
-                agent_name=agent_name,
-                detail=task.payload.get("query", "")[:200],
-            ))
+            await self._emit(
+                DistributedEvent(
+                    event_type="task.published",
+                    task_id=task.task_id,
+                    agent_name=agent_name,
+                    detail=task.payload.get("query", "")[:200],
+                )
+            )
 
             # Publish task
             await self._bus.publish(TASK_TOPIC, task_to_bytes(stamped), key=task.task_id)
@@ -251,13 +262,15 @@ class DistributedOrchestrator:
             result = await self._wait_for_result(reply_topic, task, agent_name, timeout)
 
             # Emit completion event
-            await self._emit(DistributedEvent(
-                event_type="task.completed",
-                task_id=task.task_id,
-                agent_name=agent_name,
-                success=result.success,
-                duration_ms=result.duration_ms,
-            ))
+            await self._emit(
+                DistributedEvent(
+                    event_type="task.completed",
+                    task_id=task.task_id,
+                    agent_name=agent_name,
+                    success=result.success,
+                    duration_ms=result.duration_ms,
+                )
+            )
 
         return result
 
@@ -273,14 +286,11 @@ class DistributedOrchestrator:
             raise ValueError("tasks and agent_names must have the same length")
 
         coros = [
-            self.dispatch(t, n, timeout=timeout)
-            for t, n in zip(tasks, agent_names, strict=False)
+            self.dispatch(t, n, timeout=timeout) for t, n in zip(tasks, agent_names, strict=False)
         ]
         results = await asyncio.gather(*coros, return_exceptions=True)
         return [
-            self._exception_to_result(r, tasks[i])
-            if isinstance(r, BaseException)
-            else r
+            self._exception_to_result(r, tasks[i]) if isinstance(r, BaseException) else r
             for i, r in enumerate(results)
         ]
 

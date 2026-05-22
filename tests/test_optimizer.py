@@ -1,6 +1,7 @@
 """Tests for memfun-optimizer package: signatures, patterns, discovery,
 synthesizer, skill synthesis, memory store, and memory search.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
@@ -123,7 +124,8 @@ def _make_discovered_agent(
         description=f"A test agent for {task_type}",
         task_type=task_type,
         source_pattern=pattern or _make_pattern(),
-        stages=stages or [
+        stages=stages
+        or [
             {"name": "Read", "kind": "PEEK", "description": "Read source files"},
             {"name": "Query", "kind": "QUERY", "description": "Analyze with LLM"},
         ],
@@ -149,7 +151,7 @@ class TestStrategyExtractor:
     def test_classify_step_peek_read_text(self) -> None:
         """Code with .read_text() is classified as PEEK."""
         extractor = StrategyExtractor()
-        step = _make_trace_step(1, 'content = path.read_text()')
+        step = _make_trace_step(1, "content = path.read_text()")
         result = extractor.classify_step(step)
         assert result.kind == StepKind.PEEK
 
@@ -192,7 +194,7 @@ class TestStrategyExtractor:
     def test_classify_step_batch_query(self) -> None:
         """Code with llm_query_batched() is classified as BATCH_QUERY."""
         extractor = StrategyExtractor()
-        step = _make_trace_step(1, 'results = llm_query_batched(items)')
+        step = _make_trace_step(1, "results = llm_query_batched(items)")
         result = extractor.classify_step(step)
         assert result.kind == StepKind.BATCH_QUERY
 
@@ -214,21 +216,21 @@ class TestStrategyExtractor:
     def test_classify_step_aggregate(self) -> None:
         """Code with .append() is classified as AGGREGATE."""
         extractor = StrategyExtractor()
-        step = _make_trace_step(1, 'results.append(item)')
+        step = _make_trace_step(1, "results.append(item)")
         result = extractor.classify_step(step)
         assert result.kind == StepKind.AGGREGATE
 
     def test_classify_step_transform(self) -> None:
         """Code with json.dumps() is classified as TRANSFORM."""
         extractor = StrategyExtractor()
-        step = _make_trace_step(1, 'output = json.dumps(data)')
+        step = _make_trace_step(1, "output = json.dumps(data)")
         result = extractor.classify_step(step)
         assert result.kind == StepKind.TRANSFORM
 
     def test_classify_step_other(self) -> None:
         """Unrecognized code is classified as OTHER with low confidence."""
         extractor = StrategyExtractor()
-        step = _make_trace_step(1, 'x = 42')
+        step = _make_trace_step(1, "x = 42")
         result = extractor.classify_step(step)
         assert result.kind == StepKind.OTHER
         assert result.confidence == pytest.approx(0.1)
@@ -403,9 +405,7 @@ class TestPatternAnalyzer:
         """find_dominant returns empty list when nothing qualifies."""
         analyzer = PatternAnalyzer()
         patterns = [_make_pattern(frequency=1, confidence=0.1)]
-        dominant = analyzer.find_dominant(
-            patterns, min_frequency=10, min_confidence=0.9
-        )
+        dominant = analyzer.find_dominant(patterns, min_frequency=10, min_confidence=0.9)
         assert dominant == []
 
     def test_rank_by_composite_score(self) -> None:
@@ -539,9 +539,7 @@ class TestDiscoveryPipeline:
         collector.list_trace_ids = AsyncMock(return_value=trace_ids)
         collector.load = AsyncMock(side_effect=lambda tid: trace_map.get(tid))
 
-        pipeline = DiscoveryPipeline(
-            collector, min_traces=3, min_frequency=2, min_confidence=0.3
-        )
+        pipeline = DiscoveryPipeline(collector, min_traces=3, min_frequency=2, min_confidence=0.3)
         discovered = await pipeline.run(task_type="fix")
         assert len(discovered) >= 1
         agent = discovered[0]
@@ -573,11 +571,13 @@ class TestAgentSynthesizer:
     def test_synthesize_source_has_stages(self) -> None:
         """Generated source code contains stage methods."""
         synthesizer = AgentSynthesizer()
-        agent = _make_discovered_agent(stages=[
-            {"name": "Read", "kind": "PEEK", "description": "Read files"},
-            {"name": "Analyze", "kind": "QUERY", "description": "Run LLM"},
-            {"name": "Format", "kind": "TRANSFORM", "description": "Format output"},
-        ])
+        agent = _make_discovered_agent(
+            stages=[
+                {"name": "Read", "kind": "PEEK", "description": "Read files"},
+                {"name": "Analyze", "kind": "QUERY", "description": "Run LLM"},
+                {"name": "Format", "kind": "TRANSFORM", "description": "Format output"},
+            ]
+        )
         result = synthesizer.synthesize(agent)
 
         assert "_stage_1" in result.source_code
@@ -720,12 +720,8 @@ class TestSkillSynthesizer:
     def test_synthesize_confidence_increases_with_traces(self) -> None:
         """More traces should yield higher confidence (all else equal)."""
         synth = SkillSynthesizer(min_pattern_frequency=3)
-        skill_5 = synth.synthesize(
-            self._make_skill_traces(5), task_type="code-review"
-        )
-        skill_15 = synth.synthesize(
-            self._make_skill_traces(15), task_type="code-review"
-        )
+        skill_5 = synth.synthesize(self._make_skill_traces(5), task_type="code-review")
+        skill_15 = synth.synthesize(self._make_skill_traces(15), task_type="code-review")
         assert skill_5 is not None
         assert skill_15 is not None
         assert skill_15.confidence >= skill_5.confidence
@@ -739,9 +735,7 @@ class TestSkillSynthesizer:
                 task_type="misc",
                 query="do something completely abstract",
                 steps=[
-                    _make_trace_step(
-                        1, "x = 42", reasoning="calculating"
-                    ),
+                    _make_trace_step(1, "x = 42", reasoning="calculating"),
                 ],
                 success=True,
             )
@@ -785,9 +779,7 @@ class TestMemoryStore:
     async def test_update_content(self) -> None:
         """Update only the content field of an entry."""
         store = MemoryStore()
-        entry_id = await store.add(
-            topic="perf", content="Original content"
-        )
+        entry_id = await store.add(topic="perf", content="Original content")
         updated = await store.update(entry_id, content="Updated content")
 
         assert updated is not None
@@ -806,9 +798,7 @@ class TestMemoryStore:
     async def test_update_tags(self) -> None:
         """Update only the tags field."""
         store = MemoryStore()
-        entry_id = await store.add(
-            topic="a", content="b", tags=("old",)
-        )
+        entry_id = await store.add(topic="a", content="b", tags=("old",))
         updated = await store.update(entry_id, tags=("new", "tag"))
 
         assert updated is not None
@@ -974,10 +964,7 @@ class TestMemorySearch:
         query = MemoryQuery(query="slow", tags=["cache"])
         results = search.search(query, entries)
         assert len(results) >= 1
-        assert all(
-            any(t in r.entry.tags for t in ["cache"])
-            for r in results
-        )
+        assert all(any(t in r.entry.tags for t in ["cache"]) for r in results)
 
     def test_search_topic_filter(self) -> None:
         """Topic filter restricts results to entries in specified topics."""

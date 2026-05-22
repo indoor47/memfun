@@ -7,9 +7,11 @@ from typing import Any
 
 # ── Event Bus Types ──────────────────────────────────────────────────
 
+
 @dataclass(frozen=True, slots=True)
 class Message:
     """A message received from the event bus."""
+
     id: str
     topic: str
     payload: bytes
@@ -21,6 +23,7 @@ class Message:
 @dataclass(frozen=True, slots=True)
 class TopicConfig:
     """Configuration for creating a topic."""
+
     retention_seconds: int = 86400
     max_consumers: int | None = None
     max_message_bytes: int = 1_048_576
@@ -30,6 +33,7 @@ class TopicConfig:
 
 # ── State Store Types ────────────────────────────────────────────────
 
+
 class StateChangeKind(enum.Enum):
     PUT = "put"
     DELETE = "delete"
@@ -38,6 +42,7 @@ class StateChangeKind(enum.Enum):
 @dataclass(frozen=True, slots=True)
 class StateChange:
     """Notification of a state change on a watched key."""
+
     key: str
     kind: StateChangeKind
     value: bytes | None
@@ -47,9 +52,11 @@ class StateChange:
 
 # ── Sandbox Types ────────────────────────────────────────────────────
 
+
 @dataclass(frozen=True, slots=True)
 class SandboxConfig:
     """Configuration for creating a sandbox."""
+
     language: str = "python"
     timeout_seconds: int = 30
     memory_limit_mb: int = 512
@@ -62,6 +69,7 @@ class SandboxConfig:
 @dataclass(frozen=True, slots=True)
 class SandboxHandle:
     """Opaque handle to a running sandbox."""
+
     id: str
     backend: str
     created_at: float = field(default_factory=time.time)
@@ -70,6 +78,7 @@ class SandboxHandle:
 @dataclass(frozen=True, slots=True)
 class ExecutionResult:
     """Result of executing code in a sandbox."""
+
     stdout: str
     stderr: str
     exit_code: int
@@ -78,6 +87,7 @@ class ExecutionResult:
 
 
 # ── Agent Types ──────────────────────────────────────────────────────
+
 
 class AgentStatusKind(enum.Enum):
     STARTING = "starting"
@@ -91,6 +101,7 @@ class AgentStatusKind(enum.Enum):
 @dataclass(frozen=True, slots=True)
 class AgentStatus:
     """Current status of a running agent."""
+
     agent_id: str
     status: AgentStatusKind
     uptime_seconds: float
@@ -101,6 +112,7 @@ class AgentStatus:
 @dataclass(frozen=True, slots=True)
 class AgentInfo:
     """Metadata about a registered agent."""
+
     agent_id: str
     name: str
     version: str
@@ -111,9 +123,11 @@ class AgentInfo:
 
 # ── Session Types ────────────────────────────────────────────────────
 
+
 @dataclass(frozen=True, slots=True)
 class SessionConfig:
     """Configuration for creating a user session."""
+
     ttl_seconds: int = 3600
     max_history: int = 1000
     metadata: dict[str, str] = field(default_factory=dict)
@@ -122,6 +136,7 @@ class SessionConfig:
 @dataclass(slots=True)
 class Session:
     """A user session with mutable data."""
+
     session_id: str
     user_id: str
     created_at: float
@@ -130,6 +145,7 @@ class Session:
 
 
 # ── Health Types ─────────────────────────────────────────────────────
+
 
 class HealthState(enum.Enum):
     HEALTHY = "healthy"
@@ -141,6 +157,7 @@ class HealthState(enum.Enum):
 @dataclass(frozen=True, slots=True)
 class HealthStatus:
     """Health check result for an agent."""
+
     agent_id: str
     state: HealthState
     last_heartbeat: float
@@ -150,9 +167,11 @@ class HealthStatus:
 
 # ── Task Types (for agent delegation) ───────────────────────────────
 
+
 @dataclass(frozen=True, slots=True)
 class TaskMessage:
     """A task to be processed by an agent."""
+
     task_id: str
     agent_id: str
     payload: dict[str, Any]
@@ -164,6 +183,7 @@ class TaskMessage:
 @dataclass(frozen=True, slots=True)
 class TaskResult:
     """Result of a task processed by an agent."""
+
     task_id: str
     agent_id: str
     success: bool

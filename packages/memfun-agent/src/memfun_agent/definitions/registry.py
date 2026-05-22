@@ -1,4 +1,5 @@
 """Registry bridge: connects the agent definition loader to the runtime RegistryAdapter."""
+
 from __future__ import annotations
 
 import logging

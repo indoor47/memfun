@@ -1,4 +1,5 @@
 """Protocol interfaces for the Memfun pluggable runtime."""
+
 from __future__ import annotations
 
 from memfun_runtime.protocols.event_bus import EventBusAdapter

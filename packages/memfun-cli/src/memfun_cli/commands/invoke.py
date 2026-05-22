@@ -1,4 +1,5 @@
 """Skill invocation: resolve a skill by name and display its instructions."""
+
 from __future__ import annotations
 
 import typer
@@ -36,10 +37,7 @@ def invoke_skill(
         console.print(f"[red]Skill not found:[/red] '{skill_name}'")
         available = [s.name for s in skills if s.user_invocable]
         if available:
-            console.print(
-                "[dim]Available skills: "
-                f"{', '.join(sorted(available))}[/dim]"
-            )
+            console.print(f"[dim]Available skills: {', '.join(sorted(available))}[/dim]")
         else:
             console.print(
                 "[dim]No user-invocable skills discovered. "
@@ -68,36 +66,36 @@ def invoke_skill(
     if match.tags:
         meta_lines.append(f"[bold]Tags:[/bold]    {', '.join(match.tags)}")
     if match.allowed_tools:
-        meta_lines.append(
-            f"[bold]Tools:[/bold]   {', '.join(match.allowed_tools)}"
-        )
+        meta_lines.append(f"[bold]Tools:[/bold]   {', '.join(match.allowed_tools)}")
     if args_display:
         meta_lines.append(f"[bold]Args:[/bold]    {args_display}")
 
-    console.print(Panel(
-        "\n".join(meta_lines),
-        title=title,
-        subtitle="skill invocation",
-        border_style="cyan",
-    ))
+    console.print(
+        Panel(
+            "\n".join(meta_lines),
+            title=title,
+            subtitle="skill invocation",
+            border_style="cyan",
+        )
+    )
 
     # Instructions that would be sent to the agent
     if match.instructions:
         console.print()
-        console.print(Panel(
-            Syntax(
-                match.instructions,
-                "markdown",
-                theme="monokai",
-                word_wrap=True,
-            ),
-            title="Instructions (would be sent to agent)",
-            border_style="dim",
-        ))
-    else:
         console.print(
-            "\n[dim]This skill has no instruction body.[/dim]"
+            Panel(
+                Syntax(
+                    match.instructions,
+                    "markdown",
+                    theme="monokai",
+                    word_wrap=True,
+                ),
+                title="Instructions (would be sent to agent)",
+                border_style="dim",
+            )
         )
+    else:
+        console.print("\n[dim]This skill has no instruction body.[/dim]")
 
     console.print()
     console.print(

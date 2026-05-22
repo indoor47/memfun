@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 @dataclass(frozen=True, slots=True)
 class SkillInfo:
     """Metadata about a registered skill."""
+
     name: str
     description: str
     source_path: str

@@ -1,4 +1,5 @@
 """Memfun Runtime: pluggable backend architecture for autonomous agents."""
+
 from __future__ import annotations
 
 from memfun_runtime.agent import BaseAgent, agent, get_agent_registry

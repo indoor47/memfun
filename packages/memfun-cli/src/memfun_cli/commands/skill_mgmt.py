@@ -3,6 +3,7 @@
 These functions are registered onto the existing ``skill_app`` Typer
 sub-application in ``main.py``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -47,9 +48,7 @@ def skill_search(
     results = router.route_all(query, skills)
 
     if not results:
-        console.print(
-            f"[yellow]No skills matched query:[/yellow] '{query}'"
-        )
+        console.print(f"[yellow]No skills matched query:[/yellow] '{query}'")
         console.print(
             f"[dim]{len(skills)} skill(s) available. "
             "Try a different query or run 'memfun skill list'.[/dim]"
@@ -81,9 +80,7 @@ def skill_search(
 
 def skill_invoke(
     name: str = typer.Argument(..., help="Name of the skill to invoke"),
-    query: str = typer.Argument(
-        "", help="Query or input for the skill (optional)"
-    ),
+    query: str = typer.Argument("", help="Query or input for the skill (optional)"),
 ) -> None:
     """Invoke a skill by name (dry-run: builds execution prompt)."""
     loader = _build_loader()
@@ -94,9 +91,7 @@ def skill_invoke(
         console.print(f"[red]Skill not found:[/red] '{name}'")
         available = [s.name for s in skills]
         if available:
-            console.print(
-                f"[dim]Available skills: {', '.join(sorted(available))}[/dim]"
-            )
+            console.print(f"[dim]Available skills: {', '.join(sorted(available))}[/dim]")
         raise typer.Exit(1)
 
     # Activate the skill (resolve references, map tools)
@@ -110,9 +105,7 @@ def skill_invoke(
     try:
         activated = asyncio.run(activator.activate(match, context))
     except Exception as exc:
-        console.print(
-            f"[red]Activation error:[/red] {type(exc).__name__}: {exc}"
-        )
+        console.print(f"[red]Activation error:[/red] {type(exc).__name__}: {exc}")
         raise typer.Exit(1) from None
 
     # Execute in dry-run mode (no LLM callback)
@@ -122,9 +115,7 @@ def skill_invoke(
     try:
         result = asyncio.run(executor.execute(activated, task_payload))
     except Exception as exc:
-        console.print(
-            f"[red]Execution error:[/red] {type(exc).__name__}: {exc}"
-        )
+        console.print(f"[red]Execution error:[/red] {type(exc).__name__}: {exc}")
         raise typer.Exit(1) from None
 
     # Show skill metadata
@@ -133,25 +124,27 @@ def skill_invoke(
         f"[bold]Source:[/bold]  {match.source_path}",
     ]
     if activated.mapped_tools:
-        meta_lines.append(
-            f"[bold]Tools:[/bold]   {', '.join(activated.mapped_tools)}"
-        )
+        meta_lines.append(f"[bold]Tools:[/bold]   {', '.join(activated.mapped_tools)}")
     meta_lines.append(f"[bold]Duration:[/bold] {result.duration_ms:.1f}ms")
 
-    console.print(Panel(
-        "\n".join(meta_lines),
-        title=f"Skill Invocation: {match.name}",
-        subtitle="dry-run",
-        border_style="cyan",
-    ))
+    console.print(
+        Panel(
+            "\n".join(meta_lines),
+            title=f"Skill Invocation: {match.name}",
+            subtitle="dry-run",
+            border_style="cyan",
+        )
+    )
 
     # Show assembled prompt
     console.print()
-    console.print(Panel(
-        Syntax(result.output, "markdown", theme="monokai", word_wrap=True),
-        title="Assembled Prompt (dry-run)",
-        border_style="dim",
-    ))
+    console.print(
+        Panel(
+            Syntax(result.output, "markdown", theme="monokai", word_wrap=True),
+            title="Assembled Prompt (dry-run)",
+            border_style="dim",
+        )
+    )
 
     console.print()
     console.print(
@@ -168,9 +161,7 @@ def skill_create(
     skill_dir = skills_dir / name
 
     if skill_dir.exists():
-        console.print(
-            f"[red]Skill directory already exists:[/red] {skill_dir}"
-        )
+        console.print(f"[red]Skill directory already exists:[/red] {skill_dir}")
         raise typer.Exit(1)
 
     # Create the skill directory structure
@@ -181,15 +172,17 @@ def skill_create(
     skill_file = skill_dir / "SKILL.md"
     skill_file.write_text(template, encoding="utf-8")
 
-    console.print(Panel(
-        f"[bold]Created:[/bold] {skill_file}\n"
-        f"[bold]Directory:[/bold] {skill_dir}\n\n"
-        "Edit the SKILL.md file to customize the skill's metadata\n"
-        "and instructions. Then validate with:\n\n"
-        f"  memfun skill validate {skill_dir}",
-        title=f"New Skill: {name}",
-        border_style="green",
-    ))
+    console.print(
+        Panel(
+            f"[bold]Created:[/bold] {skill_file}\n"
+            f"[bold]Directory:[/bold] {skill_dir}\n\n"
+            "Edit the SKILL.md file to customize the skill's metadata\n"
+            "and instructions. Then validate with:\n\n"
+            f"  memfun skill validate {skill_dir}",
+            title=f"New Skill: {name}",
+            border_style="green",
+        )
+    )
 
 
 def _build_skill_template(name: str) -> str:

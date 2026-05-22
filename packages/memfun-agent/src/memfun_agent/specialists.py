@@ -5,6 +5,7 @@ prompts, reduced iteration caps, and shared-spec awareness.  Each
 is registered via the ``@agent`` decorator so that
 :class:`AgentManager` can instantiate them by name.
 """
+
 from __future__ import annotations
 
 import os
@@ -142,10 +143,12 @@ class _SpecialistBase(BaseAgent):
                 from memfun_agent.context_first import ContextGatherer
 
                 gatherer = ContextGatherer(
-                    max_bytes=100_000, max_files=10,
+                    max_bytes=100_000,
+                    max_files=10,
                 )
                 extra = await gatherer.agather(
-                    files=inputs, project_root=task_cwd,
+                    files=inputs,
+                    project_root=task_cwd,
                 )
                 if extra.strip():
                     context = extra + "\n\n" + context
@@ -165,16 +168,14 @@ class _SpecialistBase(BaseAgent):
 
                 project_root = Path(task_cwd)
                 existing = await read_affected_files(
-                    outputs, project_root,
+                    outputs,
+                    project_root,
                 )
                 if existing.strip():
                     context = (
                         "=== EXISTING OUTPUT FILES (DO NOT REWRITE "
                         "FROM SCRATCH — use edit_file to modify) "
-                        "===\n"
-                        + existing
-                        + "\n\n"
-                        + context
+                        "===\n" + existing + "\n\n" + context
                     )
             except Exception:
                 logger.debug(
@@ -263,10 +264,7 @@ class _SpecialistBase(BaseAgent):
                 "answer": rlm_result.answer,
                 "method": f"specialist_{self._SPECIALIST_TYPE}",
                 "iterations": rlm_result.iterations,
-                "ops": [
-                    {"type": o[0], "target": o[1], "detail": o[2]}
-                    for o in rlm_result.ops
-                ],
+                "ops": [{"type": o[0], "target": o[1], "detail": o[2]} for o in rlm_result.ops],
                 "files_created": rlm_result.files_created,
                 "trajectory_length": len(rlm_result.trajectory),
                 "final_reasoning": rlm_result.final_reasoning,
@@ -274,7 +272,6 @@ class _SpecialistBase(BaseAgent):
             error=rlm_result.error,
             duration_ms=elapsed_ms,
         )
-
 
     async def _post_process(
         self,
@@ -324,11 +321,13 @@ class _SpecialistBase(BaseAgent):
                 if not vr.passed:
                     logger.info(
                         "%s: verification failed, attempting fix: %s",
-                        self.agent_id, vr.errors[:200],
+                        self.agent_id,
+                        vr.errors[:200],
                     )
                     _update_activity("Fixing lint errors...")
                     current = await read_affected_files(
-                        rlm_result.files_created, project_root,
+                        rlm_result.files_created,
+                        project_root,
                     )
                     if current:
                         fix_solver = FixSolver()
@@ -340,7 +339,8 @@ class _SpecialistBase(BaseAgent):
                             )
                             if fix_ops:
                                 executor = OperationExecutor(
-                                    project_root, edit_only=True,
+                                    project_root,
+                                    edit_only=True,
                                 )
                                 await executor.execute(fix_ops)
                                 extra_ops.extend(executor.ops)
@@ -348,7 +348,8 @@ class _SpecialistBase(BaseAgent):
                         except Exception as exc:
                             logger.warning(
                                 "%s: fix solver failed: %s",
-                                self.agent_id, exc,
+                                self.agent_id,
+                                exc,
                             )
 
             # ── Phase 2: Consistency review + polish ───────────
@@ -360,22 +361,19 @@ class _SpecialistBase(BaseAgent):
                     reviewer = ConsistencyReviewer()
                     review = await reviewer.areview(
                         user_request=query,
-                        intended_changes=(
-                            f"Agent answer:\n{rlm_result.answer[:2000]}"
-                        ),
+                        intended_changes=(f"Agent answer:\n{rlm_result.answer[:2000]}"),
                         actual_file_contents=actual,
                     )
                     if review.has_issues and review.issues:
                         logger.info(
                             "%s: %d consistency issues, polishing",
-                            self.agent_id, len(review.issues),
+                            self.agent_id,
+                            len(review.issues),
                         )
                         _update_activity("Polishing...")
                         issues_text = (
                             "CONSISTENCY REVIEW ISSUES:\n"
-                            + "\n".join(
-                                f"- {i}" for i in review.issues
-                            )
+                            + "\n".join(f"- {i}" for i in review.issues)
                             + f"\n\nReasoning: {review.reasoning}"
                         )
                         fix_solver = FixSolver()
@@ -386,7 +384,8 @@ class _SpecialistBase(BaseAgent):
                         )
                         if polish_ops:
                             executor = OperationExecutor(
-                                project_root, edit_only=True,
+                                project_root,
+                                edit_only=True,
                             )
                             await executor.execute(polish_ops)
                             extra_ops.extend(executor.ops)
@@ -401,7 +400,8 @@ class _SpecialistBase(BaseAgent):
             # Post-processing is best-effort — never block the pipeline.
             logger.warning(
                 "%s: post-processing failed (non-fatal): %s",
-                self.agent_id, exc,
+                self.agent_id,
+                exc,
             )
         finally:
             AGENT_ACTIVITY.pop(sub_task_id, None)
@@ -409,9 +409,7 @@ class _SpecialistBase(BaseAgent):
         # Merge extras into result.
         if extra_ops or extra_files:
             rlm_result.ops = list(rlm_result.ops) + extra_ops
-            rlm_result.files_created = list(set(
-                rlm_result.files_created + extra_files
-            ))
+            rlm_result.files_created = list(set(rlm_result.files_created + extra_files))
 
         return rlm_result
 

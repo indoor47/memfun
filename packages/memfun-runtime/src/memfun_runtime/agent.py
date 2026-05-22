@@ -68,6 +68,7 @@ def agent(
             async def handle(self, task: TaskMessage) -> TaskResult:
                 ...
     """
+
     def decorator(cls: type[BaseAgent]) -> type[BaseAgent]:
         cls._agent_meta = {  # type: ignore[attr-defined]
             "name": name,
@@ -77,6 +78,7 @@ def agent(
         _AGENT_REGISTRY[name] = cls
         logger.debug("Registered agent: %s v%s", name, version)
         return cls
+
     return decorator
 
 

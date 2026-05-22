@@ -27,6 +27,7 @@ class InProcessSkillRegistry:
     async def search_skills(self, query: str) -> list[SkillInfo]:
         query_lower = query.lower()
         return [
-            skill for skill in self._skills.values()
+            skill
+            for skill in self._skills.values()
             if query_lower in skill.name.lower() or query_lower in skill.description.lower()
         ]

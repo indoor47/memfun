@@ -25,7 +25,8 @@ async def create_pool(redis_url: str) -> Redis:
         ) from exc
 
     client: Redis = AsyncRedis.from_url(
-        redis_url, decode_responses=False,
+        redis_url,
+        decode_responses=False,
     )
     try:
         await client.ping()

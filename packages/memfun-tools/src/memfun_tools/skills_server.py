@@ -1,4 +1,5 @@
 """MCP tool server exposing memfun skills as tools."""
+
 from __future__ import annotations
 
 from fastmcp import FastMCP
@@ -7,9 +8,7 @@ skills_server = FastMCP("memfun-skills")
 
 
 @skills_server.tool()
-async def invoke_skill(
-    skill_name: str, query: str, context: str = ""
-) -> str:
+async def invoke_skill(skill_name: str, query: str, context: str = "") -> str:
     """Invoke a skill by name (dry-run prompt assembly).
 
     Discovers the skill definition, activates it (resolves references
@@ -40,10 +39,7 @@ async def invoke_skill(
 
     if skill is None:
         available = ", ".join(s.name for s in skills)
-        return (
-            f"Skill '{skill_name}' not found. "
-            f"Available skills: {available}"
-        )
+        return f"Skill '{skill_name}' not found. Available skills: {available}"
 
     exec_context = SkillExecutionContext(
         skill=skill,
@@ -118,14 +114,10 @@ async def search_skills(query: str) -> str:
     if not scored:
         return f"No skills matched query: '{query}'"
 
-    lines: list[str] = [
-        f"Found {len(scored)} match(es) for '{query}':\n"
-    ]
+    lines: list[str] = [f"Found {len(scored)} match(es) for '{query}':\n"]
     for s in scored:
         reasons = ", ".join(s.match_reasons)
-        lines.append(
-            f"- **{s.skill.name}** (score: {s.score}) -- {reasons}"
-        )
+        lines.append(f"- **{s.skill.name}** (score: {s.score}) -- {reasons}")
         lines.append(f"  {s.skill.description}")
         lines.append("")
 
@@ -156,10 +148,7 @@ async def get_skill_info(skill_name: str) -> str:
 
     if skill is None:
         available = ", ".join(s.name for s in skills)
-        return (
-            f"Skill '{skill_name}' not found. "
-            f"Available skills: {available}"
-        )
+        return f"Skill '{skill_name}' not found. Available skills: {available}"
 
     tags = ", ".join(skill.tags) if skill.tags else "(none)"
     tools = ", ".join(skill.allowed_tools) if skill.allowed_tools else "(none)"

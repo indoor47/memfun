@@ -1,4 +1,5 @@
 """T3 NATS Backend: distributed, NATS JetStream-backed runtime adapters."""
+
 from __future__ import annotations
 
 from memfun_runtime.backends.nats.event_bus import NATSEventBus

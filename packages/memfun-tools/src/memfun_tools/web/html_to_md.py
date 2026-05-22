@@ -8,6 +8,7 @@ def html_to_markdown(html: str, max_length: int = 50000) -> str:
     """
     try:
         from markdownify import markdownify
+
         md = markdownify(html, heading_style="ATX", strip=["img", "script", "style"])
     except ImportError:
         md = _basic_strip(html)
@@ -35,6 +36,7 @@ def html_to_markdown(html: str, max_length: int = 50000) -> str:
 def _basic_strip(html: str) -> str:
     """Basic HTML tag stripping fallback."""
     import re
+
     text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL)
     text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL)
     text = re.sub(r"<[^>]+>", "", text)

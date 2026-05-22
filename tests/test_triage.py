@@ -1,4 +1,5 @@
 """Tests for QueryTriage enrichment and workflow routing."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -40,7 +41,7 @@ class TestBuildTriageSummary:
     def test_extracts_project_type_pyproject(self) -> None:
         context = (
             "--- pyproject.toml ---\n"
-            "[project]\nname = \"myapp\"\nversion = \"1.0\"\n"
+            '[project]\nname = "myapp"\nversion = "1.0"\n'
             "--- Code Map ---\napp.py (1 KB)\n"
         )
         result = self._build(context)
@@ -93,7 +94,11 @@ class TestTriageCategoryValidation:
     def test_invalid_category_normalizes_to_project(self) -> None:
         """Unknown categories should fall back to 'project'."""
         valid = (
-            "direct", "project", "task", "web", "workflow",
+            "direct",
+            "project",
+            "task",
+            "web",
+            "workflow",
         )
         assert "unknown" not in valid
         assert "complex" not in valid
@@ -117,15 +122,11 @@ class TestWorkflowRouting:
 
         from memfun_cli.commands.chat import ChatSession
 
-        src = inspect.getsource(
-            ChatSession._try_workflow_or_single
-        )
+        src = inspect.getsource(ChatSession._try_workflow_or_single)
         # "workflow" routing should appear BEFORE "task" routing
         wf_idx = src.index('category == "workflow"')
         task_idx = src.index('category == "task"')
-        assert wf_idx < task_idx, (
-            "'workflow' routing must come before 'task' routing"
-        )
+        assert wf_idx < task_idx, "'workflow' routing must come before 'task' routing"
 
     @pytest.mark.asyncio
     async def test_workflow_fallback_to_single_agent(
@@ -136,9 +137,7 @@ class TestWorkflowRouting:
 
         from memfun_cli.commands.chat import ChatSession
 
-        src = inspect.getsource(
-            ChatSession._try_workflow_or_single
-        )
+        src = inspect.getsource(ChatSession._try_workflow_or_single)
         # After workflow failure, should fall through (not raise)
         assert "falling back to single-agent" in src
 
@@ -154,9 +153,7 @@ class TestQueryTriageSignature:
     ) -> None:
         from memfun_agent.signatures import QueryTriage
 
-        desc = QueryTriage.model_fields[
-            "category"
-        ].json_schema_extra["desc"]
+        desc = QueryTriage.model_fields["category"].json_schema_extra["desc"]
         assert "workflow" in desc.lower()
 
     def test_signature_has_task_and_workflow_distinction(
@@ -164,9 +161,7 @@ class TestQueryTriageSignature:
     ) -> None:
         from memfun_agent.signatures import QueryTriage
 
-        desc = QueryTriage.model_fields[
-            "category"
-        ].json_schema_extra["desc"]
+        desc = QueryTriage.model_fields["category"].json_schema_extra["desc"]
         # 'task' is DEFAULT, 'workflow' is EXTREMELY RARE
         assert "task" in desc.lower()
         assert "workflow" in desc.lower()
@@ -176,9 +171,7 @@ class TestQueryTriageSignature:
     ) -> None:
         from memfun_agent.signatures import QueryTriage
 
-        desc = QueryTriage.model_fields[
-            "project_summary"
-        ].json_schema_extra["desc"]
+        desc = QueryTriage.model_fields["project_summary"].json_schema_extra["desc"]
         assert "code map" in desc.lower()
 
 
@@ -273,8 +266,10 @@ class TestDecomposerGroupValidation:
         tasks = [
             SubTask(id="T1", description="a", agent_type="coder"),
             SubTask(
-                id="T2", description="b",
-                agent_type="coder", depends_on=["T1"],
+                id="T2",
+                description="b",
+                agent_type="coder",
+                depends_on=["T1"],
             ),
             SubTask(id="T3", description="c", agent_type="coder"),
         ]
@@ -360,10 +355,7 @@ class TestDecomposerGroupValidation:
             is_single_task=False,
         )
         known_ids = {t.id for t in result.sub_tasks}
-        group_ids = {
-            tid for grp in result.parallelism_groups
-            for tid in grp
-        }
+        group_ids = {tid for grp in result.parallelism_groups for tid in grp}
         assert group_ids.issubset(known_ids)
 
 
@@ -387,7 +379,8 @@ class TestWorkflowGroupExecution:
         state.sub_task_statuses["T1"] = SubTaskStatus(
             task_id="test123_T1",
             sub_task=SubTask(
-                id="T1", description="do stuff",
+                id="T1",
+                description="do stuff",
                 agent_type="coder",
             ),
             agent_name="coder-agent",
@@ -395,10 +388,14 @@ class TestWorkflowGroupExecution:
         # result is None (default) — agent never ran.
 
         review = ReviewResult(
-            approved=True, issues=[], summary="ok",
+            approved=True,
+            issues=[],
+            summary="ok",
         )
         wf_result = WorkflowEngine._build_result(
-            state, review, 100.0,
+            state,
+            review,
+            100.0,
         )
         assert "No result" in wf_result.answer
         assert "coder-agent" in wf_result.answer
@@ -419,7 +416,8 @@ class TestWorkflowGroupExecution:
         state.sub_task_statuses["T1"] = SubTaskStatus(
             task_id="test456_T1",
             sub_task=SubTask(
-                id="T1", description="write code",
+                id="T1",
+                description="write code",
                 agent_type="coder",
             ),
             agent_name="coder-agent",
@@ -436,10 +434,14 @@ class TestWorkflowGroupExecution:
         )
 
         review = ReviewResult(
-            approved=True, issues=[], summary="ok",
+            approved=True,
+            issues=[],
+            summary="ok",
         )
         wf_result = WorkflowEngine._build_result(
-            state, review, 200.0,
+            state,
+            review,
+            200.0,
         )
         assert "No result" not in wf_result.answer
         assert "Done! Created app.py" in wf_result.answer
@@ -501,7 +503,8 @@ class TestReadAffectedFiles:
         from memfun_agent.context_first import read_affected_files
 
         result = await read_affected_files(
-            [str(tmp_path / "nonexistent.py")], tmp_path,
+            [str(tmp_path / "nonexistent.py")],
+            tmp_path,
         )
         assert result == ""
 
@@ -552,9 +555,7 @@ class TestWriteFileOverwriteGuard:
         """write_file should block when new content loses >30% of lines."""
         from memfun_agent.rlm import _make_write_file
 
-        ns: dict[str, dict[str, list[object]]] = {
-            "state": {"_ops": [], "_files": []}
-        }
+        ns: dict[str, dict[str, list[object]]] = {"state": {"_ops": [], "_files": []}}
         write_file = _make_write_file(ns)
 
         # Create a file with 20 lines.
@@ -575,9 +576,7 @@ class TestWriteFileOverwriteGuard:
         """write_file should allow overwrites that don't lose lines."""
         from memfun_agent.rlm import _make_write_file
 
-        ns: dict[str, dict[str, list[object]]] = {
-            "state": {"_ops": [], "_files": []}
-        }
+        ns: dict[str, dict[str, list[object]]] = {"state": {"_ops": [], "_files": []}}
         write_file = _make_write_file(ns)
 
         fpath = tmp_path / "app.py"
@@ -595,9 +594,7 @@ class TestWriteFileOverwriteGuard:
         """write_file should allow writing new files freely."""
         from memfun_agent.rlm import _make_write_file
 
-        ns: dict[str, dict[str, list[object]]] = {
-            "state": {"_ops": [], "_files": []}
-        }
+        ns: dict[str, dict[str, list[object]]] = {"state": {"_ops": [], "_files": []}}
         write_file = _make_write_file(ns)
 
         fpath = tmp_path / "new_file.py"
@@ -611,9 +608,7 @@ class TestWriteFileOverwriteGuard:
         """write_file should allow overwriting small files (<=10 lines)."""
         from memfun_agent.rlm import _make_write_file
 
-        ns: dict[str, dict[str, list[object]]] = {
-            "state": {"_ops": [], "_files": []}
-        }
+        ns: dict[str, dict[str, list[object]]] = {"state": {"_ops": [], "_files": []}}
         write_file = _make_write_file(ns)
 
         fpath = tmp_path / "small.py"
@@ -660,9 +655,7 @@ class TestReadFileCaching:
     def test_first_read_returns_full_content(self, tmp_path: Path) -> None:
         from memfun_agent.rlm import _make_read_file
 
-        ns: dict[str, dict[str, list[object]]] = {
-            "state": {"_ops": [], "_files": []}
-        }
+        ns: dict[str, dict[str, list[object]]] = {"state": {"_ops": [], "_files": []}}
         read_file = _make_read_file(ns)
 
         fpath = tmp_path / "app.py"
@@ -675,9 +668,7 @@ class TestReadFileCaching:
     def test_second_read_returns_cache_message(self, tmp_path: Path) -> None:
         from memfun_agent.rlm import _make_read_file
 
-        ns: dict[str, dict[str, list[object]]] = {
-            "state": {"_ops": [], "_files": []}
-        }
+        ns: dict[str, dict[str, list[object]]] = {"state": {"_ops": [], "_files": []}}
         read_file = _make_read_file(ns)
 
         fpath = tmp_path / "app.py"
@@ -693,13 +684,12 @@ class TestReadFileCaching:
         assert "x = 1" not in result2
 
     def test_read_after_file_change_returns_new_content(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         from memfun_agent.rlm import _make_read_file
 
-        ns: dict[str, dict[str, list[object]]] = {
-            "state": {"_ops": [], "_files": []}
-        }
+        ns: dict[str, dict[str, list[object]]] = {"state": {"_ops": [], "_files": []}}
         read_file = _make_read_file(ns)
 
         fpath = tmp_path / "app.py"
@@ -719,9 +709,7 @@ class TestReadFileCaching:
         """Both cached and uncached reads should log ops."""
         from memfun_agent.rlm import _make_read_file
 
-        ns: dict[str, dict[str, list[object]]] = {
-            "state": {"_ops": [], "_files": []}
-        }
+        ns: dict[str, dict[str, list[object]]] = {"state": {"_ops": [], "_files": []}}
         read_file = _make_read_file(ns)
 
         fpath = tmp_path / "app.py"
@@ -739,7 +727,8 @@ class TestEditOnlyExecutor:
 
     @pytest.mark.asyncio
     async def test_edit_only_blocks_write_on_existing_file(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         from memfun_agent.context_first import OperationExecutor
 
@@ -747,11 +736,14 @@ class TestEditOnlyExecutor:
         fpath.write_text("original content\n")
 
         executor = OperationExecutor(
-            tmp_path, edit_only=True,
+            tmp_path,
+            edit_only=True,
         )
-        await executor.execute([
-            {"op": "write_file", "path": str(fpath), "content": "new"},
-        ])
+        await executor.execute(
+            [
+                {"op": "write_file", "path": str(fpath), "content": "new"},
+            ]
+        )
 
         # File should be unchanged.
         assert fpath.read_text() == "original content\n"
@@ -760,18 +752,22 @@ class TestEditOnlyExecutor:
 
     @pytest.mark.asyncio
     async def test_edit_only_allows_write_new_file(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         from memfun_agent.context_first import OperationExecutor
 
         fpath = tmp_path / "new_file.py"
 
         executor = OperationExecutor(
-            tmp_path, edit_only=True,
+            tmp_path,
+            edit_only=True,
         )
-        await executor.execute([
-            {"op": "write_file", "path": str(fpath), "content": "hello"},
-        ])
+        await executor.execute(
+            [
+                {"op": "write_file", "path": str(fpath), "content": "hello"},
+            ]
+        )
 
         # New file should be created.
         assert fpath.read_text() == "hello"
@@ -780,7 +776,8 @@ class TestEditOnlyExecutor:
 
     @pytest.mark.asyncio
     async def test_edit_only_allows_edit_file(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         from memfun_agent.context_first import OperationExecutor
 
@@ -788,16 +785,19 @@ class TestEditOnlyExecutor:
         fpath.write_text("old_value = 1\n")
 
         executor = OperationExecutor(
-            tmp_path, edit_only=True,
+            tmp_path,
+            edit_only=True,
         )
-        await executor.execute([
-            {
-                "op": "edit_file",
-                "path": str(fpath),
-                "old": "old_value = 1",
-                "new": "new_value = 42",
-            },
-        ])
+        await executor.execute(
+            [
+                {
+                    "op": "edit_file",
+                    "path": str(fpath),
+                    "old": "old_value = 1",
+                    "new": "new_value = 42",
+                },
+            ]
+        )
 
         assert "new_value = 42" in fpath.read_text()
         assert executor.failed == 0

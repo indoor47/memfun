@@ -1,4 +1,5 @@
 """Skill validation: checks skill definitions against the agentskills.io spec."""
+
 from __future__ import annotations
 
 import re
@@ -41,8 +42,7 @@ class SkillValidator:
                 )
             if not _NAME_PATTERN.match(skill.name):
                 errors.append(
-                    f"Skill name must be lowercase alphanumeric with hyphens: "
-                    f"'{skill.name}'."
+                    f"Skill name must be lowercase alphanumeric with hyphens: '{skill.name}'."
                 )
 
         # Description checks
@@ -56,15 +56,11 @@ class SkillValidator:
 
         # Version check (semver)
         if skill.version and not _SEMVER_PATTERN.match(skill.version):
-            errors.append(
-                f"Skill version is not valid SemVer: '{skill.version}'."
-            )
+            errors.append(f"Skill version is not valid SemVer: '{skill.version}'.")
 
         # If scripts directory exists, allowed_tools should not be empty
         if skill.scripts_dir is not None and not skill.allowed_tools:
-            errors.append(
-                "Skill has a scripts/ directory but no allowed-tools declared."
-            )
+            errors.append("Skill has a scripts/ directory but no allowed-tools declared.")
 
         return errors
 

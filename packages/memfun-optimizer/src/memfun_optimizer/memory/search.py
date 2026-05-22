@@ -4,6 +4,7 @@ This module provides a pure-Python search implementation with no external
 dependencies. It uses a simple inverted index and TF-IDF-like scoring to
 rank memory entries by relevance.
 """
+
 from __future__ import annotations
 
 import math
@@ -19,12 +20,46 @@ if TYPE_CHECKING:
     )
 
 # Common English stopwords to filter out
-_STOPWORDS = frozenset({
-    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
-    "has", "he", "in", "is", "it", "its", "of", "on", "that", "the",
-    "to", "was", "will", "with", "this", "but", "they", "have",
-    "had", "what", "when", "where", "who", "which", "why", "how",
-})
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "has",
+        "he",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "that",
+        "the",
+        "to",
+        "was",
+        "will",
+        "with",
+        "this",
+        "but",
+        "they",
+        "have",
+        "had",
+        "what",
+        "when",
+        "where",
+        "who",
+        "which",
+        "why",
+        "how",
+    }
+)
 
 
 class MemorySearch:
@@ -89,11 +124,13 @@ class MemorySearch:
 
         for entry in entries:
             # Combine all searchable text
-            searchable_text = " ".join([
-                entry.topic,
-                entry.content,
-                *entry.tags,
-            ])
+            searchable_text = " ".join(
+                [
+                    entry.topic,
+                    entry.content,
+                    *entry.tags,
+                ]
+            )
             terms = set(self._tokenize(searchable_text))
 
             for term in terms:
@@ -149,9 +186,9 @@ class MemorySearch:
                 score += len(matching_tags) * 5.0
 
             # Content keyword matching with IDF weighting
-            entry_terms = set(self._tokenize(
-                f"{entry.topic} {entry.content} {' '.join(entry.tags)}"
-            ))
+            entry_terms = set(
+                self._tokenize(f"{entry.topic} {entry.content} {' '.join(entry.tags)}")
+            )
 
             for term in query_terms:
                 if term in entry_terms:
@@ -174,7 +211,7 @@ class MemorySearch:
         scored_results.sort(key=lambda x: x[0], reverse=True)
 
         # Limit results
-        scored_results = scored_results[:query.limit]
+        scored_results = scored_results[: query.limit]
 
         # Convert to MemorySearchResult objects
         return [

@@ -55,21 +55,25 @@ class NATSLifecycle:
             pass
 
         now = time.time()
-        payload = json.dumps({
-            "status": "running",
-            "uptime_start": now,
-            "last_heartbeat": now,
-            "error": None,
-        })
+        payload = json.dumps(
+            {
+                "status": "running",
+                "uptime_start": now,
+                "last_heartbeat": now,
+                "error": None,
+            }
+        )
         await self._kv.put(agent_id, payload.encode())  # type: ignore[union-attr]
 
     async def stop(self, agent_id: str) -> None:
-        payload = json.dumps({
-            "status": "stopped",
-            "uptime_start": None,
-            "last_heartbeat": time.time(),
-            "error": None,
-        })
+        payload = json.dumps(
+            {
+                "status": "stopped",
+                "uptime_start": None,
+                "last_heartbeat": time.time(),
+                "error": None,
+            }
+        )
         await self._kv.put(agent_id, payload.encode())  # type: ignore[union-attr]
 
     async def restart(self, agent_id: str) -> None:

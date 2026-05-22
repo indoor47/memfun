@@ -2,6 +2,7 @@
 
 Tests deictic reference resolution for short/ambiguous user queries.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch

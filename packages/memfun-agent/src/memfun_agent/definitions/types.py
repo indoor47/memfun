@@ -1,4 +1,5 @@
 """Agent definition types for the AGENT.md system."""
+
 from __future__ import annotations
 
 import time

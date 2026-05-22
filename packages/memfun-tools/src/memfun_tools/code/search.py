@@ -46,8 +46,7 @@ async def grep(
     rg = shutil.which("rg")
     if not rg:
         raise RuntimeError(
-            "ripgrep (rg) not found. Install it:"
-            " https://github.com/BurntSushi/ripgrep"
+            "ripgrep (rg) not found. Install it: https://github.com/BurntSushi/ripgrep"
         )
 
     # Clamp user-controllable numeric parameters
@@ -55,8 +54,11 @@ async def grep(
     context_lines = max(0, min(context_lines, 20))
 
     cmd = [
-        rg, "--no-heading", "--line-number",
-        "--color=never", f"--max-count={max_results}",
+        rg,
+        "--no-heading",
+        "--line-number",
+        "--color=never",
+        f"--max-count={max_results}",
     ]
     if case_insensitive:
         cmd.append("--ignore-case")
@@ -91,28 +93,46 @@ async def ast_grep(
     """
     sg = shutil.which("sg") or shutil.which("ast-grep")
     if not sg:
-        raise RuntimeError(
-            "ast-grep (sg) not found. Install it:"
-            " https://ast-grep.github.io"
-        )
+        raise RuntimeError("ast-grep (sg) not found. Install it: https://ast-grep.github.io")
 
     # Validate language to prevent flag injection
-    allowed_langs = frozenset({
-        "python", "javascript", "typescript", "tsx",
-        "jsx", "go", "rust", "java", "c", "cpp",
-        "csharp", "ruby", "swift", "kotlin", "scala",
-        "html", "css", "json", "yaml", "toml",
-    })
+    allowed_langs = frozenset(
+        {
+            "python",
+            "javascript",
+            "typescript",
+            "tsx",
+            "jsx",
+            "go",
+            "rust",
+            "java",
+            "c",
+            "cpp",
+            "csharp",
+            "ruby",
+            "swift",
+            "kotlin",
+            "scala",
+            "html",
+            "css",
+            "json",
+            "yaml",
+            "toml",
+        }
+    )
 
     cmd = [
-        sg, "run", "--pattern", pattern, path, "--json",
+        sg,
+        "run",
+        "--pattern",
+        pattern,
+        path,
+        "--json",
     ]
     if language:
         lang = language.lower().strip()
         if lang not in allowed_langs:
-            raise ValueError(
-                f"Unsupported language: {language!r}"
-            )
+            raise ValueError(f"Unsupported language: {language!r}")
         cmd.extend(["--lang", lang])
 
     stdout, stderr, rc = await _run_command(cmd)

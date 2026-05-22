@@ -3,6 +3,7 @@
 Bridges the synchronous Typer CLI to the async RLMCodingAgent by loading
 configuration, building a RuntimeContext, and dispatching TaskMessages.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -23,11 +24,33 @@ console = Console()
 _MAX_FILE_READ_BYTES = 256_000
 
 # Extensions we consider "source code" when scanning a directory
-_SOURCE_EXTENSIONS = frozenset({
-    ".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".go", ".java",
-    ".c", ".cpp", ".h", ".hpp", ".rb", ".ex", ".exs", ".kt",
-    ".swift", ".toml", ".yaml", ".yml", ".json", ".md", ".sh",
-})
+_SOURCE_EXTENSIONS = frozenset(
+    {
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".rs",
+        ".go",
+        ".java",
+        ".c",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".rb",
+        ".ex",
+        ".exs",
+        ".kt",
+        ".swift",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".md",
+        ".sh",
+    }
+)
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -37,13 +60,9 @@ def _load_config() -> MemfunConfig:
     """Load MemfunConfig from memfun.toml in cwd, falling back to defaults."""
     toml_path = Path("memfun.toml")
     if toml_path.exists():
-        console.print(
-            "[dim]Loaded configuration from memfun.toml[/dim]"
-        )
+        console.print("[dim]Loaded configuration from memfun.toml[/dim]")
         return MemfunConfig.from_toml(toml_path)
-    console.print(
-        "[dim]No memfun.toml found; using default configuration[/dim]"
-    )
+    console.print("[dim]No memfun.toml found; using default configuration[/dim]")
     return MemfunConfig()
 
 
@@ -85,8 +104,7 @@ def _read_path_context(path: Path) -> str:
             if any(p.startswith(".") for p in rel.parts):
                 continue
             if any(
-                p in {"node_modules", "__pycache__", ".git", "dist", "build"}
-                for p in rel.parts
+                p in {"node_modules", "__pycache__", ".git", "dist", "build"} for p in rel.parts
             ):
                 continue
             source_files.append(child)
@@ -141,8 +159,7 @@ def _configure_dspy(config: MemfunConfig) -> None:
 
     if not api_key and provider != "ollama":
         console.print(
-            f"[yellow]Warning: No API key for {provider} "
-            f"(set {config.llm.api_key_env})[/yellow]"
+            f"[yellow]Warning: No API key for {provider} (set {config.llm.api_key_env})[/yellow]"
         )
         return
 
@@ -241,11 +258,13 @@ async def run_agent_task(
 def _display_result(result: TaskResult, task_type: str) -> None:
     """Render a TaskResult using Rich panels and syntax highlighting."""
     if not result.success:
-        console.print(Panel(
-            f"[red]{result.error}[/red]",
-            title="Error",
-            border_style="red",
-        ))
+        console.print(
+            Panel(
+                f"[red]{result.error}[/red]",
+                title="Error",
+                border_style="red",
+            )
+        )
         return
 
     data = result.result
@@ -268,40 +287,50 @@ def _display_result(result: TaskResult, task_type: str) -> None:
 
 
 def _display_analyze(
-    data: dict[str, Any], method: str, duration: str,
+    data: dict[str, Any],
+    method: str,
+    duration: str,
 ) -> None:
     """Display analysis results."""
     answer = data.get("answer", data.get("analysis", ""))
     issues = data.get("issues", [])
     suggestions = data.get("suggestions", [])
 
-    console.print(Panel(
-        Markdown(answer) if answer else "[dim]No analysis returned.[/dim]",
-        title=f"Analysis  [dim]({method}, {duration})[/dim]",
-        border_style="cyan",
-    ))
+    console.print(
+        Panel(
+            Markdown(answer) if answer else "[dim]No analysis returned.[/dim]",
+            title=f"Analysis  [dim]({method}, {duration})[/dim]",
+            border_style="cyan",
+        )
+    )
 
     if issues:
         console.print()
         issue_text = "\n".join(f"  - {i}" for i in issues)
-        console.print(Panel(
-            issue_text,
-            title="Issues",
-            border_style="yellow",
-        ))
+        console.print(
+            Panel(
+                issue_text,
+                title="Issues",
+                border_style="yellow",
+            )
+        )
 
     if suggestions:
         console.print()
         suggestion_text = "\n".join(f"  - {s}" for s in suggestions)
-        console.print(Panel(
-            suggestion_text,
-            title="Suggestions",
-            border_style="green",
-        ))
+        console.print(
+            Panel(
+                suggestion_text,
+                title="Suggestions",
+                border_style="green",
+            )
+        )
 
 
 def _display_fix(
-    data: dict[str, Any], method: str, duration: str,
+    data: dict[str, Any],
+    method: str,
+    duration: str,
 ) -> None:
     """Display bug-fix results."""
     answer = data.get("answer", "")
@@ -311,39 +340,49 @@ def _display_fix(
 
     # RLM path returns "answer"; direct path returns structured fields
     if answer and not root_cause:
-        console.print(Panel(
-            Markdown(answer),
-            title=f"Fix  [dim]({method}, {duration})[/dim]",
-            border_style="green",
-        ))
+        console.print(
+            Panel(
+                Markdown(answer),
+                title=f"Fix  [dim]({method}, {duration})[/dim]",
+                border_style="green",
+            )
+        )
         return
 
     if root_cause:
-        console.print(Panel(
-            Markdown(root_cause),
-            title="Root Cause",
-            border_style="yellow",
-        ))
+        console.print(
+            Panel(
+                Markdown(root_cause),
+                title="Root Cause",
+                border_style="yellow",
+            )
+        )
 
     if fixed_code:
         console.print()
-        console.print(Panel(
-            Syntax(fixed_code, "python", theme="monokai", word_wrap=True),
-            title=f"Fixed Code  [dim]({method}, {duration})[/dim]",
-            border_style="green",
-        ))
+        console.print(
+            Panel(
+                Syntax(fixed_code, "python", theme="monokai", word_wrap=True),
+                title=f"Fixed Code  [dim]({method}, {duration})[/dim]",
+                border_style="green",
+            )
+        )
 
     if explanation:
         console.print()
-        console.print(Panel(
-            Markdown(explanation),
-            title="Explanation",
-            border_style="cyan",
-        ))
+        console.print(
+            Panel(
+                Markdown(explanation),
+                title="Explanation",
+                border_style="cyan",
+            )
+        )
 
 
 def _display_review(
-    data: dict[str, Any], method: str, duration: str,
+    data: dict[str, Any],
+    method: str,
+    duration: str,
 ) -> None:
     """Display code-review results."""
     answer = data.get("answer", "")
@@ -352,37 +391,41 @@ def _display_review(
     approved = data.get("approved")
 
     if answer and not summary:
-        console.print(Panel(
-            Markdown(answer),
-            title=f"Review  [dim]({method}, {duration})[/dim]",
-            border_style="cyan",
-        ))
+        console.print(
+            Panel(
+                Markdown(answer),
+                title=f"Review  [dim]({method}, {duration})[/dim]",
+                border_style="cyan",
+            )
+        )
         return
 
     if summary:
-        status = (
-            "[green]APPROVED[/green]"
-            if approved
-            else "[yellow]CHANGES REQUESTED[/yellow]"
+        status = "[green]APPROVED[/green]" if approved else "[yellow]CHANGES REQUESTED[/yellow]"
+        console.print(
+            Panel(
+                Markdown(summary),
+                title=f"Review Summary  {status}  [dim]({method}, {duration})[/dim]",
+                border_style="cyan",
+            )
         )
-        console.print(Panel(
-            Markdown(summary),
-            title=f"Review Summary  {status}  [dim]({method}, {duration})[/dim]",
-            border_style="cyan",
-        ))
 
     if findings:
         console.print()
         findings_text = "\n".join(f"  - {f}" for f in findings)
-        console.print(Panel(
-            findings_text,
-            title="Findings",
-            border_style="yellow",
-        ))
+        console.print(
+            Panel(
+                findings_text,
+                title="Findings",
+                border_style="yellow",
+            )
+        )
 
 
 def _display_explain(
-    data: dict[str, Any], method: str, duration: str,
+    data: dict[str, Any],
+    method: str,
+    duration: str,
 ) -> None:
     """Display explanation results."""
     answer = data.get("answer", "")
@@ -390,29 +433,35 @@ def _display_explain(
     key_concepts = data.get("key_concepts", [])
 
     text = answer or explanation
-    console.print(Panel(
-        Markdown(text) if text else "[dim]No explanation returned.[/dim]",
-        title=f"Explanation  [dim]({method}, {duration})[/dim]",
-        border_style="cyan",
-    ))
+    console.print(
+        Panel(
+            Markdown(text) if text else "[dim]No explanation returned.[/dim]",
+            title=f"Explanation  [dim]({method}, {duration})[/dim]",
+            border_style="cyan",
+        )
+    )
 
     if key_concepts:
         console.print()
         concepts_text = "\n".join(f"  - {c}" for c in key_concepts)
-        console.print(Panel(
-            concepts_text,
-            title="Key Concepts",
-            border_style="green",
-        ))
+        console.print(
+            Panel(
+                concepts_text,
+                title="Key Concepts",
+                border_style="green",
+            )
+        )
 
 
 def _display_generic(answer: str, method: str, duration: str) -> None:
     """Display a generic answer (for ask and fallback)."""
-    console.print(Panel(
-        Markdown(answer) if answer else "[dim]No response returned.[/dim]",
-        title=f"Answer  [dim]({method}, {duration})[/dim]",
-        border_style="cyan",
-    ))
+    console.print(
+        Panel(
+            Markdown(answer) if answer else "[dim]No response returned.[/dim]",
+            title=f"Answer  [dim]({method}, {duration})[/dim]",
+            border_style="cyan",
+        )
+    )
 
 
 # ── CLI-facing functions (called from main.py) ────────────────────
@@ -423,15 +472,15 @@ def ask_command(question: str) -> None:
     cwd_context = _read_path_context(Path.cwd())
     with console.status("[bold cyan]Thinking...[/bold cyan]", spinner="dots"):
         try:
-            result = asyncio.run(
-                run_agent_task("ask", question, context=cwd_context)
-            )
+            result = asyncio.run(run_agent_task("ask", question, context=cwd_context))
         except Exception as exc:
-            console.print(Panel(
-                f"[red]{type(exc).__name__}: {exc}[/red]",
-                title="Agent Error",
-                border_style="red",
-            ))
+            console.print(
+                Panel(
+                    f"[red]{type(exc).__name__}: {exc}[/red]",
+                    title="Agent Error",
+                    border_style="red",
+                )
+            )
             return
     _display_result(result, "ask")
 
@@ -449,15 +498,15 @@ def analyze_command(path: str | None = None) -> None:
     query = f"Analyze the code at {target.resolve()}"
     with console.status("[bold cyan]Analyzing...[/bold cyan]", spinner="dots"):
         try:
-            result = asyncio.run(
-                run_agent_task("analyze", query, context=context)
-            )
+            result = asyncio.run(run_agent_task("analyze", query, context=context))
         except Exception as exc:
-            console.print(Panel(
-                f"[red]{type(exc).__name__}: {exc}[/red]",
-                title="Agent Error",
-                border_style="red",
-            ))
+            console.print(
+                Panel(
+                    f"[red]{type(exc).__name__}: {exc}[/red]",
+                    title="Agent Error",
+                    border_style="red",
+                )
+            )
             return
     _display_result(result, "analyze")
 
@@ -467,15 +516,15 @@ def fix_command(description: str) -> None:
     cwd_context = _read_path_context(Path.cwd())
     with console.status("[bold cyan]Fixing...[/bold cyan]", spinner="dots"):
         try:
-            result = asyncio.run(
-                run_agent_task("fix", description, context=cwd_context)
-            )
+            result = asyncio.run(run_agent_task("fix", description, context=cwd_context))
         except Exception as exc:
-            console.print(Panel(
-                f"[red]{type(exc).__name__}: {exc}[/red]",
-                title="Agent Error",
-                border_style="red",
-            ))
+            console.print(
+                Panel(
+                    f"[red]{type(exc).__name__}: {exc}[/red]",
+                    title="Agent Error",
+                    border_style="red",
+                )
+            )
             return
     _display_result(result, "fix")
 
@@ -493,15 +542,15 @@ def review_command(path: str | None = None) -> None:
     query = f"Review the code at {target.resolve()}"
     with console.status("[bold cyan]Reviewing...[/bold cyan]", spinner="dots"):
         try:
-            result = asyncio.run(
-                run_agent_task("review", query, context=context)
-            )
+            result = asyncio.run(run_agent_task("review", query, context=context))
         except Exception as exc:
-            console.print(Panel(
-                f"[red]{type(exc).__name__}: {exc}[/red]",
-                title="Agent Error",
-                border_style="red",
-            ))
+            console.print(
+                Panel(
+                    f"[red]{type(exc).__name__}: {exc}[/red]",
+                    title="Agent Error",
+                    border_style="red",
+                )
+            )
             return
     _display_result(result, "review")
 
@@ -519,14 +568,14 @@ def explain_command(path: str | None = None) -> None:
     query = f"Explain the code at {target.resolve()}"
     with console.status("[bold cyan]Explaining...[/bold cyan]", spinner="dots"):
         try:
-            result = asyncio.run(
-                run_agent_task("explain", query, context=context)
-            )
+            result = asyncio.run(run_agent_task("explain", query, context=context))
         except Exception as exc:
-            console.print(Panel(
-                f"[red]{type(exc).__name__}: {exc}[/red]",
-                title="Agent Error",
-                border_style="red",
-            ))
+            console.print(
+                Panel(
+                    f"[red]{type(exc).__name__}: {exc}[/red]",
+                    title="Agent Error",
+                    border_style="red",
+                )
+            )
             return
     _display_result(result, "explain")

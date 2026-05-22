@@ -1,4 +1,5 @@
 """T2 Redis Backend: distributed, Redis-backed runtime adapters."""
+
 from __future__ import annotations
 
 from memfun_runtime.backends.redis.event_bus import RedisEventBus

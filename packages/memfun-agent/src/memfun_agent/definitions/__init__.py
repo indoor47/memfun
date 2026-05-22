@@ -1,4 +1,5 @@
 """Agent definition system: AGENT.md parsing, loading, validation, and registry."""
+
 from __future__ import annotations
 
 from memfun_agent.definitions.defined_agent import DefinedAgent

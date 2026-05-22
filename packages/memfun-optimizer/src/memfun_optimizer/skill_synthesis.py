@@ -4,6 +4,7 @@ Analyzes patterns in agent execution traces to identify recurring
 strategies and automatically generate new SKILL.md files that
 codify those strategies as reusable skills.
 """
+
 from __future__ import annotations
 
 import re
@@ -165,9 +166,7 @@ class SkillSynthesizer:
             confidence=confidence,
         )
 
-    def _extract_skill_metadata(
-        self, traces: list[ExecutionTrace]
-    ) -> dict[str, Any]:
+    def _extract_skill_metadata(self, traces: list[ExecutionTrace]) -> dict[str, Any]:
         """Extract common patterns from traces.
 
         Analyzes query patterns, tool usage, trajectory structure,
@@ -232,9 +231,7 @@ class SkillSynthesizer:
         # Require at least some common keywords
         return len(metadata["common_keywords"]) >= 2
 
-    def _generate_skill_name(
-        self, task_type: str, metadata: dict[str, Any]
-    ) -> str:
+    def _generate_skill_name(self, task_type: str, metadata: dict[str, Any]) -> str:
         """Generate a descriptive skill name from task type and patterns."""
         # Sanitize task_type for use as skill name
         base_name = task_type.lower().replace(" ", "-").replace("_", "-")
@@ -249,9 +246,7 @@ class SkillSynthesizer:
         # it matches the allowed skill name pattern
         return _sanitize_skill_name(base_name)
 
-    def _generate_description(
-        self, task_type: str, metadata: dict[str, Any]
-    ) -> str:
+    def _generate_description(self, task_type: str, metadata: dict[str, Any]) -> str:
         """Generate a description based on task type and patterns."""
         tool_summary = (
             ", ".join(metadata["common_tools"][:3])
@@ -284,9 +279,7 @@ class SkillSynthesizer:
         for i, step in enumerate(representative.trajectory, 1):
             # Extract concise reasoning
             reasoning_preview = (
-                step.reasoning[:200] + "..."
-                if len(step.reasoning) > 200
-                else step.reasoning
+                step.reasoning[:200] + "..." if len(step.reasoning) > 200 else step.reasoning
             )
             steps_summary.append(f"{i}. {reasoning_preview}")
 
@@ -298,15 +291,15 @@ This skill was automatically generated from successful execution patterns.
 
 ## Observed Strategy
 
-The following approach was extracted from {metadata['total_traces']} successful executions:
+The following approach was extracted from {metadata["total_traces"]} successful executions:
 
 {steps_text}
 
 ## Key Patterns
 
-- **Common tools**: {', '.join(metadata['common_tools'][:5])}
-- **Average steps**: {metadata['avg_steps']:.1f}
-- **Success rate**: {metadata['success_rate']:.0%}
+- **Common tools**: {", ".join(metadata["common_tools"][:5])}
+- **Average steps**: {metadata["avg_steps"]:.1f}
+- **Success rate**: {metadata["success_rate"]:.0%}
 
 ## Execution Approach
 
@@ -379,9 +372,7 @@ When invoked, follow these guidelines based on successful patterns:
         # Combine frontmatter and instructions
         return f"{frontmatter}\n\n{instructions}\n"
 
-    def _calculate_confidence(
-        self, metadata: dict[str, Any], trace_count: int
-    ) -> float:
+    def _calculate_confidence(self, metadata: dict[str, Any], trace_count: int) -> float:
         """Calculate confidence score for the synthesized skill.
 
         Based on:
@@ -394,11 +385,11 @@ When invoked, follow these guidelines based on successful patterns:
 
         # Boost confidence for higher trace counts (up to 20 traces)
         trace_factor = min(trace_count / 20.0, 1.0)
-        confidence *= (0.5 + 0.5 * trace_factor)
+        confidence *= 0.5 + 0.5 * trace_factor
 
         # Boost confidence for strong tool patterns
         tool_count = len(metadata["common_tools"])
         tool_factor = min(tool_count / 5.0, 1.0)
-        confidence *= (0.7 + 0.3 * tool_factor)
+        confidence *= 0.7 + 0.3 * tool_factor
 
         return min(confidence, 1.0)

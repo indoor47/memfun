@@ -4,6 +4,7 @@ Placed between raw user input and the triage/RLM pipeline.
 Expands short/ambiguous queries like "fix this", "2", "do it"
 into fully explicit task descriptions using conversation history.
 """
+
 from __future__ import annotations
 
 import asyncio

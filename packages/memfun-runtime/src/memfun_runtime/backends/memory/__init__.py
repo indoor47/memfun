@@ -1,4 +1,5 @@
 """T0 In-Process Backend: zero dependencies, in-memory only."""
+
 from __future__ import annotations
 
 from memfun_runtime.backends.memory.event_bus import InProcessEventBus

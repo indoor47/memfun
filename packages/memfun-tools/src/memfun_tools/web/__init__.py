@@ -1,4 +1,5 @@
 """Web tools: fetch and search MCP servers with SSRF prevention."""
+
 from __future__ import annotations
 
 from memfun_tools.web.fetch import fetch_server

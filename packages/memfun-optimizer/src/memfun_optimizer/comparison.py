@@ -4,6 +4,7 @@ Provides tools to compare original agents against synthesized versions,
 measuring accuracy, latency, token cost, and overall quality. Uses
 statistical analysis to make promotion recommendations.
 """
+
 from __future__ import annotations
 
 import time
@@ -136,34 +137,22 @@ class ComparisonRunner:
         )
 
         # Run both agents on all tasks
-        original_results = await self._run_all_tasks(
-            original_agent, test_tasks, "original"
-        )
+        original_results = await self._run_all_tasks(original_agent, test_tasks, "original")
         synthesized_results = await self._run_all_tasks(
             synthesized_agent, test_tasks, "synthesized"
         )
 
         # Compute aggregated metrics
         original_metrics = self._compute_metrics(original_results)
-        synthesized_metrics = self._compute_metrics(
-            synthesized_results
-        )
+        synthesized_metrics = self._compute_metrics(synthesized_results)
 
         # Calculate comparison statistics
-        speedup = self._calculate_speedup(
-            original_metrics, synthesized_metrics
-        )
-        cost_reduction = self._calculate_cost_reduction(
-            original_metrics, synthesized_metrics
-        )
-        accuracy_delta = self._calculate_accuracy_delta(
-            original_metrics, synthesized_metrics
-        )
+        speedup = self._calculate_speedup(original_metrics, synthesized_metrics)
+        cost_reduction = self._calculate_cost_reduction(original_metrics, synthesized_metrics)
+        accuracy_delta = self._calculate_accuracy_delta(original_metrics, synthesized_metrics)
 
         # Make recommendation
-        recommendation = self._make_recommendation(
-            speedup, cost_reduction, accuracy_delta
-        )
+        recommendation = self._make_recommendation(speedup, cost_reduction, accuracy_delta)
 
         logger.info(
             "Comparison complete: speedup=%.1fx, cost_reduction=%.1f%%, "
@@ -207,9 +196,7 @@ class ComparisonRunner:
             task_id = task.get("task_id", "unknown")
 
             for run_idx in range(self._num_runs):
-                result = await self._run_agent(
-                    agent, task, run_idx=run_idx
-                )
+                result = await self._run_agent(agent, task, run_idx=run_idx)
                 results.append(result)
 
                 logger.debug(
@@ -286,9 +273,7 @@ class ComparisonRunner:
         except Exception as exc:
             success = False
             error_msg = f"{type(exc).__name__}: {exc}"
-            logger.debug(
-                "Agent run failed for task %s: %s", task_id, error_msg
-            )
+            logger.debug("Agent run failed for task %s: %s", task_id, error_msg)
 
         duration_ms = (time.perf_counter() - start) * 1000.0
 
@@ -301,9 +286,7 @@ class ComparisonRunner:
             error=error_msg,
         )
 
-    def _compute_metrics(
-        self, results: list[AgentRunResult]
-    ) -> dict[str, float]:
+    def _compute_metrics(self, results: list[AgentRunResult]) -> dict[str, float]:
         """Aggregate metrics from agent run results.
 
         Args:

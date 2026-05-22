@@ -1,4 +1,5 @@
 """Tests for the memfun-skills package: parser, loader, validator, registry bridge."""
+
 from __future__ import annotations
 
 import textwrap
@@ -117,9 +118,7 @@ class TestParseSkillMd:
         """)
         skill_file = _write_skill_md(tmp_path / "no-desc", content)
 
-        with pytest.raises(
-            SkillValidationError, match="missing required field 'description'"
-        ):
+        with pytest.raises(SkillValidationError, match="missing required field 'description'"):
             parse_skill_md(skill_file)
 
     def test_parse_malformed_yaml(self, tmp_path: Path) -> None:
@@ -438,9 +437,7 @@ class TestSkillRegistryBridge:
         bridge = SkillRegistryBridge()
 
         # Use explicit paths to avoid picking up real ./skills/ dir
-        synced = await bridge.sync_skills(
-            loader, registry, paths=[skills_root]
-        )
+        synced = await bridge.sync_skills(loader, registry, paths=[skills_root])
 
         assert len(synced) == 2
 

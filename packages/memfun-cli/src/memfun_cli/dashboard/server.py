@@ -12,6 +12,7 @@ Usage (embedded — auto-started by memfun chat)::
     from memfun_cli.dashboard.server import create_app
     app = create_app(event_bus=runtime.event_bus, project_name="my-project")
 """
+
 from __future__ import annotations
 
 import argparse
@@ -107,7 +108,9 @@ def _load_state() -> None:
             _events.pop(0)
         logger.info(
             "Restored dashboard state: %d requests, %d tasks, %d events",
-            len(_requests), len(_tasks), len(_events),
+            len(_requests),
+            len(_tasks),
+            len(_events),
         )
     except Exception:
         logger.debug("Failed to load dashboard state", exc_info=True)
@@ -307,15 +310,11 @@ def _update_state(event: dict) -> None:
             _workers[worker_id]["last_seen"] = time.time()
     elif etype == "task.completed" and task_id:
         if task_id in _tasks:
-            _tasks[task_id]["status"] = (
-                "completed" if event.get("success") else "failed"
-            )
+            _tasks[task_id]["status"] = "completed" if event.get("success") else "failed"
             _tasks[task_id]["duration_ms"] = event.get("duration_ms")
         if worker_id and worker_id in _workers:
             _workers[worker_id]["status"] = "idle"
-            _workers[worker_id]["tasks_done"] = (
-                _workers[worker_id].get("tasks_done", 0) + 1
-            )
+            _workers[worker_id]["tasks_done"] = _workers[worker_id].get("tasks_done", 0) + 1
             _workers[worker_id]["last_seen"] = time.time()
 
     # Persist state to disk (debounced)
@@ -2079,7 +2078,8 @@ def main() -> None:
         description="Memfun Agent Dashboard",
     )
     parser.add_argument(
-        "--redis-url", default="redis://localhost:6379",
+        "--redis-url",
+        default="redis://localhost:6379",
     )
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--host", default="0.0.0.0")
@@ -2092,7 +2092,10 @@ def main() -> None:
 
     app = create_app()
     uvicorn.run(
-        app, host=args.host, port=args.port, log_level="info",
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="info",
     )
 
 

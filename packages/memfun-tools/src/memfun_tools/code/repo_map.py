@@ -7,8 +7,18 @@ from fastmcp import FastMCP
 repo_map_server = FastMCP("memfun-repo-map")
 
 IGNORE_DIRS = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
-    ".eggs", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".eggs",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
 }
 
 IGNORE_EXTS = {".pyc", ".pyo", ".so", ".o", ".a", ".dylib", ".class", ".jar"}

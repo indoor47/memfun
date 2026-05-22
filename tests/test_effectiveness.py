@@ -1,5 +1,5 @@
-"""Tests for skill effectiveness tracking and marketplace (packaging/importing).
-"""
+"""Tests for skill effectiveness tracking and marketplace (packaging/importing)."""
+
 from __future__ import annotations
 
 import json
@@ -77,14 +77,12 @@ class TestSkillEffectivenessTracker:
         """Avg user rating is computed from non-None ratings."""
         tracker = SkillEffectivenessTracker()
 
+        await tracker.record_execution("review", success=True, duration_ms=100.0, user_rating=4.0)
+        await tracker.record_execution("review", success=True, duration_ms=150.0, user_rating=5.0)
         await tracker.record_execution(
-            "review", success=True, duration_ms=100.0, user_rating=4.0
-        )
-        await tracker.record_execution(
-            "review", success=True, duration_ms=150.0, user_rating=5.0
-        )
-        await tracker.record_execution(
-            "review", success=True, duration_ms=120.0  # no rating
+            "review",
+            success=True,
+            duration_ms=120.0,  # no rating
         )
 
         stats = await tracker.get_stats("review")
@@ -128,19 +126,13 @@ class TestSkillEffectivenessTracker:
 
         # Bad skill: 1/5 success
         for i in range(5):
-            await tracker.record_execution(
-                "bad", success=(i == 0), duration_ms=100.0
-            )
+            await tracker.record_execution("bad", success=(i == 0), duration_ms=100.0)
 
         # Mediocre skill: 3/5 success (60%)
         for i in range(5):
-            await tracker.record_execution(
-                "mediocre", success=(i < 3), duration_ms=100.0
-            )
+            await tracker.record_execution("mediocre", success=(i < 3), duration_ms=100.0)
 
-        underperforming = await tracker.get_underperforming(
-            min_executions=5, max_success_rate=0.7
-        )
+        underperforming = await tracker.get_underperforming(min_executions=5, max_success_rate=0.7)
 
         names = {s.skill_name for s in underperforming}
         assert "bad" in names
@@ -153,19 +145,13 @@ class TestSkillEffectivenessTracker:
 
         # 40% success
         for i in range(5):
-            await tracker.record_execution(
-                "forty", success=(i < 2), duration_ms=100.0
-            )
+            await tracker.record_execution("forty", success=(i < 2), duration_ms=100.0)
 
         # 20% success
         for i in range(5):
-            await tracker.record_execution(
-                "twenty", success=(i < 1), duration_ms=100.0
-            )
+            await tracker.record_execution("twenty", success=(i < 1), duration_ms=100.0)
 
-        underperforming = await tracker.get_underperforming(
-            min_executions=5, max_success_rate=0.5
-        )
+        underperforming = await tracker.get_underperforming(min_executions=5, max_success_rate=0.5)
         assert len(underperforming) == 2
         assert underperforming[0].skill_name == "twenty"
         assert underperforming[1].skill_name == "forty"
@@ -185,15 +171,9 @@ class TestSkillEffectivenessTracker:
         """Common errors are tracked and deduplicated in stats."""
         tracker = SkillEffectivenessTracker()
 
-        await tracker.record_execution(
-            "buggy", success=False, duration_ms=100.0, error="timeout"
-        )
-        await tracker.record_execution(
-            "buggy", success=False, duration_ms=100.0, error="timeout"
-        )
-        await tracker.record_execution(
-            "buggy", success=False, duration_ms=100.0, error="oom"
-        )
+        await tracker.record_execution("buggy", success=False, duration_ms=100.0, error="timeout")
+        await tracker.record_execution("buggy", success=False, duration_ms=100.0, error="timeout")
+        await tracker.record_execution("buggy", success=False, duration_ms=100.0, error="oom")
 
         stats = await tracker.get_stats("buggy")
         assert stats is not None
@@ -421,9 +401,7 @@ class TestSkillImporter:
         """Raises FileNotFoundError for nonexistent package file."""
         importer = SkillImporter()
         with pytest.raises(FileNotFoundError, match="not found"):
-            importer.import_from_file(
-                tmp_path / "nonexistent.skill", tmp_path
-            )
+            importer.import_from_file(tmp_path / "nonexistent.skill", tmp_path)
 
     def test_import_from_file_malformed_raises(self, tmp_path: Path) -> None:
         """Raises ValueError for malformed package file."""
@@ -485,7 +463,7 @@ class TestSkillImporter:
         assert imported_skill_dir.is_dir()
         imported_md = (imported_skill_dir / "SKILL.md").read_text(encoding="utf-8")
         assert imported_md == SAMPLE_SKILL_MD
-        imported_script = (
-            imported_skill_dir / "scripts" / "analyze.py"
-        ).read_text(encoding="utf-8")
+        imported_script = (imported_skill_dir / "scripts" / "analyze.py").read_text(
+            encoding="utf-8"
+        )
         assert imported_script == "# analyzer"

@@ -6,6 +6,7 @@ These types represent the abstraction layers in the optimization process:
 - Strategy patterns: recurring multi-trace patterns
 - Discovered agents: synthesized agent specifications from patterns
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass

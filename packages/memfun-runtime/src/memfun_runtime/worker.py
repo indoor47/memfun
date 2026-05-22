@@ -13,6 +13,7 @@ Usage::
     python -m memfun_runtime.worker --agent coder-agent --redis-url redis://localhost:6379 &
     python -m memfun_runtime.worker --agent test-agent  --redis-url redis://localhost:6379 &
 """
+
 from __future__ import annotations
 
 import argparse
@@ -71,17 +72,27 @@ class AgentWorker:
 
         logger.info(
             "[%s] Starting worker (agent=%s, redis=%s)",
-            self.worker_id, self.agent_name, self.redis_url,
+            self.worker_id,
+            self.agent_name,
+            self.redis_url,
         )
 
         # Build runtime with Redis backend
         config = MemfunConfig.load()
-        config = config.model_copy(update={
-            "backend": config.backend.model_copy(update={
-                "tier": "redis",
-                "redis_url": self.redis_url,
-            }),
-        }) if hasattr(config, 'model_copy') else config
+        config = (
+            config.model_copy(
+                update={
+                    "backend": config.backend.model_copy(
+                        update={
+                            "tier": "redis",
+                            "redis_url": self.redis_url,
+                        }
+                    ),
+                }
+            )
+            if hasattr(config, "model_copy")
+            else config
+        )
 
         # Override backend config for Redis
         os.environ["MEMFUN_REDIS_URL"] = self.redis_url
@@ -102,11 +113,13 @@ class AgentWorker:
         self._agent = manager.get_agent(self.agent_name)
 
         # Announce worker online
-        await self._emit(DistributedEvent(
-            event_type="worker.online",
-            agent_name=self.agent_name,
-            worker_id=self.worker_id,
-        ))
+        await self._emit(
+            DistributedEvent(
+                event_type="worker.online",
+                agent_name=self.agent_name,
+                worker_id=self.worker_id,
+            )
+        )
 
         self._running = True
         logger.info("[%s] Worker ready, listening for tasks...", self.worker_id)
@@ -115,11 +128,13 @@ class AgentWorker:
         try:
             await self._process_loop()
         finally:
-            await self._emit(DistributedEvent(
-                event_type="worker.offline",
-                agent_name=self.agent_name,
-                worker_id=self.worker_id,
-            ))
+            await self._emit(
+                DistributedEvent(
+                    event_type="worker.offline",
+                    agent_name=self.agent_name,
+                    worker_id=self.worker_id,
+                )
+            )
             await manager.stop_all()
 
     async def _process_loop(self) -> None:
@@ -146,15 +161,18 @@ class AgentWorker:
         """Execute a single task and publish the result."""
         logger.info(
             "[%s] Picked up task %s",
-            self.worker_id, task.task_id,
+            self.worker_id,
+            task.task_id,
         )
 
-        await self._emit(DistributedEvent(
-            event_type="task.picked_up",
-            task_id=task.task_id,
-            agent_name=self.agent_name,
-            worker_id=self.worker_id,
-        ))
+        await self._emit(
+            DistributedEvent(
+                event_type="task.picked_up",
+                task_id=task.task_id,
+                agent_name=self.agent_name,
+                worker_id=self.worker_id,
+            )
+        )
 
         start = time.monotonic()
         try:
@@ -162,7 +180,9 @@ class AgentWorker:
         except Exception as exc:
             logger.error(
                 "[%s] Task %s failed: %s",
-                self.worker_id, task.task_id, exc,
+                self.worker_id,
+                task.task_id,
+                exc,
             )
             result = TaskResult(
                 task_id=task.task_id,
@@ -216,12 +236,14 @@ async def run_worker(agent_name: str, redis_url: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Memfun distributed agent worker")
     parser.add_argument(
-        "--agent", "-a",
+        "--agent",
+        "-a",
         required=True,
         help="Agent name to run (e.g. coder-agent, test-agent)",
     )
     parser.add_argument(
-        "--redis-url", "-r",
+        "--redis-url",
+        "-r",
         default="redis://localhost:6379",
         help="Redis connection URL",
     )

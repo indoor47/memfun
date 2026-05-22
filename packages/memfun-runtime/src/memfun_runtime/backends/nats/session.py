@@ -52,14 +52,16 @@ class NATSSessionManager:
         now = time.time()
         session = Session(session_id=session_id, user_id=user_id, created_at=now)
 
-        payload = json.dumps({
-            "session_id": session_id,
-            "user_id": user_id,
-            "created_at": now,
-            "data": {},
-            "history": [],
-            "ttl_seconds": config.ttl_seconds,
-        })
+        payload = json.dumps(
+            {
+                "session_id": session_id,
+                "user_id": user_id,
+                "created_at": now,
+                "data": {},
+                "history": [],
+                "ttl_seconds": config.ttl_seconds,
+            }
+        )
         await self._kv.put(session_id, payload.encode())  # type: ignore[union-attr]
         return session
 

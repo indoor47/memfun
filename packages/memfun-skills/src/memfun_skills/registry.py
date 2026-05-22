@@ -1,4 +1,5 @@
 """Registry bridge: connects the skill loader to the runtime SkillRegistryAdapter."""
+
 from __future__ import annotations
 
 import logging

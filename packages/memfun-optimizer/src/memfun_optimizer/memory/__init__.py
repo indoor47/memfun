@@ -33,6 +33,7 @@ Example usage::
     for result in results:
         print(f"[{result.relevance_score:.2f}] {result.entry.content}")
 """
+
 from __future__ import annotations
 
 from memfun_optimizer.memory.search import MemorySearch

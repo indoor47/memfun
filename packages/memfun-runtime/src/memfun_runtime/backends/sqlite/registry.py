@@ -63,11 +63,16 @@ class SQLiteRegistry:
             for row in rows:
                 caps = json.loads(row[3])
                 if capability in caps:
-                    results.append(AgentInfo(
-                        agent_id=row[0], name=row[1], version=row[2],
-                        capabilities=caps, metadata=json.loads(row[4]),
-                        endpoint=row[5],
-                    ))
+                    results.append(
+                        AgentInfo(
+                            agent_id=row[0],
+                            name=row[1],
+                            version=row[2],
+                            capabilities=caps,
+                            metadata=json.loads(row[4]),
+                            endpoint=row[5],
+                        )
+                    )
             return results
 
     async def get(self, agent_id: str) -> AgentInfo | None:
@@ -78,7 +83,10 @@ class SQLiteRegistry:
             if not row:
                 return None
             return AgentInfo(
-                agent_id=row[0], name=row[1], version=row[2],
-                capabilities=json.loads(row[3]), metadata=json.loads(row[4]),
+                agent_id=row[0],
+                name=row[1],
+                version=row[2],
+                capabilities=json.loads(row[3]),
+                metadata=json.loads(row[4]),
                 endpoint=row[5],
             )

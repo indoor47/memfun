@@ -1,4 +1,5 @@
 """Memfun Core: shared types, config, errors, and logging."""
+
 from __future__ import annotations
 
 from memfun_core._version import __version__

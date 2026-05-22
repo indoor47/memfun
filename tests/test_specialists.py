@@ -3,6 +3,7 @@
 Tests specialist agent registration and type mapping.
 Does NOT test handle() method (requires full RLM setup).
 """
+
 from __future__ import annotations
 
 from memfun_agent.specialists import (

@@ -1,4 +1,5 @@
 """Agent management commands: list, info, validate, run."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -75,9 +76,7 @@ def agent_info(
         console.print(f"[red]Agent not found:[/red] '{name}'")
         available = [a.name for a in agents]
         if available:
-            console.print(
-                f"[dim]Available agents: {', '.join(sorted(available))}[/dim]"
-            )
+            console.print(f"[dim]Available agents: {', '.join(sorted(available))}[/dim]")
         raise typer.Exit(1)
 
     # Metadata panel
@@ -88,19 +87,13 @@ def agent_info(
     ]
 
     if match.capabilities:
-        meta_lines.append(
-            f"[bold]Capabilities:[/bold]  {', '.join(match.capabilities)}"
-        )
+        meta_lines.append(f"[bold]Capabilities:[/bold]  {', '.join(match.capabilities)}")
 
     if match.allowed_tools:
-        meta_lines.append(
-            f"[bold]Allowed tools:[/bold] {', '.join(match.allowed_tools)}"
-        )
+        meta_lines.append(f"[bold]Allowed tools:[/bold] {', '.join(match.allowed_tools)}")
 
     if match.delegates_to:
-        meta_lines.append(
-            f"[bold]Delegates to:[/bold]  {', '.join(match.delegates_to)}"
-        )
+        meta_lines.append(f"[bold]Delegates to:[/bold]  {', '.join(match.delegates_to)}")
 
     if match.model:
         meta_lines.append(f"[bold]Model:[/bold]         {match.model}")
@@ -110,11 +103,13 @@ def agent_info(
     if match.source_path:
         meta_lines.append(f"[bold]Source:[/bold]        {match.source_path}")
 
-    console.print(Panel(
-        "\n".join(meta_lines),
-        title=f"Agent: {match.name}",
-        border_style="cyan",
-    ))
+    console.print(
+        Panel(
+            "\n".join(meta_lines),
+            title=f"Agent: {match.name}",
+            border_style="cyan",
+        )
+    )
 
     # Instructions preview
     if match.instructions:
@@ -122,11 +117,13 @@ def agent_info(
         if len(preview) > 500:
             preview = preview[:500] + "\n\n... (truncated)"
         console.print()
-        console.print(Panel(
-            Syntax(preview, "markdown", theme="monokai", word_wrap=True),
-            title="Instructions (preview)",
-            border_style="dim",
-        ))
+        console.print(
+            Panel(
+                Syntax(preview, "markdown", theme="monokai", word_wrap=True),
+                title="Instructions (preview)",
+                border_style="dim",
+            )
+        )
     else:
         console.print("\n[dim]No instructions body defined.[/dim]")
 
@@ -158,16 +155,11 @@ def _validate_single(path: Path, validator: AgentValidator) -> None:
     elif resolved.is_dir():
         agent_file = resolved / "AGENT.md"
     else:
-        console.print(
-            f"[red]Invalid path:[/red] '{path}' is not a directory "
-            "or an AGENT.md file."
-        )
+        console.print(f"[red]Invalid path:[/red] '{path}' is not a directory or an AGENT.md file.")
         raise typer.Exit(1)
 
     if not agent_file.exists():
-        console.print(
-            f"[red]AGENT.md not found at:[/red] {agent_file}"
-        )
+        console.print(f"[red]AGENT.md not found at:[/red] {agent_file}")
         raise typer.Exit(1)
 
     try:
@@ -203,13 +195,9 @@ def _validate_all(validator: AgentValidator) -> None:
 
     console.print()
     if total_errors == 0:
-        console.print(
-            f"[green]All {len(agents)} agent(s) passed validation.[/green]"
-        )
+        console.print(f"[green]All {len(agents)} agent(s) passed validation.[/green]")
     else:
-        console.print(
-            f"[red]{total_errors} error(s) across {len(agents)} agent(s).[/red]"
-        )
+        console.print(f"[red]{total_errors} error(s) across {len(agents)} agent(s).[/red]")
         raise typer.Exit(1)
 
 
@@ -237,9 +225,7 @@ def agent_run(
         console.print(f"[red]Agent not found:[/red] '{name}'")
         available = [a.name for a in agents]
         if available:
-            console.print(
-                f"[dim]Available agents: {', '.join(sorted(available))}[/dim]"
-            )
+            console.print(f"[dim]Available agents: {', '.join(sorted(available))}[/dim]")
         raise typer.Exit(1)
 
     # Build the prompt the same way DefinedAgent would
@@ -252,28 +238,28 @@ def agent_run(
         f"[bold]Max turns:[/bold]   {match.max_turns}",
     ]
     if match.allowed_tools:
-        meta_lines.append(
-            f"[bold]Tools:[/bold]       {', '.join(match.allowed_tools)}"
-        )
+        meta_lines.append(f"[bold]Tools:[/bold]       {', '.join(match.allowed_tools)}")
     if match.delegates_to:
-        meta_lines.append(
-            f"[bold]Delegates:[/bold]   {', '.join(match.delegates_to)}"
-        )
+        meta_lines.append(f"[bold]Delegates:[/bold]   {', '.join(match.delegates_to)}")
 
-    console.print(Panel(
-        "\n".join(meta_lines),
-        title=f"Dry-run: {match.name}",
-        subtitle="agent run",
-        border_style="cyan",
-    ))
+    console.print(
+        Panel(
+            "\n".join(meta_lines),
+            title=f"Dry-run: {match.name}",
+            subtitle="agent run",
+            border_style="cyan",
+        )
+    )
 
     # Show assembled prompt
     console.print()
-    console.print(Panel(
-        Syntax(prompt, "markdown", theme="monokai", word_wrap=True),
-        title="Assembled Prompt",
-        border_style="dim",
-    ))
+    console.print(
+        Panel(
+            Syntax(prompt, "markdown", theme="monokai", word_wrap=True),
+            title="Assembled Prompt",
+            border_style="dim",
+        )
+    )
 
     console.print()
     console.print(

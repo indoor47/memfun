@@ -87,12 +87,7 @@ class SQLiteStateStore:
         await self._cleanup_expired()
         # Escape LIKE wildcards in the prefix so that
         # characters like % and _ are matched literally.
-        escaped = (
-            prefix
-            .replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
+        escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         async with self._conn.execute(
             "SELECT key FROM state"
             " WHERE key LIKE ? ESCAPE '\\'"

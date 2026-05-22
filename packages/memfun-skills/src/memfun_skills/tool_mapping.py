@@ -1,4 +1,5 @@
 """Tool name mapping: translates skill-level tool names to MCP gateway names."""
+
 from __future__ import annotations
 
 import logging
@@ -55,9 +56,7 @@ class ToolNameMapper:
 
     def __init__(self, overrides: dict[str, str] | None = None) -> None:
         # Build the case-insensitive lookup table
-        self._map: dict[str, str] = {
-            k.lower(): v for k, v in DEFAULT_TOOL_MAP.items()
-        }
+        self._map: dict[str, str] = {k.lower(): v for k, v in DEFAULT_TOOL_MAP.items()}
         if overrides:
             for k, v in overrides.items():
                 self._map[k.lower()] = v
@@ -71,9 +70,7 @@ class ToolNameMapper:
         mapped = self._map.get(skill_tool.lower())
         if mapped is not None:
             return mapped
-        logger.debug(
-            "No mapping for tool '%s'; using name as-is", skill_tool
-        )
+        logger.debug("No mapping for tool '%s'; using name as-is", skill_tool)
         return skill_tool
 
     def map_tools(self, skill_tools: list[str]) -> list[str]:

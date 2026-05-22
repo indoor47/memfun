@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 @dataclass(frozen=True, slots=True)
 class SearchResult:
     """A single search result."""
+
     title: str
     url: str
     snippet: str
@@ -41,6 +42,7 @@ class DuckDuckGoBackend:
     async def is_available(self) -> bool:
         try:
             from ddgs import DDGS  # noqa: F401
+
             return True
         except ImportError:
             return False
@@ -81,6 +83,7 @@ class BraveBackend:
 
     async def is_available(self) -> bool:
         import os
+
         return bool(os.environ.get(self._api_key_env))
 
     async def search(self, query: str, max_results: int = 10) -> list[SearchResult]:
@@ -106,11 +109,13 @@ class BraveBackend:
 
         results = []
         for item in data.get("web", {}).get("results", [])[:max_results]:
-            results.append(SearchResult(
-                title=item.get("title", ""),
-                url=item.get("url", ""),
-                snippet=item.get("description", ""),
-            ))
+            results.append(
+                SearchResult(
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    snippet=item.get("description", ""),
+                )
+            )
         return results
 
 
@@ -130,6 +135,7 @@ class TavilyBackend:
 
     async def is_available(self) -> bool:
         import os
+
         return bool(os.environ.get(self._api_key_env))
 
     async def search(self, query: str, max_results: int = 10) -> list[SearchResult]:
@@ -186,7 +192,4 @@ async def get_best_backend(preferred: str = "duckduckgo") -> SearchBackend:
         if await backend.is_available():
             return backend
 
-    raise RuntimeError(
-        "No search backend available. "
-        "Install ddgs: pip install ddgs"
-    )
+    raise RuntimeError("No search backend available. Install ddgs: pip install ddgs")

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 logger = get_logger("sandbox.docker")
 
 _MAX_OUTPUT_BYTES = 100 * 1024  # 100 KB
-_MAX_TIMEOUT_SECONDS = 300      # 5 minutes hard cap
+_MAX_TIMEOUT_SECONDS = 300  # 5 minutes hard cap
 
 
 def _build_preamble(context: dict) -> str:
@@ -119,14 +119,15 @@ class DockerSandbox:
 
     # ── Docker helpers ──────────────────────────────────────────────
 
-    async def _create_container(
-        self, config: SandboxConfig, handle_id: str
-    ) -> str:
+    async def _create_container(self, config: SandboxConfig, handle_id: str) -> str:
         """Create and start a Docker container, returning its ID."""
         cmd: list[str] = [
-            "docker", "create",
-            "--label", f"memfun.sandbox.id={handle_id}",
-            "--memory", f"{config.memory_limit_mb}m",
+            "docker",
+            "create",
+            "--label",
+            f"memfun.sandbox.id={handle_id}",
+            "--memory",
+            f"{config.memory_limit_mb}m",
         ]
 
         # Network isolation: default to none.
@@ -146,10 +147,13 @@ class DockerSandbox:
             cmd.extend(["--volume", f"{path}:{path}:rw"])
 
         # Image and entrypoint that keeps the container alive.
-        cmd.extend([
-            self._default_image,
-            "sleep", "infinity",
-        ])
+        cmd.extend(
+            [
+                self._default_image,
+                "sleep",
+                "infinity",
+            ]
+        )
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -160,32 +164,32 @@ class DockerSandbox:
 
         if proc.returncode != 0:
             detail = stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(
-                f"Failed to create Docker container: {detail}"
-            )
+            raise RuntimeError(f"Failed to create Docker container: {detail}")
 
         container_id = stdout.decode().strip()
 
         # Start the container.
         start_proc = await asyncio.create_subprocess_exec(
-            "docker", "start", container_id,
+            "docker",
+            "start",
+            container_id,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         _, start_err = await start_proc.communicate()
         if start_proc.returncode != 0:
             detail = start_err.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(
-                f"Failed to start Docker container {container_id[:12]}: "
-                f"{detail}"
-            )
+            raise RuntimeError(f"Failed to start Docker container {container_id[:12]}: {detail}")
 
         return container_id
 
     async def _remove_container(self, container_id: str) -> None:
         """Stop and remove a Docker container (best-effort)."""
         proc = await asyncio.create_subprocess_exec(
-            "docker", "rm", "--force", container_id,
+            "docker",
+            "rm",
+            "--force",
+            container_id,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -210,13 +214,19 @@ class DockerSandbox:
         t0 = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
-                "docker", "exec", "-i", container_id,
-                "python", "-c", script,
+                "docker",
+                "exec",
+                "-i",
+                container_id,
+                "python",
+                "-c",
+                script,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout,
+                proc.communicate(),
+                timeout=timeout,
             )
         except TimeoutError:
             duration_ms = (time.monotonic() - t0) * 1000
@@ -264,6 +274,7 @@ class DockerSandbox:
         for _cfg, container_id in self._sandboxes.values():
             try:
                 import subprocess
+
                 subprocess.run(
                     ["docker", "rm", "--force", container_id],
                     capture_output=True,

@@ -1,4 +1,5 @@
 """AGENT.md parser: extracts YAML frontmatter and markdown instructions."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
@@ -49,9 +50,7 @@ def parse_agent_md(path: Path) -> AgentDefinition:
 
     # Resolve optional directories
     scripts_dir = agent_dir / "scripts" if (agent_dir / "scripts").is_dir() else None
-    references_dir = (
-        agent_dir / "references" if (agent_dir / "references").is_dir() else None
-    )
+    references_dir = agent_dir / "references" if (agent_dir / "references").is_dir() else None
 
     return AgentDefinition(
         name=str(meta["name"]),

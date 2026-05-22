@@ -1,4 +1,5 @@
 """MCP tool server exposing memfun agent definitions as tools."""
+
 from __future__ import annotations
 
 from fastmcp import FastMCP
@@ -7,9 +8,7 @@ agents_server = FastMCP("memfun-agents")
 
 
 @agents_server.tool()
-async def invoke_agent(
-    agent_name: str, task: str, context: str = ""
-) -> str:
+async def invoke_agent(agent_name: str, task: str, context: str = "") -> str:
     """Invoke an agent definition by name (dry-run prompt assembly).
 
     Loads the agent definition, builds a prompt from its instructions
@@ -33,10 +32,7 @@ async def invoke_agent(
 
     if agent is None:
         available = ", ".join(a.name for a in agents)
-        return (
-            f"Agent '{agent_name}' not found. "
-            f"Available agents: {available}"
-        )
+        return f"Agent '{agent_name}' not found. Available agents: {available}"
 
     # Build the dry-run prompt from the agent definition
     sections: list[str] = []
@@ -131,10 +127,7 @@ async def get_agent_info(agent_name: str) -> str:
 
     if agent is None:
         available = ", ".join(a.name for a in agents)
-        return (
-            f"Agent '{agent_name}' not found. "
-            f"Available agents: {available}"
-        )
+        return f"Agent '{agent_name}' not found. Available agents: {available}"
 
     caps = ", ".join(agent.capabilities) if agent.capabilities else "(none)"
     tools = ", ".join(agent.allowed_tools) if agent.allowed_tools else "(none)"

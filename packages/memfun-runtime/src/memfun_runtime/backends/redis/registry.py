@@ -37,14 +37,16 @@ class RedisRegistry:
             capabilities=capabilities,
             metadata={k: str(v) for k, v in metadata.items()},
         )
-        data = json.dumps({
-            "agent_id": info.agent_id,
-            "name": info.name,
-            "version": info.version,
-            "capabilities": info.capabilities,
-            "metadata": info.metadata,
-            "endpoint": info.endpoint,
-        })
+        data = json.dumps(
+            {
+                "agent_id": info.agent_id,
+                "name": info.name,
+                "version": info.version,
+                "capabilities": info.capabilities,
+                "metadata": info.metadata,
+                "endpoint": info.endpoint,
+            }
+        )
         await self._r.hset(self._hash_key(), agent_id, data)
 
     async def deregister(self, agent_id: str) -> None:

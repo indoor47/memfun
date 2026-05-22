@@ -5,6 +5,7 @@ sub-tasks with dependency information and shared specifications.
 Falls back to a single-task result when decomposition fails or
 the task is too simple to decompose.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -116,10 +117,19 @@ class DecompositionConfig:
 
 # ── Helpers ───────────────────────────────────────────────────
 
-_VALID_AGENT_TYPES = frozenset({
-    "file", "coder", "test", "review",
-    "web_search", "web_fetch", "planner", "debug", "security",
-})
+_VALID_AGENT_TYPES = frozenset(
+    {
+        "file",
+        "coder",
+        "test",
+        "review",
+        "web_search",
+        "web_fetch",
+        "planner",
+        "debug",
+        "security",
+    }
+)
 
 
 def _normalize_list(value: Any) -> list[Any]:
@@ -169,15 +179,17 @@ def _parse_sub_tasks(raw: Any) -> list[SubTask]:
             depends = [str(x) for x in (item.get("depends_on") or [])]
             max_iter = int(item.get("max_iterations", 10))
             max_iter = max(3, min(max_iter, 25))
-            tasks.append(SubTask(
-                id=tid,
-                description=desc,
-                agent_type=agent_type,
-                inputs=inputs,
-                outputs=outputs,
-                depends_on=depends,
-                max_iterations=max_iter,
-            ))
+            tasks.append(
+                SubTask(
+                    id=tid,
+                    description=desc,
+                    agent_type=agent_type,
+                    inputs=inputs,
+                    outputs=outputs,
+                    depends_on=depends,
+                    max_iterations=max_iter,
+                )
+            )
 
     return tasks
 
@@ -249,8 +261,7 @@ def _validate_dag(tasks: list[SubTask]) -> None:
 
     if visited < len(tasks):
         raise ValueError(
-            f"Cycle detected in task dependency graph "
-            f"(visited {visited}/{len(tasks)} tasks)"
+            f"Cycle detected in task dependency graph (visited {visited}/{len(tasks)} tasks)"
         )
 
 
@@ -405,9 +416,7 @@ def resolve_output_overlap(
         return parallelism_groups, []
 
     if strategy == "reject":
-        details = "; ".join(
-            f"{path}: {', '.join(ids)}" for path, ids in sorted(overlaps.items())
-        )
+        details = "; ".join(f"{path}: {', '.join(ids)}" for path, ids in sorted(overlaps.items()))
         raise DecompositionError(
             f"Decomposition has overlapping outputs in parallel groups "
             f"({len(overlaps)} conflict(s)): {details}"
@@ -470,17 +479,21 @@ def _backfill_outputs_with_heuristic(tasks: list[SubTask]) -> list[SubTask]:
             continue
         logger.debug(
             "Backfilled outputs for %s (%s) from description: %s",
-            task.id, task.agent_type, guessed,
+            task.id,
+            task.agent_type,
+            guessed,
         )
-        out.append(SubTask(
-            id=task.id,
-            description=task.description,
-            agent_type=task.agent_type,
-            inputs=task.inputs,
-            outputs=guessed,
-            depends_on=task.depends_on,
-            max_iterations=task.max_iterations,
-        ))
+        out.append(
+            SubTask(
+                id=task.id,
+                description=task.description,
+                agent_type=task.agent_type,
+                inputs=task.inputs,
+                outputs=guessed,
+                depends_on=task.depends_on,
+                max_iterations=task.max_iterations,
+            )
+        )
     return out
 
 
@@ -542,15 +555,17 @@ def _renumber_children(parent_id: str, children: list[SubTask]) -> list[SubTask]
     out: list[SubTask] = []
     for child in children:
         new_deps = [old_to_new.get(d, d) for d in child.depends_on]
-        out.append(SubTask(
-            id=old_to_new[child.id],
-            description=child.description,
-            agent_type=child.agent_type,
-            inputs=child.inputs,
-            outputs=child.outputs,
-            depends_on=new_deps,
-            max_iterations=child.max_iterations,
-        ))
+        out.append(
+            SubTask(
+                id=old_to_new[child.id],
+                description=child.description,
+                agent_type=child.agent_type,
+                inputs=child.inputs,
+                outputs=child.outputs,
+                depends_on=new_deps,
+                max_iterations=child.max_iterations,
+            )
+        )
     return out
 
 
@@ -688,9 +703,7 @@ class TaskDecomposer(dspy.Module):
             # all tasks silently.
             known_ids = {t.id for t in sub_tasks}
             if groups:
-                all_group_ids = {
-                    tid for grp in groups for tid in grp
-                }
+                all_group_ids = {tid for grp in groups for tid in grp}
                 if not all_group_ids.issubset(known_ids):
                     logger.warning(
                         "Group IDs %s don't match sub_task IDs %s"
@@ -716,10 +729,7 @@ class TaskDecomposer(dspy.Module):
             # the coarse-grained ones.  This must happen BEFORE the
             # overlap detector so the (now-finer) leaves are what the
             # detector sees.
-            if (
-                self.config.enable_hierarchical
-                and _depth < self.config.max_depth
-            ):
+            if self.config.enable_hierarchical and _depth < self.config.max_depth:
                 sub_tasks, groups = await self._recurse_into_subtasks(
                     sub_tasks,
                     groups,
@@ -800,8 +810,7 @@ class TaskDecomposer(dspy.Module):
                 )
             except Exception as exc:
                 logger.warning(
-                    "Recursive decomposition of %s failed (%s) — "
-                    "keeping as leaf",
+                    "Recursive decomposition of %s failed (%s) — keeping as leaf",
                     task.id,
                     exc,
                 )
@@ -817,8 +826,7 @@ class TaskDecomposer(dspy.Module):
 
             children = _renumber_children(task.id, child_result.sub_tasks)
             child_id_map = {
-                old.id: new.id
-                for old, new in zip(child_result.sub_tasks, children, strict=True)
+                old.id: new.id for old, new in zip(child_result.sub_tasks, children, strict=True)
             }
             child_groups = [
                 [child_id_map[cid] for cid in grp if cid in child_id_map]
@@ -833,25 +841,28 @@ class TaskDecomposer(dspy.Module):
             new_tasks_after_rewrite: list[SubTask] = []
             for existing in new_tasks:
                 if task.id in existing.depends_on:
-                    rewritten_deps = [
-                        d for d in existing.depends_on if d != task.id
-                    ] + child_ids
-                    new_tasks_after_rewrite.append(SubTask(
-                        id=existing.id,
-                        description=existing.description,
-                        agent_type=existing.agent_type,
-                        inputs=existing.inputs,
-                        outputs=existing.outputs,
-                        depends_on=rewritten_deps,
-                        max_iterations=existing.max_iterations,
-                    ))
+                    rewritten_deps = [d for d in existing.depends_on if d != task.id] + child_ids
+                    new_tasks_after_rewrite.append(
+                        SubTask(
+                            id=existing.id,
+                            description=existing.description,
+                            agent_type=existing.agent_type,
+                            inputs=existing.inputs,
+                            outputs=existing.outputs,
+                            depends_on=rewritten_deps,
+                            max_iterations=existing.max_iterations,
+                        )
+                    )
                 else:
                     new_tasks_after_rewrite.append(existing)
             new_tasks = new_tasks_after_rewrite
 
             new_tasks.extend(children)
             new_groups = _splice_children_into_groups(
-                new_groups, task.id, child_ids, child_groups,
+                new_groups,
+                task.id,
+                child_ids,
+                child_groups,
             )
 
         # Same dependency rewrite for siblings later in the list — any
@@ -880,15 +891,17 @@ class TaskDecomposer(dspy.Module):
                     else:
                         new_deps.append(d)
                 if changed:
-                    patched.append(SubTask(
-                        id=t.id,
-                        description=t.description,
-                        agent_type=t.agent_type,
-                        inputs=t.inputs,
-                        outputs=t.outputs,
-                        depends_on=new_deps,
-                        max_iterations=t.max_iterations,
-                    ))
+                    patched.append(
+                        SubTask(
+                            id=t.id,
+                            description=t.description,
+                            agent_type=t.agent_type,
+                            inputs=t.inputs,
+                            outputs=t.outputs,
+                            depends_on=new_deps,
+                            max_iterations=t.max_iterations,
+                        )
+                    )
                 else:
                     patched.append(t)
             new_tasks = patched

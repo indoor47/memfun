@@ -10,6 +10,7 @@ Extraction strategies:
 - Go/Rust/Java: simple regex (basic coverage)
 - Other: path + size only (no definitions)
 """
+
 from __future__ import annotations
 
 import ast
@@ -130,12 +131,14 @@ def _extract_python(source: str, path: str, size: int) -> FileMap:
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
             sig = _format_class_sig(node)
-            defs.append(Definition(
-                name=node.name,
-                kind="class",
-                signature=sig,
-                line=node.lineno,
-            ))
+            defs.append(
+                Definition(
+                    name=node.name,
+                    kind="class",
+                    signature=sig,
+                    line=node.lineno,
+                )
+            )
             # Extract methods
             for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -147,20 +150,24 @@ def _extract_python(source: str, path: str, size: int) -> FileMap:
                     ):
                         continue
                     msig = _format_func_sig(item)
-                    defs.append(Definition(
-                        name=f"{node.name}.{item.name}",
-                        kind="method",
-                        signature=msig,
-                        line=item.lineno,
-                    ))
+                    defs.append(
+                        Definition(
+                            name=f"{node.name}.{item.name}",
+                            kind="method",
+                            signature=msig,
+                            line=item.lineno,
+                        )
+                    )
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             sig = _format_func_sig(node)
-            defs.append(Definition(
-                name=node.name,
-                kind="function",
-                signature=sig,
-                line=node.lineno,
-            ))
+            defs.append(
+                Definition(
+                    name=node.name,
+                    kind="function",
+                    signature=sig,
+                    line=node.lineno,
+                )
+            )
 
     return FileMap(path=path, definitions=tuple(defs), size=size)
 
@@ -343,6 +350,7 @@ def build_code_map(
 
     if manifest is None:
         from memfun_agent.context_first import build_file_manifest
+
         manifest = build_file_manifest(root)
 
     file_maps: list[FileMap] = []

@@ -25,18 +25,10 @@ ASCII_BANNER = """\
 
 
 def init_command(
-    backend: str | None = typer.Option(
-        None, help="Backend: memory, sqlite, redis, nats"
-    ),
-    llm: str | None = typer.Option(
-        None, help="LLM provider: anthropic, openai, ollama, custom"
-    ),
-    sandbox: str | None = typer.Option(
-        None, help="Sandbox: local, docker, modal"
-    ),
-    non_interactive: bool = typer.Option(
-        False, "--non-interactive", "-y"
-    ),
+    backend: str | None = typer.Option(None, help="Backend: memory, sqlite, redis, nats"),
+    llm: str | None = typer.Option(None, help="LLM provider: anthropic, openai, ollama, custom"),
+    sandbox: str | None = typer.Option(None, help="Sandbox: local, docker, modal"),
+    non_interactive: bool = typer.Option(False, "--non-interactive", "-y"),
     check: bool = typer.Option(
         True,
         "--check/--no-check",
@@ -57,9 +49,7 @@ def init_command(
         else:
             run_global_setup()
     else:
-        console.print(
-            "[dim]Global config: ~/.memfun/config.toml (exists)[/dim]"
-        )
+        console.print("[dim]Global config: ~/.memfun/config.toml (exists)[/dim]")
 
     # Step 2: Project init if needed
     project_config = project_dir / "config.toml"
@@ -69,10 +59,7 @@ def init_command(
                 backend=backend or "sqlite",
                 sandbox=sandbox or "local",
             )
-            console.print(
-                f"[green]✓[/green] Project initialized: "
-                f"{Path.cwd().name}/"
-            )
+            console.print(f"[green]✓[/green] Project initialized: {Path.cwd().name}/")
         else:
             _interactive_project_init(backend, sandbox)
     else:
@@ -102,21 +89,20 @@ def init_command(
                 raise
 
     console.print()
-    console.print(
-        "[green]Ready.[/green] Run [bold cyan]memfun[/bold cyan] "
-        "to start chatting."
-    )
+    console.print("[green]Ready.[/green] Run [bold cyan]memfun[/bold cyan] to start chatting.")
 
 
 def run_global_setup() -> None:
     """First-time global setup: LLM provider + API key."""
     console.print()
-    console.print(Panel.fit(
-        ASCII_BANNER,
-        border_style="cyan",
-        title="[bold cyan]Welcome to Memfun[/bold cyan]",
-        subtitle="Autonomous coding agent",
-    ))
+    console.print(
+        Panel.fit(
+            ASCII_BANNER,
+            border_style="cyan",
+            title="[bold cyan]Welcome to Memfun[/bold cyan]",
+            subtitle="Autonomous coding agent",
+        )
+    )
     console.print()
     console.print("[bold]First-time setup[/bold]")
     console.print()
@@ -131,10 +117,7 @@ def run_global_setup() -> None:
             },
             {"name": "OpenAI (GPT)", "value": "openai"},
             {
-                "name": (
-                    "OpenAI-compatible "
-                    "(local llama.cpp / vLLM / OpenRouter)"
-                ),
+                "name": ("OpenAI-compatible (local llama.cpp / vLLM / OpenRouter)"),
                 "value": "openai-compat",
             },
             {"name": "Ollama (local)", "value": "ollama"},
@@ -165,27 +148,21 @@ def run_global_setup() -> None:
         config["llm"]["api_key_env"] = env_var
         existing = os.environ.get(env_var, "")
         if existing:
-            console.print(
-                f"  [green]✓[/green] Found {env_var} in environment"
-            )
+            console.print(f"  [green]✓[/green] Found {env_var} in environment")
             api_key = existing
         elif provider == "openai-compat":
             # Optional API key for openai-compatible endpoints — many
             # local servers (llama.cpp, vLLM) accept any non-empty
             # value or no key at all.
             key = _prompt_secret(
-                message=(
-                    "Paste API key "
-                    "(optional — leave blank for local endpoints)"
-                ),
+                message=("Paste API key (optional — leave blank for local endpoints)"),
             )
             if key.strip():
                 api_key = key.strip()
                 console.print("  [green]✓[/green] API key saved")
             else:
                 console.print(
-                    "  [dim]No API key — using placeholder "
-                    "'sk-local' for local endpoints[/dim]"
+                    "  [dim]No API key — using placeholder 'sk-local' for local endpoints[/dim]"
                 )
         else:
             key = _prompt_secret(
@@ -195,10 +172,7 @@ def run_global_setup() -> None:
                 api_key = key.strip()
                 console.print("  [green]✓[/green] API key saved")
             else:
-                console.print(
-                    f"  [yellow]![/yellow] Set {env_var} before "
-                    "using Memfun"
-                )
+                console.print(f"  [yellow]![/yellow] Set {env_var} before using Memfun")
 
     if provider == "custom":
         base_url = inquirer.text(
@@ -221,10 +195,7 @@ def run_global_setup() -> None:
         creds_path.write_text(json.dumps({env_var: api_key}, indent=2))
         creds_path.chmod(0o600)
         os.environ[env_var] = api_key
-        console.print(
-            "  [green]✓[/green] Credentials saved to "
-            "~/.memfun/credentials.json"
-        )
+        console.print("  [green]✓[/green] Credentials saved to ~/.memfun/credentials.json")
 
     # Create dirs
     (global_dir / "agents").mkdir(exist_ok=True)
@@ -261,12 +232,14 @@ def run_project_init(
         config["backend"]["sqlite_path"] = ".memfun/memfun.db"
     elif backend == "redis":
         redis_url = os.environ.get(
-            "MEMFUN_REDIS_URL", "redis://localhost:6379",
+            "MEMFUN_REDIS_URL",
+            "redis://localhost:6379",
         )
         config["backend"]["redis_url"] = redis_url
     elif backend == "nats":
         nats_url = os.environ.get(
-            "MEMFUN_NATS_URL", "nats://localhost:4222",
+            "MEMFUN_NATS_URL",
+            "nats://localhost:4222",
         )
         config["backend"]["nats_url"] = nats_url
 
@@ -292,14 +265,10 @@ def run_project_init(
             old_history.rename(dest)
 
 
-def _interactive_project_init(
-    backend: str | None, sandbox: str | None
-) -> None:
+def _interactive_project_init(backend: str | None, sandbox: str | None) -> None:
     """Interactive project-level setup."""
     console.print()
-    console.print(
-        f"[bold]Project:[/bold] [cyan]{Path.cwd().name}[/cyan]"
-    )
+    console.print(f"[bold]Project:[/bold] [cyan]{Path.cwd().name}[/cyan]")
 
     setup_mode = inquirer.select(
         message="Setup mode:",
@@ -318,9 +287,7 @@ def _interactive_project_init(
 
     if setup_mode == "quick":
         run_project_init()
-        console.print(
-            "[green]✓[/green] Project initialized with defaults"
-        )
+        console.print("[green]✓[/green] Project initialized with defaults")
         return
 
     # Custom: pick backend
@@ -412,10 +379,7 @@ def _docker_start(service: str) -> str:
             ["docker", "start", container],
             capture_output=True,
         )
-        console.print(
-            f"  [green]✓[/green] {service.title()} container "
-            f"already exists, started"
-        )
+        console.print(f"  [green]✓[/green] {service.title()} container already exists, started")
         return default_url
 
     # Build docker run command
@@ -430,22 +394,14 @@ def _docker_start(service: str) -> str:
     console.print(f"  [dim]Starting {service} via Docker...[/dim]")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        console.print(
-            f"  [red]✗[/red] Failed to start {service}: "
-            f"{result.stderr.strip()}"
-        )
-        console.print(
-            "  [yellow]Falling back to manual URL entry[/yellow]"
-        )
+        console.print(f"  [red]✗[/red] Failed to start {service}: {result.stderr.strip()}")
+        console.print("  [yellow]Falling back to manual URL entry[/yellow]")
         return inquirer.text(
             message=f"{service.title()} URL:",
             default=default_url,
         ).execute()
 
-    console.print(
-        f"  [green]✓[/green] {service.title()} started "
-        f"at {default_url}"
-    )
+    console.print(f"  [green]✓[/green] {service.title()} started at {default_url}")
     return default_url
 
 
@@ -457,20 +413,24 @@ def _setup_service(service: str) -> str:
 
     choices = []
     if has_docker:
-        choices.append({
-            "name": f"Auto-start {service.title()} via Docker (recommended)",
-            "value": "auto",
-        })
-    choices.extend([
-        {
-            "name": f"Connect to existing {service.title()}",
-            "value": "custom",
-        },
-        {
-            "name": f"Use default ({default_url})",
-            "value": "default",
-        },
-    ])
+        choices.append(
+            {
+                "name": f"Auto-start {service.title()} via Docker (recommended)",
+                "value": "auto",
+            }
+        )
+    choices.extend(
+        [
+            {
+                "name": f"Connect to existing {service.title()}",
+                "value": "custom",
+            },
+            {
+                "name": f"Use default ({default_url})",
+                "value": "default",
+            },
+        ]
+    )
 
     mode = inquirer.select(
         message=f"{service.title()} setup:",
@@ -511,9 +471,7 @@ def _non_interactive_global_setup(llm: str | None) -> None:
     config = {
         "llm": {
             "provider": provider,
-            "api_key_env": (
-                _get_api_key_env(provider) or "ANTHROPIC_API_KEY"
-            ),
+            "api_key_env": (_get_api_key_env(provider) or "ANTHROPIC_API_KEY"),
         },
     }
     _write_toml(global_dir / "config.toml", config)
@@ -541,8 +499,7 @@ _PROVIDER_MODELS: dict[str, list[tuple[str, str]]] = {
     "anthropic": [
         (
             "claude-sonnet-4-6",
-            "Sonnet 4.6 — fast + smart, good for most tasks "
-            "(default)",
+            "Sonnet 4.6 — fast + smart, good for most tasks (default)",
         ),
         (
             "claude-opus-4-6",
@@ -585,9 +542,7 @@ def _prompt_select(
 ) -> str:
     """Thin wrapper around `inquirer.select` returning a typed str."""
     select_fn = cast("Any", inquirer).select
-    raw: Any = select_fn(
-        message=message, choices=choices, default=default
-    ).execute()
+    raw: Any = select_fn(message=message, choices=choices, default=default).execute()
     return str(raw)
 
 
@@ -602,8 +557,7 @@ def _pick_model(provider: str) -> str:
     if provider in _PROVIDER_MODELS:
         models = _PROVIDER_MODELS[provider]
         choices: list[dict[str, str]] = [
-            {"name": f"{name} — {desc}", "value": name}
-            for name, desc in models
+            {"name": f"{name} — {desc}", "value": name} for name, desc in models
         ]
         choices.append({"name": "Type custom...", "value": "__custom__"})
         selection = _prompt_select(
@@ -628,17 +582,13 @@ def _pick_model(provider: str) -> str:
         # Free-text, required (no default — depends on the endpoint).
         while True:
             result = _prompt_text(
-                message=(
-                    "Model name (e.g. qwen-coder-7b, "
-                    "meta-llama/Llama-3.1-70B)"
-                ),
+                message=("Model name (e.g. qwen-coder-7b, meta-llama/Llama-3.1-70B)"),
             )
             stripped = result.strip()
             if stripped:
                 return stripped
             console.print(
-                "  [yellow]Model name is required for "
-                "OpenAI-compatible endpoints.[/yellow]"
+                "  [yellow]Model name is required for OpenAI-compatible endpoints.[/yellow]"
             )
 
     # provider == "custom" — free-text fallback.

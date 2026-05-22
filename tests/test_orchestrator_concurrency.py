@@ -4,6 +4,7 @@ These tests verify that ``OrchestratorConfig.max_concurrency`` (and the
 analogous ``DistributedConfig.max_concurrency``) actually caps the
 number of in-flight agent dispatches, regardless of fan-out width.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -110,9 +111,7 @@ def _make_task(agent_id: str) -> TaskMessage:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cap", [2, 8])
-async def test_fan_out_respects_concurrency_cap(
-    runtime_context: Any, cap: int
-) -> None:
+async def test_fan_out_respects_concurrency_cap(runtime_context: Any, cap: int) -> None:
     """Peak in-flight handles must never exceed ``max_concurrency``."""
     probe = _ConcurrencyProbe()
     agent = _SleepingAgent(runtime_context, probe, sleep_seconds=0.05)
@@ -139,14 +138,10 @@ async def test_fan_out_respects_concurrency_cap(
     assert all(r.success for r in results)
     # The cap is the only thing standing between this many parallel
     # sleeping agents and a peak of ``n_tasks``.
-    assert probe.peak <= cap, (
-        f"peak in-flight {probe.peak} exceeded cap {cap}"
-    )
+    assert probe.peak <= cap, f"peak in-flight {probe.peak} exceeded cap {cap}"
     # Sanity: with such a tight workload we should actually saturate
     # the cap (otherwise the test wouldn't prove anything).
-    assert probe.peak == cap, (
-        f"expected peak == cap={cap} given 20 tasks, got peak={probe.peak}"
-    )
+    assert probe.peak == cap, f"expected peak == cap={cap} given 20 tasks, got peak={probe.peak}"
 
 
 @pytest.mark.asyncio
@@ -215,9 +210,7 @@ async def test_semaphore_is_shared_across_calls(
     )
 
     assert all(r.success for r in [*results_a, *results_b])
-    assert probe.peak <= 3, (
-        f"peak in-flight {probe.peak} exceeded shared cap 3"
-    )
+    assert probe.peak <= 3, f"peak in-flight {probe.peak} exceeded shared cap 3"
 
 
 # ── DistributedOrchestrator tests ───────────────────────────────────
@@ -301,9 +294,7 @@ async def test_distributed_fan_out_respects_concurrency_cap() -> None:
 
     assert len(results) == n_tasks
     assert all(r.success for r in results), [r.error for r in results if not r.success]
-    assert probe.peak <= 2, (
-        f"distributed peak in-flight {probe.peak} exceeded cap 2"
-    )
+    assert probe.peak <= 2, f"distributed peak in-flight {probe.peak} exceeded cap 2"
     assert probe.peak == 2, (
         f"expected distributed peak == cap=2 given {n_tasks} tasks, got {probe.peak}"
     )

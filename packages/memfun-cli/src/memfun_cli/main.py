@@ -69,9 +69,7 @@ def ask(
 
 @app.command()
 def analyze(
-    path: str | None = typer.Argument(
-        None, help="File or directory to analyze (defaults to cwd)"
-    ),
+    path: str | None = typer.Argument(None, help="File or directory to analyze (defaults to cwd)"),
 ) -> None:
     """Analyze code at a path for structure, quality, and issues."""
     analyze_command(path)
@@ -79,9 +77,7 @@ def analyze(
 
 @app.command()
 def fix(
-    description: str = typer.Argument(
-        ..., help="Description of the bug to fix"
-    ),
+    description: str = typer.Argument(..., help="Description of the bug to fix"),
 ) -> None:
     """Fix a bug based on its description."""
     fix_command(description)
@@ -89,9 +85,7 @@ def fix(
 
 @app.command()
 def review(
-    path: str | None = typer.Argument(
-        None, help="File or directory to review (defaults to cwd)"
-    ),
+    path: str | None = typer.Argument(None, help="File or directory to review (defaults to cwd)"),
 ) -> None:
     """Review code at a path and provide structured feedback."""
     review_command(path)
@@ -99,9 +93,7 @@ def review(
 
 @app.command()
 def explain(
-    path: str | None = typer.Argument(
-        None, help="File or directory to explain (defaults to cwd)"
-    ),
+    path: str | None = typer.Argument(None, help="File or directory to explain (defaults to cwd)"),
 ) -> None:
     """Explain how code at a path works."""
     explain_command(path)
@@ -112,6 +104,7 @@ def version() -> None:
     """Show the Memfun version."""
     from memfun_core._version import __version__
     from rich.console import Console
+
     Console().print(f"memfun {__version__}")
 
 

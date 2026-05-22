@@ -4,6 +4,7 @@ Provides a ``SharedSpec`` dataclass that all agents in a workflow can
 read from and contribute to, and a ``SharedSpecStore`` that persists
 it via a :class:`StateStoreAdapter`.
 """
+
 from __future__ import annotations
 
 import json
@@ -33,14 +34,16 @@ class SharedSpec:
     # ── Serialisation ─────────────────────────────────────────
 
     def to_json(self) -> str:
-        return json.dumps({
-            "workflow_id": self.workflow_id,
-            "spec_text": self.spec_text,
-            "findings": self.findings,
-            "interfaces": self.interfaces,
-            "file_registry": self.file_registry,
-            "created_at": self.created_at,
-        })
+        return json.dumps(
+            {
+                "workflow_id": self.workflow_id,
+                "spec_text": self.spec_text,
+                "findings": self.findings,
+                "interfaces": self.interfaces,
+                "file_registry": self.file_registry,
+                "created_at": self.created_at,
+            }
+        )
 
     @classmethod
     def from_json(cls, raw: str | bytes) -> SharedSpec:
@@ -119,7 +122,10 @@ class SharedSpecStore:
         return SharedSpec.from_json(raw)
 
     async def append_finding(
-        self, workflow_id: str, agent_id: str, finding: str,
+        self,
+        workflow_id: str,
+        agent_id: str,
+        finding: str,
     ) -> None:
         """Append a finding to a workflow's shared spec."""
         spec = await self.load(workflow_id)
