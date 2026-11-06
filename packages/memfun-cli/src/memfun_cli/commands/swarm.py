@@ -25,10 +25,13 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import secrets
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import typer
 from memfun_core.config import MemfunConfig
@@ -195,6 +198,120 @@ def _display_final_summary(
         )
 
 
+# ── Opt-in machine-readable result (MEMFUN_SWARM_RESULT_JSON) ───────
+
+#: When set, ``memfun swarm`` writes a JSON summary of the run to this path.
+RESULT_JSON_ENV = "MEMFUN_SWARM_RESULT_JSON"
+RESULT_JSON_SCHEMA_VERSION = 1
+_MAX_OPS_PER_TASK = 2000
+_MAX_DETAIL_CHARS = 200
+
+
+def _normalize_op(op: Any) -> dict[str, str]:
+    """``{type, target, detail}`` from an op dict or ``(type, target, detail)`` tuple."""
+    if isinstance(op, dict):
+        raw: dict[str, Any] = op  # pyright: ignore[reportUnknownVariableType]
+        typ, target, detail = raw.get("type"), raw.get("target"), raw.get("detail")
+    elif isinstance(op, (list, tuple)):
+        seq: list[Any] = list(op)  # pyright: ignore[reportUnknownArgumentType]
+        typ, target, detail = [*seq, None, None, None][:3]
+    else:
+        typ, target, detail = "unknown", op, None
+    return {
+        "type": str(typ or "unknown")[:_MAX_DETAIL_CHARS],
+        "target": "" if target is None else str(target)[:_MAX_DETAIL_CHARS],
+        "detail": "" if detail is None else str(detail)[:_MAX_DETAIL_CHARS],
+    }
+
+
+def _swarm_result_payload(
+    result: WorkflowResult | None,
+    wall_seconds: float,
+    sub_tasks_seen: dict[str, SubTaskStatus],
+    error: str | None = None,
+) -> dict[str, Any]:
+    """JSON-safe summary of a swarm run.  Ops are commands/paths only, no prompts."""
+    sub_results: dict[str, Any] = dict(result.sub_task_results) if result is not None else {}
+    decomposition = result.decomposition if result is not None else None
+    sub_tasks: dict[str, Any] = {}
+    ops_total: dict[str, int] = {}
+    for tid in sorted(set(sub_results) | set(sub_tasks_seen)):
+        res = sub_results.get(tid)
+        status = sub_tasks_seen.get(tid)
+        data: dict[str, Any] = {}
+        if res is not None and isinstance(getattr(res, "result", None), dict):
+            data = res.result
+        raw_ops: list[Any] = list(data.get("ops") or [])
+        ops = [_normalize_op(o) for o in raw_ops[:_MAX_OPS_PER_TASK]]
+        for op in [_normalize_op(o) for o in raw_ops]:
+            ops_total[op["type"]] = ops_total.get(op["type"], 0) + 1
+        iterations = data.get("iterations")
+        sub_tasks[tid] = {
+            "agent": (status.agent_name if status is not None else "")
+            or (getattr(res, "agent_id", "") if res is not None else ""),
+            "status": status.status if status is not None else None,
+            "success": bool(res.success) if res is not None else None,
+            "error": (
+                str(res.error)[:_MAX_DETAIL_CHARS] if res is not None and res.error else None
+            ),
+            "iterations": iterations if isinstance(iterations, int) else None,
+            "ops": ops,
+            "ops_count": len(raw_ops),
+            "truncated": len(raw_ops) > _MAX_OPS_PER_TASK,
+            "files_created": [str(f) for f in cast("list[Any]", data.get("files_created") or [])][
+                :500
+            ],
+            "started_at": status.started_at if status is not None else None,
+            "completed_at": status.completed_at if status is not None else None,
+            # Per-task review verdicts live in engine state, not on WorkflowResult.
+            "review": None,
+        }
+    return {
+        "schema_version": RESULT_JSON_SCHEMA_VERSION,
+        "workflow_id": result.workflow_id if result is not None else None,
+        "success": bool(result.success) if result is not None else False,
+        "error": (result.error if result is not None else error) or None,
+        "unaccepted_tasks": list(result.unaccepted_tasks) if result is not None else [],
+        "review_errors": result.review_errors if result is not None else 0,
+        "review_rounds": result.review_rounds if result is not None else 0,
+        "files_created": list(result.files_created) if result is not None else [],
+        "decomposition": None
+        if decomposition is None
+        else {
+            "n_sub_tasks": len(decomposition.sub_tasks),
+            "is_single_task": bool(decomposition.is_single_task),
+            "groups": [list(g) for g in decomposition.parallelism_groups],
+        },
+        "sub_tasks": sub_tasks,
+        "ops_total": ops_total,
+        "wall_seconds": round(wall_seconds, 3),
+    }
+
+
+def _write_swarm_result_json(payload: dict[str, Any]) -> None:
+    """Write ``payload`` to ``$MEMFUN_SWARM_RESULT_JSON`` if set; never raises.
+
+    The file is written to an exclusive no-follow temp file and then hard-linked into
+    place, so it appears atomically and an existing entry at the path (a planted file
+    or symlink included) is refused rather than overwritten or followed.
+    """
+    target = os.environ.get(RESULT_JSON_ENV, "").strip()
+    if not target:
+        return
+    path = Path(target)
+    tmp = path.parent / f".{path.name}.{secrets.token_hex(6)}.tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, default=str)
+            os.link(tmp, path)
+        finally:
+            os.unlink(tmp)
+    except Exception as exc:
+        logger.warning("Could not write %s=%s: %s", RESULT_JSON_ENV, target, exc)
+
+
 # ── Async runner ───────────────────────────────────────────────────
 
 
@@ -352,7 +469,12 @@ async def _run_swarm(
     )
 
     status_by_tid: dict[str, str] = {}
-    on_sub_task = _on_sub_task_status_factory(status_by_tid)
+    print_sub_task = _on_sub_task_status_factory(status_by_tid)
+    sub_tasks_seen: dict[str, SubTaskStatus] = {}
+
+    def on_sub_task(tid: str, status: SubTaskStatus) -> None:
+        sub_tasks_seen[tid] = status
+        print_sub_task(tid, status)
 
     engine = WorkflowEngine(
         context=runtime,
@@ -418,6 +540,14 @@ async def _run_swarm(
                 border_style="red",
             )
         )
+        _write_swarm_result_json(
+            _swarm_result_payload(
+                None,
+                time.perf_counter() - start,
+                sub_tasks_seen,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        )
         return 1
     finally:
         # Best-effort: stop all managed agents so the process can exit.
@@ -428,6 +558,7 @@ async def _run_swarm(
 
     wall = time.perf_counter() - start
     _display_final_summary(result, wall)
+    _write_swarm_result_json(_swarm_result_payload(result, wall, sub_tasks_seen))
     return 0 if result.success else 1
 
 
