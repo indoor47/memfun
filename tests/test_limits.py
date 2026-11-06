@@ -95,6 +95,10 @@ def test_made_progress_rules() -> None:
     assert not _made_progress([("cmd", "pytest -q", 1)], reads, cmds)  # same, no edit between
     assert _made_progress([("edit", "a.py", "x")], reads, cmds)
     assert _made_progress([("cmd", "pytest -q", 0)], reads, cmds)  # after an edit it counts again
+    # paging through one big file in slices is progress; repeating a slice is not
+    assert _made_progress([("read", "big.py", 900, 1)], reads, cmds)
+    assert _made_progress([("read", "big.py", 900, 201)], reads, cmds)
+    assert not _made_progress([("read", "big.py", 900, 201)], reads, cmds)
     assert _made_progress([("grep", "foo", 3)], reads, cmds)
     assert not _made_progress([("grep", "foo", 3)], reads, cmds)
 
@@ -122,6 +126,20 @@ def test_rereading_the_same_file_stops_the_agent_with_a_reason(tmp_path: Path) -
     assert result.stop_reason.startswith("stalled: 3 consecutive iterations")
     assert result.iterations == 4  # 1 new read, then 3 idle iterations
     assert result.answer.startswith("[STOPPED: stalled")
+
+
+def test_paging_through_a_big_file_is_not_a_stall(tmp_path: Path) -> None:
+    (tmp_path / "big.txt").write_text("\n".join(f"line {i}" for i in range(2000)))
+    module = _module(
+        tmp_path,
+        lambda n: (
+            "state['FINAL'] = 'done'" if n > 20 else f"print(read_file('big.txt', {n * 50}, 20))"
+        ),
+        max_iterations=60,
+        stall_steps=5,
+    )
+    result = asyncio.run(module.aforward(query="q", context="ctx"))
+    assert result.stop_reason == "" and result.answer == "done"
 
 
 def test_progress_resets_the_stall_counter_and_the_cap_is_only_a_backstop(

@@ -348,9 +348,11 @@ def _made_progress(
                 progress = True
                 cmds_since_edit.add(target)
         elif kind == "read":
-            if target not in seen_reads:
+            # A slice read (path, size, start) is a different read per start line.
+            key = f"{target}@{op[3]}" if len(op) > 3 else target
+            if key not in seen_reads:
                 progress = True
-                seen_reads.add(target)
+                seen_reads.add(key)
         else:
             key = f"{kind}:{target}"
             if key not in seen_reads:
@@ -1315,7 +1317,8 @@ def _make_read_file(
                 print(note)
                 return note
             chunk = all_lines[start - 1 : start - 1 + count]
-            ns["state"]["_ops"].append(("read", path, sum(len(x) for x in chunk)))
+            # 4th element: the slice start, so paging through one file is not a re-read.
+            ns["state"]["_ops"].append(("read", path, sum(len(x) for x in chunk), start))
             body = "\n".join(f"{start + i:6d}\t{text}" for i, text in enumerate(chunk))
             end = start + len(chunk) - 1
             note = f"[{path}: lines {start}-{end} of {len(all_lines)}]"
