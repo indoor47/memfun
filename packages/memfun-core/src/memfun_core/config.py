@@ -151,6 +151,11 @@ class LLMConfig:
                 updates["base_url"] = None
                 continue
             updates[f.name] = val
+        # A role that switches provider does not inherit [llm]'s base_url:
+        # e.g. an anthropic role over an openai tunnel [llm] must go to
+        # Anthropic, not send its key to the tunnel.
+        if "base_url" not in updates and updates.get("provider", self.provider) != self.provider:
+            updates["base_url"] = None
         # Never send [llm]'s key to a different endpoint: api_key_env is
         # inherited only when provider AND base_url resolve to [llm]'s --
         # and, for providers routed by the model string (custom), when

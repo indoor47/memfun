@@ -39,7 +39,7 @@ from __future__ import annotations
 import contextlib
 import time
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from memfun_core.logging import get_logger
 
@@ -214,12 +214,14 @@ def _extract_completion_and_usage(
 
     Prefers the structured ``instance.history[-1]`` entry (DSPy stores
     raw response + usage there) and falls back to inspecting *outputs*
-    if history is empty (eg. on exception paths).
+    if history is empty (eg. on exception paths).  ``model`` is the
+    calling LM's configured model id, not the provider-echoed name.
     """
     completion = ""
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
-    model: str | None = None
+    entry_model: str | None = None
+    response_model: str | None = None
 
     # Path 1: DSPy populates instance.history just before on_lm_end fires.
     history = getattr(instance, "history", None)
@@ -234,12 +236,12 @@ def _extract_completion_and_usage(
                     prompt_tokens = pt
                 if isinstance(ct, int):
                     completion_tokens = ct
-            model = (
-                entry.get("response_model") or entry.get("model")
-                if isinstance(entry.get("response_model"), str)
-                or isinstance(entry.get("model"), str)
-                else None
-            )
+            em = cast("object", entry.get("model"))
+            rm = cast("object", entry.get("response_model"))
+            if isinstance(em, str):
+                entry_model = em
+            if isinstance(rm, str):
+                response_model = rm
             outs = entry.get("outputs")
             if isinstance(outs, list) and outs:
                 completion = _stringify_output(outs[0])
@@ -251,10 +253,17 @@ def _extract_completion_and_usage(
         else:
             completion = _stringify_output(outputs)
 
-    if model is None:
-        model = getattr(instance, "model", None)
-        if not isinstance(model, str):
-            model = None
+    # ``model`` is the id of the LM that made the call -- the configured
+    # DSPy/LiteLLM model string (e.g. ``openai/qwen3.8-27b``), which is
+    # what role binding chose.  The provider-echoed ``response_model`` is
+    # whatever the server reports (an alias, a weights path, "default",
+    # or "dummy" for DSPy 3.4's DummyEngine) and is only a last resort.
+    instance_model = getattr(instance, "model", None)
+    model = (
+        entry_model
+        or (instance_model if isinstance(instance_model, str) else None)
+        or response_model
+    )
 
     return _truncate(completion), prompt_tokens, completion_tokens, model
 

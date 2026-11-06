@@ -104,15 +104,23 @@ this field names the variable that holds the key and never holds the key
 itself; `api_key_env = ""` means "no key". `base_url = ""` clears an
 inherited `[llm].base_url`.
 
-`api_key_env` is the one exception to field-by-field fallback: a role
-inherits `[llm].api_key_env` only when its `provider` **and** `base_url`
-both resolve to the same values as `[llm]`'s. A role that changes either
-gets no key unless it sets its own `api_key_env`, so the `[llm]` key is
-never sent to a different endpoint. For `custom` (and any other provider
-memfun does not map itself) the route is part of `model` (e.g.
-`openrouter/...`), so a role that changes the model's route prefix also
-gets no inherited key. Provider names are matched case-insensitively;
-an unrecognized provider logs a warning.
+Two fields are exceptions to plain field-by-field fallback, so a role
+never sends credentials to the wrong place:
+
+- `base_url`: a role that switches `provider` does **not** inherit
+  `[llm].base_url` (it uses the new provider's default endpoint unless it
+  sets its own `base_url`). `base_url = ""` clears an inherited value
+  explicitly.
+- `api_key_env`: a role inherits `[llm].api_key_env` only when its
+  `provider` **and** `base_url` both resolve to the same values as
+  `[llm]`'s. A role that changes either gets no key unless it sets its own
+  `api_key_env`, so the `[llm]` key is never sent to a different endpoint.
+  For `custom` (and any other provider memfun does not map itself) the
+  route is part of `model` (e.g. `openrouter/...`), so a role that changes
+  the model's route prefix also gets no inherited key.
+
+Provider names are matched case-insensitively; an unrecognized provider
+logs a warning.
 
 Global and project configs are merged before roles are resolved, so an
 `api_key_env` from `~/.memfun/config.toml` combined with a project-level
@@ -120,17 +128,46 @@ Global and project configs are merged before roles are resolved, so an
 same trust model as `[llm].base_url`. Review merged configs from untrusted
 projects.
 
-Example: orchestrator and decomposer on Claude Opus 5.5 through the
-Anthropic API; workers and auditors on a self-hosted OpenAI-compatible
-server (for example SGLang or vLLM) reached through an SSH tunnel on
-`localhost:18000`; the PR reviewer falls back to `[llm]`.
+#### Default example: Qwen for every role
+
+The shipped example runs **all five roles** on one self-hosted
+OpenAI-compatible server (SGLang serving Qwen3.8-27B under the alias
+`qwen3.8-27b`) reached through an SSH tunnel on `localhost:18000`. No
+Anthropic key is needed. Set the endpoint once in `[llm]`; every role
+inherits it, and a role table is only needed to tune that role:
 
 ```toml
 [llm]
-provider = "anthropic"
-model = "claude-sonnet-4-6"
-api_key_env = "ANTHROPIC_API_KEY"
+provider = "openai"                     # OpenAI-compatible endpoint
+model = "qwen3.8-27b"                   # the alias the server serves
+base_url = "http://127.0.0.1:18000/v1"  # local end of the SSH tunnel
+api_key_env = "MEMFUN_WORKER_API_KEY"   # dummy; unset -> placeholder key
 
+# Optional per-role tuning; omitted fields (endpoint, key) are inherited.
+[llm.roles.worker]
+max_tokens = 16384
+```
+
+| Role | Resolves to |
+|------|-------------|
+| `orchestrator` | `[llm]`: `openai/qwen3.8-27b` at `http://127.0.0.1:18000/v1` |
+| `decomposer` | `[llm]`: same endpoint |
+| `worker` | `[llm]` plus its own `max_tokens` |
+| `auditor` | `[llm]`: same endpoint |
+| `reviewer` | `[llm]`: same endpoint |
+
+Open the tunnel before starting the swarm, e.g.
+`ssh -N -L 18000:127.0.0.1:<server-port> <user>@<host>`.
+
+#### Optional comparison arm: Claude Opus 5.5 as orchestrator/decomposer
+
+Not the default. To compare against a frontier planner, add these tables
+on top of the Qwen `[llm]` above; workers, auditors and the reviewer stay
+on Qwen. Each anthropic role sets its own `api_key_env` (it would not
+inherit `MEMFUN_WORKER_API_KEY` anyway, because the provider differs) and
+does not inherit the tunnel `base_url`:
+
+```toml
 [llm.roles.orchestrator]
 provider = "anthropic"
 model = "claude-opus-5-5"
@@ -140,24 +177,7 @@ api_key_env = "ANTHROPIC_API_KEY"
 provider = "anthropic"
 model = "claude-opus-5-5"
 api_key_env = "ANTHROPIC_API_KEY"
-
-[llm.roles.worker]
-provider = "openai"                     # OpenAI-compatible endpoint
-model = "qwen3.8-27b"                   # the alias the server serves
-base_url = "http://127.0.0.1:18000/v1"  # local end of the SSH tunnel
-api_key_env = "MEMFUN_WORKER_API_KEY"   # dummy; unset -> placeholder key
-
-[llm.roles.auditor]
-provider = "openai"
-model = "qwen3.8-27b"
-base_url = "http://127.0.0.1:18000/v1"
-api_key_env = "MEMFUN_WORKER_API_KEY"
-
-# [llm.roles.reviewer] omitted -> pr-reviewer uses [llm]
 ```
-
-Open the tunnel before starting the swarm, e.g.
-`ssh -N -L 18000:127.0.0.1:<server-port> <user>@<host>`.
 
 Notes:
 
@@ -172,16 +192,14 @@ Notes:
   model explicitly; a role without a table runs on `[llm]`, never on the
   model of an enclosing role (for example a worker dispatched by the
   orchestrator).
-- Field-by-field fallback means a role that switches `provider` still
-  inherits `[llm].base_url` unless it sets `base_url` (use `base_url = ""`
-  to clear it).
 - Chat requests answered outside a multi-agent workflow (direct answers,
   the single-agent and context-first paths) run as role `default` on
   `[llm]`.
 - Each role's model is bound per call with a task-local `dspy.context`, so
   concurrent agents running different roles do not interfere.
-- Every `llm.call` telemetry event carries `model` (the model id used) and
-  `role` (`default` when no role is bound).
+- Every `llm.call` telemetry event carries `model` (the configured model id
+  of the LM that made the call, e.g. `openai/qwen3.8-27b`, not the name the
+  server echoes back) and `role` (`default` when no role is bound).
 
 ### [backend]
 

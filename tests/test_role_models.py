@@ -89,19 +89,22 @@ def _cfg(toml: str, tmp_path: Path) -> MemfunConfig:
 
 
 class _NamedLM(DummyLM):
-    """DummyLM that reports a configurable model id and counts calls."""
+    """DummyLM with a configurable model id; counts calls via its history.
+
+    No ``forward`` override: DSPy 3.4 routes DummyLM through its
+    DummyEngine (the legacy ``forward`` hook is deprecated, removed in
+    3.5) and records a normalized response whose ``model`` is always
+    ``"dummy"`` -- the LM's own ``model`` is what telemetry must report.
+    """
 
     def __init__(self, model: str) -> None:
         super().__init__({"": {"answer": f"from {model}"}})
         self.model = model
         self.cache = False
-        self.calls = 0
 
-    def forward(self, prompt: Any = None, messages: Any = None, **kwargs: Any) -> Any:
-        self.calls += 1
-        res = super().forward(prompt=prompt, messages=messages, **kwargs)
-        res.model = self.model
-        return res
+    @property
+    def calls(self) -> int:
+        return len(self.history)
 
 
 class _FakeEventBus:
@@ -1059,3 +1062,239 @@ def test_unrecognized_provider_warns_with_role(
     assert len(msgs) == 1
     assert "[llm.roles.auditor]" in msgs[0]
     assert "'opnai'" in msgs[0]
+
+
+# ── Real dspy.LM through a stubbed transport (no network) ────────────
+
+
+@pytest.fixture
+def stub_transport(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Replace DSPy's HTTP layer with a canned OpenAI chat completion.
+
+    DSPy 3.4 sends OpenAI-compatible calls through its vendored lm15
+    ``StdlibTransport``; LiteLLM's ``completion`` is stubbed to fail too,
+    so no code path can reach the network.  The server echoes a model
+    name (``echoed``) that differs from the LM's configured id, like a
+    real SGLang/vLLM server reporting its served name or weights path.
+    """
+    import litellm
+    from dspy._vendor.lm15.transports import _sync  # pyright: ignore[reportPrivateUsage]
+    from dspy._vendor.lm15.transports._types import TransportResponse
+
+    sent: list[dict[str, Any]] = []
+
+    def _release(consumed: bool) -> None:
+        return None
+
+    def _stream(self: Any, request: Any) -> TransportResponse:
+        sent.append({"url": request.url, "body": json.loads(request.body or b"{}")})
+        body = json.dumps(
+            {
+                "id": "x",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "/models/served-weights-path",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "[[ ## answer ## ]]\nok\n\n[[ ## completed ## ]]",
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            }
+        ).encode()
+        return TransportResponse(
+            status=200,
+            reason="OK",
+            headers=[("content-type", "application/json"), ("content-length", str(len(body)))],
+            http_version="HTTP/1.1",
+            chunks=iter([body]),
+            release=_release,
+        )
+
+    def _no_litellm(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("unexpected LiteLLM network path")
+
+    monkeypatch.setattr(_sync.StdlibTransport, "stream", _stream)
+    monkeypatch.setattr(litellm, "completion", _no_litellm)
+    # Production role LMs keep DSPy's default response cache; disable it
+    # here so every call reaches the stub and nothing is written to the
+    # user's on-disk DSPy cache.
+    from dspy.clients.cache import Cache
+
+    monkeypatch.setattr(
+        dspy,
+        "cache",
+        Cache(enable_disk_cache=False, enable_memory_cache=False, disk_cache_dir=None),
+        raising=False,
+    )
+    return sent
+
+
+def test_real_dspy_lm_event_model_is_the_lms_model(
+    stub_transport: list[dict[str, Any]],
+) -> None:
+    """Regression guard for DSPy upgrades: the llm.call ``model`` is the
+    calling dspy.LM's model string, not the server-echoed name."""
+    bus = _FakeEventBus()
+    set_active_runtime(_FakeRuntime(event_bus=bus))  # type: ignore[arg-type]
+    lm = dspy.LM(
+        "openai/qwen3.8-27b",
+        api_base="http://127.0.0.1:18000/v1",
+        api_key="sk-local",
+        cache=False,
+    )
+    with dspy.context(lm=lm, callbacks=[make_dspy_callback()]):
+        out = dspy.Predict("question -> answer")(question="hi")
+
+    assert str(out.answer) == "ok"
+    assert len(stub_transport) == 1  # the stub (not the network) served it
+    assert stub_transport[0]["body"]["model"] == "qwen3.8-27b"
+    events = [e for e in _events(bus) if e["event_type"] == "llm.call"]
+    assert len(events) == 1
+    assert events[0]["model"] == lm.model == "openai/qwen3.8-27b"
+    assert events[0]["role"] == DEFAULT_ROLE
+
+
+async def test_real_role_lm_event_carries_role_and_model(
+    tmp_path: Path, stub_transport: list[dict[str, Any]]
+) -> None:
+    """End to end with the real factory: [llm.roles.worker] -> build_lm ->
+    dspy.LM -> stub transport -> llm.call {model, role}."""
+    bus = _FakeEventBus()
+    set_active_runtime(_FakeRuntime(event_bus=bus))  # type: ignore[arg-type]
+    set_role_config(_cfg(QWEN_EVERYWHERE_TOML, tmp_path))
+
+    def _call() -> None:
+        dspy.Predict("question -> answer")(question="hi")
+
+    with dspy.context(callbacks=[make_dspy_callback()]), role_scope("worker"):
+        await asyncio.to_thread(_call)
+
+    events = [e for e in _events(bus) if e["event_type"] == "llm.call"]
+    assert [(e["model"], e["role"]) for e in events] == [("openai/qwen3.8-27b", "worker")]
+    assert stub_transport[0]["url"] == "http://127.0.0.1:18000/v1/chat/completions"
+
+
+# ── Shipped example: Qwen everywhere, optional Opus comparison arm ───
+
+QWEN_EVERYWHERE_TOML = """
+[llm]
+provider = "openai"
+model = "qwen3.8-27b"
+base_url = "http://127.0.0.1:18000/v1"
+api_key_env = "MEMFUN_WORKER_API_KEY"
+
+[llm.roles.worker]
+max_tokens = 16384
+"""
+
+OPUS_ARM_TOML = (
+    QWEN_EVERYWHERE_TOML
+    + """
+[llm.roles.orchestrator]
+provider = "anthropic"
+model = "claude-opus-5-5"
+base_url = ""
+api_key_env = "ANTHROPIC_API_KEY"
+
+[llm.roles.decomposer]
+provider = "anthropic"
+model = "claude-opus-5-5"
+base_url = ""
+"""
+)
+
+
+def test_qwen_everywhere_all_roles_resolve_to_one_endpoint(tmp_path: Path) -> None:
+    cfg = _cfg(QWEN_EVERYWHERE_TOML, tmp_path)
+    for role in LLM_ROLES:
+        llm = cfg.llm_for_role(role)
+        assert (llm.provider, llm.model, llm.base_url, llm.api_key_env) == (
+            "openai",
+            "qwen3.8-27b",
+            "http://127.0.0.1:18000/v1",
+            "MEMFUN_WORKER_API_KEY",
+        )
+        assert lm_settings(llm)[0] == "openai/qwen3.8-27b"
+
+
+def test_opus_comparison_arm_over_openai_llm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An anthropic role over an openai [llm] never inherits the openai
+    key env, and clears the tunnel base_url."""
+    monkeypatch.setenv("MEMFUN_WORKER_API_KEY", "test-worker-secret")
+    cfg = _cfg(OPUS_ARM_TOML, tmp_path)
+    orch = cfg.llm_for_role("orchestrator")
+    assert (orch.provider, orch.model, orch.base_url) == ("anthropic", "claude-opus-5-5", None)
+    assert orch.api_key_env == "ANTHROPIC_API_KEY"
+    dec = cfg.llm_for_role("decomposer")
+    assert dec.api_key_env == ""  # NOT MEMFUN_WORKER_API_KEY
+    assert lm_settings(dec)[1].get("api_key") != "test-worker-secret"
+    assert cfg.llm_for_role("worker").model == "qwen3.8-27b"
+
+
+def test_anthropic_role_over_openai_llm_without_base_url_override(tmp_path: Path) -> None:
+    cfg = _cfg(
+        '[llm]\nprovider = "openai"\napi_key_env = "OPENAI_KEY"\n'
+        '[llm.roles.orchestrator]\nprovider = "anthropic"\nmodel = "claude-opus-5-5"\n',
+        tmp_path,
+    )
+    assert cfg.llm_for_role("orchestrator").api_key_env == ""
+
+
+def test_no_code_default_references_opus() -> None:
+    import memfun_core.config as config_mod
+
+    assert "opus" not in LLMConfig().model.lower()
+    assert "claude-opus-5-5" not in Path(config_mod.__file__).read_text()
+    assert "claude-opus-5-5" not in Path(role_models.__file__).read_text()
+
+
+def test_provider_switch_does_not_inherit_tunnel_base_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An anthropic role over an openai tunnel [llm] must not send its
+    (explicit) Anthropic key to the tunnel base_url."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-secret")
+    cfg = _cfg(
+        QWEN_EVERYWHERE_TOML
+        + '[llm.roles.orchestrator]\nprovider = "anthropic"\nmodel = "claude-opus-5-5"\n'
+        'api_key_env = "ANTHROPIC_API_KEY"\n',
+        tmp_path,
+    )
+    orch = cfg.llm_for_role("orchestrator")
+    assert orch.base_url is None
+    name, kw = lm_settings(orch)
+    assert name == "anthropic/claude-opus-5-5"
+    assert "api_base" not in kw
+    assert kw["api_key"] == "test-anthropic-secret"
+    # Same provider keeps the inherited base_url.
+    assert cfg.llm_for_role("worker").base_url == "http://127.0.0.1:18000/v1"
+
+
+def test_docs_example_blocks_parse_and_match(tmp_path: Path) -> None:
+    """The TOML blocks in docs/configuration.md's roles section parse and
+    the default resolves every role to Qwen (no Anthropic)."""
+    import re
+
+    root = Path(__file__).resolve().parents[1]
+    doc = (root / "docs" / "configuration.md").read_text()
+    section = doc[doc.index("#### Default example") : doc.index("### [backend]")]
+    blocks = re.findall(r"```toml\n(.*?)```", section, flags=re.S)
+    assert len(blocks) == 2
+    default = _cfg(blocks[0], tmp_path)
+    for role in LLM_ROLES:
+        assert default.llm_for_role(role).model == "qwen3.8-27b"
+        assert default.llm_for_role(role).provider == "openai"
+    arm = _cfg(blocks[0] + blocks[1], tmp_path)
+    for role in ("orchestrator", "decomposer"):
+        llm = arm.llm_for_role(role)
+        assert (llm.provider, llm.model, llm.base_url) == ("anthropic", "claude-opus-5-5", None)
+    for role in ("worker", "auditor", "reviewer"):
+        assert arm.llm_for_role(role).model == "qwen3.8-27b"
