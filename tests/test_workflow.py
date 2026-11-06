@@ -19,16 +19,27 @@ from memfun_agent.workflow import (
 )
 from memfun_core.types import TaskResult
 
+# Canned reviewer answers embed the pinned nonce (see conftest).
+pytestmark = pytest.mark.usefixtures("fixed_review_id")
+
 # ── Helper function tests ─────────────────────────────────────
 
 
 # Structured cross-task review answers (verdict computed from severities).
-_APPROVE = 'approved: true\n\n```json\n{"findings": [], "summary": "All good"}\n```'
+_APPROVE = (
+    'approved: true\n\n```json\n{"review_id": "test-review-id",'
+    ' "findings": [], "summary": "All good"}\n```'
+)
 
 
 def _reject(task_id: str = "T1", issue: str = "Still broken") -> str:
     return json.dumps(
-        {"findings": [{"severity": "MEDIUM", "task_id": task_id, "file": "a.py", "issue": issue}]}
+        {
+            "review_id": "test-review-id",
+            "findings": [
+                {"severity": "MEDIUM", "task_id": task_id, "file": "a.py", "issue": issue}
+            ],
+        }
     )
 
 
@@ -41,7 +52,7 @@ def test_parse_review_result_approved():
         result={"answer": _APPROVE},
     )
 
-    review = WorkflowEngine._parse_review_result(result)
+    review = WorkflowEngine._parse_review_result(result, review_id="test-review-id")
 
     assert review.approved is True
     assert review.status == "approved"
@@ -53,11 +64,12 @@ def test_parse_review_result_not_approved():
     """Blocking findings with task_ids become routable ReviewIssues."""
     answer = "Found several issues:\n" + json.dumps(
         {
+            "review_id": "test-review-id",
             "findings": [
                 {"severity": "major", "task_id": "T1", "issue": "Missing error handling"},
                 {"severity": "critical", "task_id": "T2", "issue": "SQL injection"},
                 {"severity": "minor", "task_id": "T3", "issue": "Inconsistent naming"},
-            ]
+            ],
         }
     )
     result = TaskResult(
@@ -67,7 +79,7 @@ def test_parse_review_result_not_approved():
         result={"answer": answer},
     )
 
-    review = WorkflowEngine._parse_review_result(result)
+    review = WorkflowEngine._parse_review_result(result, review_id="test-review-id")
 
     assert review.approved is False
     assert review.status == "rejected"
@@ -88,7 +100,7 @@ def test_parse_review_result_prose_only_is_error():
         result={"answer": "approved: true\n\nAll code looks good."},
     )
 
-    review = WorkflowEngine._parse_review_result(result)
+    review = WorkflowEngine._parse_review_result(result, review_id="test-review-id")
 
     assert review.approved is False
     assert review.status == "error"
@@ -103,7 +115,7 @@ def test_parse_review_result_lowercase_task_id():
         result={"answer": _reject(task_id="t2", issue="Issue description")},
     )
 
-    review = WorkflowEngine._parse_review_result(result)
+    review = WorkflowEngine._parse_review_result(result, review_id="test-review-id")
 
     assert len(review.issues) == 1
     assert review.issues[0].task_id == "T2"
@@ -118,7 +130,7 @@ def test_parse_review_result_failed_review():
         error="Review agent crashed",
     )
 
-    review = WorkflowEngine._parse_review_result(result)
+    review = WorkflowEngine._parse_review_result(result, review_id="test-review-id")
 
     assert review.approved is False
     assert review.status == "error"
@@ -135,7 +147,7 @@ def test_parse_review_result_summary_extraction():
         result={"answer": answer},
     )
 
-    review = WorkflowEngine._parse_review_result(result)
+    review = WorkflowEngine._parse_review_result(result, review_id="test-review-id")
 
     assert "First paragraph line 1" in review.summary
     assert "First paragraph line 2" in review.summary
@@ -152,7 +164,7 @@ def test_parse_review_result_summary_truncation():
         result={"answer": answer},
     )
 
-    review = WorkflowEngine._parse_review_result(result)
+    review = WorkflowEngine._parse_review_result(result, review_id="test-review-id")
 
     assert len(review.summary) <= 300
 

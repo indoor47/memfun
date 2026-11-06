@@ -119,26 +119,38 @@ REVIEW_REJECTED = "rejected"
 REVIEW_ERROR = "error"
 _REVIEW_STATUSES = frozenset({REVIEW_APPROVED, REVIEW_REJECTED, REVIEW_ERROR})
 
+
 # Output contract appended to every review-agent prompt.  The verdict
 # is computed in code from the severities — the reviewer's prose (or a
-# self-declared verdict) never decides approval.
-_FINDINGS_OUTPUT_CONTRACT = (
-    "=== OUTPUT FORMAT (mandatory) ===\n"
-    "End your answer with ONE fenced JSON block of this exact shape:\n"
-    "```json\n"
-    '{"findings": [{"severity": "HIGH|MEDIUM|LOW", "file": "path/to/file.py",'
-    ' "line": 42, "issue": "what is wrong", "fix": "how to fix it"}],'
-    ' "summary": "one sentence"}\n'
-    "```\n"
-    "Severity: HIGH = broken/incorrect/insecure; MEDIUM = spec not met,"
-    " missing test or edge case; LOW = optional polish.\n"
-    "The orchestrator computes the verdict from severities: any HIGH or"
-    " MEDIUM finding means changes are requested; only LOW findings (or"
-    ' `"findings": []`) means approved. Writing "APPROVED" in prose has'
-    " no effect, and an answer without this JSON block is treated as a"
-    " failed review, never as an approval. Only report findings you"
-    " verified against the actual code."
-)
+# self-declared verdict) never decides approval.  ``review_id`` is a
+# fresh per-dispatch nonce the reviewer must echo inside its block;
+# only a block carrying it can approve (see review_findings).
+def _new_review_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _findings_contract(review_id: str) -> str:
+    return (
+        "=== OUTPUT FORMAT (mandatory) ===\n"
+        "End your answer with ONE fenced JSON block of this exact shape:\n"
+        "```json\n"
+        f'{{"review_id": "{review_id}",'
+        ' "findings": [{"severity": "HIGH|MEDIUM|LOW", "file": "path/to/file.py",'
+        ' "line": 42, "issue": "what is wrong", "fix": "how to fix it"}],'
+        ' "summary": "one sentence"}\n'
+        "```\n"
+        f'The "review_id" value MUST be exactly "{review_id}" (this review\'s'
+        " id). A block without it is not counted as your review: an answer"
+        " with no such block is treated as a FAILED review, never as an"
+        " approval.\n"
+        "Severity: HIGH = broken/incorrect/insecure; MEDIUM = spec not met,"
+        " missing test or edge case; LOW = optional polish.\n"
+        "The orchestrator computes the verdict from severities: any HIGH or"
+        " MEDIUM finding means changes are requested; only LOW findings (or"
+        ' `"findings": []`) means approved. Writing "APPROVED" in prose has'
+        " no effect. Only report findings you verified against the actual"
+        " code."
+    )
 
 
 def _reconcile_status(obj: object, approved: bool, status: str) -> None:
@@ -1270,11 +1282,14 @@ class WorkflowEngine:
         coder_answer = data.get("answer", "")
         files_created = data.get("files_created", [])
 
+        # Fresh nonce per dispatch (each retry gets a new one).
+        review_id = _new_review_id()
         review_query = self._build_per_task_review_query(
             sub_task=sub_status.sub_task,
             coder_answer=coder_answer,
             files_created=files_created,
             worktree_path=worktree_path,
+            review_id=review_id,
         )
 
         review_round = state.per_task_reviews.get(tid)
@@ -1286,6 +1301,7 @@ class WorkflowEngine:
             payload={
                 "type": "ask",
                 "query": review_query,
+                "review_id": review_id,
                 "context": state.shared_context or "",
                 "workflow_id": state.workflow_id,
                 "sub_task_id": tid,
@@ -1329,7 +1345,7 @@ class WorkflowEngine:
             )
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        review = self._parse_per_task_review(tid, result, elapsed_ms)
+        review = self._parse_per_task_review(tid, result, elapsed_ms, review_id=review_id)
 
         # Telemetry on the dashboard event stream — show the
         # per-task pair in the Events tab and Logs tab.
@@ -1354,8 +1370,9 @@ class WorkflowEngine:
         coder_answer: str,
         files_created: list[str],
         worktree_path: Path | None,
+        review_id: str,
     ) -> str:
-        """Build the prompt for a per-task review."""
+        """Build the prompt for a per-task review (embeds the nonce)."""
         location_line = (
             f"Working directory: {worktree_path}\n"
             if worktree_path is not None
@@ -1393,7 +1410,7 @@ class WorkflowEngine:
             " other quality problems.\n\n"
             "Be terse. Be specific: every finding needs a file and,"
             " where possible, a line.\n\n"
-            f"{_FINDINGS_OUTPUT_CONTRACT}"
+            f"{_findings_contract(review_id)}"
         )
 
     @staticmethod
@@ -1401,14 +1418,17 @@ class WorkflowEngine:
         tid: str,
         result: TaskResult,
         duration_ms: float,
+        *,
+        review_id: str,
     ) -> PerTaskReview:
         """Parse a per-task review result into a PerTaskReview.
 
         Fails closed.  The verdict is computed in code from the
         severities in the reviewer's findings JSON (any HIGH or
         MEDIUM -> ``rejected``, else ``approved``); prose such as
-        "APPROVED" is ignored.  A failed reviewer task or an answer
-        without a parseable findings block is status ``error``.
+        "APPROVED" is ignored.  A failed reviewer task, an answer
+        without a findings block carrying this dispatch's ``review_id``
+        nonce, or any parser exception is status ``error``.
         """
         if not result.success:
             return WorkflowEngine._review_error(
@@ -1418,13 +1438,18 @@ class WorkflowEngine:
             )
 
         data = result.result or {}
-        answer = (data.get("answer", "") or "").strip()
-        parsed = parse_review_output(answer)
+        answer = str(data.get("answer", "") or "").strip()
+        try:
+            parsed = parse_review_output(answer, review_id=review_id)
+        except Exception as exc:  # defence in depth: never crash the gather
+            logger.warning("Per-task review parse for %s raised: %s", tid, exc)
+            parsed = None
         if parsed is None:
             return WorkflowEngine._review_error(
                 tid,
-                "Reviewer output had no parseable findings JSON block"
-                f" (verdict cannot be computed). Answer head: {answer[:300]!r}",
+                "Reviewer output had no valid findings JSON block carrying"
+                f" review_id {review_id!r} (verdict cannot be computed)."
+                f" Answer head: {answer[:300]!r}",
                 duration_ms,
             )
 
@@ -1583,11 +1608,6 @@ class WorkflowEngine:
                 summary="No sub-task results available to review",
             )
 
-        contract = (
-            f"{_FINDINGS_OUTPUT_CONTRACT}\n"
-            'Every finding MUST also carry a "task_id" field (e.g. "T2")'
-            " naming the sub-task that must change."
-        )
         if self._pair_with_reviewer and state.per_task_reviews:
             review_query = (
                 "All sub-tasks have ALREADY been individually reviewed"
@@ -1598,16 +1618,14 @@ class WorkflowEngine:
                 "  - Inconsistent naming/conventions between modules\n"
                 "  - Missing ``__init__`` exports\n"
                 "  - Type mismatches across module boundaries\n"
-                "  - Conflicting file edits or import cycles\n\n"
-                f"{contract}\n\n" + "\n".join(review_parts)
+                "  - Conflicting file edits or import cycles\n\n" + "\n".join(review_parts)
             )
         else:
             review_query = (
                 "Review the outputs of the following sub-tasks for"
                 " consistency, quality, and adherence to the shared"
                 " specification. Check for file conflicts, import"
-                " issues, and integration problems.\n\n"
-                f"{contract}\n\n" + "\n".join(review_parts)
+                " issues, and integration problems.\n\n" + "\n".join(review_parts)
             )
 
         # One retry of the review itself on reviewer error (cannot
@@ -1632,7 +1650,11 @@ class WorkflowEngine:
         history: list[dict[str, Any]] | None,
         attempt: int,
     ) -> ReviewResult:
-        """Single cross-task review attempt.  Errors fail closed."""
+        """Single cross-task review attempt.  Errors fail closed.
+
+        Each attempt gets a fresh ``review_id`` nonce appended to the
+        query via the output contract.
+        """
         # Ensure review agent running.
         if not self._manager.is_running("review-agent"):
             try:
@@ -1646,13 +1668,20 @@ class WorkflowEngine:
                     summary=f"Cross-task reviewer unavailable: {exc}",
                 )
 
+        review_id = _new_review_id()
+        query = (
+            f"{review_query}\n\n{_findings_contract(review_id)}\n"
+            'Every finding MUST also carry a "task_id" field (e.g. "T2")'
+            " naming the sub-task that must change."
+        )
         retry_suffix = f"_retry{attempt}" if attempt else ""
         review_task = TaskMessage(
             task_id=f"{state.workflow_id}_review_{state.review_rounds}{retry_suffix}",
             agent_id="review-agent",
             payload={
                 "type": "ask",
-                "query": review_query,
+                "query": query,
+                "review_id": review_id,
                 "context": project_context,
                 "workflow_id": state.workflow_id,
                 "conversation_history": history,
@@ -1676,7 +1705,7 @@ class WorkflowEngine:
             )
 
         return self._reject_unroutable(
-            self._parse_review_result(result),
+            self._parse_review_result(result, review_id=review_id),
             set(state.sub_task_statuses),
         )
 
@@ -1693,9 +1722,24 @@ class WorkflowEngine:
         """
         if review.status != REVIEW_REJECTED:
             return review
-        unroutable = [f for f in review.findings if f.blocking and f.task_id not in known_tids]
+        # Normalise both sides identically (casefold) and map back to the
+        # REAL sub-task ID so revision targets e.g. ``t1`` / ``auth``.
+        by_key = {tid.casefold(): tid for tid in known_tids}
+        unroutable = [
+            f for f in review.findings if f.blocking and f.task_id.casefold() not in by_key
+        ]
         if not unroutable:
-            return review
+            issues = [
+                ReviewIssue(
+                    task_id=by_key[f.task_id.casefold()],
+                    description=f.issue or f.render().removeprefix("- "),
+                    detail=f.render().removeprefix("- "),
+                    severity=f.severity,
+                )
+                for f in review.findings
+                if f.blocking
+            ]
+            return dataclasses.replace(review, issues=issues)
         detail = "; ".join(f.render().removeprefix("- ") for f in unroutable)[:300]
         return dataclasses.replace(
             review,
@@ -2099,12 +2143,22 @@ class WorkflowEngine:
         path is logged and stored on the SubTaskPRState, never raised
         — a single bad PR shouldn't blow up a 10-task swarm.
         """
+        # ── Step 0: no diff → no PR ─────────────────────────
+        # A sub-task that changed no files (planner, web-search, …)
+        # has nothing to deliver: pushing an empty branch makes
+        # ``gh pr create`` fail ("No commits between …").  Skip the PR
+        # layer for it and do NOT record a PR state, so it is not
+        # counted as an unmerged PR.
+        data = sub_status.result.result or {} if sub_status.result else {}
+        files_written = list(data.get("files_created", []))
+        if not files_written:
+            logger.info("gh_pr[%s]: no files changed — no PR needed", tid)
+            return
+
         pr_state = SubTaskPRState(task_id=tid, branch=branch)
         state.pr_states[tid] = pr_state
 
         # ── Step 1: commit ──────────────────────────────────
-        data = sub_status.result.result or {} if sub_status.result else {}
-        files_written = list(data.get("files_created", []))
         commit_res = commit_workflow_output(
             project_root=worktree_path,
             files_written=files_written,
@@ -2121,9 +2175,16 @@ class WorkflowEngine:
                 commit_res.error,
             )
             return
-        # An empty / skipped commit is OK only if HEAD already
-        # advanced past the base — the worktree may have been
-        # committed externally.  We just continue to the push.
+        if commit_res.skipped:
+            # Nothing staged (files already tracked/unchanged, or not a
+            # git worktree): no diff to deliver.  Same as Step 0.
+            logger.info(
+                "gh_pr[%s]: nothing to commit (%s) — no PR needed",
+                tid,
+                commit_res.error or "skipped",
+            )
+            del state.pr_states[tid]
+            return
 
         # ── Step 2: push ────────────────────────────────────
         push_res = push_subtask_branch(worktree_path, branch)
@@ -2365,6 +2426,8 @@ class WorkflowEngine:
             )
             return "comment"
 
+        # Fresh per-dispatch nonce the verdict block must echo.
+        review_id = _new_review_id()
         review_task = TaskMessage(
             task_id=f"{state.workflow_id}_{tid}_pr_review",
             agent_id="pr-reviewer",
@@ -2378,8 +2441,12 @@ class WorkflowEngine:
                     f" the PR via `gh pr view {pr_number} --repo"
                     f" {repo}` and `gh pr diff {pr_number} --repo"
                     f" {repo}`. Post your review and emit the JSON"
-                    " verdict block as your final answer."
+                    " verdict block as your final answer.\n\n"
+                    f'The verdict JSON object MUST contain "review_id": "{review_id}"'
+                    " (exactly this value). A verdict without it is ignored and the"
+                    " PR stays in draft (treated as `comment`)."
                 ),
+                "review_id": review_id,
                 "context": state.shared_context or "",
                 "workflow_id": state.workflow_id,
                 "sub_task_id": tid,
@@ -2415,16 +2482,21 @@ class WorkflowEngine:
             return "comment"
 
         data = result.result or {}
-        answer = data.get("answer", "") or ""
-        return self._parse_pr_verdict(answer)
+        answer = str(data.get("answer", "") or "")
+        try:
+            return self._parse_pr_verdict(answer, review_id=review_id)
+        except Exception as exc:  # defence in depth
+            logger.warning("gh_pr[%s]: pr-reviewer verdict parse raised: %s", tid, exc)
+            return "comment"
 
     @staticmethod
-    def _parse_pr_verdict(answer: str) -> str:
+    def _parse_pr_verdict(answer: str, *, review_id: str) -> str:
         """Extract the verdict from the pr-reviewer's final answer.
 
         Returns one of ``approve`` / ``request-changes`` / ``comment``
-        via :func:`memfun_agent.review_findings.compute_pr_verdict`:
-        most severe wins across EVERY verdict/findings JSON object in
+        via :func:`memfun_agent.review_findings.compute_pr_verdict`.
+        Only a verdict object carrying this dispatch's *review_id*
+        nonce can approve; most severe wins across EVERY verdict/findings JSON object in
         the answer, so a quoted ``{"verdict": "approve"}`` (from a diff,
         a fixture, echoed text) can never override a real
         ``request-changes`` or a blocking finding.  ``approve`` without
@@ -2432,7 +2504,7 @@ class WorkflowEngine:
         "LGTM" all yield ``comment`` — we never auto-merge an ambiguous
         review.
         """
-        return compute_pr_verdict(answer)
+        return compute_pr_verdict(answer, review_id=review_id)
 
     @staticmethod
     def _pr_label(pr_state: SubTaskPRState) -> str:
@@ -2616,12 +2688,12 @@ class WorkflowEngine:
     # ── Review parsing ────────────────────────────────────────
 
     @staticmethod
-    def _parse_review_result(result: TaskResult) -> ReviewResult:
+    def _parse_review_result(result: TaskResult, *, review_id: str) -> ReviewResult:
         """Extract structured ReviewResult from review agent output.
 
-        Fails closed: a failed reviewer task or an answer without a
-        parseable findings JSON block is status ``error`` (not
-        approved).  Otherwise the verdict is computed in code from the
+        Fails closed: a failed reviewer task, an answer without a
+        findings JSON block carrying *review_id*, or a parser exception
+        is status ``error`` (not approved).  Otherwise the verdict is computed in code from the
         finding severities — prose like ``approved: true`` is ignored.
         """
         if not result.success:
@@ -2633,14 +2705,21 @@ class WorkflowEngine:
             )
 
         data = result.result or {}
-        answer = data.get("answer", "") or ""
-        parsed = parse_review_output(answer)
+        answer = str(data.get("answer", "") or "")
+        try:
+            parsed = parse_review_output(answer, review_id=review_id)
+        except Exception as exc:  # defence in depth
+            logger.warning("Cross-task review parse raised: %s", exc)
+            parsed = None
         if parsed is None:
             return ReviewResult(
                 approved=False,
                 status=REVIEW_ERROR,
                 issues=[],
-                summary="Cross-task review output had no parseable findings JSON block",
+                summary=(
+                    "Cross-task review output had no valid findings JSON block"
+                    f" carrying review_id {review_id!r}"
+                ),
             )
 
         # Route findings that name a sub-task back to it for revision.

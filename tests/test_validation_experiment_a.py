@@ -155,7 +155,9 @@ def _build_workflow_engine(
         success=True,
         # Structured findings JSON: the verdict is computed in code
         # from severities (prose "approved: true" is not an approval).
-        result={"answer": 'Looks fine\n```json\n{"findings": []}\n```'},
+        result={
+            "answer": 'Looks fine\n```json\n{"review_id": "test-review-id", "findings": []}\n```'
+        },
     )
 
     orchestrator = MagicMock()
@@ -286,6 +288,7 @@ def _patch_decomposer_to_emit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("fixed_review_id")
 async def test_workflow_engine_serialises_five_writers_to_one_file() -> None:
     """End-to-end through WorkflowEngine: 5 middleware.py writers serialise.
 

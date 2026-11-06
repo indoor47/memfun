@@ -20,6 +20,9 @@ from memfun_agent.workflow import (
 )
 from memfun_core.types import TaskResult
 
+# Canned reviewer answers embed the pinned nonce (see conftest).
+pytestmark = pytest.mark.usefixtures("fixed_review_id")
+
 # ── Helpers ──────────────────────────────────────────────────
 
 
@@ -55,7 +58,9 @@ def _review_result(approved: bool, feedback: str = "") -> TaskResult:
             }
         ]
     )
-    block = json.dumps({"findings": findings, "summary": feedback or "review"})
+    block = json.dumps(
+        {"review_id": "test-review-id", "findings": findings, "summary": feedback or "review"}
+    )
     body = f"Reviewed.\n```json\n{block}\n```"
     return TaskResult(
         task_id="wf_review",
@@ -72,7 +77,9 @@ def _phase3_review(approved: bool = True) -> TaskResult:
         if approved
         else [{"severity": "MEDIUM", "task_id": "T1", "file": "a.py", "issue": "still bad"}]
     )
-    body = "All consistent.\n" + json.dumps({"findings": findings, "summary": "cross-task"})
+    body = "All consistent.\n" + json.dumps(
+        {"review_id": "test-review-id", "findings": findings, "summary": "cross-task"}
+    )
     return TaskResult(
         task_id="wf_phase3_review",
         agent_id="review-agent",
@@ -467,10 +474,14 @@ def test_parse_per_task_review_empty_findings_approves():
         task_id="r",
         agent_id="review-agent",
         success=True,
-        result={"answer": 'Tests look good.\n```json\n{"findings": []}\n```'},
+        result={
+            "answer": (
+                'Tests look good.\n```json\n{"review_id": "test-review-id", "findings": []}\n```'
+            )
+        },
     )
 
-    parsed = WorkflowEngine._parse_per_task_review("T1", result, 12.5)
+    parsed = WorkflowEngine._parse_per_task_review("T1", result, 12.5, review_id="test-review-id")
 
     assert isinstance(parsed, PerTaskReview)
     assert parsed.task_id == "T1"
@@ -483,10 +494,11 @@ def test_parse_per_task_review_changes_requested():
     """Blocking findings parse unapproved and become the issue list."""
     answer = json.dumps(
         {
+            "review_id": "test-review-id",
             "findings": [
                 {"severity": "HIGH", "file": "a.py", "line": 3, "issue": "Missing null check"},
                 {"severity": "MEDIUM", "file": "a.py", "line": 9, "issue": "Wrong return type"},
-            ]
+            ],
         }
     )
     result = TaskResult(
@@ -496,7 +508,7 @@ def test_parse_per_task_review_changes_requested():
         result={"answer": answer},
     )
 
-    parsed = WorkflowEngine._parse_per_task_review("T2", result, 0.0)
+    parsed = WorkflowEngine._parse_per_task_review("T2", result, 0.0, review_id="test-review-id")
 
     assert parsed.approved is False
     assert parsed.status == "rejected"
@@ -514,7 +526,7 @@ def test_parse_per_task_review_legacy_prose_reject_is_error():
         result={"answer": "approved: false\n[T1] major: bad code"},
     )
 
-    parsed = WorkflowEngine._parse_per_task_review("T1", result, 1.0)
+    parsed = WorkflowEngine._parse_per_task_review("T1", result, 1.0, review_id="test-review-id")
     assert parsed.approved is False
     assert parsed.status == "error"
 
@@ -531,7 +543,7 @@ def test_parse_per_task_review_failed_dispatch_is_error():
         error="reviewer crashed",
     )
 
-    parsed = WorkflowEngine._parse_per_task_review("T1", result, 5.0)
+    parsed = WorkflowEngine._parse_per_task_review("T1", result, 5.0, review_id="test-review-id")
     assert parsed.approved is False
     assert parsed.status == "error"
     assert "crashed" in parsed.feedback

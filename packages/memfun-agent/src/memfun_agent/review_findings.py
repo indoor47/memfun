@@ -3,7 +3,8 @@
 Auditors (the per-task ``review-agent`` pairing, the cross-task review
 and the PR-layer ``pr-reviewer``) emit a JSON block of findings::
 
-    {"findings": [{"severity": "HIGH", "file": "a.py", "line": 3,
+    {"review_id": "<nonce>",
+     "findings": [{"severity": "HIGH", "file": "a.py", "line": 3,
                    "issue": "...", "fix": "..."}]}
 
 The verdict is NEVER taken from the reviewer's prose or from a
@@ -11,14 +12,45 @@ The verdict is NEVER taken from the reviewer's prose or from a
 Any ``HIGH`` or ``MEDIUM`` finding means changes are requested;
 only ``LOW`` findings (or none) means approval.
 
-Parsing fails closed: when no valid findings JSON can be extracted,
-:func:`parse_review_output` returns ``None`` and callers must treat
-the review as an *error* (not approved), never as an approval.
+Two rules make the parse robust against text the reviewer quotes
+(diffs, fixtures, coder output):
+
+* **Nonce.** Every reviewer dispatch carries a fresh random
+  ``review_id`` (uuid4 hex) that only the reviewer prompt contains.
+  An object counts as the reviewer's own block only if it is a
+  top-level JSON object carrying that exact ``review_id``.  Approval
+  REQUIRES at least one such block; without one the review is an
+  error (per-task / cross-task) or ``comment`` (PR layer).  The coder
+  never sees the reviewer prompt, so it cannot forge the nonce, and a
+  nonce from an earlier dispatch or retry does not match.
+* **Most severe wins.** Blocking findings (and a PR ``request-changes``
+  verdict) in ANY object still block, nonce or not — quoted text can
+  only make a review stricter, never more lenient.
+
+Parsing fails closed: answers over :data:`MAX_REVIEW_ANSWER_CHARS`,
+truncated/malformed/duplicate-key or too-deeply-nested JSON that
+mentions ``findings``/``verdict``, and answers without a valid
+nonce-bearing block are errors, never approvals.  The scan is linear
+in the input size.
+
+Known limitations (documented, accepted):
+
+* Quoted text can still steer WHICH sub-task a cross-task revision
+  targets (a quoted blocking finding with another ``task_id`` adds a
+  revision target).  This only ever makes the gate stricter; the nonce
+  does not close it, because blocking findings count from any object.
+* Weak local models may omit the ``review_id`` echo: that is an error,
+  retried once, and then the sub-task is unaccepted — the intended
+  fail-closed behaviour, at the cost of false failures.
+* Phase 6 auto-commit (workflow.py) runs before PR-layer failures flip
+  ``success``; output revised by the Phase 4 cross-task loop is not
+  re-reviewed per task (its PR is refused as stale instead).
 """
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -131,30 +163,43 @@ def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 _DECODER = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)
 
 
+# Reviewer answers above this size are rejected outright (error /
+# ``comment``): bounds parse time and memory on the event loop.
+MAX_REVIEW_ANSWER_CHARS = 256 * 1024
+
+_LEADING_WS = " \t\r\n"
+# Characters that matter when brace-matching a JSON object.
+_JSON_SPECIAL = re.compile(r'["{}\\]')
+
+
 def _looks_like_json_object(text: str, idx: int) -> bool:
     """``{`` followed (after whitespace) by ``"`` or ``}``."""
     j = idx + 1
-    while j < len(text) and text[j] in " \t\r\n":
+    n = len(text)
+    while j < n and text[j] in _LEADING_WS:
         j += 1
-    return j < len(text) and text[j] in '"}'
+    return j < n and text[j] in '"}'
 
 
 def _balanced_end(text: str, idx: int) -> int:
     """Index just past the ``}`` matching ``text[idx]``; ``-1`` if unbalanced.
 
     String-aware (quotes and backslash escapes), so braces inside JSON
-    strings do not count.
+    strings do not count.  Linear: jumps between special characters
+    with a compiled regex instead of looping over every character.
     """
     depth = 0
     in_string = False
-    escaped = False
-    for j in range(idx, len(text)):
-        ch = text[j]
+    escaped_pos = -1
+    for m in _JSON_SPECIAL.finditer(text, idx):
+        pos = m.start()
+        if pos == escaped_pos:
+            # Character right after a backslash inside a string.
+            continue
+        ch = m.group()
         if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
+            if ch == "\\":
+                escaped_pos = pos + 1
             elif ch == '"':
                 in_string = False
             continue
@@ -165,7 +210,7 @@ def _balanced_end(text: str, idx: int) -> int:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return j + 1
+                return pos + 1
     return -1
 
 
@@ -174,9 +219,9 @@ class JsonScan:
     """Top-level JSON objects found in a text, plus undecodable ones.
 
     ``malformed`` holds the raw text of every JSON-looking object that
-    failed to decode (syntax error, duplicate key, or truncated — in
-    which case it runs to the end of the text).  Their contents are
-    NEVER searched for nested objects.
+    failed to decode (syntax error, duplicate key, nesting too deep, or
+    truncated — in which case it runs to the end of the text).  Their
+    contents are NEVER searched for nested objects.
     """
 
     objects: tuple[dict[str, Any], ...]
@@ -186,34 +231,36 @@ class JsonScan:
 def scan_json_objects(text: str) -> JsonScan:
     """Scan *text* for top-level JSON objects, in order.
 
-    * A decodable object is reported and the scan resumes past its end,
-      so inner objects are never reported separately.
-    * A JSON-looking object (``{"`` or ``{}``) that fails to decode is
-      recorded in ``malformed`` and skipped as a whole (balanced-brace
-      extent); when it is truncated the rest of the text is consumed.
-      This prevents falling back to nested objects of a broken outer
-      object (e.g. an inner ``"evidence": {"findings": []}``).
-    * Any other ``{`` (prose) is skipped.
+    * Only JSON-looking candidates (``{"`` or ``{}``) are considered;
+      any other ``{`` (prose) is skipped without decoding.
+    * The brace-matched extent is found first and ONLY that slice is
+      decoded, so a failed candidate costs O(its extent), never
+      O(remaining text); the scan resumes past the extent, so inner
+      objects are never reported separately.  Total work is linear.
+    * A candidate that fails to decode (syntax error, duplicate key,
+      ``RecursionError`` from deep nesting) is recorded in
+      ``malformed``; a truncated one consumes the rest of the text.
+      Nested objects of a broken outer object are never examined.
     """
     objects: list[dict[str, Any]] = []
     malformed: list[str] = []
     idx = text.find("{")
     while idx != -1:
-        try:
-            obj, end = _DECODER.raw_decode(text, idx)
-        except (json.JSONDecodeError, ValueError):
-            if not _looks_like_json_object(text, idx):
-                idx = text.find("{", idx + 1)
-                continue
-            end = _balanced_end(text, idx)
-            if end == -1:
-                malformed.append(text[idx:])
-                break
-            malformed.append(text[idx:end])
-            idx = text.find("{", end)
+        if not _looks_like_json_object(text, idx):
+            idx = text.find("{", idx + 1)
             continue
-        if isinstance(obj, dict):
-            objects.append(cast("dict[str, Any]", obj))
+        end = _balanced_end(text, idx)
+        if end == -1:
+            malformed.append(text[idx:])
+            break
+        blob = text[idx:end]
+        try:
+            obj: object = _DECODER.decode(blob)
+        except (ValueError, RecursionError):
+            malformed.append(blob)
+        else:
+            if isinstance(obj, dict):
+                objects.append(cast("dict[str, Any]", obj))
         idx = text.find("{", end)
     return JsonScan(objects=tuple(objects), malformed=tuple(malformed))
 
@@ -270,38 +317,47 @@ def findings_from_object(obj: dict[str, Any]) -> tuple[ReviewFinding, ...] | Non
     return tuple(parsed)
 
 
-def parse_review_output(answer: str) -> ParsedReview | None:
-    """Aggregate findings from EVERY findings-bearing JSON object.
+def _carries_nonce(obj: dict[str, Any], review_id: str) -> bool:
+    return bool(review_id) and obj.get("review_id") == review_id
 
-    Verdict aggregation rule: **most severe wins**.  All top-level JSON
-    objects with a ``findings`` key are collected and their findings
-    merged; the verdict is computed over the union, so one blocking
-    finding anywhere means changes requested.  Text appended after the
-    reviewer's real block (a quoted diff line, an echoed fixture, a
-    LOW-only object) can therefore only ADD findings, never cancel a
-    blocking one — injection can make a review stricter, never laxer.
 
-    Returns ``None`` (reviewer error, never approval) when:
+def parse_review_output(answer: str, *, review_id: str) -> ParsedReview | None:
+    """Parse a reviewer answer for the dispatch identified by *review_id*.
 
-    * no findings-bearing object exists (prose-only answer);
-    * any findings-bearing object has a malformed ``findings`` value;
-    * any JSON-looking object that mentions ``findings`` fails to decode
-      (truncated, syntax error, duplicate keys such as
-      ``"findings": [HIGH], "findings": []``).
+    Rules (see the module docstring):
+
+    * The reviewer's own blocks are the top-level objects whose
+      ``review_id`` equals *review_id*.  At least one is REQUIRED, and
+      every one of them must carry a well-formed ``findings`` list.
+    * **Most severe wins**: findings from EVERY findings-bearing object
+      (nonce or not) are merged, so a quoted blocking finding still
+      blocks, while a quoted ``{"findings": []}`` can never approve.
+
+    Returns ``None`` (reviewer error, never approval) when the answer
+    is over :data:`MAX_REVIEW_ANSWER_CHARS`; when any JSON-looking
+    object mentioning ``findings`` fails to decode; when any
+    findings-bearing object has a malformed ``findings`` value; when a
+    nonce-bearing object lacks a valid ``findings`` list; or when no
+    nonce-bearing block exists.
     """
-    scan = scan_json_objects(answer or "")
-    if any('"findings"' in blob for blob in scan.malformed):
+    text = answer or ""
+    if len(text) > MAX_REVIEW_ANSWER_CHARS:
         return None
-    bearing = [obj for obj in scan.objects if "findings" in obj]
-    if not bearing:
+    scan = scan_json_objects(text)
+    if any('"findings"' in blob or '"review_id"' in blob for blob in scan.malformed):
+        return None
+    own = [obj for obj in scan.objects if _carries_nonce(obj, review_id)]
+    if not own:
         return None
     merged: list[ReviewFinding] = []
-    for obj in bearing:
+    for obj in scan.objects:
+        if "findings" not in obj and obj not in own:
+            continue
         findings = findings_from_object(obj)
         if findings is None:
             return None
         merged.extend(findings)
-    last = bearing[-1]
+    last = own[-1]
     summary = last.get("summary")
     claimed = last.get("verdict")
     return ParsedReview(
@@ -317,29 +373,28 @@ PrVerdict = Literal["approve", "request-changes", "comment"]
 _PR_VERDICTS = ("approve", "request-changes", "comment")
 
 
-def compute_pr_verdict(answer: str) -> PrVerdict:
-    """Fail-closed PR-layer verdict over EVERY verdict/findings object.
+def compute_pr_verdict(answer: str, *, review_id: str) -> PrVerdict:
+    """Fail-closed PR-layer verdict for the dispatch *review_id*.
 
-    Most severe wins (``request-changes`` > ``comment`` > ``approve``):
-
-    * any object with ``"verdict": "request-changes"``, or any blocking
-      (HIGH/MEDIUM, incl. CRITICAL/WARNING) finding in any object, ->
-      ``request-changes``;
-    * otherwise any ``comment`` verdict, any unknown verdict value, any
-      malformed ``findings`` value, any undecodable JSON-looking object
-      mentioning ``verdict``/``findings``, or an ``approve`` WITHOUT a
-      ``findings`` key -> ``comment``;
-    * ``approve`` only when every verdict object approves with a
-      well-formed, non-blocking ``findings`` list;
-    * no verdict object at all (prose such as "LGTM") -> ``comment``.
+    * ``request-changes`` when ANY object (nonce or not) has
+      ``"verdict": "request-changes"`` or any blocking (HIGH/MEDIUM,
+      incl. CRITICAL/WARNING) finding — most severe wins.
+    * ``approve`` only when at least one top-level object carries the
+      matching ``review_id``, and every such object has
+      ``"verdict": "approve"`` with a well-formed, non-blocking
+      ``findings`` list.
+    * ``comment`` otherwise: no nonce-bearing verdict block (prose such
+      as "LGTM", or only quoted ``{"verdict": "approve", ...}`` from a
+      diff), a nonce block with ``comment``/unknown verdict or without
+      ``findings``, malformed findings anywhere, undecodable JSON that
+      mentions ``verdict``/``findings``, or an oversized answer.
     """
-    scan = scan_json_objects(answer or "")
-    relevant = [o for o in scan.objects if "verdict" in o or "findings" in o]
-    verdict_objs = [o for o in relevant if "verdict" in o]
-    downgrade = any('"verdict"' in b or '"findings"' in b for b in scan.malformed)
-    if not verdict_objs:
+    text = answer or ""
+    if len(text) > MAX_REVIEW_ANSWER_CHARS:
         return "comment"
-    for obj in relevant:
+    scan = scan_json_objects(text)
+    downgrade = any('"verdict"' in b or '"findings"' in b for b in scan.malformed)
+    for obj in scan.objects:
         if obj.get("verdict") == "request-changes":
             return "request-changes"
         if "findings" in obj:
@@ -348,8 +403,11 @@ def compute_pr_verdict(answer: str) -> PrVerdict:
                 downgrade = True
             elif compute_verdict(findings) == "CHANGES_REQUESTED":
                 return "request-changes"
-    for obj in verdict_objs:
+    own = [obj for obj in scan.objects if _carries_nonce(obj, review_id)]
+    if not own:
+        return "comment"
+    for obj in own:
         verdict = obj.get("verdict")
-        if verdict not in _PR_VERDICTS or verdict == "comment" or "findings" not in obj:
+        if verdict != "approve" or "findings" not in obj:
             downgrade = True
     return "comment" if downgrade else "approve"

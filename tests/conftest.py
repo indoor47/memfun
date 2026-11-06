@@ -389,3 +389,22 @@ async def nats_skill_registry():
         await reg._js.delete_key_value(bucket)
     with contextlib.suppress(Exception):
         await reg._nc.close()
+
+
+# ── Reviewer nonce (fail-closed auditors) ─────────────────────
+#
+# Every reviewer dispatch carries a fresh ``review_id`` nonce that the
+# reviewer must echo in its findings JSON.  Integration tests with
+# canned reviewer answers opt into this fixture to pin the nonce to
+# ``FIXED_REVIEW_ID`` so the canned answers can embed it.  Nonce
+# mechanics themselves (fresh per dispatch/retry, stale nonce
+# rejected) are tested in ``test_fail_closed_auditors.py`` with real
+# nonces.
+
+FIXED_REVIEW_ID = "test-review-id"
+
+
+@pytest.fixture
+def fixed_review_id(monkeypatch: pytest.MonkeyPatch) -> str:
+    monkeypatch.setattr("memfun_agent.workflow._new_review_id", lambda: FIXED_REVIEW_ID)
+    return FIXED_REVIEW_ID

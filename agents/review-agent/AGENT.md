@@ -36,6 +36,7 @@ End your `state['FINAL']` with ONE fenced JSON block of this exact shape:
 
 ```json
 {
+  "review_id": "<the review_id given in your prompt>",
   "findings": [
     {"severity": "HIGH", "task_id": "T2", "file": "src/users.py", "line": 42,
      "issue": "UserService does not implement IUserService from the shared spec",
@@ -48,6 +49,7 @@ End your `state['FINAL']` with ONE fenced JSON block of this exact shape:
 - `severity` is `HIGH` (broken, incorrect, insecure), `MEDIUM` (spec not met, missing test or edge case) or `LOW` (optional polish). Legacy `critical`/`major`/`minor` are read as HIGH/MEDIUM/LOW.
 - `task_id` names the sub-task that must change. It is required in cross-task reviews and optional when you review a single sub-task.
 - `"findings": []` means you found nothing.
+- `review_id` must be copied exactly from your prompt. Every dispatch (and every retry) has a fresh one. A block without the matching `review_id` is not counted as your review, so an answer that has no such block is treated as a failed review (an error), never as an approval. Do not reuse an id from an earlier round.
 
 **The orchestrator computes the verdict from the severities**: any HIGH or MEDIUM finding means changes are requested; only LOW findings (or none) means approved. Writing "APPROVED" or `approved: true` in prose has no effect. An answer without a parseable findings block counts as a failed review, never as an approval.
 

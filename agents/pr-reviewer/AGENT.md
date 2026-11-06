@@ -170,6 +170,7 @@ Output a structured verdict the orchestrator can parse:
 
 ```json
 {
+  "review_id": "<the review_id given in your prompt>",
   "verdict": "approve" | "request-changes" | "comment",
   "findings": [
     {"severity": "CRITICAL"|"WARNING"|"INFO", "title": "...", "file": "...", "line": 42, "fix": "..."}
@@ -178,6 +179,8 @@ Output a structured verdict the orchestrator can parse:
   "rationale": "<one short paragraph>"
 }
 ```
+
+`review_id` must be copied exactly from your prompt (it is fresh for every dispatch). Only a verdict object carrying the matching `review_id` can approve; an answer without one is treated as `comment` and the PR stays in draft. A `request-changes` verdict or a blocking finding anywhere in your answer still counts.
 
 `HIGH`/`MEDIUM`/`LOW` are accepted as severities too (CRITICAL = HIGH, WARNING = MEDIUM, INFO = LOW). The orchestrator re-checks your verdict in code: an `approve` that lists any CRITICAL/HIGH or WARNING/MEDIUM finding is treated as `request-changes`, and an answer without this JSON block is treated as `comment`. Prose such as "LGTM" is never read as a verdict.
 

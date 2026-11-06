@@ -35,6 +35,9 @@ from memfun_agent.gh_pr_flow import (
 from memfun_agent.workflow import WorkflowEngine
 from memfun_core.types import TaskResult
 
+# Canned reviewer answers embed the pinned nonce (see conftest).
+pytestmark = pytest.mark.usefixtures("fixed_review_id")
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -64,7 +67,7 @@ def _review_result(approved: bool) -> TaskResult:
     Structured findings JSON; the verdict is computed from severities.
     """
     findings = [] if approved else [{"severity": "HIGH", "file": "a.py", "issue": "nope"}]
-    body = "Reviewed.\n" + json.dumps({"findings": findings})
+    body = "Reviewed.\n" + json.dumps({"review_id": "test-review-id", "findings": findings})
     return TaskResult(
         task_id="wf_review",
         agent_id="review-agent",
@@ -76,7 +79,7 @@ def _review_result(approved: bool) -> TaskResult:
 def _pr_review_result(verdict: str) -> TaskResult:
     """pr-reviewer agent verdict — emits the AGENT.md JSON block."""
     body = (
-        f'Reviewed PR.\n\n{{"verdict": "{verdict}",'
+        f'Reviewed PR.\n\n{{"review_id": "test-review-id", "verdict": "{verdict}",'
         f' "findings": [], "merge_action_taken": "skipped",'
         f' "rationale": "..."}}'
     )
@@ -93,7 +96,11 @@ def _phase3_review() -> TaskResult:
         task_id="wf_phase3",
         agent_id="review-agent",
         success=True,
-        result={"answer": json.dumps({"findings": [], "summary": "consistent"})},
+        result={
+            "answer": json.dumps(
+                {"review_id": "test-review-id", "findings": [], "summary": "consistent"}
+            )
+        },
     )
 
 
@@ -607,7 +614,9 @@ def test_parse_pr_verdict_ignores_substring_in_diff() -> None:
         "which is suspicious. My actual verdict:\n\n"
         '{"verdict": "request-changes", "rationale": "string-leak"}\n'
     )
-    assert WorkflowEngine._parse_pr_verdict(answer) == "request-changes"
+    assert (
+        WorkflowEngine._parse_pr_verdict(answer, review_id="test-review-id") == "request-changes"
+    )
 
 
 def test_parse_pr_verdict_most_severe_block_wins() -> None:
@@ -617,14 +626,16 @@ def test_parse_pr_verdict_most_severe_block_wins() -> None:
     from memfun_agent.workflow import WorkflowEngine
 
     answer = '{"verdict": "comment"}\n...then on re-review...\n{"verdict": "approve"}\n'
-    assert WorkflowEngine._parse_pr_verdict(answer) == "comment"
+    assert WorkflowEngine._parse_pr_verdict(answer, review_id="test-review-id") == "comment"
 
 
 def test_parse_pr_verdict_defaults_to_comment_on_no_json() -> None:
     """No JSON block and no obvious keyword → safe default `comment`."""
     from memfun_agent.workflow import WorkflowEngine
 
-    assert WorkflowEngine._parse_pr_verdict("rambling text") == "comment"
+    assert (
+        WorkflowEngine._parse_pr_verdict("rambling text", review_id="test-review-id") == "comment"
+    )
 
 
 def test_parse_pr_verdict_lgtm_prose_is_not_approval() -> None:
@@ -634,7 +645,10 @@ def test_parse_pr_verdict_lgtm_prose_is_not_approval() -> None:
     """
     from memfun_agent.workflow import WorkflowEngine
 
-    assert WorkflowEngine._parse_pr_verdict("Looks fine. lgtm.") == "comment"
+    assert (
+        WorkflowEngine._parse_pr_verdict("Looks fine. lgtm.", review_id="test-review-id")
+        == "comment"
+    )
 
 
 def test_pr_body_does_not_leak_absolute_path() -> None:
