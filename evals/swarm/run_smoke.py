@@ -1267,6 +1267,7 @@ def classify(
     all_pass: bool = False,
     any_output: bool = True,
     server_errors: int = 0,
+    truncated_failure: bool = False,
 ) -> tuple[str, str]:
     """One of OUTCOMES plus a reason.  Same rules for passing and failing episodes.
 
@@ -1291,6 +1292,8 @@ def classify(
         return "pass", "all hidden tests pass"
     if hidden_passed:
         return "partial", "some hidden tests pass"
+    if truncated_failure:
+        return "model_failure", "truncated response"
     return "model_failure", "no hidden test passes"
 
 
@@ -1560,9 +1563,13 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
         rec["server_errors"] = server_errors
         rec["server_error_lines"] = signals["server_error_lines"]
         rec["reviewer_json_rejections"] = signals["reviewer_json_rejections"]
-        rec["truncated_responses"] = signals["truncated_responses"]
-        rec["stalled_stops"] = signals["stalled_stops"]
         swarm_doc, swarm_problem = load_swarm_result(plan.ep_dir, metrics["workflow_ids"])
+        rec["truncated_responses"] = signals["truncated_responses"]
+        # Max of log count and result-file count: same events, never summed.
+        doc_truncated = (swarm_doc or {}).get("truncated_responses") if swarm_doc else None
+        if isinstance(doc_truncated, int) and not isinstance(doc_truncated, bool):
+            rec["truncated_responses"] = max(rec["truncated_responses"], doc_truncated)
+        rec["stalled_stops"] = signals["stalled_stops"]
         usage = tool_usage(swarm_doc, swarm_problem)
         rec["tool_usage"] = usage
         rec["tool_usage_source"] = usage["source"]
@@ -1647,6 +1654,10 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
             all_pass=bool(grade and grade["all_pass"]),
             any_output=any(u["output"] for u in collected["units"].values()),
             server_errors=server_errors,
+            truncated_failure=bool(
+                rec["truncated_responses"]
+                and (swarm_doc.get("success") is False if swarm_doc else proc.returncode != 0)
+            ),
         )
         rec.update(outcome=outcome, reason=reason, metrics=metrics)
         return rec

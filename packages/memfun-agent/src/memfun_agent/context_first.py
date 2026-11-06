@@ -1314,8 +1314,21 @@ class ContextFirstSolver:
             A :class:`ContextFirstResult`.  Check ``success`` to decide
             whether to fall back to the RLM.
         """
+        from memfun_agent.llm_telemetry import (
+            ContextFirstTruncatedError,
+            current_role,
+            truncation_advice,
+            truncation_counts,
+        )
+
+        role = current_role()
+        truncated_before = truncation_counts().get(role, 0)
+
+        def _truncated() -> bool:
+            return truncation_counts().get(role, 0) > truncated_before
+
         try:
-            return await self._solve_internal(
+            result = await self._solve_internal(
                 query,
                 context,
                 conversation_history,
@@ -1323,6 +1336,12 @@ class ContextFirstSolver:
                 raw_query=raw_query or query,
             )
         except Exception as exc:
+            if _truncated():
+                # Cut off by max_tokens: fail visibly, do not fall back.
+                raise ContextFirstTruncatedError(
+                    f"context-first solver LLM response truncated; {truncation_advice(role)} "
+                    f"(error: {exc})"
+                ) from exc
             logger.warning("Context-first solver failed: %s", exc)
             return ContextFirstResult(
                 answer="",
@@ -1332,6 +1351,11 @@ class ContextFirstSolver:
                 success=False,
                 method="context_first_error",
             )
+        if not result.success and _truncated():
+            raise ContextFirstTruncatedError(
+                f"context-first solver LLM response truncated; {truncation_advice(role)}"
+            )
+        return result
 
     async def _solve_internal(
         self,

@@ -341,6 +341,8 @@ class RLMCodingAgent(BaseAgent):
         category: str = "",
     ) -> dict[str, Any]:
         """Handle a task using context-first solver, falling back to RLM."""
+        from memfun_agent.llm_telemetry import LLMTruncatedError
+
         assert self._rlm is not None
 
         # Build a richer query incorporating the task type
@@ -387,6 +389,9 @@ class RLMCodingAgent(BaseAgent):
                     "files_created": [],
                     "_escalate": True,
                 }
+            except LLMTruncatedError:
+                # Truncated by max_tokens: surface as a failed task, never escalate quietly.
+                raise
             except Exception as exc:
                 logger.warning(
                     "Context-first solver failed: %s, signalling escalation to multi-agent",
