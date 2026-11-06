@@ -396,6 +396,141 @@ def _fetch_text(url: str, timeout: float) -> str:
         return resp.read().decode("utf-8", "replace")
 
 
+# ── Remote access: token auth for non-loopback clients ─────────────
+
+# The dashboard binds 0.0.0.0 when started by ``memfun chat`` so phones and
+# other machines on the LAN/VPN can watch a run.  Loopback clients stay
+# token-free (local use unchanged); every other client must present the
+# token, and with no token configured remote access is refused outright.
+_TOKEN_ENV = "MEMFUN_DASHBOARD_TOKEN"
+_TOKEN_FILE = Path.home() / ".config" / "memfun" / "dashboard_token"
+_TOKEN_COOKIE = "memfun_dash"
+
+
+def dashboard_token() -> str:
+    """The configured token (env first, then the token file), or ``""``."""
+    env = os.environ.get(_TOKEN_ENV, "").strip()
+    if env:
+        return env
+    try:
+        return _TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def ensure_dashboard_token() -> str:
+    """Return the token, creating a random one in the token file if unset."""
+    existing = dashboard_token()
+    if existing:
+        return existing
+    import secrets
+
+    token = secrets.token_urlsafe(24)
+    _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _TOKEN_FILE.touch(mode=0o600, exist_ok=True)
+    _TOKEN_FILE.write_text(token + "\n", encoding="utf-8")
+    _TOKEN_FILE.chmod(0o600)
+    return token
+
+
+def _is_remote_client(scope: dict[str, Any]) -> bool:
+    """True for a real non-loopback IP client.
+
+    Clients without an IP (unix sockets, in-process test clients) are
+    local by construction; uvicorn always reports the peer IP for TCP.
+    """
+    import ipaddress
+
+    client = scope.get("client")
+    if not client:
+        return False
+    try:
+        return not ipaddress.ip_address(str(client[0])).is_loopback
+    except ValueError:
+        return False
+
+
+def _presented_token(scope: dict[str, Any]) -> tuple[str, bool]:
+    """(token, came_from_query) from query string, bearer header or cookie."""
+    from http.cookies import SimpleCookie
+    from urllib.parse import parse_qs
+
+    query = parse_qs(scope.get("query_string", b"").decode("latin-1"))
+    if query.get("token"):
+        return query["token"][0], True
+    headers = {
+        k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])
+    }
+    auth = headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip(), False
+    jar: SimpleCookie = SimpleCookie()
+    try:
+        jar.load(headers.get("cookie", ""))
+    except Exception:  # malformed cookie header: treat as absent
+        return "", False
+    morsel = jar.get(_TOKEN_COOKIE)
+    return (morsel.value if morsel else ""), False
+
+
+class _RemoteAuthMiddleware:
+    """ASGI middleware covering both HTTP and the ``/ws`` WebSocket."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        kind = scope.get("type")
+        if kind not in ("http", "websocket") or not _is_remote_client(scope):
+            await self.app(scope, receive, send)
+            return
+        if kind == "http" and scope.get("path") == "/api/health":
+            # Reachability probe for apps; reveals nothing but liveness.
+            await self._send_json(send, 200, b'{"status":"ok"}')
+            return
+        expected = dashboard_token()
+        presented, from_query = _presented_token(scope)
+        import hmac
+
+        ok = bool(expected) and bool(presented) and hmac.compare_digest(presented, expected)
+        if not ok:
+            if kind == "websocket":
+                await receive()  # websocket.connect
+                await send({"type": "websocket.close", "code": 1008})
+                return
+            status = 401 if expected else 403
+            await self._send_json(send, status, b'{"error":"dashboard token required"}')
+            return
+        if kind == "http" and from_query:
+            # Remember the token so the page's WebSocket and fetches carry it.
+            cookie = (
+                f"{_TOKEN_COOKIE}={presented}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000"
+            ).encode("latin-1")
+
+            async def send_with_cookie(message: dict[str, Any]) -> None:
+                if message.get("type") == "http.response.start":
+                    message = {
+                        **message,
+                        "headers": [*message.get("headers", []), (b"set-cookie", cookie)],
+                    }
+                await send(message)
+
+            await self.app(scope, receive, send_with_cookie)
+            return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _send_json(send: Any, status: int, body: bytes) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
 def create_app(
     event_bus: Any | None = None,
     project_name: str = "",
@@ -435,6 +570,7 @@ def create_app(
         task.cancel()
 
     app = FastAPI(title="Memfun Agent Dashboard", lifespan=lifespan)
+    app.add_middleware(_RemoteAuthMiddleware)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
@@ -833,6 +969,25 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   }
   .task-lane .task-node { display: block; margin: 0 0 4px 0; }
   .worker .sub { display: block; font-size: 10px; color: var(--muted); margin-top: 1px; }
+
+  /* ── Phone layout (narrow screens, ?mobile=1) and app embed (?embed=1) ── */
+  body.mobile { height: auto; overflow: auto; }
+  body.mobile .header { height: auto; flex-wrap: wrap; padding: 8px 12px; gap: 8px; }
+  body.mobile .header .stats { margin-left: 0; font-size: 11px; }
+  body.mobile .live-banner {
+    height: auto; flex-wrap: wrap; gap: 8px; padding: 6px 12px; position: static;
+  }
+  body.mobile .live-banner .last-call { margin-left: 0; }
+  body.mobile .main-layout { height: auto; }
+  body.mobile .top-area { display: flex; flex-direction: column; overflow: visible; }
+  body.mobile .top-area > .panel { grid-row: auto !important; }
+  body.mobile .top-area > .panel:nth-child(2) { order: 1; height: 68vh; }
+  body.mobile .top-area > .panel:nth-child(4) { order: 2; height: 45vh; }
+  body.mobile .top-area > .panel:nth-child(3) { order: 3; max-height: 50vh; }
+  body.mobile .top-area > .panel:nth-child(1) { order: 4; max-height: 30vh; }
+  body.mobile .swarm-legend { flex-wrap: wrap; gap: 6px; right: 10px; }
+  body.mobile .swarm-metrics { gap: 2px 10px; }
+  body.embed .header { display: none; }
   .tab-pane { display: none; }
   .tab-pane.active { display: block; }
 
@@ -2701,6 +2856,17 @@ function drawTimeline() {
   if (!rows) { ctx.fillStyle = '#8b949e'; ctx.textAlign = 'center';
     ctx.font = '12px SF Mono, monospace'; ctx.fillText('No agents yet', w / 2, h / 2); }
 }
+
+// ── Phone layout / app embed ─────────────────────────────────────
+const pageParams = new URLSearchParams(location.search);
+if (pageParams.get('embed') === '1') document.body.classList.add('embed');
+function applyMobileLayout() {
+  const on = pageParams.get('mobile') === '1' || window.innerWidth <= 820;
+  document.body.classList.toggle('mobile', on);
+  SW.dirty = true;
+}
+applyMobileLayout();
+window.addEventListener('resize', applyMobileLayout);
 
 // ── View switching, hover, animation loop ───────────────────────
 let activeView = 'swarm';
