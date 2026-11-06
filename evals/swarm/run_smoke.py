@@ -43,7 +43,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
@@ -700,6 +700,39 @@ class SharedDashboard:
                 self.proc.wait(timeout=10)
 
 
+_TERM_SIGNALS = frozenset({signal.SIGINT, signal.SIGTERM})
+
+
+@contextlib.contextmanager
+def _term_signals_deferred() -> Generator[bool]:
+    """Block SIGINT/SIGTERM in the main thread for the block (pending ones fire after)."""
+    if threading.current_thread() is not threading.main_thread():
+        yield False
+        return
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, _TERM_SIGNALS)
+    try:
+        yield True
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
+def _unblock_term_signals() -> None:
+    """Child side of :func:`_term_signals_deferred`: the dashboard must stay killable."""
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, _TERM_SIGNALS)
+
+
+def record_pgid(run_dir: Path | None, pgid: int, label: str) -> None:
+    """Append ``<pgid> <label>`` to ``<run_dir>/pgids.txt`` (operator cleanup after SIGKILL)."""
+    if run_dir is None:
+        return
+    with contextlib.suppress(OSError):
+        fd = os.open(
+            run_dir / "pgids.txt", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644
+        )
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(f"{pgid} {label}\n")
+
+
 def start_dashboard(
     memfun_cmd: list[str],
     port: int,
@@ -725,24 +758,27 @@ def start_dashboard(
         )
     (workdir / ".memfun").mkdir(parents=True, exist_ok=True)
     log = (workdir / "dashboard.log").open("wb")
+    dash: SharedDashboard | None = None
     try:
-        proc = subprocess.Popen(
-            [*memfun_cmd, "dashboard", "--remote", "--port", str(port)],
-            cwd=workdir,
-            env=dashboard_env(),
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError as exc:
-        log.close()
-        return SharedDashboard(port, 0, False, error=f"dashboard failed to start: {exc}")
-    log.close()
-    dash = SharedDashboard(port=port, lock_pid=proc.pid, owned=True, proc=proc)
-    try:
-        if register is not None:
-            register(dash)
+        # A Ctrl-C / SIGTERM landing between Popen() returning and register() would
+        # orphan the dashboard: defer those signals across spawn + register.
+        with _term_signals_deferred() as deferred:
+            try:
+                proc = subprocess.Popen(
+                    [*memfun_cmd, "dashboard", "--remote", "--port", str(port)],
+                    cwd=workdir,
+                    env=dashboard_env(),
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    preexec_fn=_unblock_term_signals if deferred else None,
+                )
+            except OSError as exc:
+                return SharedDashboard(port, 0, False, error=f"dashboard failed to start: {exc}")
+            dash = SharedDashboard(port=port, lock_pid=proc.pid, owned=True, proc=proc)
+            if register is not None:
+                register(dash)
         deadline = time.monotonic() + wait_s
         while time.monotonic() < deadline:
             if dashboard_health(port, get):
@@ -751,8 +787,11 @@ def start_dashboard(
                 break
             time.sleep(0.2)
     except BaseException:
-        dash.stop()
+        if dash is not None:
+            dash.stop()
         raise
+    finally:
+        log.close()
     dash.stop()
     tail = _tail_text(read_log(workdir / "dashboard.log"), 10)
     dash.error = f"dashboard failed to start on port {port}:\n{tail}"
@@ -1351,15 +1390,7 @@ class RunContext:
     def track(self, pgid: int, episode: str) -> None:
         with self._lock:
             self.active_groups[pgid] = episode
-            if self.run_dir is not None:  # lets an operator clean up after a SIGKILL
-                with contextlib.suppress(OSError):
-                    fd = os.open(
-                        self.run_dir / "pgids.txt",
-                        os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
-                        0o644,
-                    )
-                    with os.fdopen(fd, "a", encoding="utf-8") as fh:
-                        fh.write(f"{pgid} {episode}\n")
+            record_pgid(self.run_dir, pgid, episode)
         if self.aborted:  # started after abort() took its snapshot
             kill_group(pgid, self.kill_grace)
 
@@ -1994,13 +2025,17 @@ def run(args: argparse.Namespace) -> int:
             "server_usage": None,
         }
 
+    def _register(dash: SharedDashboard) -> None:
+        started.append(dash)
+        record_pgid(run_dir, dash.lock_pid, "_dashboard")
+
     previous = _install_signals()
     try:
         model, fatal = preflight(args.base_url, args.model)
         usage_before = server_usage_snapshot(args.metrics_url) if args.metrics_url else None
         if not args.no_dashboard and not fatal:
             dash = start_dashboard(
-                memfun_cmd, args.dashboard_port, run_dir / "_dashboard", register=started.append
+                memfun_cmd, args.dashboard_port, run_dir / "_dashboard", register=_register
             )
             if dash.error:
                 fatal = dash.error
