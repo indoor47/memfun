@@ -364,7 +364,10 @@ class TaskDecomposition(dspy.Signature):
     project_context: str = dspy.InputField(
         desc=("Project structure, existing files, conventions, and any relevant code snippets")
     )
-    sub_tasks: list[dict[str, Any]] = dspy.OutputField(
+    # Objects are the documented shape; plain-string items are still accepted
+    # (dspy validates against this annotation) and _parse_sub_tasks turns each
+    # into a coder sub-task, as it did when the annotation was list[str].
+    sub_tasks: list[dict[str, Any] | str] = dspy.OutputField(
         desc=(
             "JSON array of sub-task objects. Return 1 for simple tasks, "
             "3+ for complex ones. Each object has: "

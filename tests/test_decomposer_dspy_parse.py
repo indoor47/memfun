@@ -147,3 +147,85 @@ async def test_adecompose_builds_multi_task_dag_not_single_fallback(
     assert result.sub_tasks == EXPECTED_SUB_TASKS
     assert result.parallelism_groups == EXPECTED_GROUPS
     assert result.shared_spec == ANSWER["shared_spec"]
+
+
+# ── Reply shapes: objects, plain strings, and a mix ────────────
+
+_OBJ_B: dict[str, Any] = {
+    "id": "T2",
+    "description": "Implement wrap(text, width) in textkit/wrap.py",
+    "agent_type": "coder",
+    "inputs": ["textkit/wrap.py"],
+    "outputs": ["textkit/wrap.py"],
+    "depends_on": [],
+    "max_iterations": 8,
+}
+_SHAPES: dict[str, list[Any]] = {
+    "dict_only": [
+        {
+            **_OBJ_B,
+            "id": "T1",
+            "description": "Implement slugify in textkit/slugify.py",
+            "inputs": ["textkit/slugify.py"],
+            "outputs": ["textkit/slugify.py"],
+        },
+        _OBJ_B,
+    ],
+    "str_only": ["Implement slugify in textkit/slugify.py", "Implement wrap in textkit/wrap.py"],
+    "mixed": ["Implement slugify in textkit/slugify.py", _OBJ_B],
+}
+# (id, agent_type, description) per shape after TaskDecomposer parsing.
+_EXPECTED_IDS: dict[str, list[tuple[str, str, str]]] = {
+    "dict_only": [
+        ("T1", "coder", "Implement slugify in textkit/slugify.py"),
+        ("T2", "coder", _OBJ_B["description"]),
+    ],
+    "str_only": [
+        ("T1", "coder", "Implement slugify in textkit/slugify.py"),
+        ("T2", "coder", "Implement wrap in textkit/wrap.py"),
+    ],
+    "mixed": [
+        ("T1", "coder", "Implement slugify in textkit/slugify.py"),
+        ("T2", "coder", _OBJ_B["description"]),
+    ],
+}
+SHAPES = [pytest.param(name, id=name) for name in _SHAPES]
+
+
+def _shape_answer(shape: str) -> dict[str, Any]:
+    return {
+        "sub_tasks": _SHAPES[shape],
+        "shared_spec": "Keep signatures; stdlib only.",
+        "parallelism_groups": [["T1", "T2"]],
+    }
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("adapter_cls", ADAPTERS)
+def test_predict_accepts_dict_str_and_mixed_sub_tasks(
+    adapter_cls: type[dspy.Adapter] | None, shape: str
+) -> None:
+    adapter = adapter_cls() if adapter_cls is not None else None
+    lm = DummyLM([_shape_answer(shape)], adapter=adapter or dspy.ChatAdapter())
+    with dspy.context(lm=lm, adapter=adapter):  # pyright: ignore[reportUnknownMemberType]
+        pred: Any = dspy.Predict(TaskDecomposition)(task_description="t", project_context="c")
+
+    assert pred.sub_tasks == _SHAPES[shape]
+    history: list[Any] = lm.history  # pyright: ignore[reportUnknownMemberType]
+    assert len(history) == 1
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("adapter_cls", ADAPTERS)
+async def test_adecompose_multi_task_for_dict_str_and_mixed_replies(
+    adapter_cls: type[dspy.Adapter] | None, shape: str
+) -> None:
+    adapter = adapter_cls() if adapter_cls is not None else None
+    lm = DummyLM([_shape_answer(shape)] * 8, adapter=adapter or dspy.ChatAdapter())
+    with dspy.context(lm=lm, adapter=adapter):  # pyright: ignore[reportUnknownMemberType]
+        result = await TaskDecomposer().adecompose("Implement two utilities", "textkit/")
+
+    assert result.is_single_task is False
+    got = [(t.id, t.agent_type, t.description) for t in result.sub_tasks]
+    assert got == _EXPECTED_IDS[shape]
+    assert result.parallelism_groups == [["T1", "T2"]]
