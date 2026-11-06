@@ -144,49 +144,24 @@ def _load_credentials() -> None:
 
 def _configure_dspy(config: MemfunConfig) -> None:
     """Configure DSPy with the LLM from memfun config."""
-    import os
 
     import dspy
+    from memfun_agent.role_models import lm_settings, resolve_api_key, set_role_config
+
+    # Register [llm.roles.*] so each agent's role_scope picks its model
+    # per call (task-local dspy.context); [llm] stays the global default.
+    set_role_config(config)
 
     provider = config.llm.provider
-    model = config.llm.model
-    api_key = os.environ.get(config.llm.api_key_env, "")
+    api_key = resolve_api_key(config.llm)
 
-    # openai-compat endpoints (local llama.cpp / vLLM / OpenRouter) often
-    # don't require a real key — inject placeholder if absent.
-    if provider == "openai-compat" and not api_key:
-        api_key = "sk-local"
-
-    if not api_key and provider != "ollama":
+    if not api_key:
         console.print(
             f"[yellow]Warning: No API key for {provider} (set {config.llm.api_key_env})[/yellow]"
         )
         return
 
-    if provider == "anthropic":
-        lm_model = f"anthropic/{model}"
-    elif provider == "openai" or provider == "openai-compat":
-        lm_model = f"openai/{model}"
-    elif provider == "ollama":
-        lm_model = f"ollama_chat/{model}"
-        api_key = "ollama"
-    else:
-        lm_model = model
-
-    kwargs: dict[str, Any] = {
-        "temperature": config.llm.temperature,
-        "max_tokens": config.llm.max_tokens,
-        # Local CPU-served models (and queued multi-slot servers) can take
-        # 10-30+ minutes per call on large outputs. LiteLLM defaults to 600s
-        # which kills calls long before the server completes them — wasting
-        # all the compute already spent. Bump to 1h so the agent stays
-        # patient and self-heals through slow but progressing endpoints.
-        "timeout": 3600,
-    }
-    if api_key:
-        kwargs["api_key"] = api_key
-    if config.llm.base_url:
-        kwargs["api_base"] = config.llm.base_url
+    lm_model, kwargs = lm_settings(config.llm)
 
     try:
         lm = dspy.LM(lm_model, **kwargs)

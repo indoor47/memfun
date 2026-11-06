@@ -677,11 +677,17 @@ class TaskDecomposer(dspy.Module):
         )
 
         try:
-            result = await asyncio.to_thread(
-                self.decomposer,
-                task_description=task_description,
-                project_context=project_context[:4000],
-            )
+            from memfun_agent.role_models import role_scope
+
+            # Run on the decomposer's role model.  to_thread copies the
+            # current context, so the task-local dspy.context override
+            # reaches the worker thread.  Recursive calls re-enter here.
+            with role_scope("decomposer"):
+                result = await asyncio.to_thread(
+                    self.decomposer,
+                    task_description=task_description,
+                    project_context=project_context[:4000],
+                )
 
             raw_tasks = getattr(result, "sub_tasks", [])
             sub_tasks = _parse_sub_tasks(raw_tasks)

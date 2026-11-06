@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 import uuid
 from typing import TYPE_CHECKING
@@ -61,9 +62,15 @@ class DefinedAgent(BaseAgent):
         """
         from memfun_core.types import TaskResult as TaskRes
 
+        from memfun_agent.role_models import role_for_agent, role_scope
+
         start = time.monotonic()
 
-        prompt = self._build_prompt(task)
+        # Bind the agent's role (e.g. ``pr-reviewer`` -> ``reviewer``) so
+        # any LLM call made on its behalf uses ``[llm.roles.<role>]``.
+        role = role_for_agent(self._definition.name, default=None)
+        with role_scope(role) if role else contextlib.nullcontext():
+            prompt = self._build_prompt(task)
 
         # Build the result payload with all definition metadata
         result_payload: dict[str, object] = {

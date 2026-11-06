@@ -399,12 +399,17 @@ async def _run_swarm(
 
     start = time.perf_counter()
     try:
-        result = await engine.execute_workflow(
-            task_description=spec,
-            project_context="",  # WorkflowEngine gathers shared context internally
-            conversation_history=None,
-            project=project_root.name,
-        )
+        from memfun_agent.role_models import role_scope
+
+        # Orchestrator role: any LLM call the engine makes outside an
+        # agent / decomposer binding runs on [llm.roles.orchestrator].
+        with role_scope("orchestrator"):
+            result = await engine.execute_workflow(
+                task_description=spec,
+                project_context="",  # WorkflowEngine gathers shared context internally
+                conversation_history=None,
+                project=project_root.name,
+            )
     except Exception as exc:
         console.print(
             Panel(
