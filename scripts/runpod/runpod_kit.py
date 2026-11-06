@@ -1,0 +1,1396 @@
+"""RunPod launch kit for memfun swarm runs (stdlib only).
+
+Subcommands::
+
+    gpus     list GPU types and prices                       (read-only)
+    launch   plan, and only with explicit intent, rent a pod  (dry-run by default)
+    watch    local watchdog: live $ spent, terminate at deadline / Ctrl-C / error
+    tunnel   SSH-forward a local port to the pod's SGLang port (read-only API)
+    status   show one pod                                     (read-only)
+
+Safety model (see ``docs/runpod-launch.md``):
+
+* Every read path goes through :class:`ReadOnlyTransport`, which refuses any GraphQL
+  document containing ``mutation`` and any non-GET REST call.  ``launch`` is a dry run
+  unless BOTH ``--no-dry-run`` and ``--yes-spend-money`` are given; the mutating transport
+  is constructed only after both checks pass.
+* The account API key is wrapped in :class:`Secret`, is only ever placed in an HTTP
+  ``Authorization`` header, and is redacted from every line this module prints and every
+  error it raises.  It is never put into the pod environment.
+* Three independent hard stops: the pod-create ``terminateAfter`` field, an in-pod
+  deadline (``pod_boot.sh``, uses the pod-scoped ``runpodctl``), and the local watchdog.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import dataclasses
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol, cast
+
+# ---------------------------------------------------------------------------
+# Constants.  Every default is a flag; nothing below is used without being shown.
+# ---------------------------------------------------------------------------
+
+GRAPHQL_URL = "https://api.runpod.io/graphql"
+REST_URL = "https://rest.runpod.io/v1"
+KEY_PATH = Path("~/.config/runpod/key")
+KEY_ENV = "RUNPOD_API_KEY"
+
+#: RunPod ``gpuTypeId`` for one B300.  Verified with the read-only ``gpuTypes`` query
+#: (``runpod_kit.py gpus --filter B300``) on 2026-11-06.  For H200 pass
+#: ``--gpu-type "NVIDIA H200"``; ``gpus`` lists every id.
+DEFAULT_GPU_TYPE = "NVIDIA B300 SXM6 AC"
+
+#: Official SGLang image.  VERIFY BEFORE LAUNCH: checked on Docker Hub
+#: (hub.docker.com/r/lmsysorg/sglang/tags) on 2026-11-06, pushed 2026-10-30.  The SGLang
+#: install docs recommend the ``cu130`` images for B300/GB300 (SM103) and CUDA 13.
+DEFAULT_IMAGE = "lmsysorg/sglang:v0.5.23-cu130-runtime"
+
+#: Verified to exist (HF API, not gated, 81 files, ~30.9 GB) on 2026-11-06.
+DEFAULT_MODEL_REPO = "Qwen/Qwen3.8-27B-FP8"
+DEFAULT_SERVED_NAME = "qwen3.8-27b-fp8"
+
+#: SGLang's default ``--port`` (docs.sglang.io server arguments; install docs use 30000).
+SGLANG_DEFAULT_PORT = 30000
+DEFAULT_LOCAL_PORT = 18000
+#: Local ports the tunnel must never bind (8434 is the owner's live LLM server).
+FORBIDDEN_LOCAL_PORTS = frozenset({8434})
+
+VOLUME_MOUNT = "/workspace"
+#: Weights are ~30.9 GB; 80 GB leaves room for run trajectories and a second revision.
+DEFAULT_VOLUME_GB = 80
+DEFAULT_MAX_MINUTES = 120
+MAX_MINUTES_CAP = 720
+DEFAULT_MAX_COST_USD = 40.0
+
+BOOT_SCRIPT = Path(__file__).with_name("pod_boot.sh")
+SECRET_ENV_HINT = re.compile(r"(api[_-]?key|token|secret|password|passwd)", re.IGNORECASE)
+
+
+class KitError(Exception):
+    """User-facing failure.  Messages are redacted before they are raised."""
+
+
+class MutationRefusedError(KitError):
+    """A read-only transport was asked to mutate."""
+
+
+def _d(value: Any) -> dict[str, Any]:
+    """``value`` as a JSON object, or ``{}``."""
+    return cast("dict[str, Any]", value) if isinstance(value, dict) else {}
+
+
+def _l(value: Any) -> list[Any]:
+    """``value`` as a JSON array, or ``[]``."""
+    return cast("list[Any]", value) if isinstance(value, list) else []
+
+
+# ---------------------------------------------------------------------------
+# Secrets and redaction.
+# ---------------------------------------------------------------------------
+
+
+class Secret:
+    """A string that refuses to print itself."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return "Secret('***')"
+
+    def __str__(self) -> str:
+        return "***"
+
+    def __bool__(self) -> bool:
+        return bool(self._value)
+
+
+class Redactor:
+    """Replaces every registered secret (and its obvious encodings) with ``***``."""
+
+    def __init__(self) -> None:
+        self._needles: list[str] = []
+
+    def add(self, secret: Secret) -> None:
+        raw = secret.reveal()
+        if len(raw) < 4:
+            return
+        for needle in (raw, base64.b64encode(raw.encode()).decode(), json.dumps(raw)[1:-1]):
+            if needle and needle not in self._needles:
+                self._needles.append(needle)
+        self._needles.sort(key=len, reverse=True)
+
+    def __call__(self, text: str) -> str:
+        for needle in self._needles:
+            text = text.replace(needle, "***")
+        return text
+
+
+REDACT = Redactor()
+
+
+def emit(message: str = "", *, err: bool = False) -> None:
+    """The only way this module writes to stdout/stderr."""
+    stream = sys.stderr if err else sys.stdout
+    print(REDACT(message), file=stream, flush=True)
+
+
+def load_api_key(env: dict[str, str] | None = None, path: Path | None = None) -> Secret:
+    """Read the key from ``$RUNPOD_API_KEY`` or ``~/.config/runpod/key``.  Never echoes it."""
+    env = dict(os.environ) if env is None else env
+    raw = env.get(KEY_ENV, "").strip()
+    if not raw:
+        key_file = (path or KEY_PATH).expanduser()
+        if not key_file.is_file():
+            raise KitError(f"no RunPod API key: set ${KEY_ENV} or create {key_file} (chmod 600)")
+        mode = stat.S_IMODE(key_file.stat().st_mode)
+        if mode & 0o077:
+            emit(f"warning: {key_file} is mode {oct(mode)}; run chmod 600 on it", err=True)
+        raw = key_file.read_text(encoding="utf-8").strip()
+    if not raw:
+        raise KitError("RunPod API key is empty")
+    secret = Secret(raw)
+    REDACT.add(secret)
+    return secret
+
+
+def assert_no_secret(obj: Any, secret: Secret, what: str) -> None:
+    """Refuse to continue if ``secret`` appears anywhere inside ``obj``."""
+    if secret.reveal() and secret.reveal() in json.dumps(obj, default=str):
+        raise KitError(f"refusing: the account API key would be sent inside {what}")
+
+
+def redact_payload(obj: Any) -> Any:
+    """Copy of a launch payload with secret-looking env values hidden, for printing."""
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in _d(obj).items():
+            out[str(k)] = redact_payload(v)
+        key = out.get("key")
+        if isinstance(key, str) and "value" in out and SECRET_ENV_HINT.search(key):
+            out["value"] = "***"
+        return out
+    if isinstance(obj, list):
+        return [redact_payload(v) for v in _l(obj)]
+    if isinstance(obj, str) and len(obj) > 160:
+        return obj[:80] + f"...<{len(obj)} chars>"
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Transports.
+# ---------------------------------------------------------------------------
+
+
+class Transport(Protocol):
+    def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]: ...
+
+    def rest(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any: ...
+
+
+_MUTATION = re.compile(r"\bmutation\b", re.IGNORECASE)
+
+
+def is_mutation(query: str) -> bool:
+    """Conservative: any occurrence of the word ``mutation``, or a non-query operation."""
+    if _MUTATION.search(query):
+        return True
+    head = query.lstrip()
+    return not (head.startswith("{") or head.lower().startswith("query"))
+
+
+class ReadOnlyTransport:
+    """Wraps a transport and refuses anything that could change account state."""
+
+    def __init__(self, inner: Transport) -> None:
+        self._inner = inner
+
+    def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        if is_mutation(query):
+            raise MutationRefusedError("read-only transport refused a GraphQL mutation")
+        return self._inner.graphql(query, variables)
+
+    def rest(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        if method.upper() != "GET" or body is not None:
+            raise MutationRefusedError(f"read-only transport refused REST {method.upper()}")
+        return self._inner.rest(method, path, None)
+
+
+class HttpTransport:
+    """Real RunPod transport.  The key only ever goes into the Authorization header."""
+
+    def __init__(self, key: Secret, *, timeout: float = 30.0) -> None:
+        self._key = key
+        self._timeout = timeout
+
+    def _request(self, method: str, url: str, body: dict[str, Any] | None) -> Any:
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", f"Bearer {self._key.reveal()}")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", "memfun-runpod-kit/1")
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                text = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:400]
+            raise KitError(REDACT(f"RunPod HTTP {exc.code} for {url}: {detail}")) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise KitError(REDACT(f"RunPod request to {url} failed: {exc}")) from None
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            raise KitError(REDACT(f"RunPod returned non-JSON from {url}: {text[:200]}")) from None
+
+    def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {"query": query}
+        if variables is not None:
+            body["variables"] = variables
+        resp = self._request("POST", GRAPHQL_URL, body)
+        if not isinstance(resp, dict):
+            raise KitError("RunPod GraphQL returned an unexpected body")
+        payload = _d(resp)
+        errors = payload.get("errors")
+        if errors:
+            msgs = "; ".join(str(_d(e).get("message", e)) for e in _l(errors))
+            raise KitError(REDACT(f"RunPod GraphQL error: {msgs}"))
+        data = payload.get("data")
+        return _d(data)
+
+    def rest(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        return self._request(method.upper(), REST_URL + path, body)
+
+
+# ---------------------------------------------------------------------------
+# API helpers.
+# ---------------------------------------------------------------------------
+
+
+def _lit(value: str) -> str:
+    """A GraphQL string literal (JSON string escaping is a valid subset)."""
+    return json.dumps(value)
+
+
+@dataclass(frozen=True, slots=True)
+class GpuType:
+    id: str
+    display_name: str
+    memory_gb: float
+    secure_price: float | None
+    community_price: float | None
+    secure_cloud: bool
+    community_cloud: bool
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> GpuType:
+        return cls(
+            id=str(raw.get("id", "")),
+            display_name=str(raw.get("displayName", "")),
+            memory_gb=float(raw.get("memoryInGb") or 0),
+            secure_price=_opt_float(raw.get("securePrice")),
+            community_price=_opt_float(raw.get("communityPrice")),
+            secure_cloud=bool(raw.get("secureCloud")),
+            community_cloud=bool(raw.get("communityCloud")),
+        )
+
+    def list_price(self, cloud: str) -> float | None:
+        return self.secure_price if cloud == "secure" else self.community_price
+
+
+@dataclass(frozen=True, slots=True)
+class Offer:
+    stock_status: str | None
+    lowest_price: float | None
+    available_counts: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Volume:
+    id: str
+    name: str
+    size_gb: int
+    data_center_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class PodInfo:
+    id: str
+    name: str
+    desired_status: str
+    cost_per_hr: float | None
+    uptime_seconds: int | None
+    ports: tuple[dict[str, Any], ...]
+
+    def ssh_endpoint(self) -> tuple[str, int] | None:
+        for port in self.ports:
+            if (
+                port.get("privatePort") == 22
+                and port.get("isIpPublic")
+                and str(port.get("type", "tcp")).lower() == "tcp"
+                and port.get("ip")
+                and port.get("publicPort")
+            ):
+                return str(port["ip"]), int(port["publicPort"])
+        return None
+
+
+def _opt_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+GPU_TYPES_QUERY = (
+    "query { gpuTypes { id displayName memoryInGb secureCloud communityCloud "
+    "securePrice communityPrice } }"
+)
+
+
+def list_gpu_types(t: Transport) -> list[GpuType]:
+    data = t.graphql(GPU_TYPES_QUERY)
+    return [GpuType.from_api(_d(g)) for g in _l(data.get("gpuTypes"))]
+
+
+def resolve_gpu_type(types: list[GpuType], wanted: str) -> GpuType:
+    """Exact id, else exact (case-insensitive) display name.  Never a fuzzy pick."""
+    for g in types:
+        if g.id == wanted:
+            return g
+    for g in types:
+        if g.display_name.lower() == wanted.lower():
+            return g
+    near = [g.id for g in types if wanted.lower() in (g.id + " " + g.display_name).lower()]
+    hint = f" Close matches: {near}." if near else " Run the `gpus` subcommand to list ids."
+    raise KitError(f"unknown GPU type {wanted!r}.{hint}")
+
+
+def gpu_offer(t: Transport, gpu_id: str, count: int, cloud: str, data_center: str | None) -> Offer:
+    dc = f", dataCenterIds: [{_lit(data_center)}]" if data_center else ""
+    secure = "true" if cloud == "secure" else "false"
+    query = (
+        f"query {{ gpuTypes(input: {{id: {_lit(gpu_id)}}}) {{ id "
+        f"lowestPrice(input: {{gpuCount: {int(count)}, secureCloud: {secure}{dc}}}) "
+        f"{{ stockStatus uninterruptablePrice availableGpuCounts }} }} }}"
+    )
+    data = t.graphql(query)
+    rows = _l(data.get("gpuTypes"))
+    lp = _d(_d(rows[0]).get("lowestPrice")) if rows else {}
+    counts = tuple(int(c) for c in _l(lp.get("availableGpuCounts")))
+    return Offer(
+        stock_status=lp.get("stockStatus"),
+        lowest_price=_opt_float(lp.get("uninterruptablePrice")),
+        available_counts=counts,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DcStock:
+    id: str
+    availability: str
+    supports_network_volumes: bool
+
+
+def datacenter_stock(t: Transport, gpu_id: str, count: int, cloud: str) -> list[DcStock]:
+    """Per-data-center availability (``lowestPrice.gpuTypeDatacenters``), read-only."""
+    secure = "true" if cloud == "secure" else "false"
+    data = t.graphql(
+        f"query {{ gpuTypes(input: {{id: {_lit(gpu_id)}}}) {{ lowestPrice(input: "
+        f"{{gpuCount: {int(count)}, secureCloud: {secure}}}) {{ gpuTypeDatacenters "
+        "{ dataCenterId supportNetworkVolumes availability } } } }"
+    )
+    rows = _l(data.get("gpuTypes"))
+    lp = _d(_d(rows[0]).get("lowestPrice")) if rows else {}
+    return [
+        DcStock(
+            id=str(dc.get("dataCenterId")),
+            availability=str(dc.get("availability")),
+            supports_network_volumes=bool(dc.get("supportNetworkVolumes")),
+        )
+        for dc in map(_d, _l(lp.get("gpuTypeDatacenters")))
+    ]
+
+
+def account_summary(t: Transport) -> tuple[float | None, list[Volume]]:
+    data = t.graphql(
+        "query { myself { clientBalance networkVolumes { id name size dataCenterId } } }"
+    )
+    me = _d(data.get("myself"))
+    vols = [
+        Volume(
+            id=str(v.get("id")),
+            name=str(v.get("name")),
+            size_gb=int(v.get("size") or 0),
+            data_center_id=str(v.get("dataCenterId")),
+        )
+        for v in map(_d, _l(me.get("networkVolumes")))
+    ]
+    return _opt_float(me.get("clientBalance")), vols
+
+
+POD_FIELDS = (
+    "id name desiredStatus costPerHr "
+    "runtime { uptimeInSeconds ports { ip isIpPublic privatePort publicPort type } }"
+)
+
+
+def get_pod(t: Transport, pod_id: str) -> PodInfo | None:
+    data = t.graphql(f"query {{ pod(input: {{podId: {_lit(pod_id)}}}) {{ {POD_FIELDS} }} }}")
+    raw = _d(data.get("pod"))
+    if not raw:
+        return None
+    runtime = _d(raw.get("runtime"))
+    uptime = runtime.get("uptimeInSeconds")
+    return PodInfo(
+        id=str(raw.get("id")),
+        name=str(raw.get("name")),
+        desired_status=str(raw.get("desiredStatus")),
+        cost_per_hr=_opt_float(raw.get("costPerHr")),
+        uptime_seconds=int(uptime) if uptime is not None else None,
+        ports=tuple(_d(p) for p in _l(runtime.get("ports"))),
+    )
+
+
+DEPLOY_MUTATION = (
+    "mutation Deploy($input: PodFindAndDeployOnDemandInput!) { "
+    "podFindAndDeployOnDemand(input: $input) { id name costPerHr desiredStatus } }"
+)
+
+
+def deploy_pod(t: Transport, payload: dict[str, Any]) -> PodInfo:
+    data = t.graphql(DEPLOY_MUTATION, {"input": payload})
+    raw = _d(data.get("podFindAndDeployOnDemand"))
+    if not raw or not raw.get("id"):
+        raise KitError("RunPod did not return a pod id (no capacity?)")
+    return PodInfo(
+        id=str(raw["id"]),
+        name=str(raw.get("name")),
+        desired_status=str(raw.get("desiredStatus")),
+        cost_per_hr=_opt_float(raw.get("costPerHr")),
+        uptime_seconds=None,
+        ports=(),
+    )
+
+
+def terminate_pod(t: Transport, pod_id: str) -> None:
+    # podTerminate returns a scalar; no selection set (docs.runpod.io GraphQL manage-pods).
+    t.graphql(f"mutation {{ podTerminate(input: {{podId: {_lit(pod_id)}}}) }}")
+
+
+def create_network_volume(t: Transport, name: str, size_gb: int, data_center: str) -> Volume:
+    raw = t.rest(
+        "POST", "/networkvolumes", {"name": name, "size": size_gb, "dataCenterId": data_center}
+    )
+    vol = _d(raw)
+    if not vol.get("id"):
+        raise KitError("RunPod did not return a network volume id")
+    return Volume(str(vol["id"]), str(vol.get("name")), int(vol.get("size") or 0), data_center)
+
+
+# ---------------------------------------------------------------------------
+# Planning (pure; everything it needs comes from read-only queries).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LaunchPlan:
+    gpu: GpuType
+    gpu_count: int
+    cloud: str
+    offer: Offer
+    price_per_gpu_hr: float
+    max_minutes: int
+    volume: Volume | None
+    volume_to_create: tuple[str, int, str] | None
+    balance: float | None
+    payload: dict[str, Any]
+    data_center: str | None = None
+    dc_availability: str | None = None
+    warnings: list[str] = field(default_factory=list[str])
+
+    @property
+    def est_max_cost(self) -> float:
+        return estimate_cost(self.price_per_gpu_hr, self.gpu_count, self.max_minutes)
+
+
+def estimate_cost(price_per_gpu_hr: float, gpu_count: int, minutes: float) -> float:
+    return round(price_per_gpu_hr * gpu_count * minutes / 60.0, 2)
+
+
+def conservative_price(gpu: GpuType, offer: Offer, cloud: str) -> float:
+    """The higher of the list price and the live lowest price: an upper bound."""
+    prices = [p for p in (gpu.list_price(cloud), offer.lowest_price) if p is not None and p > 0]
+    if not prices:
+        raise KitError(f"RunPod reported no {cloud} price for {gpu.id}; refusing to estimate")
+    return max(prices)
+
+
+def build_boot_env(
+    args: argparse.Namespace, deadline_epoch: int, public_key: str
+) -> list[dict[str, str]]:
+    boot = BOOT_SCRIPT.read_bytes()
+    env = {
+        "PUBLIC_KEY": public_key,
+        "MEMFUN_BOOT_B64": base64.b64encode(boot).decode(),
+        "MEMFUN_MAX_MINUTES": str(args.max_minutes),
+        "MEMFUN_DEADLINE_EPOCH": str(deadline_epoch),
+        "MEMFUN_MODEL_DIR": f"{VOLUME_MOUNT}/models/{args.model_repo}",
+        "MEMFUN_MODEL_REPO": args.model_repo,
+        "MEMFUN_SERVED_NAME": args.served_name,
+        "MEMFUN_SGLANG_PORT": str(args.sglang_port),
+        "MEMFUN_SGLANG_ARGS": args.sglang_args,
+        "MEMFUN_ALLOW_PULL": "1" if args.pull_in_pod else "0",
+        "MEMFUN_CRASH_GRACE_MIN": str(args.crash_grace_minutes),
+    }
+    return [{"key": k, "value": v} for k, v in env.items()]
+
+
+DOCKER_ARGS = (
+    'bash -c \'printf %s "$MEMFUN_BOOT_B64" | base64 -d > /tmp/memfun_boot.sh '
+    "&& exec bash /tmp/memfun_boot.sh'"
+)
+
+
+def build_payload(
+    args: argparse.Namespace,
+    gpu: GpuType,
+    volume_id: str | None,
+    data_center: str | None,
+    now: dt.datetime,
+    public_key: str,
+) -> dict[str, Any]:
+    deadline = now + dt.timedelta(minutes=args.max_minutes)
+    payload: dict[str, Any] = {
+        "name": args.name,
+        "cloudType": args.cloud.upper(),
+        "gpuTypeId": gpu.id,
+        "gpuCount": args.gpu_count,
+        "imageName": args.image,
+        "containerDiskInGb": args.container_disk_gb,
+        "volumeInGb": 0,
+        "volumeMountPath": VOLUME_MOUNT,
+        "ports": "22/tcp",
+        "supportPublicIp": True,
+        "startSsh": True,
+        "dockerArgs": DOCKER_ARGS,
+        "env": build_boot_env(args, int(deadline.timestamp()), public_key),
+    }
+    if volume_id:
+        payload["networkVolumeId"] = volume_id
+    if data_center:
+        payload["dataCenterIds"] = [data_center]
+    if args.server_terminate_after:
+        payload["terminateAfter"] = deadline.astimezone(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return payload
+
+
+def read_public_key(path: str) -> str:
+    p = Path(path).expanduser()
+    if not p.is_file():
+        return ""
+    text = p.read_text(encoding="utf-8").strip()
+    if "PRIVATE KEY" in text:
+        raise KitError(f"{p} looks like a PRIVATE key; pass the .pub file")
+    return text
+
+
+def make_plan(t: ReadOnlyTransport, args: argparse.Namespace, now: dt.datetime) -> LaunchPlan:
+    warnings: list[str] = []
+    gpu = resolve_gpu_type(list_gpu_types(t), args.gpu_type)
+    balance, volumes = account_summary(t)
+
+    volume: Volume | None = None
+    to_create: tuple[str, int, str] | None = None
+    if args.volume_id:
+        matches = [v for v in volumes if v.id == args.volume_id]
+        if not matches:
+            raise KitError(f"network volume {args.volume_id!r} not found on this account")
+        volume = matches[0]
+    elif args.volume_name:
+        matches = [v for v in volumes if v.name == args.volume_name]
+        if len(matches) > 1:
+            raise KitError(f"{len(matches)} volumes named {args.volume_name!r}; use --volume-id")
+        if matches:
+            volume = matches[0]
+        else:
+            if not args.data_center:
+                raise KitError(
+                    "creating a network volume needs --data-center (pods are pinned to the "
+                    "volume's data center); pick one where the GPU is in stock"
+                )
+            to_create = (args.volume_name, args.volume_gb, args.data_center)
+    else:
+        warnings.append("no network volume: weights and runs are lost when the pod terminates")
+        if not args.pull_in_pod:
+            warnings.append("no volume and no --pull-in-pod: the pod will find no weights and "
+                            "self-terminate at boot")  # fmt: skip
+
+    data_center = volume.data_center_id if volume else args.data_center
+    if args.data_center and volume and args.data_center != volume.data_center_id:
+        raise KitError(
+            f"--data-center {args.data_center} != volume's data center {volume.data_center_id}"
+        )
+    if volume and volume.size_gb < 40:
+        warnings.append(f"volume {volume.id} is {volume.size_gb} GB; FP8 weights need ~31 GB")
+    if args.cloud == "community" and (volume or to_create):
+        warnings.append("UNVERIFIED: network volumes may not attach to community-cloud pods")
+
+    offer = gpu_offer(t, gpu.id, args.gpu_count, args.cloud, data_center)
+    if offer.stock_status in (None, "None"):
+        warnings.append(
+            f"no {args.cloud} stock reported for {gpu.id}"
+            + (f" in {data_center}" if data_center else "")
+        )
+    price = conservative_price(gpu, offer, args.cloud)
+    dc_availability: str | None = None
+    if data_center:
+        stock = {d.id: d for d in datacenter_stock(t, gpu.id, args.gpu_count, args.cloud)}
+        row = stock.get(data_center)
+        if row is None:
+            warnings.append(f"{data_center} does not list {gpu.id}; try `gpus --where`")
+        else:
+            dc_availability = row.availability
+            if row.availability != "AVAILABLE":
+                warnings.append(f"{gpu.id} is {row.availability} in {data_center}")
+            if (volume or to_create) and not row.supports_network_volumes:
+                warnings.append(f"{data_center} does not support network volumes")
+
+    public_key = read_public_key(args.ssh_public_key)
+    if not public_key:
+        warnings.append(f"no SSH public key at {args.ssh_public_key}: tunnel will not work")
+
+    payload = build_payload(
+        args,
+        gpu,
+        volume.id if volume else "<created-at-launch>" if to_create else None,
+        data_center,
+        now,
+        public_key,
+    )
+    return LaunchPlan(
+        gpu=gpu,
+        gpu_count=args.gpu_count,
+        cloud=args.cloud,
+        offer=offer,
+        price_per_gpu_hr=price,
+        max_minutes=args.max_minutes,
+        volume=volume,
+        volume_to_create=to_create,
+        balance=balance,
+        payload=payload,
+        data_center=data_center,
+        dc_availability=dc_availability,
+        warnings=warnings,
+    )
+
+
+def print_plan(plan: LaunchPlan) -> None:
+    g = plan.gpu
+    emit("=== RunPod launch plan ===")
+    emit(f"GPU          : {plan.gpu_count} x {g.id} ({g.display_name}, {g.memory_gb:g} GB)")
+    emit(f"cloud        : {plan.cloud}")
+    emit(f"data center  : {plan.data_center or 'any'}  availability: {plan.dc_availability}")
+    emit(
+        f"stock        : {plan.offer.stock_status}  available counts: "
+        f"{list(plan.offer.available_counts)}"
+    )
+    emit(
+        f"price/GPU/h  : list {g.list_price(plan.cloud)}  live-lowest {plan.offer.lowest_price}"
+        f"  -> estimate uses ${plan.price_per_gpu_hr:.2f}"
+    )
+    emit(f"max minutes  : {plan.max_minutes}  (hard stop in pod + watchdog + terminateAfter)")
+    emit(f"EST. MAX COST: ${plan.est_max_cost:.2f}  (GPU only; volume storage billed separately)")
+    if plan.balance is not None:
+        emit(f"balance      : ${plan.balance:.2f}")
+        if plan.balance < plan.est_max_cost:
+            plan.warnings.append("account balance is below the estimated max cost")
+    if plan.volume:
+        v = plan.volume
+        emit(f"volume       : attach {v.id} '{v.name}' {v.size_gb} GB in {v.data_center_id}")
+    elif plan.volume_to_create:
+        n, s, d = plan.volume_to_create
+        emit(f"volume       : CREATE '{n}' {s} GB in {d} (at launch)")
+    for w in plan.warnings:
+        emit(f"WARNING      : {w}")
+    emit("payload (secrets redacted):")
+    emit(json.dumps(redact_payload(plan.payload), indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Watchdog.
+# ---------------------------------------------------------------------------
+
+
+type Clock = Callable[[], float]
+type Sleeper = Callable[[float], None]
+
+
+@dataclass(frozen=True, slots=True)
+class WatchResult:
+    reason: str
+    terminated: bool
+    verified_gone: bool
+    spent_usd: float
+
+
+_GONE_ERR = re.compile(r"not\s*found|does not exist|no pod", re.IGNORECASE)
+
+
+def _pod_gone(t: Transport, pod_id: str) -> bool | None:
+    """True gone, False still there, None unknown."""
+    try:
+        pod = get_pod(t, pod_id)
+    except KitError as exc:
+        return True if _GONE_ERR.search(str(exc)) else None
+    return pod is None or pod.desired_status.upper() == "TERMINATED"
+
+
+def terminate_and_verify(
+    t: Transport,
+    pod_id: str,
+    *,
+    sleep: Sleeper,
+    retries: int = 6,
+    backoff_seconds: float = 10.0,
+    verify_polls: int = 3,
+) -> tuple[bool, bool]:
+    """Terminate with retries; return (terminate call succeeded once, verified gone)."""
+    called = False
+    for attempt in range(1, retries + 1):
+        try:
+            try:
+                terminate_pod(t, pod_id)
+                called = True
+                emit(f"[watchdog] terminate request {attempt}/{retries} accepted for {pod_id}")
+            except KitError as exc:
+                emit(f"[watchdog] terminate attempt {attempt}/{retries} failed: {exc}", err=True)
+            for _ in range(verify_polls):
+                gone = _pod_gone(t, pod_id)
+                if gone:
+                    emit(f"[watchdog] verified: pod {pod_id} is gone")
+                    return called, True
+                sleep(backoff_seconds)
+        except KeyboardInterrupt:
+            emit(
+                "[watchdog] termination in progress; Ctrl-C ignored until it is verified", err=True
+            )
+    emit(
+        f"[watchdog] !!! COULD NOT VERIFY POD {pod_id} IS TERMINATED. Terminate it now at "
+        "https://console.runpod.io/pods !!!",
+        err=True,
+    )
+    return called, False
+
+
+def run_watchdog(
+    t: Transport,
+    pod_id: str,
+    deadline: float,
+    *,
+    clock: Clock = time.time,
+    sleep: Sleeper = time.sleep,
+    started_at: float | None = None,
+    poll_seconds: float = 30.0,
+    retries: int = 6,
+    backoff_seconds: float = 10.0,
+    max_poll_errors: int = 5,
+) -> WatchResult:
+    """Poll the pod, print live spend, and terminate at the deadline or on any exit path."""
+    start = clock() if started_at is None else started_at
+    spent = 0.0
+    cost_hr: float | None = None
+    reason = "unknown"
+    poll_errors = 0
+    try:
+        while True:
+            now = clock()
+            if now >= deadline:
+                reason = "deadline"
+                break
+            try:
+                pod = get_pod(t, pod_id)
+            except KitError as exc:
+                poll_errors += 1
+                emit(f"[watchdog] poll error {poll_errors}/{max_poll_errors}: {exc}", err=True)
+                if poll_errors >= max_poll_errors:
+                    raise
+                sleep(max(0.0, min(poll_seconds, deadline - now)))
+                continue
+            poll_errors = 0
+            if pod is None or pod.desired_status.upper() == "TERMINATED":
+                emit(f"[watchdog] pod {pod_id} is already gone")
+                return WatchResult("already-gone", False, True, spent)
+            if pod.cost_per_hr is not None:
+                cost_hr = pod.cost_per_hr
+            if cost_hr is not None:
+                spent = round(cost_hr * (now - start) / 3600.0, 4)
+            left = deadline - now
+            rate = f"${cost_hr:.2f}/h" if cost_hr is not None else "rate n/a"
+            emit(
+                f"[watchdog] {pod_id} {pod.desired_status} | {rate} | spent ${spent:.2f} "
+                f"| {int(left // 60)}m{int(left % 60):02d}s to hard stop"
+            )
+            sleep(max(0.0, min(poll_seconds, left)))
+    except KeyboardInterrupt:
+        reason = "interrupt"
+    except Exception as exc:
+        reason = f"error: {REDACT(str(exc))}"
+    if cost_hr is not None:
+        spent = round(cost_hr * (clock() - start) / 3600.0, 4)
+    emit(f"[watchdog] stopping pod {pod_id} ({reason}); spent so far ~${spent:.2f}")
+    called, gone = terminate_and_verify(
+        t, pod_id, sleep=sleep, retries=retries, backoff_seconds=backoff_seconds
+    )
+    return WatchResult(reason, called, gone, spent)
+
+
+# ---------------------------------------------------------------------------
+# Tunnel.
+# ---------------------------------------------------------------------------
+
+
+def check_local_port(port: int) -> None:
+    if port in FORBIDDEN_LOCAL_PORTS:
+        raise KitError(f"refusing local port {port}: reserved for the owner's local LLM server")
+    if not 1024 <= port <= 65535:
+        raise KitError(f"local port {port} out of range 1024-65535")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            raise KitError(f"local port {port} is already in use; pick another") from None
+
+
+def build_ssh_command(
+    host: str, ssh_port: int, local_port: int, remote_port: int, identity: str | None
+) -> list[str]:
+    if local_port in FORBIDDEN_LOCAL_PORTS:
+        raise KitError(f"refusing local port {local_port}")
+    cmd = [
+        "ssh", "-N",
+        "-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
+        "-p", str(ssh_port),
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=30",
+        "-o", "StrictHostKeyChecking=accept-new",
+    ]  # fmt: skip
+    if identity:
+        cmd += ["-i", str(Path(identity).expanduser())]
+    cmd.append(f"root@{host}")
+    return cmd
+
+
+def memfun_snippet(local_port: int, served_name: str) -> str:
+    return (
+        "[llm.roles.worker]\n"
+        'provider = "openai"\n'
+        f'model = "{served_name}"\n'
+        f'base_url = "http://127.0.0.1:{local_port}/v1"\n'
+        "# Any non-empty value works: SGLang binds 127.0.0.1 in the pod; the tunnel is the auth.\n"
+        'api_key_env = "MEMFUN_SGLANG_DUMMY_KEY"\n'
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI.
+# ---------------------------------------------------------------------------
+
+
+type TransportFactory = Callable[[Secret], Transport]
+
+
+def _default_factory(key: Secret) -> Transport:
+    return HttpTransport(key)
+
+
+def _positive_minutes(text: str) -> int:
+    value = int(text)
+    if not 1 <= value <= MAX_MINUTES_CAP:
+        raise argparse.ArgumentTypeError(f"--max-minutes must be 1..{MAX_MINUTES_CAP}")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="runpod_kit", description=(__doc__ or "").split("\n\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    g = sub.add_parser("gpus", help="list GPU types and prices (read-only)")
+    g.add_argument("--filter", default="", help="substring of id/displayName")
+    g.add_argument("--where", default=None, metavar="GPU_TYPE_ID",
+                   help="show per-data-center stock for this gpuTypeId")  # fmt: skip
+    g.add_argument("--gpu-count", type=int, default=1)
+    g.add_argument("--cloud", choices=("secure", "community"), default="secure")
+
+    la = sub.add_parser("launch", help="plan (default) or rent a pod")
+    la.add_argument("--gpu-type", default=DEFAULT_GPU_TYPE, help="RunPod gpuTypeId")
+    la.add_argument("--gpu-count", type=int, default=1)
+    la.add_argument("--cloud", choices=("secure", "community"), default="secure")
+    la.add_argument("--image", default=DEFAULT_IMAGE, help="verify the tag before launch")
+    la.add_argument("--name", default="memfun-swarm")
+    la.add_argument("--volume-id", default=None, help="attach this existing network volume")
+    la.add_argument("--volume-name", default="memfun-weights", help="attach by name or create")
+    la.add_argument("--no-volume", action="store_true", help="run without a network volume")
+    la.add_argument("--volume-gb", type=int, default=DEFAULT_VOLUME_GB)
+    la.add_argument("--data-center", default=None, help="e.g. EU-RO-1 (needed to create)")
+    la.add_argument("--container-disk-gb", type=int, default=50)
+    la.add_argument("--max-minutes", type=_positive_minutes, default=DEFAULT_MAX_MINUTES)
+    la.add_argument("--max-cost-usd", type=float, default=DEFAULT_MAX_COST_USD)
+    la.add_argument("--model-repo", default=DEFAULT_MODEL_REPO)
+    la.add_argument("--served-name", default=DEFAULT_SERVED_NAME)
+    la.add_argument("--sglang-port", type=int, default=SGLANG_DEFAULT_PORT)
+    la.add_argument("--sglang-args", default="", help="extra launch_server args")
+    la.add_argument("--pull-in-pod", action="store_true", help="download weights if missing")
+    la.add_argument("--crash-grace-minutes", type=int, default=10)
+    la.add_argument("--ssh-public-key", default="~/.ssh/id_ed25519.pub")
+    la.add_argument(
+        "--server-terminate-after",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="also set the pod's terminateAfter field (server-side stop)",
+    )
+    la.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
+    la.add_argument("--yes-spend-money", action="store_true", help="required with --no-dry-run")
+    la.add_argument("--poll-seconds", type=float, default=30.0)
+
+    w = sub.add_parser("watchdog", help="terminate an existing pod at a deadline / Ctrl-C")
+    w.add_argument("--pod-id", required=True)
+    w.add_argument("--max-minutes", type=_positive_minutes, required=True,
+                   help="terminate this many minutes from now")  # fmt: skip
+    w.add_argument("--poll-seconds", type=float, default=30.0)
+
+    tu = sub.add_parser("tunnel", help="SSH tunnel local port -> pod SGLang")
+    tu.add_argument("--pod-id", required=True)
+    tu.add_argument("--local-port", type=int, default=DEFAULT_LOCAL_PORT)
+    tu.add_argument("--remote-port", type=int, default=SGLANG_DEFAULT_PORT)
+    tu.add_argument("--identity", default=None, help="ssh private key path (-i)")
+    tu.add_argument("--served-name", default=DEFAULT_SERVED_NAME)
+    tu.add_argument("--run", action="store_true", help="actually start ssh (foreground)")
+
+    sp = sub.add_parser("spend", help="live $ spent for a pod (read-only)")
+    sp.add_argument("--pod-id", required=True)
+
+    wa = sub.add_parser(
+        "watch",
+        help="tunnel + readiness check + start memfun (dashboard) with metrics/rate env",
+    )
+    wa.add_argument("--pod-id", required=True)
+    wa.add_argument("--local-port", type=int, default=DEFAULT_LOCAL_PORT)
+    wa.add_argument("--remote-port", type=int, default=SGLANG_DEFAULT_PORT)
+    wa.add_argument("--identity", default=None, help="ssh private key path (-i)")
+    wa.add_argument("--served-name", default=DEFAULT_SERVED_NAME)
+    wa.add_argument("--ready-retries", type=int, default=60)
+    wa.add_argument("--ready-interval", type=float, default=10.0)
+    wa.add_argument("--no-caffeinate", action="store_true")
+    wa.add_argument(
+        "command", nargs=argparse.REMAINDER, help="memfun command after --; default: memfun chat"
+    )
+
+    st = sub.add_parser("status", help="show a pod (read-only)")
+    st.add_argument("--pod-id", required=True)
+    return p
+
+
+def cmd_gpus(ro: ReadOnlyTransport, args: argparse.Namespace) -> int:
+    if args.where:
+        rows_dc = datacenter_stock(ro, args.where, args.gpu_count, args.cloud)
+        emit(f"{args.gpu_count} x {args.where} ({args.cloud}) by data center:")
+        emit(f"{'dataCenterId':<14} {'availability':<14} network-volumes")
+        for r in sorted(rows_dc, key=lambda r: r.id):
+            vols = "yes" if r.supports_network_volumes else "no"
+            emit(f"{r.id:<14} {r.availability:<14} {vols}")
+        if not rows_dc:
+            emit("(no data center reports this GPU type)")
+        return 0
+    rows = [
+        g for g in list_gpu_types(ro)
+        if args.filter.lower() in (g.id + " " + g.display_name).lower()
+    ]  # fmt: skip
+    emit(f"{'gpuTypeId':<34} {'displayName':<22} {'GB':>5} {'secure$/h':>10} {'comm$/h':>9}")
+    for g in sorted(rows, key=lambda r: r.id):
+        emit(
+            f"{g.id:<34} {g.display_name:<22} {g.memory_gb:>5g} "
+            f"{g.secure_price!s:>10} {g.community_price!s:>9}"
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Run card, live spend, and the watch wrapper (tunnel -> readiness -> memfun dashboard).
+# ---------------------------------------------------------------------------
+
+KIT_CMD = "uv run python scripts/runpod/launch_pod.py"
+METRICS_ENV = "MEMFUN_INFERENCE_METRICS_URL"
+RATE_ENV = "MEMFUN_POD_RATE_USD"
+WORKER_KEY_ENV = "MEMFUN_SGLANG_DUMMY_KEY"
+
+
+def metrics_url(local_port: int) -> str:
+    return f"http://127.0.0.1:{local_port}/metrics"
+
+
+def format_rate(rate: float) -> str:
+    return f"{rate:.4f}".rstrip("0").rstrip(".")
+
+
+def run_card(
+    *,
+    pod_id: str | None,
+    gpu_id: str,
+    gpu_count: int,
+    rate_per_hr: float,
+    rate_source: str,
+    deadline_utc: dt.datetime,
+    minutes: int,
+    local_port: int = DEFAULT_LOCAL_PORT,
+) -> list[str]:
+    """The launch printout.  Contains no secrets by construction (no key is passed in)."""
+    dry = pod_id is None
+    pid = pod_id or "<POD_ID>"
+    local = deadline_utc.astimezone()
+    return [
+        "=== DRY RUN: run card (nothing created) ===" if dry else "=== run card ===",
+        f"pod id     : {'<none: dry run>' if dry else pod_id}",
+        f"GPU        : {gpu_count} x {gpu_id}",
+        f"rate       : ${rate_per_hr:.2f}/h ({rate_source})",
+        f"hard stop  : {local:%Y-%m-%d %H:%M:%S %Z} local (in {minutes} min, auto-terminate)",
+        f"live spend : {KIT_CMD} spend --pod-id {pid}",
+        f"tunnel     : {KIT_CMD} tunnel --pod-id {pid} --run",
+        f"watch      : {KIT_CMD} watch --pod-id {pid} -- memfun chat",
+        f"env        : export {METRICS_ENV}={metrics_url(local_port)}",
+        f"             export {RATE_ENV}={format_rate(rate_per_hr)}",
+        "dashboard: watch in the Swarm app",
+    ]
+
+
+def cmd_spend(ro: ReadOnlyTransport, pod_id: str) -> int:
+    pod = get_pod(ro, pod_id)
+    if pod is None:
+        raise KitError(f"pod {pod_id} not found (terminated?)")
+    if pod.cost_per_hr is None:
+        raise KitError(f"RunPod reports no costPerHr for {pod_id}")
+    up = pod.uptime_seconds or 0
+    spent = pod.cost_per_hr * up / 3600.0
+    emit(
+        f"{pod_id} {pod.desired_status}: ${pod.cost_per_hr:.2f}/h x {up // 60}m{up % 60:02d}s "
+        f"uptime = ~${spent:.2f} (uptime-based; billing can also include start-up time)"
+    )
+    return 0
+
+
+def _http_get_local(url: str, timeout: float) -> tuple[int, bytes]:
+    if not url.startswith("http://127.0.0.1:"):
+        raise KitError(f"refusing non-local readiness URL {url}")
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return int(resp.status), resp.read()
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), b""
+    except (urllib.error.URLError, OSError) as exc:
+        raise KitError(f"GET {url} failed: {exc}") from None
+
+
+@dataclass
+class WatchDeps:
+    """Side effects of ``watch``, injectable for tests."""
+
+    popen: Callable[..., Any] = subprocess.Popen
+    which: Callable[[str], str | None] = shutil.which
+    http_get: Callable[[str, float], tuple[int, bytes]] = _http_get_local
+    sleep: Sleeper = time.sleep
+    environ: dict[str, str] | None = None
+
+
+def wait_ready(
+    local_port: int,
+    served_name: str,
+    deps: WatchDeps,
+    retries: int,
+    interval: float,
+    tunnel: Any = None,
+) -> list[str]:
+    """Read-only readiness: GET /metrics and /v1/models through the tunnel, with retries."""
+    base = f"http://127.0.0.1:{local_port}"
+    last = "not tried"
+    for attempt in range(1, max(1, retries) + 1):
+        if tunnel is not None and tunnel.poll() is not None:
+            raise KitError(f"ssh tunnel exited (rc={tunnel.returncode}); check ssh access")
+        try:
+            m_status, _ = deps.http_get(f"{base}/metrics", 10.0)
+            v_status, body = deps.http_get(f"{base}/v1/models", 10.0)
+            if m_status == 200 and v_status == 200:
+                models = [str(_d(m).get("id")) for m in _l(_d(json.loads(body)).get("data"))]
+                emit(f"ready: /metrics 200, /v1/models {models}")
+                if served_name not in models:
+                    emit(f"warning: served name {served_name!r} not in {models}", err=True)
+                return models
+            last = f"/metrics {m_status}, /v1/models {v_status}"
+            if m_status == 404:
+                last += " (is SGLang running with --enable-metrics?)"
+        except (KitError, json.JSONDecodeError) as exc:
+            last = str(exc)
+        emit(f"waiting for SGLang ({attempt}/{retries}): {last}")
+        deps.sleep(interval)
+    raise KitError(f"SGLang not ready through the tunnel after {retries} tries: {last}")
+
+
+def build_watch_env(base: dict[str, str], local_port: int, rate: float | None) -> dict[str, str]:
+    env = {k: v for k, v in base.items() if k != KEY_ENV}  # never hand memfun the RunPod key
+    env[METRICS_ENV] = metrics_url(local_port)
+    if rate is not None:
+        env[RATE_ENV] = format_rate(rate)
+    else:
+        env.pop(RATE_ENV, None)
+    env.setdefault(WORKER_KEY_ENV, "unused")
+    return env
+
+
+def caffeinate_argv(path: str, pid: int) -> list[str]:
+    return [path, "-dimsu", "-w", str(pid)]
+
+
+def cmd_watch(ro: ReadOnlyTransport, args: argparse.Namespace, deps: WatchDeps) -> int:
+    check_local_port(args.local_port)
+    pod = get_pod(ro, args.pod_id)
+    if pod is None:
+        raise KitError(f"pod {args.pod_id} not found")
+    endpoint = pod.ssh_endpoint()
+    if endpoint is None:
+        raise KitError("pod has no public TCP 22 mapping yet (still starting?)")
+    command = [c for c in args.command if c != "--"] or ["memfun", "chat"]
+    ssh = build_ssh_command(
+        endpoint[0], endpoint[1], args.local_port, args.remote_port, args.identity
+    )
+    emit(f"export {METRICS_ENV}={metrics_url(args.local_port)}")
+    if pod.cost_per_hr is not None:
+        emit(f"export {RATE_ENV}={format_rate(pod.cost_per_hr)}")
+    else:
+        emit(f"warning: RunPod reports no costPerHr; {RATE_ENV} not set", err=True)
+    emit("tunnel: " + shlex.join(ssh))
+    # New sessions: Ctrl-C inside memfun must not kill the tunnel or caffeinate.
+    tunnel = deps.popen(ssh, start_new_session=True)
+    caff: Any = None
+    try:
+        wait_ready(
+            args.local_port,
+            args.served_name,
+            deps,
+            args.ready_retries,
+            args.ready_interval,
+            tunnel,
+        )
+        env = build_watch_env(
+            dict(os.environ) if deps.environ is None else deps.environ,
+            args.local_port,
+            pod.cost_per_hr,
+        )
+        emit("starting: " + shlex.join(command))
+        child = deps.popen(command, env=env)
+        caff_path = None if args.no_caffeinate else deps.which("caffeinate")
+        if caff_path:
+            caff = deps.popen(caffeinate_argv(caff_path, child.pid), start_new_session=True)
+            emit(f"caffeinate: keeping the Mac awake until pid {child.pid} exits")
+        else:
+            emit("caffeinate not available (not macOS?) or disabled: the machine may sleep")
+        emit("dashboard: watch in the Swarm app")
+        while True:
+            try:
+                return int(child.wait())
+            except KeyboardInterrupt:
+                continue  # memfun owns Ctrl-C; the wrapper leaves when memfun exits
+    finally:
+        for proc in (caff, tunnel):
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+
+
+def cmd_launch(
+    key: Secret,
+    factory: TransportFactory,
+    args: argparse.Namespace,
+    *,
+    clock: Clock,
+    sleep: Sleeper,
+    now: dt.datetime,
+) -> int:
+    if args.no_volume:
+        args.volume_name = None
+        args.volume_id = None
+    ro = ReadOnlyTransport(factory(key))
+    plan = make_plan(ro, args, now)
+    print_plan(plan)
+    if args.dry_run:
+        emit("")
+        card = run_card(
+            pod_id=None,
+            gpu_id=plan.gpu.id,
+            gpu_count=plan.gpu_count,
+            rate_per_hr=plan.price_per_gpu_hr * plan.gpu_count,
+            rate_source="plan estimate from RunPod prices",
+            deadline_utc=now + dt.timedelta(minutes=plan.max_minutes),
+            minutes=plan.max_minutes,
+        )
+        for line in card:
+            emit(line)
+        emit("\nDRY RUN: nothing was created. To rent, add --no-dry-run --yes-spend-money.")
+        return 0
+    if not args.yes_spend_money:
+        emit("refusing: --no-dry-run also needs --yes-spend-money", err=True)
+        return 2
+    if plan.est_max_cost > args.max_cost_usd:
+        emit(
+            f"refusing: estimated max cost ${plan.est_max_cost:.2f} exceeds "
+            f"--max-cost-usd {args.max_cost_usd:.2f}",
+            err=True,
+        )
+        return 2
+    if plan.offer.stock_status in (None, "None"):
+        emit("refusing: RunPod reports no stock for this GPU/cloud/data center", err=True)
+        return 2
+    if plan.data_center and plan.dc_availability != "AVAILABLE":
+        emit(f"refusing: {plan.gpu.id} is not AVAILABLE in {plan.data_center}", err=True)
+        return 2
+    if not any(e["key"] == "PUBLIC_KEY" and e["value"] for e in plan.payload["env"]):
+        emit("refusing: no SSH public key (see --ssh-public-key)", err=True)
+        return 2
+
+    # Only past this point does a mutating transport exist.
+    rw = factory(key)
+    emit(f"\nLAUNCHING: up to ${plan.est_max_cost:.2f} will be spent.")
+    if plan.volume_to_create:
+        n, s, d = plan.volume_to_create
+        vol = create_network_volume(rw, n, s, d)
+        emit(f"created network volume {vol.id} ({s} GB, {d})")
+        plan.payload["networkVolumeId"] = vol.id
+    assert_no_secret(plan.payload, key, "the pod payload")
+    started = clock()
+    deadline = started + plan.max_minutes * 60
+    pod = deploy_pod(rw, plan.payload)
+    emit(f"pod {pod.id} created ({pod.desired_status})")
+    if pod.cost_per_hr is None:
+        fresh = get_pod(rw, pod.id)
+        pod = dataclasses.replace(pod, cost_per_hr=fresh.cost_per_hr if fresh else None)
+    reported = pod.cost_per_hr is not None
+    card = run_card(
+        pod_id=pod.id,
+        gpu_id=plan.gpu.id,
+        gpu_count=plan.gpu_count,
+        rate_per_hr=pod.cost_per_hr
+        if pod.cost_per_hr is not None
+        else plan.price_per_gpu_hr * plan.gpu_count,
+        rate_source="reported by RunPod for this pod" if reported else "plan estimate",
+        deadline_utc=now + dt.timedelta(minutes=plan.max_minutes),
+        minutes=plan.max_minutes,
+    )
+    for line in card:
+        emit(line)
+    result = run_watchdog(
+        rw, pod.id, deadline, clock=clock, sleep=sleep, started_at=started,
+        poll_seconds=args.poll_seconds,
+    )  # fmt: skip
+    emit(f"done: {result.reason}; ~${result.spent_usd:.2f} spent; gone={result.verified_gone}")
+    return 0 if result.verified_gone else 3
+
+
+def install_exit_signals() -> None:
+    """Turn SIGTERM/SIGHUP (closed terminal, kill) into KeyboardInterrupt so the watchdog's
+    termination path runs.  Only called from the CLI entry points, never from tests."""
+
+    def handler(signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, handler)
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    watch_deps: WatchDeps | None = None,
+    factory: TransportFactory = _default_factory,
+    env: dict[str, str] | None = None,
+    key_path: Path | None = None,
+    clock: Clock = time.time,
+    sleep: Sleeper = time.sleep,
+    now: dt.datetime | None = None,
+) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        key = load_api_key(env, key_path)
+        if args.cmd == "gpus":
+            return cmd_gpus(ReadOnlyTransport(factory(key)), args)
+        if args.cmd == "launch":
+            return cmd_launch(
+                key, factory, args, clock=clock, sleep=sleep, now=now or dt.datetime.now(dt.UTC)
+            )
+        if args.cmd == "status":
+            pod = get_pod(ReadOnlyTransport(factory(key)), args.pod_id)
+            emit(json.dumps(None if pod is None else dataclasses.asdict(pod), indent=2))
+            return 0 if pod else 1
+        if args.cmd == "spend":
+            return cmd_spend(ReadOnlyTransport(factory(key)), args.pod_id)
+        if args.cmd == "watch":
+            return cmd_watch(ReadOnlyTransport(factory(key)), args, watch_deps or WatchDeps())
+        if args.cmd == "watchdog":
+            deadline = clock() + args.max_minutes * 60
+            result = run_watchdog(
+                factory(key), args.pod_id, deadline, clock=clock, sleep=sleep,
+                poll_seconds=args.poll_seconds,
+            )  # fmt: skip
+            return 0 if result.verified_gone else 3
+        if args.cmd == "tunnel":
+            check_local_port(args.local_port)
+            pod = get_pod(ReadOnlyTransport(factory(key)), args.pod_id)
+            if pod is None:
+                raise KitError(f"pod {args.pod_id} not found")
+            endpoint = pod.ssh_endpoint()
+            if endpoint is None:
+                raise KitError("pod has no public TCP 22 mapping yet (still starting?)")
+            cmd = build_ssh_command(
+                endpoint[0], endpoint[1], args.local_port, args.remote_port, args.identity
+            )
+            emit("ssh command: " + shlex.join(cmd))
+            emit("\nmemfun config (project memfun.toml):\n" + memfun_snippet(
+                args.local_port, args.served_name))  # fmt: skip
+            emit("export MEMFUN_SGLANG_DUMMY_KEY=unused")
+            emit(f"check: curl -s http://127.0.0.1:{args.local_port}/v1/models")
+            if not args.run:
+                emit("(not started; add --run to open the tunnel)")
+                return 0
+            return subprocess.call(cmd)
+    except KitError as exc:
+        emit(f"error: {REDACT(str(exc))}", err=True)
+        return 1
+    return 2
+
+
+if __name__ == "__main__":
+    install_exit_signals()
+    sys.exit(main())
