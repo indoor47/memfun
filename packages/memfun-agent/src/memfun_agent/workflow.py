@@ -12,7 +12,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import os
-import re
 import time
 import uuid
 from collections.abc import Callable
@@ -27,6 +26,7 @@ from memfun_core.types import TaskMessage, TaskResult
 from memfun_agent.decomposer import DecompositionResult, SubTask, TaskDecomposer
 from memfun_agent.gh_pr_flow import (
     add_pr_review_comment,
+    check_pr_mergeable,
     current_repo_slug,
     mark_pr_ready,
     merge_pr,
@@ -37,6 +37,13 @@ from memfun_agent.git_committer import (
     CommitResult,
     SubTaskReview,
     commit_workflow_output,
+)
+from memfun_agent.review_findings import (
+    ReviewFinding,
+    compute_verdict,
+    findings_from_object,
+    iter_json_objects,
+    parse_review_output,
 )
 from memfun_agent.shared_spec import SharedSpec, SharedSpecStore
 from memfun_agent.specialists import agent_name_for_type
@@ -102,7 +109,54 @@ class ReviewIssue:
     task_id: str
     description: str
     detail: str
-    severity: str = "major"  # critical/major/minor
+    severity: str = "MEDIUM"  # HIGH/MEDIUM/LOW (see review_findings)
+
+
+# Review outcome statuses.  ``error`` means the reviewer could not
+# produce a usable verdict (unavailable, dispatch raised, task failed,
+# unparseable output) — it is NEVER treated as approval.
+REVIEW_APPROVED = "approved"
+REVIEW_REJECTED = "rejected"
+REVIEW_ERROR = "error"
+_REVIEW_STATUSES = frozenset({REVIEW_APPROVED, REVIEW_REJECTED, REVIEW_ERROR})
+
+# Output contract appended to every review-agent prompt.  The verdict
+# is computed in code from the severities — the reviewer's prose (or a
+# self-declared verdict) never decides approval.
+_FINDINGS_OUTPUT_CONTRACT = (
+    "=== OUTPUT FORMAT (mandatory) ===\n"
+    "End your answer with ONE fenced JSON block of this exact shape:\n"
+    "```json\n"
+    '{"findings": [{"severity": "HIGH|MEDIUM|LOW", "file": "path/to/file.py",'
+    ' "line": 42, "issue": "what is wrong", "fix": "how to fix it"}],'
+    ' "summary": "one sentence"}\n'
+    "```\n"
+    "Severity: HIGH = broken/incorrect/insecure; MEDIUM = spec not met,"
+    " missing test or edge case; LOW = optional polish.\n"
+    "The orchestrator computes the verdict from severities: any HIGH or"
+    " MEDIUM finding means changes are requested; only LOW findings (or"
+    ' `"findings": []`) means approved. Writing "APPROVED" in prose has'
+    " no effect, and an answer without this JSON block is treated as a"
+    " failed review, never as an approval. Only report findings you"
+    " verified against the actual code."
+)
+
+
+def _reconcile_status(obj: object, approved: bool, status: str) -> None:
+    """Keep ``approved`` and ``status`` consistent on a frozen dataclass.
+
+    When ``status`` is given it is authoritative and ``approved`` is
+    derived as ``status == "approved"``.  When it is omitted (legacy
+    construction ``ReviewResult(approved=..., ...)``) it is derived
+    from ``approved``.
+    """
+    if not status:
+        object.__setattr__(obj, "status", REVIEW_APPROVED if approved else REVIEW_REJECTED)
+        return
+    if status not in _REVIEW_STATUSES:
+        msg = f"invalid review status {status!r}"
+        raise ValueError(msg)
+    object.__setattr__(obj, "approved", status == REVIEW_APPROVED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +164,11 @@ class ReviewResult:
     approved: bool
     issues: list[ReviewIssue]
     summary: str
+    status: str = ""
+    findings: tuple[ReviewFinding, ...] = ()
+
+    def __post_init__(self) -> None:
+        _reconcile_status(self, self.approved, self.status)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +177,11 @@ class PerTaskReview:
 
     Emitted by :meth:`WorkflowEngine._review_sub_task` once for each
     completed coder result while the pairing loop is active.
+
+    ``status`` is one of ``approved`` / ``rejected`` / ``error``;
+    ``approved`` is always ``status == "approved"`` so legacy
+    consumers keep working.  The verdict behind ``approved`` /
+    ``rejected`` is computed in code from ``findings`` severities.
     """
 
     task_id: str
@@ -126,6 +190,11 @@ class PerTaskReview:
     issues: list[str] = field(default_factory=list)
     rounds: int = 1
     duration_ms: float = 0.0
+    status: str = ""
+    findings: tuple[ReviewFinding, ...] = ()
+
+    def __post_init__(self) -> None:
+        _reconcile_status(self, self.approved, self.status)
 
 
 @dataclass(slots=True)
@@ -158,6 +227,10 @@ class SubTaskPRState:
     verdict: str = ""
     merged: bool = False
     error: str | None = None
+    # Local HEAD SHA recorded right after the push.  Passed to
+    # ``gh pr merge --match-head-commit`` so a head that changed after
+    # review can never be merged.  ``None`` blocks the merge.
+    head_sha: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +251,13 @@ class WorkflowResult:
     # auto-commit was disabled or the workflow failed before the
     # commit step ran.
     commit_result: CommitResult | None = None
+    # Sub-tasks whose output was NOT accepted: coder failed / never
+    # ran, or the per-task review ended ``rejected`` or ``error``.
+    # Non-empty => ``success`` is False.
+    unaccepted_tasks: list[str] = field(default_factory=list[str])
+    # Number of reviews (per-task + cross-task) that ended in
+    # ``error`` (reviewer unavailable / failed / unparseable).
+    review_errors: int = 0
 
 
 # ── Callback type aliases ─────────────────────────────────────
@@ -428,7 +508,11 @@ class WorkflowEngine:
         review = await self._run_review(state, project_context, history)
 
         # ── Phase 4: REVISE (up to max rounds) ────────────────
-        while not review.approved and state.review_rounds < state.max_review_rounds:
+        # Only a ``rejected`` review (actionable findings) triggers a
+        # coder revision.  A reviewer ``error`` is not the coders'
+        # fault — re-running them would not help — so it falls
+        # straight through to the result as "not approved".
+        while review.status == REVIEW_REJECTED and state.review_rounds < state.max_review_rounds:
             state.status = WorkflowStatus.REVISING
             state.review_rounds += 1
             self._emit_status(state)
@@ -451,8 +535,10 @@ class WorkflowEngine:
 
         if not review.approved:
             logger.warning(
-                "Accepting results after %d review rounds (still unapproved)",
+                "Cross-task review not approved after %d revision round(s)"
+                " (status=%s) — workflow will NOT be reported successful",
                 state.review_rounds,
+                review.status,
             )
 
         # ── Phase 5: MERGE ────────────────────────────────────
@@ -461,7 +547,12 @@ class WorkflowEngine:
         self._emit_status(state)
 
         elapsed = (time.perf_counter() - start) * 1000.0
-        result = self._build_result(state, review, elapsed)
+        result = self._build_result(
+            state,
+            review,
+            elapsed,
+            require_per_task_review=self._pair_with_reviewer,
+        )
 
         # ── Phase 6: AUTO-COMMIT (issue #37) ─────────────────
         # Only when explicitly enabled AND the workflow succeeded —
@@ -492,9 +583,17 @@ class WorkflowEngine:
 
         # ── Phase 7: GH-PR MERGE (issue #38) ─────────────────
         # Merge approved per-sub-task PRs in dependency order.
-        # Only when the gh_pr flow ran and at least one PR was
-        # approved by the pr-reviewer agent earlier.
-        if self._gh_pr and state.pr_states:
+        # Only when the gh_pr flow ran, at least one PR was approved
+        # by the pr-reviewer agent earlier, AND the workflow as a
+        # whole succeeded (every sub-task accepted, cross-task review
+        # approved).  A failed workflow leaves approved PRs open for
+        # a human rather than merging part of an unverified whole.
+        if self._gh_pr and state.pr_states and not result.success:
+            logger.warning(
+                "gh_pr: workflow not successful — skipping merge of %d PR(s)",
+                len(state.pr_states),
+            )
+        if self._gh_pr and state.pr_states and result.success:
             merged_count, merge_failures = await self._merge_approved_prs(
                 state=state,
                 groups=(
@@ -954,13 +1053,26 @@ class WorkflowEngine:
         """Drive the coder/reviewer dyad for one sub-task.
 
         Loops:
-            review → if approved return → else re-dispatch coder
-            with feedback → review again, up to
-            ``max_review_rounds_per_task`` rounds.
+            review → if approved return → if rejected re-dispatch
+            coder with feedback → review again, up to
+            ``max_review_rounds_per_task`` re-dispatches.
+
+        Fails closed:
+
+        * A reviewer ``error`` (unavailable, dispatch raised, task
+          failed, unparseable output) is retried ONCE as a review —
+          the coder is not re-dispatched, since the coder is not at
+          fault.  If the retry also errors the sub-task is left
+          unaccepted with status ``error``.
+        * When the round cap is hit with the review still
+          ``rejected`` the sub-task is unaccepted; the last coder
+          output is kept for inspection but is not approved.
+
+        The final outcome lives in ``state.per_task_reviews[tid]``.
         """
         rounds = 0
         while True:
-            review = await self._review_sub_task(
+            review = await self._review_with_retry(
                 state=state,
                 tid=tid,
                 sub_status=sub_status,
@@ -970,16 +1082,9 @@ class WorkflowEngine:
             rounds += 1
 
             # Persist the latest review for the round.
-            state.per_task_reviews[tid] = PerTaskReview(
-                task_id=tid,
-                approved=review.approved,
-                feedback=review.feedback,
-                issues=review.issues,
-                rounds=rounds,
-                duration_ms=review.duration_ms,
-            )
+            state.per_task_reviews[tid] = dataclasses.replace(review, rounds=rounds)
 
-            if review.approved:
+            if review.status == REVIEW_APPROVED:
                 logger.info(
                     "Per-task review approved %s on round %d",
                     tid,
@@ -987,18 +1092,24 @@ class WorkflowEngine:
                 )
                 return
 
-            # Not approved — should we re-dispatch?
+            if review.status == REVIEW_ERROR:
+                logger.warning(
+                    "Per-task review for %s ended in reviewer error after"
+                    " retry; sub-task NOT accepted: %s",
+                    tid,
+                    review.feedback[:200],
+                )
+                return
+
+            # Rejected — should we re-dispatch?
             if rounds > self._max_review_rounds_per_task:
                 logger.warning(
-                    "Per-task review for %s exhausted %d round(s);"
-                    " accepting last coder output. Feedback: %s",
+                    "Per-task review for %s still rejected after %d"
+                    " re-dispatch(es); sub-task NOT accepted. Feedback: %s",
                     tid,
                     self._max_review_rounds_per_task,
                     review.feedback[:120],
                 )
-                # Stamp the final flag so callers can see we
-                # gave up — but keep the coder result so the
-                # workflow can still produce output.
                 return
 
             logger.info(
@@ -1019,8 +1130,9 @@ class WorkflowEngine:
                 history=history,
             )
             if new_result is None:
-                # Re-dispatch failed catastrophically — give up
-                # but keep the last successful coder result.
+                # Re-dispatch failed catastrophically — give up.
+                # The stored review stays ``rejected`` so the
+                # sub-task is unaccepted.
                 return
             sub_status.result = new_result
             sub_status.completed_at = time.time()
@@ -1037,7 +1149,7 @@ class WorkflowEngine:
                 )
                 return
 
-    async def _review_sub_task(
+    async def _review_with_retry(
         self,
         *,
         state: WorkflowState,
@@ -1046,49 +1158,97 @@ class WorkflowEngine:
         worktree_path: Path | None,
         history: list[dict[str, Any]] | None,
     ) -> PerTaskReview:
+        """Run one per-task review, retrying the REVIEW once on error.
+
+        Only the reviewer is retried; the coder is never re-dispatched
+        for a reviewer error.  Returns the second attempt's result when
+        the first errored (which may itself be ``error``).
+        """
+        review = await self._review_sub_task(
+            state=state,
+            tid=tid,
+            sub_status=sub_status,
+            worktree_path=worktree_path,
+            history=history,
+        )
+        if review.status != REVIEW_ERROR:
+            return review
+        logger.warning(
+            "Per-task review for %s errored (%s) — retrying review once",
+            tid,
+            review.feedback[:200],
+        )
+        retry = await self._review_sub_task(
+            state=state,
+            tid=tid,
+            sub_status=sub_status,
+            worktree_path=worktree_path,
+            history=history,
+            attempt=1,
+        )
+        if retry.status == REVIEW_ERROR:
+            return dataclasses.replace(
+                retry,
+                feedback=(
+                    f"Reviewer error on both attempts. First: {review.feedback}"
+                    f" | Retry: {retry.feedback}"
+                ),
+                duration_ms=review.duration_ms + retry.duration_ms,
+            )
+        return retry
+
+    @staticmethod
+    def _review_error(tid: str, reason: str, duration_ms: float = 0.0) -> PerTaskReview:
+        return PerTaskReview(
+            task_id=tid,
+            approved=False,
+            status=REVIEW_ERROR,
+            feedback=reason,
+            issues=[],
+            rounds=1,
+            duration_ms=duration_ms,
+        )
+
+    async def _review_sub_task(
+        self,
+        *,
+        state: WorkflowState,
+        tid: str,
+        sub_status: SubTaskStatus,
+        worktree_path: Path | None,
+        history: list[dict[str, Any]] | None,
+        attempt: int = 0,
+    ) -> PerTaskReview:
         """Dispatch the review-agent against a single sub-task.
 
         The reviewer is pointed at the same worktree the coder used
         (when present) so it can read actual file contents rather
         than relying on the coder's brief answer text.
 
+        Never approves by default: a missing coder result, a reviewer
+        that cannot start, or a dispatch exception all yield status
+        ``error`` (approved=False).
+
         Emits ``task.reviewed`` on the dashboard event stream.
         """
         coder_result = sub_status.result
         if coder_result is None:
-            # Shouldn't happen — caller guards on this — but stay
-            # defensive.  Return an approved review so we don't
-            # block the workflow on missing data.
-            return PerTaskReview(
-                task_id=tid,
-                approved=True,
-                feedback="No coder result to review",
-                issues=[],
-                rounds=1,
-                duration_ms=0.0,
-            )
+            # Shouldn't happen — caller guards on this — but fail
+            # closed: nothing to review is not an approval.
+            return self._review_error(tid, "No coder result to review")
 
-        # Ensure the reviewer is running.  Mirror the failure
-        # handling in ``_run_review`` — if we can't start the
-        # reviewer, we approve by default rather than block the
-        # entire workflow.
+        # Ensure the reviewer is running.  If it can't start, the
+        # review is an ``error`` — never an approval.
         if not self._manager.is_running("review-agent"):
             try:
                 await self._manager.start_agent("review-agent")
             except Exception as exc:
                 logger.warning(
-                    "Cannot start review-agent for per-task review %s: %s — auto-approving",
+                    "Cannot start review-agent for per-task review %s: %s — NOT approving",
                     tid,
                     exc,
                 )
-                return PerTaskReview(
-                    task_id=tid,
-                    approved=True,
-                    feedback=f"Reviewer unavailable: {exc}",
-                    issues=[],
-                    rounds=1,
-                    duration_ms=0.0,
-                )
+                return self._review_error(tid, f"Reviewer unavailable: {exc}")
 
         data = coder_result.result or {}
         coder_answer = data.get("answer", "")
@@ -1103,8 +1263,9 @@ class WorkflowEngine:
 
         review_round = state.per_task_reviews.get(tid)
         round_idx = (review_round.rounds + 1) if review_round else 1
+        retry_suffix = f"_retry{attempt}" if attempt else ""
         review_task = TaskMessage(
-            task_id=(f"{state.workflow_id}_{tid}_review_{round_idx}"),
+            task_id=(f"{state.workflow_id}_{tid}_review_{round_idx}{retry_suffix}"),
             agent_id="review-agent",
             payload={
                 "type": "ask",
@@ -1145,13 +1306,10 @@ class WorkflowEngine:
                 tid,
                 exc,
             )
-            return PerTaskReview(
-                task_id=tid,
-                approved=True,
-                feedback=f"Reviewer dispatch failed: {exc}",
-                issues=[],
-                rounds=1,
-                duration_ms=elapsed_ms,
+            return self._review_error(
+                tid,
+                f"Reviewer dispatch failed: {exc}",
+                elapsed_ms,
             )
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -1165,9 +1323,9 @@ class WorkflowEngine:
             agent_name="review-agent",
             success=review.approved,
             duration_ms=elapsed_ms,
-            detail=review.feedback[:200]
+            detail=f"{review.status.upper()}: {review.feedback[:200]}"
             if review.feedback
-            else ("APPROVED" if review.approved else "CHANGES_REQUESTED"),
+            else review.status.upper(),
             workflow_id=state.workflow_id,
             project=state.project,
         )
@@ -1217,12 +1375,9 @@ class WorkflowEngine:
             " for: missing edge cases, broken imports, type"
             " errors, missing tests, security issues, and any"
             " other quality problems.\n\n"
-            "Reply with EXACTLY one of:\n"
-            "  - `APPROVED` (followed by an optional brief note)\n"
-            "  - `CHANGES_REQUESTED: <specific actionable feedback>`\n\n"
-            "Be terse. Be specific. If you list issues, prefix"
-            " each with a dash on its own line so the implementer"
-            " can act on them one by one."
+            "Be terse. Be specific: every finding needs a file and,"
+            " where possible, a line.\n\n"
+            f"{_FINDINGS_OUTPUT_CONTRACT}"
         )
 
     @staticmethod
@@ -1233,63 +1388,50 @@ class WorkflowEngine:
     ) -> PerTaskReview:
         """Parse a per-task review result into a PerTaskReview.
 
-        We deliberately favour approval on ambiguous output so the
-        per-task loop doesn't block a workflow on a flaky reviewer.
-        The Phase 3 cross-task review is still there to catch
-        anything we let through.
+        Fails closed.  The verdict is computed in code from the
+        severities in the reviewer's findings JSON (any HIGH or
+        MEDIUM -> ``rejected``, else ``approved``); prose such as
+        "APPROVED" is ignored.  A failed reviewer task or an answer
+        without a parseable findings block is status ``error``.
         """
         if not result.success:
-            return PerTaskReview(
-                task_id=tid,
-                approved=True,
-                feedback=(
-                    f"Reviewer task failed ({result.error or 'unknown'}) — defaulting to approved"
-                ),
-                issues=[],
-                rounds=1,
-                duration_ms=duration_ms,
+            return WorkflowEngine._review_error(
+                tid,
+                f"Reviewer task failed: {result.error or 'unknown'}",
+                duration_ms,
             )
 
         data = result.result or {}
         answer = (data.get("answer", "") or "").strip()
-        low = answer.lower()
+        parsed = parse_review_output(answer)
+        if parsed is None:
+            return WorkflowEngine._review_error(
+                tid,
+                "Reviewer output had no parseable findings JSON block"
+                f" (verdict cannot be computed). Answer head: {answer[:300]!r}",
+                duration_ms,
+            )
 
-        # Default approved=True on parse ambiguity — explicit
-        # CHANGES_REQUESTED is the only "no" signal.
-        approved = True
-        # Be liberal about how the reviewer might phrase a
-        # rejection — match the canonical token and the older
-        # ``approved: false`` shape too.
-        explicit_reject = (
-            "changes_requested" in low
-            or "changes requested" in low
-            or "approved: false" in low
-            or "approved:false" in low
-        )
-        if explicit_reject:
-            approved = False
-        elif low.startswith("approved"):
-            # Explicit APPROVED token at start of answer is a
-            # positive signal — used as a tiebreaker only when
-            # there's no explicit reject marker above.
-            approved = True
-
-        # Pull issue bullets out of the body when the reviewer
-        # listed them — useful as targeted feedback for the
-        # re-dispatched coder.
-        issues = [
-            line.lstrip("-* \t").strip()
-            for line in answer.splitlines()
-            if line.lstrip().startswith(("-", "*")) and len(line.strip()) > 2
-        ]
+        rejected = parsed.verdict == "CHANGES_REQUESTED"
+        rendered = [f.render() for f in parsed.findings]
+        if rejected:
+            feedback = "Blocking findings (HIGH/MEDIUM) and notes:\n" + "\n".join(rendered)
+        elif rendered:
+            feedback = "Approved with LOW findings only:\n" + "\n".join(rendered)
+        else:
+            feedback = "Approved: no findings."
+        if parsed.summary:
+            feedback += f"\n\nReviewer summary: {parsed.summary}"
 
         return PerTaskReview(
             task_id=tid,
-            approved=approved,
-            feedback=answer[:4000],
-            issues=issues,
+            approved=not rejected,
+            status=REVIEW_REJECTED if rejected else REVIEW_APPROVED,
+            feedback=feedback[:4000],
+            issues=[r.removeprefix("- ") for r in rendered],
             rounds=1,
             duration_ms=duration_ms,
+            findings=parsed.findings,
         )
 
     async def _redispatch_with_feedback(
@@ -1310,9 +1452,18 @@ class WorkflowEngine:
             "=== REVIEWER FEEDBACK (round "
             f"{round_idx}/{self._max_review_rounds_per_task}) ===\n"
             "Your previous output was rejected by the auditor."
-            " Address the following BEFORE re-submitting — do"
-            " NOT start over from scratch; modify the existing"
+            " Do NOT start over from scratch; modify the existing"
             " files in the working directory.\n\n"
+            "Treat each finding as a HYPOTHESIS, not a fact. Before"
+            " acting on a finding, check it against the actual code:\n"
+            "  - If it is real: fix it.\n"
+            "  - If it is wrong: do not change the code for it; rebut"
+            " it in your answer with evidence (file:line, or the"
+            " command you ran and its output).\n"
+            "  - If it contradicts an earlier round's finding: pick"
+            " one explicitly and say which and why.\n"
+            "List each finding with your decision (fixed / rebutted"
+            " / chose) in your answer.\n\n"
             f"{feedback}"
         )
 
@@ -1414,10 +1565,15 @@ class WorkflowEngine:
                 summary="No sub-task results available",
             )
 
+        contract = (
+            f"{_FINDINGS_OUTPUT_CONTRACT}\n"
+            'Every finding MUST also carry a "task_id" field (e.g. "T2")'
+            " naming the sub-task that must change."
+        )
         if self._pair_with_reviewer and state.per_task_reviews:
             review_query = (
                 "All sub-tasks have ALREADY been individually reviewed"
-                " and approved by a per-task auditor pair. Look only"
+                " by a per-task auditor pair. Look only"
                 " for INTER-task issues that the per-task reviews"
                 " could not see:\n"
                 "  - Duplicated logic across files\n"
@@ -1425,17 +1581,40 @@ class WorkflowEngine:
                 "  - Missing ``__init__`` exports\n"
                 "  - Type mismatches across module boundaries\n"
                 "  - Conflicting file edits or import cycles\n\n"
-                "If everything is consistent, reply with"
-                " `approved: true`.\n\n" + "\n".join(review_parts)
+                f"{contract}\n\n" + "\n".join(review_parts)
             )
         else:
             review_query = (
                 "Review the outputs of the following sub-tasks for"
                 " consistency, quality, and adherence to the shared"
                 " specification. Check for file conflicts, import"
-                " issues, and integration problems.\n\n" + "\n".join(review_parts)
+                " issues, and integration problems.\n\n"
+                f"{contract}\n\n" + "\n".join(review_parts)
             )
 
+        # One retry of the review itself on reviewer error (cannot
+        # start, dispatch raised, task failed, unparseable output).
+        first = await self._run_review_once(state, review_query, project_context, history, 0)
+        if first.status != REVIEW_ERROR:
+            return first
+        logger.warning("Cross-task review errored (%s) — retrying once", first.summary)
+        retry = await self._run_review_once(state, review_query, project_context, history, 1)
+        if retry.status == REVIEW_ERROR:
+            logger.warning(
+                "Cross-task review errored on retry (%s) — NOT approving",
+                retry.summary,
+            )
+        return retry
+
+    async def _run_review_once(
+        self,
+        state: WorkflowState,
+        review_query: str,
+        project_context: str,
+        history: list[dict[str, Any]] | None,
+        attempt: int,
+    ) -> ReviewResult:
+        """Single cross-task review attempt.  Errors fail closed."""
         # Ensure review agent running.
         if not self._manager.is_running("review-agent"):
             try:
@@ -1443,13 +1622,15 @@ class WorkflowEngine:
             except Exception as exc:
                 logger.warning("Cannot start review-agent: %s", exc)
                 return ReviewResult(
-                    approved=True,
+                    approved=False,
+                    status=REVIEW_ERROR,
                     issues=[],
-                    summary=f"Review skipped: {exc}",
+                    summary=f"Cross-task reviewer unavailable: {exc}",
                 )
 
+        retry_suffix = f"_retry{attempt}" if attempt else ""
         review_task = TaskMessage(
-            task_id=f"{state.workflow_id}_review_{state.review_rounds}",
+            task_id=f"{state.workflow_id}_review_{state.review_rounds}{retry_suffix}",
             agent_id="review-agent",
             payload={
                 "type": "ask",
@@ -1461,11 +1642,20 @@ class WorkflowEngine:
             correlation_id=state.workflow_id,
         )
 
-        result = await self._orchestrator.dispatch(
-            review_task,
-            "review-agent",
-            timeout=300.0,
-        )
+        try:
+            result = await self._orchestrator.dispatch(
+                review_task,
+                "review-agent",
+                timeout=300.0,
+            )
+        except Exception as exc:
+            logger.warning("Cross-task review dispatch failed: %s", exc)
+            return ReviewResult(
+                approved=False,
+                status=REVIEW_ERROR,
+                issues=[],
+                summary=f"Cross-task review dispatch failed: {exc}",
+            )
 
         return self._parse_review_result(result)
 
@@ -1804,7 +1994,15 @@ class WorkflowEngine:
             sub_status = state.sub_task_statuses.get(tid)
             if sub_status is None or sub_status.result is None:
                 continue
-            if not sub_status.result.success:
+            reason = self._unaccepted_reason(
+                state,
+                tid,
+                require_per_task_review=self._pair_with_reviewer,
+            )
+            if reason is not None:
+                # Never lift unaccepted output to a PR — it could
+                # otherwise be marked ready / merged as approved.
+                logger.info("gh_pr[%s]: not opening a PR — %s", tid, reason)
                 continue
             worktree_path = wt_map.get(tid)
             if worktree_path is None:
@@ -1884,6 +2082,8 @@ class WorkflowEngine:
                 push_res.error,
             )
             return
+        # Record exactly what we pushed; the merge is pinned to it.
+        pr_state.head_sha = push_res.head_sha
 
         # ── Step 3: open PR ─────────────────────────────────
         title = sub_status.sub_task.description.strip().split("\n")[0]
@@ -1942,7 +2142,30 @@ class WorkflowEngine:
 
         # ── Step 5: mark ready / close ──────────────────────
         if pr_state.approved:
-            if mark_pr_ready(repo, open_res.pr_number):
+            # An unmergeable PR gets no CI runs, so "no checks" would
+            # look like passing.  Check mergeability (pinned to the
+            # pushed head) BEFORE marking ready.
+            mergeability = check_pr_mergeable(
+                repo,
+                open_res.pr_number,
+                expected_head_sha=pr_state.head_sha,
+            )
+            if not mergeability.mergeable:
+                pr_state.error = f"not mergeable: {mergeability.error or 'unknown'}"
+                logger.warning(
+                    "gh_pr[%s]: PR #%d approved but not mergeable (%s) — left in draft",
+                    tid,
+                    open_res.pr_number,
+                    pr_state.error,
+                )
+                add_pr_review_comment(
+                    repo,
+                    open_res.pr_number,
+                    f"pr-reviewer approved, but the PR is not mergeable:"
+                    f" {mergeability.error or 'unknown'}.\n"
+                    "Leaving PR in draft; the orchestrator will NOT merge it.",
+                )
+            elif mark_pr_ready(repo, open_res.pr_number):
                 logger.info(
                     "gh_pr[%s]: PR #%d marked ready (approved)",
                     tid,
@@ -2154,36 +2377,30 @@ class WorkflowEngine:
 
         Returns one of ``approve`` / ``request-changes`` / ``comment``.
         Defaults to ``comment`` on parse failure — we never auto-merge
-        an ambiguous review.
+        an ambiguous review.  Prose ("LGTM") is never read as a verdict.
+
+        The reviewer's own verdict can only be made STRICTER in code:
+        an ``approve`` whose ``findings`` contain any blocking severity
+        (HIGH/MEDIUM, incl. the ``CRITICAL``/``WARNING`` aliases) is
+        downgraded to ``request-changes``; an ``approve`` with a
+        malformed ``findings`` field becomes ``comment``.
         """
-        import json
-        import re
-
-        # Match flat JSON objects containing a verdict key.  Non-
-        # recursive on purpose: the verdict block emitted by the
-        # AGENT.md protocol has no nested ``verdict`` objects, so a
-        # plain bracket-match is enough and avoids parsing the entire
-        # answer with a recursive descent grammar.
-        candidates = re.findall(
-            r'\{[^{}]*"verdict"[^{}]*\}',
-            answer,
-        )
-        for blob in reversed(candidates):
-            try:
-                obj = json.loads(blob)
-            except (json.JSONDecodeError, ValueError):
-                continue
+        # Nested-aware scan (findings carry nested objects, which a
+        # flat bracket regex cannot match).
+        for obj in reversed(iter_json_objects(answer or "")):
             verdict = obj.get("verdict")
-            if verdict in {"approve", "request-changes", "comment"}:
-                return verdict
-
-        # Loose fallback ONLY when no JSON block exists at all — so a
-        # diff fragment cannot win against a real reviewer verdict.
-        lower = answer.lower()
-        if "lgtm" in lower:
+            if verdict not in {"approve", "request-changes", "comment"}:
+                continue
+            if verdict != "approve":
+                return str(verdict)
+            if "findings" not in obj:
+                return "approve"
+            findings = findings_from_object(obj)
+            if findings is None:
+                return "comment"
+            if compute_verdict(findings) == "CHANGES_REQUESTED":
+                return "request-changes"
             return "approve"
-        if "changes-requested" in lower or "changes requested" in lower:
-            return "request-changes"
         return "comment"
 
     async def _merge_approved_prs(
@@ -2237,14 +2454,37 @@ class WorkflowEngine:
                 continue
             if pr_state.merged:
                 continue
-            merge_res = merge_pr(
-                repo,
-                pr_state.pr_number,
-                self._gh_pr_merge_strategy,
+            # Fail closed on git traps before merging:
+            #  * no recorded head SHA -> cannot pin the merge;
+            #  * CONFLICTING/DIRTY (often caused by a sibling PR merged
+            #    just before) or UNKNOWN-after-retries -> do not merge.
+            # ``merge_pr`` then pins ``--match-head-commit`` and
+            # verifies the PR state is MERGED afterwards.
+            err: str | None = None
+            if not pr_state.head_sha:
+                err = "head SHA not recorded at push time; refusing unpinned merge"
+            else:
+                mergeability = check_pr_mergeable(
+                    repo,
+                    pr_state.pr_number,
+                    expected_head_sha=pr_state.head_sha,
+                )
+                if not mergeability.mergeable:
+                    err = f"not mergeable: {mergeability.error or 'unknown'}"
+            merge_res = (
+                merge_pr(
+                    repo,
+                    pr_state.pr_number,
+                    self._gh_pr_merge_strategy,
+                    match_head_commit=pr_state.head_sha,
+                )
+                if err is None
+                else None
             )
-            pr_state.merged = merge_res.merged
-            if not merge_res.merged:
-                err = merge_res.error or "unknown"
+            pr_state.merged = merge_res is not None and merge_res.merged
+            if not pr_state.merged:
+                if err is None:
+                    err = (merge_res.error if merge_res is not None else None) or "unknown"
                 pr_state.error = f"merge failed: {err}"
                 failed.append((pr_state.pr_number, err))
                 logger.warning(
@@ -2320,63 +2560,117 @@ class WorkflowEngine:
 
     @staticmethod
     def _parse_review_result(result: TaskResult) -> ReviewResult:
-        """Extract structured ReviewResult from review agent output."""
+        """Extract structured ReviewResult from review agent output.
+
+        Fails closed: a failed reviewer task or an answer without a
+        parseable findings JSON block is status ``error`` (not
+        approved).  Otherwise the verdict is computed in code from the
+        finding severities — prose like ``approved: true`` is ignored.
+        """
         if not result.success:
             return ReviewResult(
-                approved=True,
+                approved=False,
+                status=REVIEW_ERROR,
                 issues=[],
                 summary=f"Review agent failed: {result.error}",
             )
 
         data = result.result or {}
-        answer = data.get("answer", "")
+        answer = data.get("answer", "") or ""
+        parsed = parse_review_output(answer)
+        if parsed is None:
+            return ReviewResult(
+                approved=False,
+                status=REVIEW_ERROR,
+                issues=[],
+                summary="Cross-task review output had no parseable findings JSON block",
+            )
 
-        # Parse approved status.
-        approved = True
-        low = answer.lower()
-        if "approved: false" in low or "approved:false" in low:
-            approved = False
-
-        # Parse issues: [T2] major: description
+        # Route findings that name a sub-task back to it for revision.
         issues: list[ReviewIssue] = []
-        issue_pattern = re.compile(
-            r"\[([Tt]\d+)\]\s*(critical|major|minor):\s*(.+)",
-        )
-        for match in issue_pattern.finditer(answer):
-            tid = match.group(1).upper()
-            severity = match.group(2).lower()
-            desc = match.group(3).strip()
+        for f in parsed.findings:
+            if not f.task_id or not f.blocking:
+                continue
+            detail = f.render().removeprefix("- ")
             issues.append(
                 ReviewIssue(
-                    task_id=tid,
-                    description=desc,
-                    detail=desc,
-                    severity=severity,
+                    task_id=f.task_id,
+                    description=f.issue or detail,
+                    detail=detail,
+                    severity=f.severity,
                 )
             )
 
-        # Extract summary (first paragraph or first 200 chars).
-        summary_lines = []
-        for line in answer.split("\n"):
-            line = line.strip()
-            if not line:
-                if summary_lines:
+        summary = parsed.summary
+        if not summary:
+            # First prose paragraph (before any JSON) as a fallback.
+            summary_lines: list[str] = []
+            for raw_line in answer.split("\n"):
+                line = raw_line.strip()
+                if line.startswith(("{", "```")):
                     break
-                continue
-            summary_lines.append(line)
-        summary = " ".join(summary_lines)[:300]
+                if not line:
+                    if summary_lines:
+                        break
+                    continue
+                summary_lines.append(line)
+            summary = " ".join(summary_lines)
+        summary = summary[:300]
 
-        return ReviewResult(approved=approved, issues=issues, summary=summary)
+        rejected = parsed.verdict == "CHANGES_REQUESTED"
+        return ReviewResult(
+            approved=not rejected,
+            status=REVIEW_REJECTED if rejected else REVIEW_APPROVED,
+            issues=issues,
+            summary=summary,
+            findings=parsed.findings,
+        )
 
     # ── Result building ───────────────────────────────────────
+
+    @staticmethod
+    def _unaccepted_reason(
+        state: WorkflowState,
+        tid: str,
+        *,
+        require_per_task_review: bool,
+    ) -> str | None:
+        """Why sub-task *tid* is not accepted, or ``None`` if it is.
+
+        A sub-task is accepted only when its coder result exists and
+        succeeded AND — when per-task review is required (pairing on)
+        — its final per-task review is ``approved``.  A missing review
+        under required pairing is NOT accepted (fail closed).
+        """
+        sub_status = state.sub_task_statuses.get(tid)
+        if sub_status is None or sub_status.result is None:
+            return "no result (agent never ran or result was lost)"
+        if not sub_status.result.success:
+            return f"coder failed: {sub_status.result.error or 'unknown error'}"
+        review = state.per_task_reviews.get(tid)
+        if review is None:
+            return "no per-task review recorded" if require_per_task_review else None
+        if review.status == REVIEW_APPROVED:
+            return None
+        if review.status == REVIEW_ERROR:
+            return f"reviewer error: {review.feedback[:160]}"
+        return f"review rejected after {review.rounds} round(s)"
 
     @staticmethod
     def _build_result(
         state: WorkflowState,
         review: ReviewResult,
         elapsed_ms: float,
+        *,
+        require_per_task_review: bool = False,
     ) -> WorkflowResult:
-        """Aggregate all sub-task results into WorkflowResult."""
+        """Aggregate all sub-task results into WorkflowResult.
+
+        ``success`` is computed, never assumed: it is True only when
+        every sub-task is accepted (see :meth:`_unaccepted_reason`)
+        and the cross-task review is approved.  Otherwise ``error``
+        lists the unaccepted sub-tasks and the cross-task outcome.
+        """
         all_files: list[str] = []
         all_ops: list[dict[str, Any]] = []
         answer_parts: list[str] = []
@@ -2427,9 +2721,37 @@ class WorkflowEngine:
         if review.summary:
             merged_answer += f"\n\n## Review Summary\n{review.summary}"
 
+        unaccepted: list[str] = []
+        reasons: list[str] = []
+        for tid in state.sub_task_statuses:
+            reason = WorkflowEngine._unaccepted_reason(
+                state,
+                tid,
+                require_per_task_review=require_per_task_review,
+            )
+            if reason is not None:
+                unaccepted.append(tid)
+                reasons.append(f"{tid} ({reason})")
+
+        review_errors = sum(1 for r in state.per_task_reviews.values() if r.status == REVIEW_ERROR)
+        if review.status == REVIEW_ERROR:
+            review_errors += 1
+
+        error_parts: list[str] = []
+        if reasons:
+            error_parts.append("unaccepted sub-tasks: " + "; ".join(reasons))
+        if not review.approved:
+            error_parts.append(f"cross-task review {review.status}: {review.summary[:200]}")
+        success = not error_parts
+        if not success:
+            logger.warning("Workflow %s not successful: %s", state.workflow_id, error_parts)
+
         return WorkflowResult(
             workflow_id=state.workflow_id,
-            success=True,
+            success=success,
+            error="; ".join(error_parts) if error_parts else None,
+            unaccepted_tasks=unaccepted,
+            review_errors=review_errors,
             answer=merged_answer,
             sub_task_results=sub_results,
             review_summary=review.summary,

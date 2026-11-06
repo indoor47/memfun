@@ -101,7 +101,10 @@ def test_push_subtask_branch_happy_path(
     monkeypatch.setattr(
         "memfun_agent.gh_pr_flow.subprocess.run",
         _make_runner(
-            [_completed(stdout="To origin\n", returncode=0)],
+            [
+                _completed(stdout="To origin\n", returncode=0),
+                _completed(stdout="0123abcd" * 5 + "\n", returncode=0),
+            ],
             capture,
         ),
     )
@@ -112,8 +115,11 @@ def test_push_subtask_branch_happy_path(
     assert result.pushed is True
     assert result.branch == "memfun/wf/T1"
     assert result.error is None
-    # Exactly one git call, with the right argv and cwd.
-    assert len(capture) == 1
+    # The pushed HEAD SHA is recorded so the merge can be pinned to it.
+    assert result.head_sha == "0123abcd" * 5
+    # Two git calls: the push (right argv + cwd), then rev-parse HEAD.
+    assert len(capture) == 2
+    assert capture[1]["cmd"] == ("git", "rev-parse", "HEAD")
     assert capture[0]["cmd"] == (
         "git",
         "push",
@@ -370,6 +376,8 @@ def test_merge_pr_happy_path(
                     stdout="Squashed and merged pull request #142\n",
                     returncode=0,
                 ),
+                # Post-merge verification: state must be MERGED.
+                _completed(stdout='{"state": "MERGED"}', returncode=0),
             ],
             capture,
         ),
@@ -431,6 +439,7 @@ def test_merge_pr_unknown_strategy_defaults_to_squash(
             [
                 _completed(stdout="gh version 2.50.0\n", returncode=0),
                 _completed(stdout="Merged.\n", returncode=0),
+                _completed(stdout='{"state": "MERGED"}', returncode=0),
             ],
             capture,
         ),

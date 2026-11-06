@@ -399,7 +399,10 @@ class TestWorkflowGroupExecution:
         )
         assert "No result" in wf_result.answer
         assert "coder-agent" in wf_result.answer
-        assert wf_result.success is True  # workflow completed
+        # A sub-task that never ran is unaccepted: the workflow is NOT
+        # successful (was: success=True regardless).
+        assert wf_result.success is False
+        assert wf_result.unaccepted_tasks == ["T1"]
 
     def test_build_result_includes_successful_results(self) -> None:
         """_build_result should include data from successful agents."""

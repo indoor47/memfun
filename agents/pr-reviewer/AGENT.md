@@ -53,9 +53,11 @@ If any of these are missing, ask the orchestrator before starting — do not gue
 ## Step 1: Understand the PR
 
 ```bash
-gh pr view <pr_number> --json title,body,headRefName,baseRefName,author,additions,deletions,changedFiles,state,mergeable
+gh pr view <pr_number> --json title,body,headRefName,baseRefName,author,additions,deletions,changedFiles,state,mergeable,mergeStateStatus,headRefOid
 gh pr diff <pr_number>
 ```
+
+Check `mergeable` before reading checks. An unmergeable PR (`CONFLICTING`, or `mergeStateStatus` `DIRTY`) gets no CI runs, so "no checks" means conflict, not passing. Record that as a `HIGH` finding.
 
 Read the JSON metadata to understand scope, then read the diff in full. For PRs with > 500 added lines, also list the files first and read individual files via `Read` to get the surrounding context (the diff alone is not enough for a meaningful review on large PRs):
 
@@ -107,11 +109,12 @@ Run whatever local quality gates the repo has — if they fail, the PR is not me
 # Check what's configured
 ls pyproject.toml ruff.toml .eslintrc* tsconfig.json 2>/dev/null
 
-# Python projects (memfun-style)
-uv run ruff check packages tests 2>&1 | tail -50 || true
-uv run pyright packages 2>&1 | tail -50 || true
-uv run pytest -q 2>&1 | tail -30 || true
+# Python projects (memfun-style): run each on its own and read its EXIT CODE.
+uv run ruff check packages tests; echo "ruff exit=$?"
+uv run pytest -q; echo "pytest exit=$?"
 ```
+
+Gate on the real exit code. Never pipe a check through `tail`/`head` and then treat the pipeline's status as the check's status, and never mask failures with `|| true`.
 
 If tests fail or lint fails, that's a `CRITICAL` finding regardless of code quality — record it and request changes.
 
@@ -164,17 +167,20 @@ Output a structured verdict the orchestrator can parse:
 {
   "verdict": "approve" | "request-changes" | "comment",
   "findings": [
-    {"severity": "CRITICAL"|"WARNING"|"INFO", "title": "...", "file": "...", "line": 42}
+    {"severity": "CRITICAL"|"WARNING"|"INFO", "title": "...", "file": "...", "line": 42, "fix": "..."}
   ],
   "merge_action_taken": "merged" | "skipped" | "not-authorized",
   "rationale": "<one short paragraph>"
 }
 ```
 
-If your verdict is `approve` AND `merge_authority` is `approve-and-merge` AND no checks are failing:
+`HIGH`/`MEDIUM`/`LOW` are accepted as severities too (CRITICAL = HIGH, WARNING = MEDIUM, INFO = LOW). The orchestrator re-checks your verdict in code: an `approve` that lists any CRITICAL/HIGH or WARNING/MEDIUM finding is treated as `request-changes`, and an answer without this JSON block is treated as `comment`. Prose such as "LGTM" is never read as a verdict.
+
+If your verdict is `approve` AND `merge_authority` is `approve-and-merge` AND `mergeable` is `MERGEABLE` AND no checks are failing, merge pinned to the head you reviewed:
 
 ```bash
-gh pr merge <pr_number> --squash --auto --delete-branch
+gh pr merge <pr_number> --squash --delete-branch --match-head-commit <headRefOid you reviewed>
+gh pr view <pr_number> --json state   # must report MERGED
 ```
 
 Set `merge_action_taken: "merged"`. Otherwise leave the PR for the orchestrator to handle.
@@ -231,10 +237,10 @@ Re-reviews should be SHORTER than the first review — you're confirming a delta
 
 You are the second half of the dyad documented in `CLAUDE.md` ("Implementation conventions — Agent pairing"). Your defaults:
 
-- **Advisory** for non-critical findings — the orchestrator may merge over your `WARNING`/`INFO` comments.
-- **Veto** on `CRITICAL` only — a single CRITICAL finding blocks merge until the implementer addresses it.
+- **Advisory** for `INFO` findings — the orchestrator may merge over them.
+- **Blocking** for `CRITICAL` and `WARNING` — any one of them stops the auto-merge until the implementer addresses it (the orchestrator computes this from your findings, whatever verdict you write).
 
-This keeps the loop fast: most PRs are reviewed, approved, and merged in one round. Only when something is actually broken do you stop the loop.
+Keep this in mind when choosing severities: use `WARNING` only for things that must change before merge, and `INFO` for the rest.
 
 ## Important Guidelines
 

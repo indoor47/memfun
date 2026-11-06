@@ -9,6 +9,7 @@ the reviewer requests changes.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -36,10 +37,26 @@ def _coder_result(tid: str, success: bool = True, answer: str = "ok") -> TaskRes
 
 
 def _review_result(approved: bool, feedback: str = "") -> TaskResult:
-    if approved:
-        body = "APPROVED\n" + (feedback or "Looks good.")
-    else:
-        body = f"CHANGES_REQUESTED: {feedback or 'fix it'}"
+    """Per-task review answer in the structured findings format.
+
+    The verdict is computed in code from severities, so "approved"
+    means no blocking findings and "rejected" means one MEDIUM finding.
+    """
+    findings = (
+        []
+        if approved
+        else [
+            {
+                "severity": "MEDIUM",
+                "file": "src/x.py",
+                "line": 1,
+                "issue": feedback or "fix it",
+                "fix": "do it properly",
+            }
+        ]
+    )
+    block = json.dumps({"findings": findings, "summary": feedback or "review"})
+    body = f"Reviewed.\n```json\n{block}\n```"
     return TaskResult(
         task_id="wf_review",
         agent_id="review-agent",
@@ -49,12 +66,13 @@ def _review_result(approved: bool, feedback: str = "") -> TaskResult:
 
 
 def _phase3_review(approved: bool = True) -> TaskResult:
-    """The legacy Phase 3 review result (uses the older approved: true format)."""
-    body = (
-        "approved: true\n\nAll consistent."
+    """The Phase 3 cross-task review result (structured findings JSON)."""
+    findings = (
+        []
         if approved
-        else "approved: false\n\n[T1] major: still bad"
+        else [{"severity": "MEDIUM", "task_id": "T1", "file": "a.py", "issue": "still bad"}]
     )
+    body = "All consistent.\n" + json.dumps({"findings": findings, "summary": "cross-task"})
     return TaskResult(
         task_id="wf_phase3_review",
         agent_id="review-agent",
@@ -182,8 +200,13 @@ async def test_changes_requested_then_approved_redispatches_coder():
 
 
 @pytest.mark.asyncio
-async def test_max_rounds_exhausted_keeps_last_result():
-    """Reviewer rejects both rounds — sub-task finalised with last coder output."""
+async def test_max_rounds_exhausted_leaves_task_unaccepted():
+    """Reviewer rejects every round — the last coder output is kept for
+    inspection but the sub-task is NOT accepted and the workflow fails.
+
+    (Previously this asserted ``success is True``: rounds exhausted
+    silently accepted the last coder output — fail-open.)
+    """
     engine, orchestrator, _ = _make_engine(max_rounds=2)
 
     decomp = DecompositionResult(
@@ -198,16 +221,16 @@ async def test_max_rounds_exhausted_keeps_last_result():
     orchestrator.fan_out.return_value = [_coder_result("T1", answer="v1")]
 
     # Round 1: reject → re-dispatch → round 2: reject → re-dispatch
-    # → round 3 review: reject again (but we've hit max_rounds=2 so
-    # we accept the last output without re-dispatching).  Then
-    # Phase 3 review approves.
+    # → round 3 review: reject again (we've hit max_rounds=2 so we stop
+    # re-dispatching and leave T1 unaccepted).  Then Phase 3 review
+    # approves.
     #
     # Dispatch sequence:
     #   1. per-task review #1 (reject)
     #   2. coder re-dispatch round 1
     #   3. per-task review #2 (reject)
     #   4. coder re-dispatch round 2
-    #   5. per-task review #3 (reject — but cap is hit, we keep result)
+    #   5. per-task review #3 (reject — cap is hit, T1 unaccepted)
     #   6. Phase 3 review (approve)
     orchestrator.dispatch.side_effect = [
         _review_result(approved=False, feedback="round 1 issues"),
@@ -221,8 +244,12 @@ async def test_max_rounds_exhausted_keeps_last_result():
     with patch.object(engine._decomposer, "adecompose", return_value=decomp):
         result = await engine.execute_workflow("task", "context", None)
 
-    # Even with all per-task reviews rejected, workflow finalises.
-    assert result.success is True
+    # All per-task reviews rejected → T1 unaccepted → workflow failed.
+    assert result.success is False
+    assert result.unaccepted_tasks == ["T1"]
+    assert result.error is not None
+    assert "T1" in result.error
+    assert "rejected" in result.error
     # 6 dispatches total.
     assert orchestrator.dispatch.await_count == 6
 
@@ -344,8 +371,11 @@ async def test_failed_coder_skips_per_task_review():
     with patch.object(engine._decomposer, "adecompose", return_value=decomp):
         result = await engine.execute_workflow("task", "context", None)
 
-    # The workflow still produces a result (even if the coder failed).
+    # The workflow still produces a result, but a failed coder means
+    # the sub-task is unaccepted and the workflow is not successful.
     assert result is not None
+    assert result.success is False
+    assert result.unaccepted_tasks == ["T1"]
     # Only 1 dispatch — Phase 3 review.  No per-task review because
     # the coder result was a failure.
     assert orchestrator.dispatch.await_count == 1
@@ -431,13 +461,13 @@ async def test_per_task_review_includes_worktree_path_when_present():
 # ── Parser tests ─────────────────────────────────────────────
 
 
-def test_parse_per_task_review_approved_token():
-    """Reviewer answer starting with ``APPROVED`` parses approved."""
+def test_parse_per_task_review_empty_findings_approves():
+    """A findings block with no findings parses approved (computed in code)."""
     result = TaskResult(
         task_id="r",
         agent_id="review-agent",
         success=True,
-        result={"answer": "APPROVED\nTests look good."},
+        result={"answer": 'Tests look good.\n```json\n{"findings": []}\n```'},
     )
 
     parsed = WorkflowEngine._parse_per_task_review("T1", result, 12.5)
@@ -445,14 +475,19 @@ def test_parse_per_task_review_approved_token():
     assert isinstance(parsed, PerTaskReview)
     assert parsed.task_id == "T1"
     assert parsed.approved is True
+    assert parsed.status == "approved"
     assert parsed.duration_ms == 12.5
-    assert "APPROVED" in parsed.feedback
 
 
 def test_parse_per_task_review_changes_requested():
-    """Reviewer answer with CHANGES_REQUESTED parses unapproved."""
-    answer = (
-        "CHANGES_REQUESTED: there are several issues.\n- Missing null check\n- Wrong return type\n"
+    """Blocking findings parse unapproved and become the issue list."""
+    answer = json.dumps(
+        {
+            "findings": [
+                {"severity": "HIGH", "file": "a.py", "line": 3, "issue": "Missing null check"},
+                {"severity": "MEDIUM", "file": "a.py", "line": 9, "issue": "Wrong return type"},
+            ]
+        }
     )
     result = TaskResult(
         task_id="r",
@@ -464,12 +499,14 @@ def test_parse_per_task_review_changes_requested():
     parsed = WorkflowEngine._parse_per_task_review("T2", result, 0.0)
 
     assert parsed.approved is False
-    assert "Missing null check" in parsed.issues
-    assert "Wrong return type" in parsed.issues
+    assert parsed.status == "rejected"
+    assert any("Missing null check" in i for i in parsed.issues)
+    assert any("Wrong return type" in i for i in parsed.issues)
 
 
-def test_parse_per_task_review_legacy_approved_false():
-    """Older ``approved: false`` shape still parses unapproved."""
+def test_parse_per_task_review_legacy_prose_reject_is_error():
+    """Prose-only ``approved: false`` (no findings JSON) is a reviewer
+    error — still not approved, but the verdict is not read from prose."""
     result = TaskResult(
         task_id="r",
         agent_id="review-agent",
@@ -479,10 +516,14 @@ def test_parse_per_task_review_legacy_approved_false():
 
     parsed = WorkflowEngine._parse_per_task_review("T1", result, 1.0)
     assert parsed.approved is False
+    assert parsed.status == "error"
 
 
-def test_parse_per_task_review_failed_dispatch_auto_approves():
-    """Failed reviewer task → auto-approve (don't block the workflow)."""
+def test_parse_per_task_review_failed_dispatch_is_error():
+    """Failed reviewer task → status ``error``, NOT approved.
+
+    (Previously: auto-approve "so we don't block the workflow".)
+    """
     result = TaskResult(
         task_id="r",
         agent_id="review-agent",
@@ -491,5 +532,6 @@ def test_parse_per_task_review_failed_dispatch_auto_approves():
     )
 
     parsed = WorkflowEngine._parse_per_task_review("T1", result, 5.0)
-    assert parsed.approved is True
+    assert parsed.approved is False
+    assert parsed.status == "error"
     assert "crashed" in parsed.feedback

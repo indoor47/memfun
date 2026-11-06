@@ -5,6 +5,7 @@ Tests multi-agent workflow orchestration without full integration.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,31 +22,43 @@ from memfun_core.types import TaskResult
 # ── Helper function tests ─────────────────────────────────────
 
 
+# Structured cross-task review answers (verdict computed from severities).
+_APPROVE = 'approved: true\n\n```json\n{"findings": [], "summary": "All good"}\n```'
+
+
+def _reject(task_id: str = "T1", issue: str = "Still broken") -> str:
+    return json.dumps(
+        {"findings": [{"severity": "MEDIUM", "task_id": task_id, "file": "a.py", "issue": issue}]}
+    )
+
+
 def test_parse_review_result_approved():
-    """Parse approved review with no issues."""
+    """Empty findings parse approved; summary comes from the JSON."""
     result = TaskResult(
         task_id="review1",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: true\n\nAll code looks good."},
+        result={"answer": _APPROVE},
     )
 
     review = WorkflowEngine._parse_review_result(result)
 
     assert review.approved is True
+    assert review.status == "approved"
     assert len(review.issues) == 0
-    # Summary is first paragraph, which is "approved: true" before the blank line
-    assert "approved" in review.summary.lower()
+    assert review.summary == "All good"
 
 
 def test_parse_review_result_not_approved():
-    """Parse rejected review with issues."""
-    answer = (
-        "approved: false\n\n"
-        "Found several issues:\n"
-        "[T1] major: Missing error handling in auth module\n"
-        "[T2] critical: SQL injection vulnerability\n"
-        "[T3] minor: Inconsistent naming\n"
+    """Blocking findings with task_ids become routable ReviewIssues."""
+    answer = "Found several issues:\n" + json.dumps(
+        {
+            "findings": [
+                {"severity": "major", "task_id": "T1", "issue": "Missing error handling"},
+                {"severity": "critical", "task_id": "T2", "issue": "SQL injection"},
+                {"severity": "minor", "task_id": "T3", "issue": "Inconsistent naming"},
+            ]
+        }
     )
     result = TaskResult(
         task_id="review1",
@@ -57,28 +70,28 @@ def test_parse_review_result_not_approved():
     review = WorkflowEngine._parse_review_result(result)
 
     assert review.approved is False
-    assert len(review.issues) == 3
-    assert review.issues[0].task_id == "T1"
-    assert review.issues[0].severity == "major"
+    assert review.status == "rejected"
+    # Only blocking (HIGH/MEDIUM) findings are routed for revision.
+    assert [i.task_id for i in review.issues] == ["T1", "T2"]
+    assert review.issues[0].severity == "MEDIUM"
     assert "Missing error handling" in review.issues[0].description
-    assert review.issues[1].task_id == "T2"
-    assert review.issues[1].severity == "critical"
-    assert review.issues[2].task_id == "T3"
-    assert review.issues[2].severity == "minor"
+    assert review.issues[1].severity == "HIGH"
+    assert len(review.findings) == 3
 
 
-def test_parse_review_result_case_insensitive_approved():
-    """approved status is case-insensitive."""
+def test_parse_review_result_prose_only_is_error():
+    """Prose ``approved: true`` without findings JSON is NOT approval."""
     result = TaskResult(
         task_id="review1",
         agent_id="review-agent",
         success=True,
-        result={"answer": "Approved:False\n\nProblems found"},
+        result={"answer": "approved: true\n\nAll code looks good."},
     )
 
     review = WorkflowEngine._parse_review_result(result)
 
     assert review.approved is False
+    assert review.status == "error"
 
 
 def test_parse_review_result_lowercase_task_id():
@@ -87,7 +100,7 @@ def test_parse_review_result_lowercase_task_id():
         task_id="review1",
         agent_id="review-agent",
         success=True,
-        result={"answer": "[t2] major: Issue description"},
+        result={"answer": _reject(task_id="t2", issue="Issue description")},
     )
 
     review = WorkflowEngine._parse_review_result(result)
@@ -97,7 +110,7 @@ def test_parse_review_result_lowercase_task_id():
 
 
 def test_parse_review_result_failed_review():
-    """Failed review agent defaults to approved."""
+    """Failed review agent is an error, NOT approved (was: approved)."""
     result = TaskResult(
         task_id="review1",
         agent_id="review-agent",
@@ -107,15 +120,14 @@ def test_parse_review_result_failed_review():
 
     review = WorkflowEngine._parse_review_result(result)
 
-    assert review.approved is True
+    assert review.approved is False
+    assert review.status == "error"
     assert "Review agent failed" in review.summary
 
 
 def test_parse_review_result_summary_extraction():
-    """Summary is first paragraph."""
-    answer = (
-        "First paragraph line 1.\nFirst paragraph line 2.\n\nSecond paragraph.\n[T1] major: issue"
-    )
+    """Without a JSON summary, the first prose paragraph is used."""
+    answer = "First paragraph line 1.\nFirst paragraph line 2.\n\nSecond paragraph.\n" + _reject()
     result = TaskResult(
         task_id="review1",
         agent_id="review-agent",
@@ -132,7 +144,7 @@ def test_parse_review_result_summary_extraction():
 
 def test_parse_review_result_summary_truncation():
     """Summary is truncated to 300 chars."""
-    answer = "x" * 500 + "\n[T1] major: issue"
+    answer = "x" * 500 + "\n" + _reject()
     result = TaskResult(
         task_id="review1",
         agent_id="review-agent",
@@ -328,7 +340,7 @@ async def test_execute_workflow_expanded_pipeline():
         task_id="wf_review",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: true\n\nAll good"},
+        result={"answer": _APPROVE},
     )
 
     mock_orchestrator.fan_out.side_effect = [
@@ -397,7 +409,7 @@ async def test_execute_workflow_multi_task_path():
         task_id="wf_review",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: true\n\nLooks good"},
+        result={"answer": _APPROVE},
     )
 
     mock_orchestrator.fan_out.side_effect = [
@@ -512,7 +524,7 @@ async def test_execute_workflow_with_revision():
         task_id="wf_review_0",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: false\n\n[T1] major: Missing tests"},
+        result={"answer": _reject(issue="Missing tests")},
     )
 
     # Mock revision result
@@ -532,7 +544,7 @@ async def test_execute_workflow_with_revision():
         task_id="wf_review_1",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: true\n\nNow complete"},
+        result={"answer": _APPROVE},
     )
 
     mock_orchestrator.fan_out.side_effect = [
@@ -596,7 +608,7 @@ async def test_execute_workflow_max_revision_rounds():
         task_id="wf_review",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: false\n\n[T1] major: Still broken"},
+        result={"answer": _reject()},
     )
 
     mock_orchestrator.fan_out.return_value = [task_result]
@@ -606,8 +618,12 @@ async def test_execute_workflow_max_revision_rounds():
         result = await engine.execute_workflow("Task", "context", None)
 
     # Should stop after 2 revision rounds (max_review_rounds default is 2)
-    assert result.success is True
+    # and — since the cross-task review never approved — NOT report
+    # success (was: success=True, "accepting results still unapproved").
+    assert result.success is False
     assert result.review_rounds == 2
+    assert result.error is not None
+    assert "cross-task review rejected" in result.error
 
 
 @pytest.mark.asyncio
@@ -685,7 +701,7 @@ async def test_workflow_callbacks():
         task_id="wf_review",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: true\n\nLooks good"},
+        result={"answer": _APPROVE},
     )
 
     mock_state_store = AsyncMock()
@@ -764,7 +780,7 @@ async def test_execute_group_uses_fan_out_to_pool_for_repeated_names():
         task_id="wf_review",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: true\n\nLGTM"},
+        result={"answer": _APPROVE},
     )
 
     with patch.object(engine._decomposer, "adecompose", return_value=decomp):
@@ -838,7 +854,7 @@ async def test_execute_group_singleton_still_uses_fan_out():
         task_id="wf_review",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: true\n\nLGTM"},
+        result={"answer": _APPROVE},
     )
 
     with patch.object(engine._decomposer, "adecompose", return_value=decomp):

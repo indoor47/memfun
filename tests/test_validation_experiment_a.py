@@ -153,7 +153,9 @@ def _build_workflow_engine(
         task_id="review-x",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: true\n\nLooks fine"},
+        # Structured findings JSON: the verdict is computed in code
+        # from severities (prose "approved: true" is not an approval).
+        result={"answer": 'Looks fine\n```json\n{"findings": []}\n```'},
     )
 
     orchestrator = MagicMock()

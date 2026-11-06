@@ -20,12 +20,14 @@ We patch all the gh_pr_flow helpers at the boundary so no
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from memfun_agent.decomposer import DecompositionResult, SubTask
 from memfun_agent.gh_pr_flow import (
+    MergeabilityResult,
     MergeResult,
     OpenPrResult,
     PushResult,
@@ -57,8 +59,12 @@ def _coder_result(
 
 
 def _review_result(approved: bool) -> TaskResult:
-    """Per-task review verdict (the in-loop ``review-agent`` agent)."""
-    body = "APPROVED" if approved else "CHANGES_REQUESTED: nope"
+    """Per-task review verdict (the in-loop ``review-agent`` agent).
+
+    Structured findings JSON; the verdict is computed from severities.
+    """
+    findings = [] if approved else [{"severity": "HIGH", "file": "a.py", "issue": "nope"}]
+    body = "Reviewed.\n" + json.dumps({"findings": findings})
     return TaskResult(
         task_id="wf_review",
         agent_id="review-agent",
@@ -87,7 +93,7 @@ def _phase3_review() -> TaskResult:
         task_id="wf_phase3",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: true\n\nLGTM."},
+        result={"answer": json.dumps({"findings": [], "summary": "consistent"})},
     )
 
 
@@ -260,7 +266,8 @@ async def test_gh_pr_on_opens_pr_per_subtask(
             OpenPrResult(pr_number=102, url="https://x/102", draft=True),
         ],
     )
-    push = MagicMock(return_value=PushResult(pushed=True, branch="b"))
+    push = MagicMock(return_value=PushResult(pushed=True, branch="b", head_sha="abc123"))
+    mergeable = MagicMock(return_value=MergeabilityResult(mergeable=True, head_sha="abc123"))
     commit = MagicMock(
         return_value=type(
             "CR",
@@ -295,6 +302,7 @@ async def test_gh_pr_on_opens_pr_per_subtask(
         patch("memfun_agent.workflow.open_subtask_pr", open_pr),
         patch("memfun_agent.workflow.mark_pr_ready", mark_ready),
         patch("memfun_agent.workflow.merge_pr", merge),
+        patch("memfun_agent.workflow.check_pr_mergeable", mergeable),
         patch.object(
             engine._decomposer,
             "adecompose",
@@ -350,6 +358,13 @@ async def test_gh_pr_on_opens_pr_per_subtask(
     assert merge.call_count == 2
     merged_numbers = sorted(c.args[1] for c in merge.call_args_list)
     assert merged_numbers == [101, 102]
+    # Every merge is pinned to the SHA recorded at push time.
+    for call in merge.call_args_list:
+        assert call.kwargs["match_head_commit"] == "abc123"
+    # Mergeability checked before mark-ready AND before merge, pinned too.
+    assert mergeable.call_count == 4
+    for call in mergeable.call_args_list:
+        assert call.kwargs["expected_head_sha"] == "abc123"
 
 
 @pytest.mark.asyncio
@@ -603,11 +618,14 @@ def test_parse_pr_verdict_defaults_to_comment_on_no_json() -> None:
     assert WorkflowEngine._parse_pr_verdict("rambling text") == "comment"
 
 
-def test_parse_pr_verdict_lgtm_fallback() -> None:
-    """`lgtm` in unstructured text still resolves to approve."""
+def test_parse_pr_verdict_lgtm_prose_is_not_approval() -> None:
+    """`lgtm` in unstructured text is NOT a verdict (was: approve).
+
+    The verdict never comes from prose; no JSON block → `comment`.
+    """
     from memfun_agent.workflow import WorkflowEngine
 
-    assert WorkflowEngine._parse_pr_verdict("Looks fine. lgtm.") == "approve"
+    assert WorkflowEngine._parse_pr_verdict("Looks fine. lgtm.") == "comment"
 
 
 def test_pr_body_does_not_leak_absolute_path() -> None:
@@ -686,15 +704,33 @@ async def test_merge_failure_makes_workflow_result_unsuccessful(
         approved=True,
         pr_number=101,
         branch="memfun/wf/T1",
+        head_sha="aaa111",
     )
     state.pr_states["T2"] = SubTaskPRState(
         task_id="T2",
         approved=True,
         pr_number=102,
         branch="memfun/wf/T2",
+        head_sha="bbb222",
     )
 
-    def fake_merge(repo: str, pr_number: int, strategy: str) -> MergeResult:
+    def fake_check(
+        repo: str,
+        pr_number: int,
+        *,
+        expected_head_sha: str | None,
+    ) -> MergeabilityResult:
+        return MergeabilityResult(mergeable=True, head_sha=expected_head_sha)
+
+    monkeypatch.setattr("memfun_agent.workflow.check_pr_mergeable", fake_check)
+
+    def fake_merge(
+        repo: str,
+        pr_number: int,
+        strategy: str,
+        *,
+        match_head_commit: str | None = None,
+    ) -> MergeResult:
         if pr_number == 101:
             return MergeResult(
                 merged=True,

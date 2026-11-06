@@ -20,7 +20,12 @@ structured result dataclasses; expected failure modes — missing
 * :func:`mark_pr_ready` — ``gh pr ready <n>``.
 * :func:`add_pr_review_comment` — ``gh pr comment <n>
   --body-file <tmp>``.
-* :func:`merge_pr` — ``gh pr merge <n> --<strategy>``.
+* :func:`check_pr_mergeable` — ``gh pr view <n> --json
+  mergeable,mergeStateStatus,headRefOid`` with fail-closed handling
+  of ``CONFLICTING``/``DIRTY``/``UNKNOWN`` and a head-SHA pin.
+* :func:`merge_pr` — ``gh pr merge <n> --<strategy>
+  --match-head-commit <sha>``, then verifies the PR state is
+  ``MERGED``.
 * :func:`close_pr` — ``gh pr close <n>`` with reason as the
   closing comment.
 
@@ -40,12 +45,18 @@ many PRs.
 from __future__ import annotations
 
 import contextlib
+import json
 import subprocess
 import tempfile
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from memfun_core.logging import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = get_logger("agent.gh_pr_flow")
 
@@ -68,6 +79,9 @@ class PushResult:
     pushed: bool
     branch: str
     error: str | None = None
+    # Local ``HEAD`` SHA right after a successful push (``None`` if it
+    # could not be read).  Callers pin merges to it.
+    head_sha: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +118,28 @@ class MergeResult:
     merged: bool
     pr_number: int
     strategy: str
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MergeabilityResult:
+    """Outcome of :func:`check_pr_mergeable`.
+
+    Attributes:
+        mergeable: ``True`` only when GitHub reported ``MERGEABLE``,
+            the merge state is not ``DIRTY`` and (when pinned) the
+            head SHA matches.  Everything else fails closed.
+        mergeable_state: Raw ``mergeable`` value (``MERGEABLE`` /
+            ``CONFLICTING`` / ``UNKNOWN`` / ``""`` when unread).
+        merge_state_status: Raw ``mergeStateStatus`` value.
+        head_sha: ``headRefOid`` reported by GitHub.
+        error: Why the PR is not mergeable (``None`` when it is).
+    """
+
+    mergeable: bool
+    mergeable_state: str = ""
+    merge_state_status: str = ""
+    head_sha: str | None = None
     error: str | None = None
 
 
@@ -174,6 +210,17 @@ def _run_git(
         text=True,
         check=False,
     )
+
+
+def _json_dict(text: str | None) -> dict[str, object] | None:
+    """Parse *text* as a JSON object; ``None`` on any failure."""
+    try:
+        data: object = json.loads(text or "")
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return cast("dict[str, object]", data)
 
 
 def _extract_pr_number(stdout: str) -> int | None:
@@ -290,7 +337,22 @@ def push_subtask_branch(
             branch=branch,
             error=err or "git push failed",
         )
-    return PushResult(pushed=True, branch=branch)
+    # Record the SHA we just pushed so the merge can be pinned to it
+    # (``gh pr merge --match-head-commit``).  A failure here leaves
+    # ``head_sha=None``, which downstream refuses to merge.
+    head_sha: str | None = None
+    rev = _run_git("rev-parse", "HEAD", cwd=worktree_path)
+    if rev.returncode == 0:
+        candidate = (rev.stdout or "").strip()
+        if candidate and all(c in "0123456789abcdef" for c in candidate.lower()):
+            head_sha = candidate
+    else:
+        logger.warning(
+            "git rev-parse HEAD after pushing %s failed: %s",
+            branch,
+            (rev.stderr or rev.stdout or "").strip()[:200],
+        )
+    return PushResult(pushed=True, branch=branch, head_sha=head_sha)
 
 
 def open_subtask_pr(
@@ -486,16 +548,125 @@ def add_pr_review_comment(
     return True
 
 
+def check_pr_mergeable(
+    repo: str,
+    pr_number: int,
+    *,
+    expected_head_sha: str | None = None,
+    unknown_retries: int = 3,
+    retry_delay_seconds: float = 2.0,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> MergeabilityResult:
+    """Check that a PR can be merged, failing closed.
+
+    Runs ``gh pr view <n> --json mergeable,mergeStateStatus,headRefOid``.
+    An unmergeable PR gets no CI runs, so "no checks" must never be
+    read as passing: callers check this BEFORE marking ready/merging.
+
+    * ``CONFLICTING`` or ``mergeStateStatus == DIRTY`` -> not mergeable.
+    * ``UNKNOWN`` (GitHub still computing) -> re-check up to
+      *unknown_retries* more times, sleeping *retry_delay_seconds*
+      between attempts; still unknown -> not mergeable.
+    * *expected_head_sha* given and ``headRefOid`` differs -> not
+      mergeable (the head moved after we pushed/reviewed it).
+    * Non-zero ``gh`` exit or unparseable JSON -> not mergeable.
+
+    Never raises.
+    """
+    if not _gh_available():
+        return MergeabilityResult(mergeable=False, error="gh CLI not available on PATH")
+
+    attempts = max(0, unknown_retries) + 1
+    last = MergeabilityResult(mergeable=False, error="mergeability not checked")
+    for attempt in range(attempts):
+        if attempt:
+            sleep_fn(retry_delay_seconds)
+        proc = _run_gh(
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            repo,
+            "--json",
+            "mergeable,mergeStateStatus,headRefOid",
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            return MergeabilityResult(
+                mergeable=False,
+                error=f"gh pr view failed (rc={proc.returncode}): {err[:200]}",
+            )
+        data = _json_dict(proc.stdout)
+        if data is None:
+            return MergeabilityResult(
+                mergeable=False,
+                error=f"unparseable gh pr view output: {(proc.stdout or '')[:200]!r}",
+            )
+        mergeable_state = str(data.get("mergeable") or "").upper()
+        merge_state = str(data.get("mergeStateStatus") or "").upper()
+        head_raw = data.get("headRefOid")
+        head = head_raw if isinstance(head_raw, str) and head_raw else None
+
+        base = MergeabilityResult(
+            mergeable=False,
+            mergeable_state=mergeable_state,
+            merge_state_status=merge_state,
+            head_sha=head,
+        )
+
+        if mergeable_state == "CONFLICTING" or merge_state == "DIRTY":
+            return replace(
+                base, error=f"merge conflict (mergeable={mergeable_state}, state={merge_state})"
+            )
+        if mergeable_state == "UNKNOWN" or not mergeable_state or merge_state == "UNKNOWN":
+            last = replace(
+                base,
+                error=f"mergeability still UNKNOWN after {attempt + 1} check(s)",
+            )
+            continue
+        if mergeable_state != "MERGEABLE":
+            return replace(base, error=f"unexpected mergeable state {mergeable_state!r}")
+        if expected_head_sha and head != expected_head_sha:
+            return replace(
+                base,
+                error=(
+                    f"head changed: expected {expected_head_sha[:12]},"
+                    f" PR head is {(head or '?')[:12]}"
+                ),
+            )
+        return replace(base, mergeable=True)
+    return last
+
+
+def _pr_state(repo: str, pr_number: int) -> str:
+    """Return the PR ``state`` (``OPEN``/``MERGED``/``CLOSED``) or ``""``."""
+    proc = _run_gh("pr", "view", str(pr_number), "--repo", repo, "--json", "state")
+    if proc.returncode != 0:
+        return ""
+    data = _json_dict(proc.stdout)
+    if data is None:
+        return ""
+    return str(data.get("state") or "").upper()
+
+
 def merge_pr(
     repo: str,
     pr_number: int,
     strategy: str = "squash",
+    *,
+    match_head_commit: str | None = None,
 ) -> MergeResult:
     """Merge a PR with the requested strategy.
 
     Valid strategies match ``gh pr merge``'s flags:
     ``squash`` / ``merge`` / ``rebase``.  Unknown values fall
     back to ``squash`` (the issue spec's default).
+
+    When *match_head_commit* is given it is passed as
+    ``--match-head-commit`` so GitHub refuses the merge if the PR head
+    moved since that SHA was recorded.  Success is gated on the real
+    exit code AND a follow-up ``gh pr view --json state`` reporting
+    ``MERGED``; anything else is ``merged=False``.
 
     Returns :class:`MergeResult` regardless of outcome.  Common
     failure: ``gh pr merge`` blocked by branch protection — the
@@ -516,8 +687,18 @@ def merge_pr(
         )
         strategy = "squash"
 
+    if match_head_commit is not None and (
+        not match_head_commit or match_head_commit.startswith("-")
+    ):
+        return MergeResult(
+            merged=False,
+            pr_number=pr_number,
+            strategy=strategy,
+            error=f"invalid head SHA: {match_head_commit!r}",
+        )
+
     strategy_flag = f"--{strategy}"
-    proc = _run_gh(
+    args = [
         "pr",
         "merge",
         str(pr_number),
@@ -525,7 +706,10 @@ def merge_pr(
         repo,
         strategy_flag,
         "--delete-branch",
-    )
+    ]
+    if match_head_commit:
+        args.extend(["--match-head-commit", match_head_commit])
+    proc = _run_gh(*args)
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
         logger.warning(
@@ -539,6 +723,21 @@ def merge_pr(
             pr_number=pr_number,
             strategy=strategy,
             error=err or "gh pr merge failed",
+        )
+    # Exit code 0 is necessary but not sufficient: confirm GitHub now
+    # reports the PR as MERGED (e.g. not merely queued).
+    state = _pr_state(repo, pr_number)
+    if state != "MERGED":
+        logger.warning(
+            "gh pr merge %s exited 0 but PR state is %r",
+            pr_number,
+            state or "unknown",
+        )
+        return MergeResult(
+            merged=False,
+            pr_number=pr_number,
+            strategy=strategy,
+            error=f"merge not confirmed: PR state is {state or 'unknown'!s}",
         )
     return MergeResult(
         merged=True,
