@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -533,12 +534,13 @@ def test_parallel_tasks_bound_and_clean_child_env(
 
     allowed = {*rs.ENV_ALLOW, "HOME", rs.DUMMY_KEY_ENV, "PYTHONUNBUFFERED", "COLUMNS",
                "GIT_CONFIG_NOSYSTEM", "__CF_USER_TEXT_ENCODING", "LC_CTYPE",
-               rs.SWARM_RESULT_ENV}  # fmt: skip
+               rs.SWARM_RESULT_ENV, rs.NO_DASHBOARD_ENV}  # fmt: skip
     for trial in range(1, 5):
         call = json.loads((state / "calls" / f"formats-2-t{trial}.json").read_text())
         env = call["env"]
         assert set(env) <= allowed, set(env) - allowed
         assert env[rs.DUMMY_KEY_ENV] == rs.DUMMY_KEY_VALUE
+        assert env[rs.NO_DASHBOARD_ENV] == "1"
         assert env["HOME"] == str(tmp_path / "runs" / "r1" / "formats-2" / str(trial) / "home")
         assert env["HOME"] != os.path.expanduser("~")
         assert "real-looking-secret-value" not in json.dumps(env)
@@ -1360,3 +1362,47 @@ def test_dashboard_child_does_not_inherit_blocked_signals(tmp_path: Path) -> Non
         assert dash.proc.wait(timeout=30) == -signal.SIGTERM
     finally:
         dash.stop()
+
+
+def test_episode_env_forbids_dashboard_autostart_and_has_no_token(tmp_path: Path) -> None:
+    base = {
+        "PATH": "/usr/bin",
+        "MEMFUN_DASHBOARD_TOKEN": "secret-token",
+        "MEMFUN_INFERENCE_METRICS_URL": "http://127.0.0.1:1/metrics",
+    }
+    env = rs.child_env(tmp_path, base)
+    assert env[rs.NO_DASHBOARD_ENV] == "1"
+    assert "MEMFUN_DASHBOARD_TOKEN" not in env
+    assert "secret-token" not in env.values()
+
+
+def test_swarm_does_not_start_its_own_dashboard_when_autostart_is_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No lockfile + MEMFUN_NO_DASHBOARD_AUTOSTART: nothing is started, nothing binds."""
+    from memfun_cli.commands import chat
+
+    monkeypatch.chdir(tmp_path)  # no .memfun/dashboard.lock here
+    monkeypatch.setenv(rs.NO_DASHBOARD_ENV, "1")
+    assert rs.NO_DASHBOARD_ENV == chat.NO_DASHBOARD_AUTOSTART_ENV
+    import uvicorn
+
+    runtime = types.SimpleNamespace(event_bus=object())
+    started: list[object] = []
+
+    def _record(*_a: object, **_k: object) -> None:
+        started.append(1)
+        raise RuntimeError("stop here: a dashboard was about to start")
+
+    from memfun_cli.dashboard import server as dash_server
+
+    monkeypatch.setattr(dash_server, "create_app", lambda **_k: object())
+    monkeypatch.setattr(uvicorn, "Server", _record)
+    got = asyncio.run(
+        chat._start_dashboard_background(runtime)  # pyright: ignore[reportPrivateUsage]
+    )
+    assert got == (None, False) and started == []
+    # control: without the flag the same call does try to start one
+    monkeypatch.delenv(rs.NO_DASHBOARD_ENV)
+    asyncio.run(chat._start_dashboard_background(runtime))  # pyright: ignore[reportPrivateUsage]
+    assert started == [1]

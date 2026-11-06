@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import select
 import sys
 import termios
@@ -1819,6 +1820,11 @@ def _configure_dspy(config: MemfunConfig) -> None:
         logger.debug("Failed to install DSPy telemetry callback", exc_info=True)
 
 
+#: Set (1/true/yes) to keep this process from starting a dashboard of its own;
+#: reusing one named by ``.memfun/dashboard.lock`` still works.
+NO_DASHBOARD_AUTOSTART_ENV = "MEMFUN_NO_DASHBOARD_AUTOSTART"
+
+
 async def _start_dashboard_background(
     runtime: Any,
 ) -> tuple[int, bool] | tuple[None, bool]:
@@ -1852,7 +1858,14 @@ async def _start_dashboard_background(
             except Exception:
                 logger.debug("Stale dashboard on port %d", port)
 
-        # No running dashboard — start a new one
+        # No running dashboard. A supervising tool (evals/swarm/run_smoke.py) that owns
+        # the one real dashboard sets this so its child swarms never start a second,
+        # token-less one under a throwaway HOME.
+        if os.environ.get(NO_DASHBOARD_AUTOSTART_ENV, "").lower() in ("1", "true", "yes"):
+            logger.info("Dashboard auto-start disabled by %s", NO_DASHBOARD_AUTOSTART_ENV)
+            return None, False
+
+        # Start a new one
         import socket
 
         import uvicorn

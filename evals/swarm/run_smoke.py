@@ -73,6 +73,11 @@ FORBIDDEN_PORTS = frozenset({8434})
 #: RunPod kit).  The value is a dummy: SGLang / MTPLX need no key.
 DUMMY_KEY_ENV = "MEMFUN_SGLANG_DUMMY_KEY"
 DUMMY_KEY_VALUE = "dummy-not-a-secret"
+#: memfun_cli.commands.chat.NO_DASHBOARD_AUTOSTART_ENV: episodes never start a dashboard
+#: (it would run under the episode's throwaway HOME, without the owner's token, and could
+#: take the port the shared dashboard needs).  Episodes only reuse the one named by their
+#: ``.memfun/dashboard.lock``; the runner owns the single real dashboard.
+NO_DASHBOARD_ENV = "MEMFUN_NO_DASHBOARD_AUTOSTART"
 #: memfun_runtime.distributed.EVENT_TOPIC (kept literal so the runner is stdlib-only).
 EVENT_TOPIC = "memfun.distributed.events"
 VOID_THRESHOLD = 0.05
@@ -109,6 +114,9 @@ SERVER_ERROR_RE = re.compile(
 SERVER_LOG_CONTEXT_RE = re.compile(r"litellm|openai\.|httpx|httpcore")
 #: Task ids the engine derives from a sub-task (pair re-dispatch, revision, review).
 DERIVED_TASK_RE = re.compile(r"_(pair\d+|rev\d+|review_.*|pr_review)$")
+#: The fail-closed review parser's rejection of an auditor answer without a valid
+#: findings JSON block carrying the dispatch's review id.
+REVIEWER_REJECT_RE = re.compile(r"Reviewer output had no valid findings JSON block")
 RESULT_MARKER = "Swarm result"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -144,7 +152,7 @@ class Unit:
 
     @property
     def module(self) -> str:
-        return Path(self.hidden_test).stem
+        return vb.unit_module(self.hidden_test)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -481,6 +489,7 @@ def child_env(
     env["PYTHONUNBUFFERED"] = "1"
     env["COLUMNS"] = "160"
     env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env[NO_DASHBOARD_ENV] = "1"  # the token is never passed to episodes (not in ENV_ALLOW)
     if result_json is not None:
         env[SWARM_RESULT_ENV] = str(result_json)
     return env
@@ -1224,6 +1233,7 @@ def log_signals(text: str) -> dict[str, Any]:
         if SERVER_ERROR_RE.search(ln) and SERVER_LOG_CONTEXT_RE.search(ln)
     ]
     return {
+        "reviewer_json_rejections": len(REVIEWER_REJECT_RE.findall(text)),
         "warnings": warnings[:50],
         "server_error_lines": server[:20],
         "server_error_line_count": len(server),
@@ -1277,12 +1287,19 @@ def classify(
 
 
 def _unit_result(res: vb.RunResult, module: str) -> dict[str, Any]:
-    stats = res.by_file.get(module, {"passed": 0, "failed": 0})
+    suite = module == vb.ALL_MODULES
+    if module == vb.ALL_MODULES:  # whole-suite unit (Commit0): every collected test
+        stats = {"passed": res.passed, "failed": res.failed}
+    else:
+        stats = res.by_file.get(module, {"passed": 0, "failed": 0})
     return {
         "passed": res.returncode == 0 and not vb.unit_fails(res, module),
         "rc": res.returncode,
         "tests": dict(stats),
-        "crash": res.returncode not in (0, 1, -9),
+        # Suite (Commit0) units run the library's whole test tree: code the agent left
+        # broken at import makes pytest exit 2/4/5 (conftest import error, no tests),
+        # which is a model failure, not a harness crash.
+        "crash": res.returncode not in ((0, 1, 2, 4, 5, -9) if suite else (0, 1, -9)),
         "timeout": res.returncode == -9,
         "output_tail": res.output_tail,
     }
@@ -1300,7 +1317,7 @@ def grade_candidate(
     tree = vb.graded_tree(bundle.path, bundle.owned, candidate, scratch / "graded")
     jobs: list[tuple[str, str, Path]] = []
     for unit in bundle.units:
-        jobs.append((unit.id, unit.module, bundle.path / unit.hidden_test))
+        jobs.append((unit.id, unit.module, bundle.path / unit.hidden_test.rstrip("/")))
     if bundle.has_integration:
         jobs.append(
             ("<integration>", vb.INTEGRATION, bundle.path / "hidden" / f"{vb.INTEGRATION}.py")
@@ -1311,7 +1328,10 @@ def grade_candidate(
         slot = scratch / f"unit-{key.strip('<>')}"
         tests = slot / "tests"
         tests.mkdir(parents=True)
-        shutil.copy2(test_file, tests / test_file.name)
+        if test_file.is_dir():
+            shutil.copytree(test_file, tests, dirs_exist_ok=True)
+        else:
+            shutil.copy2(test_file, tests / test_file.name)
         return key, _unit_result(vb.run_grader(tree, tests, slot, timeout), module)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=GRADE_WORKERS) as pool:
@@ -1528,6 +1548,7 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
         server_errors = signals["server_error_line_count"] + metrics["llm_server_error_count"]
         rec["server_errors"] = server_errors
         rec["server_error_lines"] = signals["server_error_lines"]
+        rec["reviewer_json_rejections"] = signals["reviewer_json_rejections"]
         swarm_doc, swarm_problem = load_swarm_result(plan.ep_dir, metrics["workflow_ids"])
         usage = tool_usage(swarm_doc, swarm_problem)
         rec["tool_usage"] = usage
@@ -1700,6 +1721,7 @@ def aggregate(episodes: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str,
             else None,
             "agents_used_max": max((m["agents_used"] for m in mets), default=0),
             "peak_concurrency": max((m["peak_concurrency"] for m in mets), default=0),
+            "reviewer_json_rejections": sum(e.get("reviewer_json_rejections", 0) for e in eps),
             "flags": sorted({f for e in eps for f in e.get("flags", [])}),
             "tool_usage": _tool_block(eps),
         }
@@ -1823,10 +1845,24 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--base-url", required=True, help="OpenAI-compatible base URL (…/v1)")
     ap.add_argument("--model", help="served model id (default: the single one at GET /models)")
     ap.add_argument(
+        "--suite",
+        choices=("smoke", "commit0"),
+        default="smoke",
+        help="bundle source: the 6 toy smoke bundles, or Commit0 libraries built by "
+        "commit0_adapter.py into --commit0-dir",
+    )
+    ap.add_argument(
+        "--commit0-dir",
+        type=Path,
+        default=Path.home() / ".cache" / "memfun-commit0",
+        help="commit0_adapter.py cache (bundles under <dir>/bundles)",
+    )
+    ap.add_argument(
         "--bundles",
         nargs="+",
-        default=list(DEFAULT_BUNDLES),
-        help="bundle ids (space or comma separated); default: all 6",
+        default=None,
+        help="bundle ids (space or comma separated); default: all 6 smoke bundles, or "
+        "every built Commit0 bundle",
     )
     ap.add_argument("--bundles-root", type=Path, default=SMOKE_ROOT, help=argparse.SUPPRESS)
     ap.add_argument("--trials", type=int, default=1)
@@ -1873,7 +1909,11 @@ def _validate_args(args: argparse.Namespace) -> None:
                 "specs leave this machine (use an SSH tunnel to 127.0.0.1)",
                 file=sys.stderr,
             )
+    if args.suite == "commit0":
+        args.bundles_root = args.commit0_dir.expanduser().resolve() / "bundles"
     known = set(known_bundles(args.bundles_root))
+    if args.bundles is None:
+        args.bundles = list(DEFAULT_BUNDLES) if args.suite == "smoke" else sorted(known)
     selected: list[str] = []
     for item in args.bundles:
         for bid in (b.strip() for b in item.split(",")):
@@ -1928,7 +1968,7 @@ def dry_plan(args: argparse.Namespace, run_dir: Path, plans: list[EpisodePlan]) 
         f"memfun --timeout {args.task_timeout}s, grader {args.grader_timeout:g}s per unit",
     ]
     if args.no_dashboard:
-        out.append("dashboard     : disabled (each memfun swarm may start its own)")
+        out.append("dashboard     : disabled (episodes never start one either)")
     else:
         out.append(
             f"dashboard     : ONE on port {args.dashboard_port}: reuse it if a memfun dashboard "
