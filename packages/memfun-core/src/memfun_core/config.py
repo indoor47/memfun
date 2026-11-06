@@ -27,6 +27,35 @@ LLM_ROLES: tuple[str, ...] = (
     "reviewer",
 )
 
+#: Providers memfun maps itself (provider + model -> LiteLLM route).  For
+#: these the endpoint is (provider, base_url).  Anything else -- notably
+#: ``custom`` -- passes ``model`` straight to LiteLLM, so the route lives
+#: in the model string (``openrouter/x``) and a model change can mean a
+#: different provider.
+KNOWN_LLM_PROVIDERS: tuple[str, ...] = ("anthropic", "openai", "openai-compat", "ollama")
+#: Provider spellings accepted without a warning.
+_RECOGNIZED_PROVIDERS: tuple[str, ...] = (*KNOWN_LLM_PROVIDERS, "custom")
+
+
+def _normalize_provider(value: str, where: str) -> str:
+    """Lower-case/strip known provider names; warn on unrecognized ones."""
+    norm = value.strip().lower()
+    if norm in _RECOGNIZED_PROVIDERS:
+        return norm
+    logger.warning(
+        "%s: unrecognized provider %r; it is passed to LiteLLM as a custom route (known: %s)",
+        where,
+        value,
+        ", ".join(_RECOGNIZED_PROVIDERS),
+    )
+    return value
+
+
+def _model_route(model: str) -> str:
+    """LiteLLM route of a raw model string: the prefix before the first '/'."""
+    return model.split("/", 1)[0] if "/" in model else model
+
+
 # An env var NAME (never a value).  Rejecting anything else catches the
 # common mistake of pasting the API key itself into ``api_key_env``.
 _ENV_VAR_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -123,11 +152,18 @@ class LLMConfig:
                 continue
             updates[f.name] = val
         # Never send [llm]'s key to a different endpoint: api_key_env is
-        # inherited only when provider AND base_url resolve to [llm]'s.
+        # inherited only when provider AND base_url resolve to [llm]'s --
+        # and, for providers routed by the model string (custom), when
+        # the model's LiteLLM route prefix is unchanged too.
         if "api_key_env" not in updates:
-            same_endpoint = updates.get("provider", self.provider) == self.provider and (
+            provider = updates.get("provider", self.provider)
+            same_endpoint = provider == self.provider and (
                 updates.get("base_url", self.base_url) == self.base_url
             )
+            if same_endpoint and provider not in KNOWN_LLM_PROVIDERS:
+                same_endpoint = _model_route(updates.get("model", self.model)) == _model_route(
+                    self.model
+                )
             if not same_endpoint:
                 updates["api_key_env"] = ""
         return dataclasses.replace(self, roles={}, **updates)
@@ -274,7 +310,7 @@ class MemfunConfig:
         return cls(
             project_name=_section("project").get("name", "memfun-project"),
             llm=LLMConfig(
-                **{k: v for k, v in _pick(llm_raw, LLMConfig).items() if k != "roles"},
+                **_llm_fields(_pick(llm_raw, LLMConfig)),
                 roles=_parse_roles(llm_raw.get("roles")),
             ),
             backend=BackendConfig(**_pick(backend_raw, BackendConfig)),
@@ -282,6 +318,15 @@ class MemfunConfig:
             web=WebToolsConfig(**_pick(web_raw, WebToolsConfig)),
             workflow=WorkflowConfig(**_pick(workflow_raw, WorkflowConfig)),
         )
+
+
+def _llm_fields(picked: dict[str, Any]) -> dict[str, Any]:
+    """``[llm]`` fields minus ``roles``, with ``provider`` normalized."""
+    fields = {k: v for k, v in picked.items() if k != "roles"}
+    provider = fields.get("provider")
+    if isinstance(provider, str):
+        fields["provider"] = _normalize_provider(provider, "[llm]")
+    return fields
 
 
 def _parse_roles(raw: Any) -> dict[str, LLMRoleConfig]:
@@ -337,6 +382,8 @@ def _validate_role_value(role: str, key: str, val: Any) -> Any:
                 "(e.g. ANTHROPIC_API_KEY), not a key value"
             )
             raise ConfigError(msg)
+        if key == "provider":
+            return _normalize_provider(val, f"[llm.roles.{role}]")
         return val
     if key == "temperature":
         if isinstance(val, bool) or not isinstance(val, int | float):

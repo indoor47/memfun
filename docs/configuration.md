@@ -108,7 +108,17 @@ inherited `[llm].base_url`.
 inherits `[llm].api_key_env` only when its `provider` **and** `base_url`
 both resolve to the same values as `[llm]`'s. A role that changes either
 gets no key unless it sets its own `api_key_env`, so the `[llm]` key is
-never sent to a different endpoint.
+never sent to a different endpoint. For `custom` (and any other provider
+memfun does not map itself) the route is part of `model` (e.g.
+`openrouter/...`), so a role that changes the model's route prefix also
+gets no inherited key. Provider names are matched case-insensitively;
+an unrecognized provider logs a warning.
+
+Global and project configs are merged before roles are resolved, so an
+`api_key_env` from `~/.memfun/config.toml` combined with a project-level
+`provider` or `base_url` change is sent to the project's endpoint -- the
+same trust model as `[llm].base_url`. Review merged configs from untrusted
+projects.
 
 Example: orchestrator and decomposer on Claude Opus 5.5 through the
 Anthropic API; workers and auditors on a self-hosted OpenAI-compatible

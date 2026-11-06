@@ -963,3 +963,99 @@ def test_api_key_env_rejects_non_names(tmp_path: Path, value: str) -> None:
 def test_api_key_env_empty_means_no_key(tmp_path: Path) -> None:
     cfg = _cfg('[llm.roles.worker]\napi_key_env = ""\n', tmp_path)
     assert cfg.llm_for_role("worker").api_key_env == ""
+
+
+# ── Custom (model-routed) providers, URL redaction, provider spelling ─
+
+
+@pytest.mark.parametrize(
+    ("llm_model", "role_model", "inherits"),
+    [
+        ("openrouter/x", "together_ai/y", False),  # route prefix changes
+        ("openrouter/x", "y", False),  # prefix dropped -> LiteLLM infers route
+        ("openrouter/x", "openrouter/z", True),  # same route
+        ("openrouter/x", "openrouter/x", True),  # same model
+        ("gpt-4o", "claude-opus-5-5", False),  # bare names: any change differs
+    ],
+)
+def test_custom_provider_model_route_change_drops_key(
+    tmp_path: Path, llm_model: str, role_model: str, inherits: bool
+) -> None:
+    cfg = _cfg(
+        f'[llm]\nprovider = "custom"\nmodel = "{llm_model}"\napi_key_env = "MAIN_KEY"\n'
+        f'[llm.roles.auditor]\nmodel = "{role_model}"\n',
+        tmp_path,
+    )
+    assert cfg.llm_for_role("auditor").api_key_env == ("MAIN_KEY" if inherits else "")
+
+
+def test_custom_route_change_never_sends_main_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MAIN_KEY", "test-main-secret")
+    cfg = _cfg(
+        '[llm]\nprovider = "custom"\nmodel = "openrouter/x"\napi_key_env = "MAIN_KEY"\n'
+        '[llm.roles.auditor]\nmodel = "together_ai/y"\n',
+        tmp_path,
+    )
+    assert lm_settings(cfg.llm_for_role("auditor"))[1].get("api_key") != "test-main-secret"
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai", "openai-compat"])
+def test_known_provider_model_only_change_still_inherits(tmp_path: Path, provider: str) -> None:
+    cfg = _cfg(
+        f'[llm]\nprovider = "{provider}"\nmodel = "a"\napi_key_env = "MAIN_KEY"\n'
+        '[llm.roles.worker]\nmodel = "other/b"\n',
+        tmp_path,
+    )
+    assert cfg.llm_for_role("worker").api_key_env == "MAIN_KEY"
+
+
+def test_redact_url_strips_userinfo_query_fragment() -> None:
+    url = "https://user:URLSECRET@hosted.example:8443/v1?api_key=QSECRET#frag"
+    assert role_models.redact_url(url) == "https://hosted.example:8443/v1"
+    assert role_models.redact_url("http://[::1]:18000/v1?k=s") == "http://[::1]:18000/v1"
+    assert role_models.redact_url(None) == ""
+
+
+def test_preflight_log_redacts_base_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("NOPE_KEY", raising=False)
+    cfg = _cfg(
+        '[llm.roles.worker]\nprovider = "openai"\nmodel = "q"\napi_key_env = "NOPE_KEY"\n'
+        'base_url = "https://user:URLSECRET@hosted.example/v1?api_key=QSECRET"\n',
+        tmp_path,
+    )
+    with caplog.at_level(logging.WARNING):
+        assert role_models.preflight_roles(cfg) == ["worker"]
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "https://hosted.example/v1" in text
+    assert "URLSECRET" not in text
+    assert "QSECRET" not in text
+    assert "user:" not in text
+
+
+def test_provider_spelling_is_normalized(tmp_path: Path) -> None:
+    cfg = _cfg(
+        '[llm]\nprovider = " Anthropic "\n'
+        '[llm.roles.worker]\nprovider = "OpenAI"\nmodel = "q"\n'
+        'base_url = "http://127.0.0.1:18000/v1"\n',
+        tmp_path,
+    )
+    assert cfg.llm.provider == "anthropic"
+    worker = cfg.llm_for_role("worker")
+    assert worker.provider == "openai"
+    assert lm_settings(worker)[0] == "openai/q"  # mapped, not passed through raw
+
+
+def test_unrecognized_provider_warns_with_role(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        cfg = _cfg('[llm.roles.auditor]\nprovider = "opnai"\nmodel = "q"\n', tmp_path)
+    assert cfg.llm_for_role("auditor").provider == "opnai"
+    msgs = [r.getMessage() for r in caplog.records if "unrecognized provider" in r.getMessage()]
+    assert len(msgs) == 1
+    assert "[llm.roles.auditor]" in msgs[0]
+    assert "'opnai'" in msgs[0]

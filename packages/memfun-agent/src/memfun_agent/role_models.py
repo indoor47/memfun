@@ -105,6 +105,27 @@ def is_local_base_url(url: str | None) -> bool:
     return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
+def redact_url(url: str | None) -> str:
+    """Return *url* as ``scheme://host[:port]/path`` for logging.
+
+    Drops userinfo, query and fragment (they can carry credentials,
+    e.g. ``https://user:pass@host/v1?api_key=...``).
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        return "<unparseable url>"
+    if ":" in host:  # IPv6 literal
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    scheme = f"{parts.scheme}://" if parts.scheme else ""
+    return f"{scheme}{netloc}{parts.path}"
+
+
 def resolve_api_key(llm: LLMConfig) -> str:
     """Read the API key from the env var NAMED by ``llm.api_key_env``.
 
@@ -242,7 +263,7 @@ def preflight_roles(config: MemfunConfig) -> list[str]:
                     resolved.api_key_env or "(api_key_env not set)",
                     "unset" if resolved.api_key_env else "not configured",
                     resolved.provider,
-                    resolved.base_url or "the provider's default endpoint",
+                    redact_url(resolved.base_url) or "the provider's default endpoint",
                     role,
                 )
                 continue
