@@ -161,7 +161,7 @@ def test_dashboard_html_contains_tab_markup() -> None:
     from memfun_cli.dashboard.server import create_app
 
     app = create_app()
-    response = TestClient(app).get("/")
+    response = TestClient(app, client=("127.0.0.1", 50000)).get("/")
     assert response.status_code == 200
     html = response.text
 
@@ -191,7 +191,7 @@ def test_dashboard_html_contains_sparkline_cards() -> None:
     from memfun_cli.dashboard.server import create_app
 
     app = create_app()
-    response = TestClient(app).get("/")
+    response = TestClient(app, client=("127.0.0.1", 50000)).get("/")
     assert response.status_code == 200
     html = response.text
 
@@ -226,7 +226,7 @@ def test_dashboard_logs_filter_checkboxes_present() -> None:
     from memfun_cli.dashboard.server import create_app
 
     app = create_app()
-    html = TestClient(app).get("/").text
+    html = TestClient(app, client=("127.0.0.1", 50000)).get("/").text
 
     # Filter UI markup.
     assert 'class="logs-toolbar"' in html
@@ -266,7 +266,7 @@ def test_dashboard_ingests_llm_call_event(
     _server._requests.clear()
 
     app = _server.create_app()
-    client = TestClient(app)
+    client = TestClient(app, client=("127.0.0.1", 50000))
 
     llm_event = {
         "event_type": "llm.call",
@@ -319,7 +319,7 @@ def test_dashboard_api_state_reflects_ingested_events(
     _server._requests.clear()
 
     app = _server.create_app()
-    client = TestClient(app)
+    client = TestClient(app, client=("127.0.0.1", 50000))
 
     events = [
         {

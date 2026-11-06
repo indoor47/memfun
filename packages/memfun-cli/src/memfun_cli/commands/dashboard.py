@@ -41,6 +41,14 @@ def dashboard_command(
         "--host",
         help="Host to bind.",
     ),
+    remote: bool = typer.Option(
+        False,
+        "--remote",
+        help=(
+            "Listen on all interfaces so phones / other machines can watch. "
+            "Non-local clients need the dashboard token (created if missing)."
+        ),
+    ),
 ) -> None:
     """Start ONLY the dashboard server (no chat REPL required).
 
@@ -84,10 +92,23 @@ def dashboard_command(
         project_name=project_root.name,
     )
 
+    remote_note = ""
+    if remote:
+        from memfun_cli.dashboard.server import ensure_dashboard_token
+
+        host = "0.0.0.0"
+        ensure_dashboard_token()
+        remote_note = (
+            f"[bold]Remote:[/bold] http://{_primary_ip()}:{port}/?token=<token>\n"
+            "[dim]token: $MEMFUN_DASHBOARD_TOKEN or ~/.config/memfun/dashboard_token"
+            " (local clients need no token)[/dim]\n"
+        )
+
     url = f"http://{host}:{port}"
     console.print(
         Panel(
             f"[bold]Dashboard URL:[/bold] {url}\n"
+            f"{remote_note}"
             f"[dim]project:[/dim] {project_root.name}\n"
             f"[dim]state file:[/dim] {memfun_dir / 'dashboard.json'}\n\n"
             "Press [bold]Ctrl-C[/bold] to stop.",
@@ -99,6 +120,18 @@ def dashboard_command(
     # Block on uvicorn — Ctrl-C cleanly stops the server via uvicorn's
     # signal handler.
     _run_uvicorn(app, host=host, port=port)
+
+
+def _primary_ip() -> str:
+    """Best-effort LAN address of this machine (no packets are sent)."""
+    import socket
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))  # TEST-NET-1; connect() on UDP sends nothing
+            return str(s.getsockname()[0])
+    except OSError:
+        return "127.0.0.1"
 
 
 def _run_uvicorn(
