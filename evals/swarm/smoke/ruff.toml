@@ -1,0 +1,13 @@
+# Task-bundle sources are starting trees / reference answers for model agents, written as
+# plain idiomatic Python rather than to this repo's typing-import conventions.
+extend = "../../../pyproject.toml"
+
+[lint]
+extend-ignore = [
+  "E402",   # hidden tests put a shared contract helper above the unit imports
+  "TC001",  # runtime imports kept simple in bundle code
+  "TC003",
+  "B905",   # zip() over equal-length sequences
+  "RUF007",
+  "RUF059",
+]

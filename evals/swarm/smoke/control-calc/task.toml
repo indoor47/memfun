@@ -1,0 +1,35 @@
+id = "control-calc"
+kind = "control"
+spec = """
+CONTROL TASK (not decomposable): implement a tiny expression language in the `calc`
+package. The lexer, parser and evaluator form a strict dependency chain whose internal
+interfaces are yours to design, so this is one unit with one owner. Public API only:
+
+  calc.evaluate(src: str, env: dict[str, int | float] | None = None) -> int | float
+  calc.CalcError(Exception)  with attribute `pos` (0-based char offset, or None)
+
+Language:
+- numbers: integers (`42`) and decimals (`3.5`, `.5`); identifiers [A-Za-z_][A-Za-z0-9_]*
+- operators by precedence (low to high): `+ -` ; `* / %` ; unary `-`/`+` ; `**`
+  (right-associative, binds tighter than unary minus on its left: -2**2 == -4)
+- parentheses; calls min(...), max(...) (1+ args), abs(x)
+- statements separated by `;`, assignments `name = expr`; result is the value of the
+  last statement (an assignment's value is the assigned value). `env` supplies
+  initial variables and is NOT mutated.
+- Python numeric semantics (`/` true division, `%` Python modulo, ints stay ints).
+- Empty statements are allowed: `a = 2;;` and a trailing `;` are fine.
+- Errors (raise CalcError, never another exception type) and their `pos`:
+  syntax error -> start of the offending token (end of input: len(src));
+  unexpected character -> its offset; unknown variable -> start of the name;
+  unknown function or wrong arity (abs takes 1, min/max take 1+) -> start of the
+  function name; division or modulo by zero -> offset of the `/` or `%` operator;
+  empty program (no statements) -> len(src).
+"""
+
+[[units]]
+id = "calc"
+owns = ["calc/__init__.py", "calc/lexer.py", "calc/parser.py", "calc/evaluator.py"]
+hidden_test = "hidden/test_calc.py"
+
+[budget]
+max_minutes = 15
