@@ -91,7 +91,19 @@ def build_context_metadata(
         lines.append("")
     lines.append("Available helper functions in the REPL:")
     lines.append("  write_file(path: str, content: str) -> str  # Write a file, returns abs path")
-    lines.append("  read_file(path: str) -> str  # Read file contents as string")
+    lines.append(
+        "  read_file(path: str, offset: int | None = None, limit: int | None = None) -> str"
+        "  # Whole file, or a line-numbered slice from line `offset` (1-based)"
+    )
+    lines.append(
+        "  grep(pattern: str, path: str = '.', glob: str | None = None,"
+        " ignore_case: bool = False, context: int = 0, max_results: int = 200) -> str"
+        "  # ripgrep regex search; returns 'file:line: text' lines. Use this to find code"
+    )
+    lines.append(
+        "  glob(pattern: str, path: str = '.') -> list[str]"
+        "  # Files matching e.g. '**/*.py', newest first"
+    )
     lines.append("  run_cmd(cmd: str) -> str  # Run shell command, returns stdout string")
     lines.append("  edit_file(path: str, old: str, new: str) -> bool  # Replace text in file")
     lines.append(
@@ -876,6 +888,8 @@ class RLMModule(dspy.Module):
         repl.namespace["run_cmd"] = _make_run_cmd(repl.namespace, root=root)
         repl.namespace["edit_file"] = _make_edit_file(repl.namespace, root=root)
         repl.namespace["list_files"] = _make_list_files(root=root)
+        repl.namespace["grep"] = _make_grep(repl.namespace, root=root)
+        repl.namespace["glob"] = _make_glob(root=root)
         if root is not None:
             repl.namespace["PROJECT_ROOT"] = root
         repl.namespace["web_search"] = _make_web_search(repl.namespace)
@@ -1164,17 +1178,33 @@ def _make_read_file(
     # Track {abs_path: content_md5} for cache invalidation.
     _read_cache: dict[str, str] = {}
 
-    def read_file(path: str) -> str:
+    def read_file(path: str, offset: int | None = None, limit: int | None = None) -> str:
         """Read and return file contents.
 
-        If the file was already read and hasn't changed, returns a
-        short summary instead of the full content.  The original
-        content is still accessible as a Python variable from a
+        With *offset* (1-based first line) and/or *limit* (line count),
+        returns just that slice with ``cat -n`` style line numbers, which
+        is how to look at part of a large file found via ``grep``.
+
+        Without them, if the file was already read and hasn't changed,
+        returns a short summary instead of the full content.  The
+        original content is still accessible as a Python variable from a
         prior iteration.
         """
         path = _resolve_path(path, root)
-        with open(path) as fh:
+        with open(path, errors="replace") as fh:
             content = fh.read()
+
+        if offset is not None or limit is not None:
+            all_lines = content.splitlines()
+            start = max(1, int(offset or 1))
+            count = max(0, int(limit if limit is not None else _READ_SLICE_DEFAULT))
+            chunk = all_lines[start - 1 : start - 1 + count]
+            ns["state"]["_ops"].append(("read", path, sum(len(x) for x in chunk)))
+            body = "\n".join(f"{start + i:6d}\t{text}" for i, text in enumerate(chunk))
+            end = start + len(chunk) - 1
+            note = f"[{path}: lines {start}-{end} of {len(all_lines)}]"
+            print(note)
+            return f"{note}\n{body}" if body else f"{note}\n(no lines in range)"
 
         content_hash = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()
 
@@ -1333,6 +1363,168 @@ def _make_list_files(
         return sorted(files)
 
     return list_files
+
+
+_READ_SLICE_DEFAULT = 2000
+_GREP_TIMEOUT_S = 30
+_SEARCH_SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv", "venv"})
+
+
+def _make_grep(
+    ns: dict[str, Any],
+    *,
+    root: str | None = None,
+) -> Callable[..., str]:
+    """Create a ``grep`` helper: ripgrep search rooted like the file helpers.
+
+    Uses ``rg`` when installed (respects .gitignore, skips binaries, does
+    not follow symlinks) and a pure-Python fallback otherwise.  Results
+    are ``path:line: text`` with paths relative to the search base,
+    capped at *max_results* lines with an explicit truncation note.
+    Never goes through a shell; the pattern is passed as an argument.
+    """
+    import os as _os
+    import shutil
+    import subprocess as _sp
+
+    def grep(
+        pattern: str,
+        path: str = ".",
+        glob: str | None = None,
+        ignore_case: bool = False,
+        context: int = 0,
+        max_results: int = 200,
+    ) -> str:
+        base = root if root is not None else _os.getcwd()
+        target = _resolve_path(path, root)
+        rel_target = _os.path.relpath(target, base)
+        cap = max(1, int(max_results))
+        ctx = max(0, int(context))
+        rg = shutil.which("rg")
+        if rg:
+            argv = [
+                rg,
+                "--line-number",
+                "--no-heading",
+                "--color",
+                "never",
+                "--max-columns",
+                "400",
+            ]
+            if ignore_case:
+                argv.append("--ignore-case")
+            if ctx:
+                argv += ["--context", str(ctx)]
+            if glob:
+                argv += ["--glob", glob]
+            argv += ["-e", pattern, "--", rel_target]
+            try:
+                proc = _sp.run(
+                    argv, cwd=base, capture_output=True, text=True, timeout=_GREP_TIMEOUT_S
+                )
+            except _sp.TimeoutExpired:
+                return f"[grep timed out after {_GREP_TIMEOUT_S}s; narrow the path or glob]"
+            if proc.returncode == 1:
+                lines: list[str] = []
+            elif proc.returncode != 0:
+                return f"[grep error: {proc.stderr.strip()[:500]}]"
+            else:
+                lines = [ln for ln in proc.stdout.splitlines() if ln != "--"]
+        else:
+            lines = _python_grep(pattern, target, base, glob=glob, ignore_case=ignore_case)
+        ns["state"]["_ops"].append(("grep", pattern, len(lines)))
+        if not lines:
+            return f"No matches for {pattern!r} in {rel_target}"
+        shown = lines[:cap]
+        out = "\n".join(shown)
+        if len(lines) > cap:
+            out += (
+                f"\n[truncated: {len(lines) - cap} more lines;"
+                " narrow path/glob or raise max_results]"
+            )
+        print(f"grep {pattern!r}: {len(lines)} line(s)")
+        return out
+
+    return grep
+
+
+def _python_grep(
+    pattern: str,
+    target: str,
+    base: str,
+    *,
+    glob: str | None,
+    ignore_case: bool,
+) -> list[str]:
+    """Fallback search when ripgrep is not installed (no context lines)."""
+    import fnmatch
+    import os as _os
+    import re
+
+    try:
+        rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    except re.error as exc:
+        return [f"[grep error: invalid regex: {exc}]"]
+    files: list[str] = []
+    if _os.path.isfile(target):
+        files = [target]
+    else:
+        for dirpath, dirs, filenames in _os.walk(target):
+            dirs[:] = [d for d in dirs if d not in _SEARCH_SKIP_DIRS and not d.startswith(".")]
+            files += [_os.path.join(dirpath, f) for f in filenames]
+    out: list[str] = []
+    for fpath in sorted(files):
+        rel = _os.path.relpath(fpath, base)
+        if glob and not (
+            fnmatch.fnmatch(rel, glob) or fnmatch.fnmatch(_os.path.basename(rel), glob)
+        ):
+            continue
+        try:
+            with open(fpath, encoding="utf-8") as fh:
+                for n, line in enumerate(fh, 1):
+                    if rx.search(line):
+                        out.append(f"{rel}:{n}:{line.rstrip()[:400]}")
+        except (UnicodeDecodeError, OSError):
+            continue  # binary or unreadable
+    return out
+
+
+def _make_glob(
+    *,
+    root: str | None = None,
+) -> Callable[..., list[str]]:
+    """Create a ``glob`` helper: files matching a pattern, newest first.
+
+    Patterns are relative (``**/*.py``); absolute patterns and ``..``
+    segments are refused, and with a task root every match must resolve
+    inside it (symlinks pointing out are dropped).
+    """
+    import os as _os
+    from pathlib import Path
+
+    def glob(pattern: str, path: str = ".", max_results: int = 500) -> list[str]:
+        if _os.path.isabs(pattern) or ".." in Path(pattern).parts:
+            raise PathOutsideRootError(f"glob pattern must stay relative: {pattern!r}")
+        base = root if root is not None else _os.getcwd()
+        start = Path(_resolve_path(path, root))
+        found: list[tuple[float, str]] = []
+        for p in start.glob(pattern):
+            if any(part in _SEARCH_SKIP_DIRS for part in p.relative_to(start).parts):
+                continue
+            if not p.is_file():
+                continue
+            real = p.resolve()
+            if root is not None and not real.is_relative_to(root):
+                continue
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            found.append((mtime, _os.path.relpath(p, base)))
+        found.sort(key=lambda t: (-t[0], t[1]))
+        return [f for _, f in found[: max(1, int(max_results))]]
+
+    return glob
 
 
 def _make_search_history(
