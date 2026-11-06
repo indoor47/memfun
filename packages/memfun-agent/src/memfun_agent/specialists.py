@@ -134,6 +134,10 @@ class _SpecialistBase(BaseAgent):
         # a WorktreeManager is configured.  Falls back to the process
         # cwd when not set, preserving existing single-tree semantics.
         task_cwd = payload.get("cwd") or os.getcwd()
+        # Only an explicit payload cwd roots the RLM's REPL helpers.
+        # Without one, the helpers keep resolving against the process
+        # cwd at call time (legacy behaviour).
+        rlm_root: str | None = str(payload["cwd"]) if payload.get("cwd") else None
 
         # Augment context with sub-task specific input files if
         # they weren't already gathered by the shared context pass.
@@ -222,6 +226,7 @@ class _SpecialistBase(BaseAgent):
                 max_iterations=max_iter,
                 verbose=True,
                 enable_planning=False,
+                root=rlm_root,
             ),
             extra_tools=self._extra_tools,
             on_step=_on_step,
