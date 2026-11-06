@@ -1301,11 +1301,21 @@ def test_scan_is_linear_on_adversarial_megabyte(unit: str) -> None:
 
     from memfun_agent.review_findings import scan_json_objects
 
-    text = unit * (1_000_000 // len(unit))
-    start = time.perf_counter()
-    scan_json_objects(text)
-    elapsed = time.perf_counter() - start
-    assert elapsed < 1.0, f"{unit!r} x1MB took {elapsed:.2f}s"
+    def timed(size: int) -> float:
+        text = unit * (size // len(unit))
+        start = time.perf_counter()
+        scan_json_objects(text)
+        return time.perf_counter() - start
+
+    # Linearity, not a wall-clock budget: CI runners are several times
+    # slower than a dev laptop, so an absolute "< 1 s" was flaky
+    # (1.7-2.2 s on GitHub runners, 0.2 s locally).  4x the input must
+    # cost roughly 4x the time; quadratic would be ~16x.
+    small = max(timed(250_000), 1e-4)
+    big = timed(1_000_000)
+    assert big / small < 8.0, f"{unit!r}: 4x input took {big / small:.1f}x the time"
+    # Coarse ceiling: a quadratic scan of 1 MB takes minutes, not seconds.
+    assert big < 15.0, f"{unit!r} x1MB took {big:.2f}s"
 
 
 def test_oversized_answer_is_rejected_fast() -> None:
