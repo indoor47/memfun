@@ -272,21 +272,23 @@ def test_bridge_path_tools_are_rooted(dirs: tuple[Path, Path, Path]) -> None:
     def custom(x: int) -> int:
         return x
 
-    tools = {"grep": fake_grep, "git_status": fake_grep, "custom": custom}
+    # The bridge's "grep" is shadowed by the built-in rooted grep helper
+    # (like read_file/write_file); use other path-scoped bridge tools here.
+    tools = {"glob_files": fake_grep, "git_status": fake_grep, "custom": custom}
     ns = _repl_ns(b, extra_tools=tools)
 
-    assert ns["grep"](pattern="foo") == "ok"
-    assert calls[-1] == {"pattern": "foo", "path": str(b)}
+    assert ns["glob_files"](pattern="*.py") == "ok"
+    assert calls[-1] == {"pattern": "*.py", "path": str(b)}
     ns["git_status"](path="sub")
     assert calls[-1] == {"path": str(b / "sub")}
-    out = ns["grep"](pattern="foo", path=str(c))
-    assert out.startswith("[tool error: grep]")
+    out = ns["glob_files"](pattern="*.py", path=str(c))
+    assert out.startswith("[tool error: glob_files]")
     assert len(calls) == 2
     assert ns["custom"] is custom
 
     # No root -> bridge tools passed through untouched.
     ns_legacy = _repl_ns(None, extra_tools=tools)
-    assert ns_legacy["grep"] is fake_grep
+    assert ns_legacy["glob_files"] is fake_grep
 
 
 # ── (e) real specialist _handle_impl honours payload["cwd"] ───
@@ -458,3 +460,10 @@ async def test_post_process_fix_and_polish_edit_task_cwd(
     # Main tree untouched, no new file there.
     assert {p.name: p.read_text() for p in a.iterdir()} == a_before
     assert str(b / "fix_added.py") in out.files_created
+
+
+def test_builtin_grep_shadows_the_bridge_grep(dirs: tuple[Path, Path, Path]) -> None:
+    # Core search must not depend on the optional MCP gateway.
+    _, b, _ = dirs
+    ns = _repl_ns(b, extra_tools={"grep": lambda **_kw: "bridge"})
+    assert ns["grep"]("nothing-here").startswith("No matches")

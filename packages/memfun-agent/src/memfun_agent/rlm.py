@@ -91,7 +91,19 @@ def build_context_metadata(
         lines.append("")
     lines.append("Available helper functions in the REPL:")
     lines.append("  write_file(path: str, content: str) -> str  # Write a file, returns abs path")
-    lines.append("  read_file(path: str) -> str  # Read file contents as string")
+    lines.append(
+        "  read_file(path: str, offset: int | None = None, limit: int | None = None) -> str"
+        "  # Whole file, or a line-numbered slice from line `offset` (1-based)"
+    )
+    lines.append(
+        "  grep(pattern: str, path: str = '.', glob: str | None = None,"
+        " ignore_case: bool = False, context: int = 0, max_results: int = 200) -> str"
+        "  # ripgrep regex search; returns 'file:line: text' lines. Use this to find code"
+    )
+    lines.append(
+        "  find_files(pattern: str, path: str = '.', max_results: int = 500) -> list[str]"
+        "  # Files matching e.g. '**/*.py', newest first"
+    )
     lines.append("  run_cmd(cmd: str) -> str  # Run shell command, returns stdout string")
     lines.append("  edit_file(path: str, old: str, new: str) -> bool  # Replace text in file")
     lines.append(
@@ -876,6 +888,8 @@ class RLMModule(dspy.Module):
         repl.namespace["run_cmd"] = _make_run_cmd(repl.namespace, root=root)
         repl.namespace["edit_file"] = _make_edit_file(repl.namespace, root=root)
         repl.namespace["list_files"] = _make_list_files(root=root)
+        repl.namespace["grep"] = _make_grep(repl.namespace, root=root)
+        repl.namespace["find_files"] = _make_find_files(repl.namespace, root=root)
         if root is not None:
             repl.namespace["PROJECT_ROOT"] = root
         repl.namespace["web_search"] = _make_web_search(repl.namespace)
@@ -1043,7 +1057,9 @@ def _resolve_path(path: str, root: str | None) -> str:
         candidate = root_path / candidate
     resolved = candidate.resolve()
     if not resolved.is_relative_to(root_path):
-        raise PathOutsideRootError(f"path outside task root: {path!r} -> {resolved} (root={root})")
+        # Don't echo the resolved target: for a symlink it reveals where
+        # outside the root it points.
+        raise PathOutsideRootError(f"path outside task root: {path!r}")
     return str(resolved)
 
 
@@ -1059,10 +1075,10 @@ def _root_extra_tools(
     i.e. the process cwd).  Escapes return a ``[tool error ...]`` string
     in the same shape the bridge uses for failures.
 
-    Known residual gaps (not path arguments, so not rewritten here):
-    ``glob_files``'s ``pattern`` and ``git_diff``'s ``file`` are passed
-    through unchanged and interpreted by the tool relative to ``path``.
-    Tools outside the known set are passed through unwrapped.
+    Non-path arguments (``glob_files``'s ``pattern``, ``grep``'s ``glob``,
+    ``git_diff``'s ``file``) are checked by the bridge itself (absolute and
+    ``..`` patterns rejected) and the filesystem tools bound their matches
+    to the root.  Tools outside the known set are passed through unwrapped.
     """
     wrapped: dict[str, Callable[..., Any]] = {}
     for name, func in tools.items():
@@ -1164,17 +1180,41 @@ def _make_read_file(
     # Track {abs_path: content_md5} for cache invalidation.
     _read_cache: dict[str, str] = {}
 
-    def read_file(path: str) -> str:
+    def read_file(path: str, offset: int | None = None, limit: int | None = None) -> str:
         """Read and return file contents.
 
-        If the file was already read and hasn't changed, returns a
-        short summary instead of the full content.  The original
-        content is still accessible as a Python variable from a
+        With *offset* (1-based first line) and/or *limit* (line count),
+        returns just that slice with ``cat -n`` style line numbers, which
+        is how to look at part of a large file found via ``grep``.
+
+        Without them, if the file was already read and hasn't changed,
+        returns a short summary instead of the full content.  The
+        original content is still accessible as a Python variable from a
         prior iteration.
         """
         path = _resolve_path(path, root)
-        with open(path) as fh:
+        with open(path, errors="replace") as fh:
             content = fh.read()
+
+        if offset is not None or limit is not None:
+            # Count lines exactly like grep (``\\n`` only), so a grep hit's
+            # line number is the line read_file(offset=...) returns.
+            all_lines = content.split("\n")
+            if all_lines and all_lines[-1] == "":
+                all_lines.pop()
+            start = _as_int(offset, 1, low=1, high=10**9)
+            count = _as_int(limit, _READ_SLICE_DEFAULT, low=0, high=10**6)
+            if start > len(all_lines):
+                note = f"[{path}: offset {start} is past the end ({len(all_lines)} lines)]"
+                print(note)
+                return note
+            chunk = all_lines[start - 1 : start - 1 + count]
+            ns["state"]["_ops"].append(("read", path, sum(len(x) for x in chunk)))
+            body = "\n".join(f"{start + i:6d}\t{text}" for i, text in enumerate(chunk))
+            end = start + len(chunk) - 1
+            note = f"[{path}: lines {start}-{end} of {len(all_lines)}]"
+            print(note)
+            return f"{note}\n{body}" if body else f"{note}\n(no lines in range)"
 
         content_hash = hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()
 
@@ -1333,6 +1373,245 @@ def _make_list_files(
         return sorted(files)
 
     return list_files
+
+
+_READ_SLICE_DEFAULT = 2000
+_GREP_TIMEOUT_S = 30
+_SEARCH_SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv", "venv"})
+
+
+def _as_int(value: object, default: int, *, low: int, high: int) -> int:
+    """Clamp an LLM-supplied number; None/garbage falls back to *default*."""
+    try:
+        n = int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        n = default
+    return max(low, min(high, n))
+
+
+def _make_grep(
+    ns: dict[str, Any],
+    *,
+    root: str | None = None,
+) -> Callable[..., str]:
+    """Create a ``grep`` helper: ripgrep search rooted like the file helpers.
+
+    Uses ``rg`` when installed (respects .gitignore, skips binaries, does
+    not follow symlinks) and a pure-Python fallback otherwise.  Results
+    are ``path:line: text`` with paths relative to the search base,
+    capped at *max_results* lines with an explicit truncation note.  rg's
+    output is streamed and the process is stopped once the cap is
+    reached, so a huge result never sits in memory.  Never goes through
+    a shell; the pattern is passed as an argument.
+    """
+    import os as _os
+    import shutil
+    import subprocess as _sp
+    import time as _time
+
+    def grep(
+        pattern: str,
+        path: str = ".",
+        glob: str | None = None,
+        ignore_case: bool = False,
+        context: int = 0,
+        max_results: int = 200,
+    ) -> str:
+        base = root if root is not None else _os.getcwd()
+        target = _resolve_path(path, root)
+        rel_target = _os.path.relpath(target, base)
+        cap = _as_int(max_results, 200, low=1, high=5000)
+        ctx = _as_int(context, 0, low=0, high=20)
+        note = ""
+        rg = shutil.which("rg")
+        if rg:
+            argv = [rg, "--line-number", "--with-filename", "--no-heading", "--color", "never"]
+            argv += ["--max-columns", "400", "--max-columns-preview"]
+            if ignore_case:
+                argv.append("--ignore-case")
+            if ctx:
+                argv += ["--context", str(ctx)]
+            if glob:
+                argv += ["--glob", str(glob)]
+            argv += ["-e", str(pattern)]
+            if rel_target != ".":
+                # Searching "." would print "./"-prefixed paths; omitting the
+                # path makes rg search cwd (= base) with plain relative paths.
+                argv += ["--", rel_target]
+            lines, more, err, code = _stream_capped(argv, base, cap, _sp, _time)
+            if "No files were searched" in err:
+                err, code = "", 1  # empty tree / everything ignored: no matches
+            if code not in (0, 1) and not lines:
+                return f"[grep error: {err.strip()[:500] or f'rg exited {code}'}]"
+            if err.strip() and lines:
+                note = f"\n[some files could not be searched: {err.strip().splitlines()[0][:200]}]"
+        else:
+            all_lines = _python_grep(
+                pattern, target, base, root=root, glob=glob, ignore_case=ignore_case
+            )
+            if all_lines and all_lines[0].startswith("[grep error:"):
+                return all_lines[0]
+            lines, more = all_lines[:cap], max(0, len(all_lines) - cap)
+        ns["state"]["_ops"].append(("grep", pattern, len(lines) + max(more, 0)))
+        if not lines:
+            return f"No matches for {pattern!r} in {rel_target}"
+        out = "\n".join(lines)
+        if more:
+            out += (
+                f"\n[truncated: {more if more > 0 else 'more'} more lines;"
+                " narrow path/glob or raise max_results]"
+            )
+        print(f"grep {pattern!r}: {len(lines)} line(s) shown")
+        return out + note
+
+    return grep
+
+
+def _stream_capped(
+    argv: list[str], cwd: str, cap: int, _sp: Any, _time: Any
+) -> tuple[list[str], int, str, int]:
+    """Run *argv*, keep at most *cap* output lines, stop the process after.
+
+    Returns ``(lines, more, stderr, returncode)`` where ``more`` is ``-1``
+    when the process was stopped early (count unknown) and the number of
+    dropped lines otherwise.  Undecodable bytes are replaced, never fatal.
+    """
+    proc = _sp.Popen(
+        argv,
+        cwd=cwd,
+        stdout=_sp.PIPE,
+        stderr=_sp.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    deadline = _time.monotonic() + _GREP_TIMEOUT_S
+    lines: list[str] = []
+    more = 0
+    assert proc.stdout is not None
+    for raw in proc.stdout:
+        line = raw.rstrip("\n")
+        if line == "--":
+            continue
+        if len(lines) < cap:
+            lines.append(line)
+        else:
+            more = -1  # stop early; exact remainder unknown
+            break
+        if _time.monotonic() > deadline:
+            more = -1
+            break
+    if more == -1:
+        proc.kill()
+    try:
+        _, err = proc.communicate(timeout=5)
+    except _sp.TimeoutExpired:
+        proc.kill()
+        _, err = proc.communicate()
+    return lines, more, err or "", proc.returncode if more != -1 else 0
+
+
+def _python_grep(
+    pattern: str,
+    target: str,
+    base: str,
+    *,
+    root: str | None,
+    glob: str | None,
+    ignore_case: bool,
+) -> list[str]:
+    """Fallback search when ripgrep is not installed (no context lines).
+
+    Like rg it does not follow symlinks; with a task root, anything that
+    resolves outside it is skipped.  Undecodable bytes are replaced.
+    """
+    import fnmatch
+    import os as _os
+    import re
+    from pathlib import Path
+
+    try:
+        rx = re.compile(str(pattern), re.IGNORECASE if ignore_case else 0)
+    except re.error as exc:
+        return [f"[grep error: invalid regex: {exc}]"]
+    files: list[str] = []
+    if _os.path.isfile(target):
+        files = [target]
+    else:
+        for dirpath, dirs, filenames in _os.walk(target):
+            dirs[:] = [d for d in dirs if d not in _SEARCH_SKIP_DIRS and not d.startswith(".")]
+            files += [_os.path.join(dirpath, f) for f in filenames if not f.startswith(".")]
+    out: list[str] = []
+    for fpath in sorted(files):
+        if _os.path.islink(fpath):
+            continue
+        if root is not None and not Path(fpath).resolve().is_relative_to(root):
+            continue
+        rel = _os.path.relpath(fpath, base)
+        if glob and not (
+            fnmatch.fnmatch(rel, glob) or fnmatch.fnmatch(_os.path.basename(rel), glob)
+        ):
+            continue
+        try:
+            with open(fpath, "rb") as fh:
+                head = fh.read(8192)
+                if b"\0" in head:
+                    continue  # binary, like rg
+                fh.seek(0)
+                text = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        for n, line in enumerate(text.split("\n"), 1):
+            if rx.search(line):
+                out.append(f"{rel}:{n}:{line.rstrip()[:400]}")
+    return out
+
+
+def _make_find_files(
+    ns: dict[str, Any],
+    *,
+    root: str | None = None,
+) -> Callable[..., list[str]]:
+    """Create a ``find_files`` helper (Claude Code's Glob): newest first.
+
+    Named ``find_files`` rather than ``glob`` so it can't clash with the
+    stdlib ``glob`` module inside the REPL.  Patterns are relative
+    (``**/*.py``); absolute patterns and ``..`` segments are refused, and
+    with a task root every match must resolve inside it (symlinks
+    pointing out are dropped).
+    """
+    import os as _os
+    from pathlib import Path
+
+    def find_files(pattern: str, path: str = ".", max_results: int = 500) -> list[str]:
+        pattern = str(pattern or "").strip()
+        if not pattern:
+            return []
+        if _os.path.isabs(pattern) or ".." in Path(pattern).parts:
+            raise PathOutsideRootError(f"pattern must stay relative: {pattern!r}")
+        cap = _as_int(max_results, 500, low=1, high=10000)
+        base = root if root is not None else _os.getcwd()
+        start = Path(_resolve_path(path, root))
+        found: list[tuple[float, str]] = []
+        for p in start.glob(pattern):
+            if any(part in _SEARCH_SKIP_DIRS for part in p.relative_to(start).parts):
+                continue
+            if not p.is_file():
+                continue
+            real = p.resolve()
+            if root is not None and not real.is_relative_to(root):
+                continue
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            found.append((mtime, _os.path.relpath(p, base)))
+        found.sort(key=lambda t: (-t[0], t[1]))
+        result = [f for _, f in found[:cap]]
+        ns["state"]["_ops"].append(("find_files", pattern, len(result)))
+        return result
+
+    return find_files
 
 
 def _make_search_history(
