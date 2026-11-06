@@ -8,17 +8,21 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tomllib
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
-from evals.swarm import commit0_adapter as c0
-from evals.swarm import run_smoke as rs
-from evals.swarm import validate_bundles as vb
+# Same as the other run_smoke tests: ``evals`` is not an installed package, so put the
+# repo root on sys.path (CI runs from a checkout where it is not importable).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-if TYPE_CHECKING:
-    from pathlib import Path
+from evals.swarm import commit0_adapter as c0  # noqa: E402
+from evals.swarm import run_smoke as rs  # noqa: E402
+from evals.swarm import validate_bundles as vb  # noqa: E402
 
 _ENV = {
     **os.environ,
