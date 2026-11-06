@@ -90,6 +90,61 @@ def _worktree(repo: Path, tid: str) -> Path:
     return wt
 
 
+def _fake_ops(n: int, owns: list[str]) -> list[dict[str, str]]:
+    """Deterministic ops for sub-task ``n``: grep on even n, find_files on n == 0."""
+    ops: list[dict[str, str]] = []
+    if n % 2 == 0:
+        ops.append({"type": "grep", "target": "def ", "detail": "3"})
+    if n == 0:
+        ops.append({"type": "find_files", "target": "*.py", "detail": "5"})
+    ops.append({"type": "read", "target": "README", "detail": "10"})
+    for rel in owns:
+        ops.append({"type": "read", "target": rel, "detail": "100"})
+        ops.append({"type": "write", "target": rel, "detail": "200"})
+    return ops
+
+
+def _write_result(result_mode: str, groups: list[list[int]], units: list[Any]) -> None:
+    """Write $MEMFUN_SWARM_RESULT_JSON like memfun swarm does (O_EXCL, no-follow)."""
+    target = os.environ.get("MEMFUN_SWARM_RESULT_JSON")
+    if not target or result_mode == "none":
+        return
+    path = Path(target)
+    sub_tasks: dict[str, Any] = {}
+    totals: dict[str, int] = {}
+    for n, idxs in enumerate(groups):
+        ops = _fake_ops(n, [rel for i in idxs for rel in units[i]["owns"]])
+        for op in ops:
+            totals[op["type"]] = totals.get(op["type"], 0) + 1
+        sub_tasks[f"T{n + 1}"] = {
+            "agent": "coder-agent",
+            "status": "completed",
+            "success": True,
+            "error": None,
+            "iterations": 3,
+            "ops": ops,
+            "ops_count": len(ops),
+            "truncated": False,
+        }
+    doc: dict[str, Any] = {
+        "schema_version": 2 if result_mode == "schema2" else 1,
+        "workflow_id": WF, "success": True, "error": None, "unaccepted_tasks": [],
+        "review_errors": 0, "review_rounds": 1, "files_created": [],
+        "decomposition": {"n_sub_tasks": len(groups), "is_single_task": len(groups) == 1,
+                          "groups": [[f"T{n + 1}" for n in range(len(groups))]]},
+        "sub_tasks": sub_tasks, "ops_total": totals, "wall_seconds": 1.0,
+    }  # fmt: skip
+    if result_mode == "symlink":  # an agent planting a forged file behind a symlink
+        forged = path.parent / "home" / "forged.json"
+        forged.write_text(json.dumps(doc))
+        path.symlink_to(forged)
+        return
+    data = "{not json" if result_mode == "invalid" else json.dumps(doc)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(data)
+
+
 def swarm(args: argparse.Namespace, rest: list[str]) -> int:
     state = Path(args.state)
     repo = Path.cwd()
@@ -213,6 +268,8 @@ def swarm(args: argparse.Namespace, rest: list[str]) -> int:
                      workflow_id=WF, project=project, success=True)  # fmt: skip
         if mode in ("server_error", "server_error_recovered"):
             print("ERROR litellm.APIConnectionError: Connection refused")
+        result_mode = dict(m.split("=", 1) for m in args.result_mode).get(bundle_id, "normal")
+        _write_result(result_mode, groups, units)
         print("Swarm result\nsuccess True", flush=True)
         return 0
     finally:
@@ -259,6 +316,7 @@ def main() -> int:
     ap.add_argument("--bundle-mode", action="append", default=[])
     ap.add_argument("--hold", type=float, default=0.0)
     ap.add_argument("--dash-delay", type=float, default=0.0)
+    ap.add_argument("--result-mode", action="append", default=[])
     ap.add_argument("command")
     args, rest = ap.parse_known_args()
     Path(args.state).mkdir(parents=True, exist_ok=True)

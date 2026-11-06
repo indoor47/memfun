@@ -91,10 +91,17 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def _fake_cmd(state: Path, modes: dict[str, str] | None = None, hold: float = 0.0) -> str:
+def _fake_cmd(
+    state: Path,
+    modes: dict[str, str] | None = None,
+    hold: float = 0.0,
+    result_modes: dict[str, str] | None = None,
+) -> str:
     cmd = [sys.executable, str(FAKE), "--state", str(state), "--bundles-root", str(SMOKE)]
     for bundle, mode in (modes or {}).items():
         cmd += ["--bundle-mode", f"{bundle}={mode}"]
+    for bundle, mode in (result_modes or {}).items():
+        cmd += ["--result-mode", f"{bundle}={mode}"]
     if hold:
         cmd += ["--hold", str(hold)]
     return shlex.join(cmd)
@@ -108,6 +115,7 @@ def _run(
     modes: dict[str, str] | None = None,
     hold: float = 0.0,
     dashboard: bool = False,
+    result_modes: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, Any], Path]:
     state = tmp_path / "state"
     argv = [
@@ -116,7 +124,7 @@ def _run(
         "--bundles",
         *bundles,
         "--memfun-cmd",
-        _fake_cmd(state, modes, hold),
+        _fake_cmd(state, modes, hold, result_modes),
         "--out-dir",
         str(tmp_path / "runs"),
         "--run-id",
@@ -438,7 +446,8 @@ def test_parallel_tasks_bound_and_clean_child_env(
     assert results["overall"]["outcomes"]["pass"] == 4
 
     allowed = {*rs.ENV_ALLOW, "HOME", rs.DUMMY_KEY_ENV, "PYTHONUNBUFFERED", "COLUMNS",
-               "GIT_CONFIG_NOSYSTEM", "__CF_USER_TEXT_ENCODING", "LC_CTYPE"}  # fmt: skip
+               "GIT_CONFIG_NOSYSTEM", "__CF_USER_TEXT_ENCODING", "LC_CTYPE",
+               rs.SWARM_RESULT_ENV}  # fmt: skip
     for trial in range(1, 5):
         call = json.loads((state / "calls" / f"formats-2-t{trial}.json").read_text())
         env = call["env"]
@@ -1142,3 +1151,73 @@ def test_episode_repo_is_its_own_pytest_rootdir(
     )  # fmt: skip
     assert f"rootdir: {repo.resolve()}" in proc.stdout or f"rootdir: {repo}" in proc.stdout
     assert "configfile: pytest.ini" in proc.stdout
+
+
+# ── tool usage from the swarm's result file ───────────────────────────────────
+
+
+def test_tool_usage_counts_from_the_swarm_result_file(
+    tmp_path: Path, models_server: tuple[str, type[_Models]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    base_url, _ = models_server
+    _, results, state = _run(tmp_path, base_url, ["textkit-3", "minicli-3"],
+                             "--parallel-tasks", "2", modes={"minicli-3": "single"})  # fmt: skip
+    call = json.loads((state / "calls" / "textkit-3-t1.json").read_text())
+    ep_dir = tmp_path / "runs" / "r1" / "textkit-3" / "1"
+    assert call["env"][rs.SWARM_RESULT_ENV] == str(ep_dir / rs.SWARM_RESULT_NAME)
+    eps = _episodes(results)
+    tk = eps["textkit-3"]
+    assert tk["tool_usage_source"] == "swarm-result.json"
+    tu = tk["tool_usage"]
+    # T1: grep find read read write | T2: read read write | T3: grep read read write
+    assert tu["counts"] == {"grep": 2, "find_files": 1, "read": 6, "write": 3}
+    assert tu["sub_tasks"]["T1"]["counts"] == {"grep": 1, "find_files": 1, "read": 2,
+                                               "write": 1}  # fmt: skip
+    assert tu["used_search_tools"] is True and tu["sub_tasks_used_search"] == 2
+    assert tk["n_sub_tasks"] == 3 and tk["agents_used"] == 3 and tk["unaccepted_tasks"] == []
+    assert tk["produced_result"] is True
+    mc = eps["minicli-3"]
+    assert mc["n_sub_tasks"] == 1 and "decomposition_fallback" in mc["flags"]
+    block = results["bundles"]["textkit-3"]["tool_usage"]
+    assert block["episodes_with_data"] == 1 and block["mean_counts"]["read"] == 6.0
+    assert block["episodes_used_search"] == 1.0
+    assert block["sub_tasks_used_search"] == round(2 / 3, 4)
+    overall = results["overall"]["tool_usage"]
+    assert overall["sub_tasks_used_search"] == round(3 / 4, 4)  # minicli's single T1 searched
+    out = capsys.readouterr().out
+    assert "tool usage" in out and "textkit-3      grep 2 find 1 read 6" in out
+
+
+@pytest.mark.parametrize(
+    ("result_mode", "problem"),
+    [
+        ("none", "missing"),
+        ("symlink", "symlink"),
+        ("invalid", "not JSON"),
+        ("schema2", "unsupported schema_version 2"),
+    ],
+)
+def test_missing_or_untrusted_result_file_falls_back(
+    tmp_path: Path, models_server: tuple[str, type[_Models]], result_mode: str, problem: str
+) -> None:
+    base_url, _ = models_server
+    _, results, _ = _run(
+        tmp_path, base_url, ["textkit-3"], result_modes={"textkit-3": result_mode}
+    )
+    ep = results["episodes"][0]
+    assert ep["tool_usage_source"] == "unavailable"
+    assert problem in ep["tool_usage"]["problem"]
+    assert ep["outcome"] == "pass"  # the fallback (log + events) still works
+    assert ep["n_sub_tasks"] == 3 and ep["agents_used"] == 3  # from events
+    assert ep["produced_result"] is True  # from the log marker
+    assert results["bundles"]["textkit-3"]["tool_usage"]["episodes_without_data"] == 1
+
+
+def test_result_file_with_a_foreign_workflow_id_is_ignored(tmp_path: Path) -> None:
+    (tmp_path / rs.SWARM_RESULT_NAME).write_text(
+        json.dumps({"schema_version": 1, "workflow_id": "wf-other", "sub_tasks": {}})
+    )
+    doc, problem = rs.load_swarm_result(tmp_path, ["wf-fake01"])
+    assert doc is None and "not in the episode's events" in problem
+    doc, problem = rs.load_swarm_result(tmp_path, [])
+    assert doc is not None and problem == ""

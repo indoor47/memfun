@@ -184,6 +184,30 @@ reads that table **read-only** and computes:
 - `primary_sub_tasks`: sub-tasks that are not derived from another one, so revisions,
   pair re-dispatches and reviews do not count.
 
+### Tool usage and sub-task counts (from the swarm's own result file)
+
+The runner sets `MEMFUN_SWARM_RESULT_JSON=<ep_dir>/swarm-result.json` for each swarm.
+`memfun swarm` writes that file after the run (also when it fails) with the decomposition,
+per-sub-task agent/status/success/iterations and the ops the RLM helpers recorded
+(`grep`, `find_files`, `read`, `edit`, `write`, `cmd`, `web_search`, `web_fetch`). It is
+the **primary** source for `n_sub_tasks`, `agents_used` (one agent instance per sub-task;
+instance ids are not recorded), `unaccepted_tasks`, per-sub-task success, and
+`tool_usage`:
+
+- per episode and per sub-task: `counts` by op type, `used_search_tools` (at least one
+  `grep` or `find_files`), `sub_tasks_used_search`; `read` counts full and ranged reads
+  together (the op does not distinguish them);
+- per bundle and overall: `tool_usage.mean_counts`, `episodes_used_search`,
+  `sub_tasks_used_search`, `mean_sub_tasks`, and how many episodes had data.
+
+It also replaces parsing the Rich "Swarm result" panel to tell that the swarm finished
+(the log marker is the fallback). The file is read with no symlink following and must be a
+JSON object with `schema_version` 1, a `sub_tasks` object and a workflow id matching the
+episode's events. A missing, symlinked, invalid or mismatched file gives
+`tool_usage_source: "unavailable"` (reason in `tool_usage.problem`), and the counts fall
+back to the event bus (`primary_sub_tasks`, `agents_used`). Like the event DB this is
+telemetry an unconfined agent could forge; it is never used for grading.
+
 Flags (recorded, not a pass/fail reason by themselves):
 
 - `decomposition_fallback`: a fan-out bundle ran as one sub-task or none (a serial
@@ -269,13 +293,18 @@ server_usage: {available, prompt?, completion?} | null,
 void, void_threshold,
 overall / bundles.<id>: {episodes, outcomes{pass,partial,model_failure,harness_error},
     episode_pass_rate, unit_pass_rate, harness_error_rate, tokens{prompt,completion},
-    wall_s_mean, agents_used_max, peak_concurrency, flags[]},
+    wall_s_mean, agents_used_max, peak_concurrency, flags[],
+    tool_usage{episodes_with_data, episodes_without_data, mean_counts, episodes_used_search,
+               sub_tasks_used_search, mean_sub_tasks}},
 units."<bundle>/<unit>": {graded, passed, no_output, pass_rate},
 harness_errors[]: {episode, reason, log_tail},
 episodes[]: the episode.json records:
     bundle, kind, trial, episode, dir, repo, started_at, wall_s, outcome, reason, flags[],
     warnings[], returncode, timed_out, produced_result, server_errors, server_error_lines[],
     log_tail, dashboard{forwarded, post_errors},
+    n_sub_tasks, agents_used, unaccepted_tasks, tool_usage_source,
+    tool_usage{source, problem?, counts, used_search_tools, sub_tasks_used_search,
+               n_sub_tasks, agents_used, agent_types, sub_tasks.<tid>{counts, ...}},
     collection{worktrees[], files.<path>{source, changed_in[], duplicate, tampered},
                units.<id>{...}, tampering[], stray_changes[], tests_modified},
     grade{hidden_passed, hidden_failed,

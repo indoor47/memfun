@@ -120,6 +120,13 @@ MAX_PARALLEL = 64
 MAX_TRIALS = 1000
 GRADE_WORKERS = 4
 LOOPBACK_NAMES = frozenset({"localhost"})
+#: memfun_cli.commands.swarm.RESULT_JSON_ENV and its schema (the swarm's own result file).
+SWARM_RESULT_ENV = "MEMFUN_SWARM_RESULT_JSON"
+SWARM_RESULT_SCHEMA = 1
+SWARM_RESULT_NAME = "swarm-result.json"
+MAX_SWARM_RESULT_BYTES = 20_000_000
+TOOL_TYPES = ("grep", "find_files", "read", "edit", "write", "cmd", "web_search", "web_fetch")
+SEARCH_TOOLS = ("grep", "find_files")
 
 
 class UsageError(Exception):
@@ -458,7 +465,9 @@ def archive_dir(src: Path, ep_dir: Path, name: str) -> str:
 # ── Child environment and process groups ─────────────────────────────────────────
 
 
-def child_env(home: Path, base: Mapping[str, str] | None = None) -> dict[str, str]:
+def child_env(
+    home: Path, base: Mapping[str, str] | None = None, result_json: Path | None = None
+) -> dict[str, str]:
     """Clean allowlist env for ``memfun swarm``: no real credentials, a throwaway HOME.
 
     HOME points at the episode's own directory so ``~/.memfun/credentials.json`` and
@@ -472,6 +481,8 @@ def child_env(home: Path, base: Mapping[str, str] | None = None) -> dict[str, st
     env["PYTHONUNBUFFERED"] = "1"
     env["COLUMNS"] = "160"
     env["GIT_CONFIG_NOSYSTEM"] = "1"
+    if result_json is not None:
+        env[SWARM_RESULT_ENV] = str(result_json)
     return env
 
 
@@ -1065,6 +1076,103 @@ def event_metrics(events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# ── The swarm's own result file (MEMFUN_SWARM_RESULT_JSON) ─────────────────────
+
+
+def _op_counts(ops: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for op in cast("list[Any]", ops if isinstance(ops, list) else []):
+        typ = cast("dict[str, Any]", op).get("type") if isinstance(op, dict) else None
+        if isinstance(typ, str) and typ:
+            counts[typ] = counts.get(typ, 0) + 1
+    return counts
+
+
+def load_swarm_result(ep_dir: Path, workflow_ids: list[str]) -> tuple[dict[str, Any] | None, str]:
+    """Read and validate the swarm's result file.  ``(doc, "")`` or ``(None, problem)``.
+
+    Read with no symlink following; it must be a JSON object with the expected schema
+    version, a ``sub_tasks`` object, and a workflow id consistent with the episode's
+    event bus (when both are known).  Anything else is "unavailable" and the runner
+    falls back to the log and events.  NOTE: unconfined agent code could forge it, like
+    the event DB; it is telemetry, never used for grading.
+    """
+    probe = safe_read(ep_dir, SWARM_RESULT_NAME, MAX_SWARM_RESULT_BYTES)
+    if probe.problem:
+        return None, f"{SWARM_RESULT_NAME}: {probe.problem}"
+    if probe.data is None:
+        return None, f"{SWARM_RESULT_NAME} missing"
+    try:
+        doc = json.loads(probe.data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return None, f"{SWARM_RESULT_NAME} is not JSON: {exc}"
+    if not isinstance(doc, dict):
+        return None, f"{SWARM_RESULT_NAME} is not a JSON object"
+    d = cast("dict[str, Any]", doc)
+    if d.get("schema_version") != SWARM_RESULT_SCHEMA:
+        return None, f"unsupported schema_version {d.get('schema_version')!r}"
+    if not isinstance(d.get("sub_tasks"), dict):
+        return None, "sub_tasks missing"
+    wf = d.get("workflow_id")
+    if wf and workflow_ids and wf not in workflow_ids:
+        return None, f"workflow_id {wf!r} not in the episode's events {workflow_ids}"
+    return d, ""
+
+
+def tool_usage(doc: dict[str, Any] | None, problem: str = "") -> dict[str, Any]:
+    """Per-episode and per-sub-task tool counts from the swarm's result file."""
+    if doc is None:
+        return {"source": "unavailable", "problem": problem}
+    subs = cast("dict[str, Any]", doc["sub_tasks"])
+    per_task: dict[str, Any] = {}
+    for tid, raw in sorted(subs.items()):
+        st = cast("dict[str, Any]", raw) if isinstance(raw, dict) else {}
+        counts = _op_counts(st.get("ops"))
+        per_task[tid] = {
+            "agent": st.get("agent"),
+            "status": st.get("status"),
+            "success": st.get("success"),
+            "iterations": st.get("iterations"),
+            "counts": counts,
+            "truncated": bool(st.get("truncated")),
+            "used_search_tools": any(counts.get(t, 0) for t in SEARCH_TOOLS),
+        }
+    totals: dict[str, int] = {}
+    raw_totals = doc.get("ops_total")
+    if isinstance(raw_totals, dict):
+        for k, v in cast("dict[str, Any]", raw_totals).items():
+            if isinstance(v, int) and not isinstance(v, bool):
+                totals[str(k)] = v
+    else:
+        for t in per_task.values():
+            for k, v in t["counts"].items():
+                totals[k] = totals.get(k, 0) + v
+    decomposition = doc.get("decomposition")
+    n_sub = (
+        cast("dict[str, Any]", decomposition).get("n_sub_tasks")
+        if isinstance(decomposition, dict)
+        else None
+    )
+    agents = {t["agent"] for t in per_task.values() if t["agent"]}
+    unaccepted = doc.get("unaccepted_tasks")
+    return {
+        "source": SWARM_RESULT_NAME,
+        "workflow_id": doc.get("workflow_id"),
+        "success": doc.get("success"),
+        "n_sub_tasks": n_sub if isinstance(n_sub, int) else len(per_task),
+        # Distinct agent instance ids are not in the file: one instance per sub-task.
+        "agents_used": len(per_task),
+        "agent_types": sorted(str(a) for a in agents),
+        "unaccepted_tasks": list(cast("list[Any]", unaccepted))
+        if isinstance(unaccepted, list)
+        else [],
+        "counts": totals,
+        "used_search_tools": any(totals.get(t, 0) for t in SEARCH_TOOLS),
+        "sub_tasks_used_search": sum(1 for t in per_task.values() if t["used_search_tools"]),
+        "sub_tasks": per_task,
+    }
+
+
 # ── Logs ─────────────────────────────────────────────────────────────────────────
 
 
@@ -1356,10 +1464,11 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
             forwarder.start()
 
         cmd = swarm_cmd(ctx.memfun_cmd, episode_spec(bundle), ctx.max_agents, ctx.task_timeout)
+        result_json = plan.ep_dir / SWARM_RESULT_NAME  # must not exist yet: memfun uses O_EXCL
         proc = run_in_group(
             cmd,
             cwd=plan.repo,
-            env=child_env(plan.home),
+            env=child_env(plan.home, result_json=result_json),
             log_path=log_path,
             timeout=ctx.episode_timeout,
             grace=ctx.kill_grace,
@@ -1388,17 +1497,29 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
         server_errors = signals["server_error_line_count"] + metrics["llm_server_error_count"]
         rec["server_errors"] = server_errors
         rec["server_error_lines"] = signals["server_error_lines"]
-        rec["produced_result"] = signals["produced_result"]
+        swarm_doc, swarm_problem = load_swarm_result(plan.ep_dir, metrics["workflow_ids"])
+        usage = tool_usage(swarm_doc, swarm_problem)
+        rec["tool_usage"] = usage
+        rec["tool_usage_source"] = usage["source"]
+        # The result file is the primary signal that memfun swarm finished; the Rich
+        # "Swarm result" panel text is only the fallback.
+        rec["produced_result"] = swarm_doc is not None or signals["produced_result"]
+        signals["produced_result"] = rec["produced_result"]
+        if swarm_doc is not None:
+            rec["n_sub_tasks"] = usage["n_sub_tasks"]
+            rec["agents_used"] = usage["agents_used"]
+            rec["unaccepted_tasks"] = usage["unaccepted_tasks"]
+        else:
+            rec["n_sub_tasks"] = metrics["primary_sub_tasks"]
+            rec["agents_used"] = metrics["agents_used"]
+            rec["unaccepted_tasks"] = None
 
         collected_dir = private / "collected"
         collected_dir.mkdir()
         collected = collect_owned(bundle, plan.repo, collected_dir)
         rec["collection"] = collected
         flags: list[str] = rec["flags"]
-        if (
-            bundle.kind == "fanout"
-            and max(metrics["primary_sub_tasks"], len(collected["worktrees"])) <= 1
-        ):
+        if bundle.kind == "fanout" and max(rec["n_sub_tasks"], len(collected["worktrees"])) <= 1:
             flags.append("decomposition_fallback")
         if any(u["duplicate_work"] for u in collected["units"].values()):
             flags.append("duplicate_work")
@@ -1500,6 +1621,30 @@ def _units_of(episode: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return cast("dict[str, dict[str, Any]]", episode.get("units") or {})
 
 
+def _tool_block(eps: list[dict[str, Any]]) -> dict[str, Any]:
+    """Mean tool counts per episode and search-tool use, over episodes with the file."""
+    usages = [
+        cast("dict[str, Any]", e["tool_usage"])
+        for e in eps
+        if isinstance(e.get("tool_usage"), dict) and e["tool_usage"].get("source") != "unavailable"
+    ]
+    n = len(usages)
+    types = sorted({k for u in usages for k in u["counts"]} | set(TOOL_TYPES))
+    sub_total = sum(len(u["sub_tasks"]) for u in usages)
+    return {
+        "episodes_with_data": n,
+        "episodes_without_data": sum(
+            1 for e in eps if e.get("tool_usage_source") == "unavailable"
+        ),
+        "mean_counts": {t: round(sum(u["counts"].get(t, 0) for u in usages) / n, 3) for t in types}
+        if n
+        else {},
+        "episodes_used_search": _rate(sum(1 for u in usages if u["used_search_tools"]), n),
+        "sub_tasks_used_search": _rate(sum(u["sub_tasks_used_search"] for u in usages), sub_total),
+        "mean_sub_tasks": round(sum(u["n_sub_tasks"] for u in usages) / n, 3) if n else None,
+    }
+
+
 def aggregate(episodes: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]:
     def counts(eps: list[dict[str, Any]]) -> dict[str, int]:
         return {o: sum(1 for e in eps if e.get("outcome") == o) for o in OUTCOMES}
@@ -1525,6 +1670,7 @@ def aggregate(episodes: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str,
             "agents_used_max": max((m["agents_used"] for m in mets), default=0),
             "peak_concurrency": max((m["peak_concurrency"] for m in mets), default=0),
             "flags": sorted({f for e in eps for f in e.get("flags", [])}),
+            "tool_usage": _tool_block(eps),
         }
 
     by_bundle: dict[str, list[dict[str, Any]]] = {}
@@ -1598,6 +1744,22 @@ def summary_table(results: dict[str, Any]) -> str:
         f"harness_error={o['harness_error']}  (ep% and unit% exclude harness errors; "
         "harness rate is over ALL episodes)"
     )
+    rows.append("")
+    rows.append("tool usage (mean per episode; search = grep/find_files):")
+    for name, b in [*results["bundles"].items(), ("ALL", results["overall"])]:
+        tu = b["tool_usage"]
+        if not tu["episodes_with_data"]:
+            rows.append(f"  {name:<14} no data ({tu['episodes_without_data']} unavailable)")
+            continue
+        mc = tu["mean_counts"]
+        rows.append(
+            f"  {name:<14} grep {mc.get('grep', 0):g} find {mc.get('find_files', 0):g} "
+            f"read {mc.get('read', 0):g} edit {mc.get('edit', 0):g} "
+            f"write {mc.get('write', 0):g} cmd {mc.get('cmd', 0):g} | sub-tasks "
+            f"{tu['mean_sub_tasks']:g} | search: eps {_pct(tu['episodes_used_search'])} "
+            f"sub-tasks {_pct(tu['sub_tasks_used_search'])} "
+            f"(data {tu['episodes_with_data']}/{b['episodes']})"
+        )
     rows.append("")
     rows.append("units (graded episodes only):")
     for uid, u in results["units"].items():
