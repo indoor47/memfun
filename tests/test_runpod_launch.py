@@ -2107,7 +2107,7 @@ def test_launch_pod_wrapper_knows_every_kit_subcommand() -> None:
 @pytest.fixture(autouse=True)
 def _reset_termination_state() -> Iterator[None]:
     def reset() -> None:
-        for name in ("VERIFIED_GONE", "LAST_STATUS"):
+        for name in ("VERIFIED_GONE", "LAST_STATUS", "_ABSENT_SINCE", "_BUDGET"):
             state = getattr(kit, name, None)
             if state is not None:
                 state.clear()
@@ -2577,3 +2577,185 @@ def test_boot_refuses_names_starting_with_dash(tmp_path: Path) -> None:
     assert "invalid MEMFUN_MODEL_REVISION" in log and py == []
     log, _rp, py = _run_boot(tmp_path, {"MEMFUN_MODEL_REPO": "Qwen/-x"})
     assert "invalid MEMFUN_MODEL_REPO" in log and py == []
+
+
+# ---------------------------------------------------------------------------
+# Audit round 2, kit: deploy window, termination budget, strict gone semantics.
+# ---------------------------------------------------------------------------
+
+
+def _deploy_then_raise(fake: FakeRunPod, exc: BaseException) -> None:
+    orig = fake.graphql
+
+    def graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        out = orig(query, variables)
+        if "podFindAndDeployOnDemand" in query:
+            raise exc  # RunPod created the pod, then the signal hit
+        return out
+
+    fake.graphql = graphql  # type: ignore[method-assign]
+
+
+def test_sighup_in_deploy_with_dead_stderr_still_terminates(
+    monkeypatch: pytest.MonkeyPatch, pubkey: str
+) -> None:
+    import errno
+
+    fake = FakeRunPod()
+    _deploy_then_raise(fake, kit.TerminateRequestedError("signal 1"))
+    real_emit = kit.emit
+
+    def emit(message: str = "", *, err: bool = False) -> None:
+        if err:
+            raise OSError(errno.EIO, "stderr closed")
+        real_emit(message)
+
+    monkeypatch.setattr(kit, "emit", emit)
+    with contextlib.suppress(BaseException):
+        _real_launch(fake, pubkey)
+    assert "terminate" in fake.mutations and fake.pods == {}
+
+
+def test_ctrl_c_in_deploy_then_ctrl_c_in_lookup_still_terminates(pubkey: str) -> None:
+    fake = FakeRunPod()
+    _deploy_then_raise(fake, KeyboardInterrupt())
+    inner = fake.graphql
+    hit = {"n": 0}
+
+    def graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        if "myself { pods" in query and hit["n"] == 0:
+            hit["n"] = 1
+            raise KeyboardInterrupt()  # second Ctrl-C during the by-name lookup
+        return inner(query, variables)
+
+    fake.graphql = graphql  # type: ignore[method-assign]
+    with contextlib.suppress(BaseException):
+        _real_launch(fake, pubkey)
+    assert "terminate" in fake.mutations and fake.pods == {}
+
+
+class SlowFailingTransport:
+    """Every call costs 30 s of FAKE time, then fails."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+        self.calls = 0
+
+    def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.calls += 1
+        self.clock.t += 30.0
+        raise kit.KitError(f"RunPod request failed: TimeoutError (auth {FAKE_KEY})")
+
+    def rest(self, *_a: Any, **_k: Any) -> Any:
+        raise AssertionError("no REST")
+
+
+def test_termination_has_one_shared_bounded_budget(capsys: pytest.CaptureFixture[str]) -> None:
+    clock = FakeClock()
+    t = SlowFailingTransport(clock)
+    t0 = clock.t
+    called, gone = kit.terminate_guarded(t, "pod1", sleep=clock.sleep, clock=clock)
+    assert not called and not gone
+    assert clock.t - t0 <= kit.TERM_BUDGET_SECONDS + 30 + 10  # one call + one sleep overrun
+    n = t.calls
+    called, gone = kit.terminate_guarded(t, "pod1", sleep=clock.sleep, clock=clock)  # net
+    assert t.calls == n and not gone  # the shared budget is spent: no further calls
+    cap = capsys.readouterr()
+    assert "COULD NOT VERIFY POD pod1" in cap.err and "terminate --pod-id pod1 --yes" in cap.err
+    _assert_clean(cap.out + cap.err, FAKE_KEY)
+
+
+def test_launch_with_failing_api_after_deploy_ends_within_budget(pubkey: str) -> None:
+    fake = FakeRunPod()
+    clock = FakeClock()
+    orig = fake.graphql
+
+    def graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        if fake.deployed:  # after the pod exists, every call is slow and fails
+            clock.t += 30.0
+            raise kit.KitError("RunPod HTTP 503: unavailable")
+        return orig(query, variables)
+
+    fake.graphql = graphql  # type: ignore[method-assign]
+    t0 = clock.t
+    argv = ["launch", "--no-dry-run", "--yes-spend-money", "--ssh-public-key", pubkey]
+    rc = run([*argv, "--max-minutes", "1", "--poll-seconds", "30"], fake, clock)
+    assert rc == 3
+    # watchdog (<= 5 failed polls) + ONE shared termination budget for both passes
+    assert clock.t - t0 <= 60 + 5 * 60 + kit.TERM_BUDGET_SECONDS + 60
+
+
+def test_signal_during_termination_is_reported_not_raised(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    fake = _fake_with_pod()
+    orig = fake.graphql
+    sent = {"n": 0}
+
+    def graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        if "podTerminate" in query and sent["n"] == 0:
+            sent["n"] = 1
+            signal.raise_signal(signal.SIGTERM)
+        return orig(query, variables)
+
+    fake.graphql = graphql  # type: ignore[method-assign]
+    old = signal.getsignal(signal.SIGTERM)
+    kit.install_exit_signals()
+    try:
+        called, gone = kit.terminate_guarded(fake, "pod1", sleep=lambda _s: None)
+    finally:
+        signal.signal(signal.SIGTERM, old)
+    assert called and gone and fake.pods == {}
+    assert "termination of pod pod1 in progress" in capfd.readouterr().err
+
+
+def test_http_errors_in_fallback_are_unknown_not_gone() -> None:
+    class Failing:
+        def __init__(self, message: str) -> None:
+            self.message = message
+
+        def graphql(self, *_a: Any) -> dict[str, Any]:
+            raise kit.KitError(self.message)
+
+        def rest(self, *_a: Any) -> Any:
+            raise AssertionError
+
+    gone = kit._pod_gone  # pyright: ignore[reportPrivateUsage]
+    assert (
+        gone(Failing("RunPod HTTP 404 for https://api.runpod.io/graphql: Not Found"), "p1") is None
+    )
+    redirect = "RunPod request failed: KitError: refusing HTTP 302 redirect to /not-found"
+    assert gone(Failing(redirect), "p1") is None
+    assert gone(Failing("RunPod GraphQL error: pod not found"), "p1") is True
+
+
+def test_single_absence_from_listing_needs_confirmation() -> None:
+    gone = kit._pod_gone  # pyright: ignore[reportPrivateUsage]
+    clock = FakeClock()
+    fake = _fake_with_pod()
+    fake.pods.clear()
+    fake.pod_errors = 1  # pod(input) cannot confirm
+    assert gone(fake, "pod1", clock=clock) is None
+    clock.t += 5
+    fake.pod_errors = 1
+    assert gone(fake, "pod1", clock=clock) is None  # second absence too soon
+    clock.t += 6
+    fake.pod_errors = 1
+    assert gone(fake, "pod1", clock=clock) is True  # absent twice >= 10 s apart
+    assert gone(fake, "other", clock=clock) is True  # absent AND pod(input) null
+
+
+def test_second_sigterm_after_the_first_is_a_no_op() -> None:
+    old = signal.getsignal(signal.SIGTERM)
+    kit.install_exit_signals()
+    try:
+        with pytest.raises(kit.TerminateRequestedError):
+            signal.raise_signal(signal.SIGTERM)
+        second_raised = False
+        try:
+            signal.raise_signal(signal.SIGTERM)  # latched: must not raise
+        except kit.TerminateRequestedError:
+            second_raised = True
+        assert not second_raised, "a second SIGTERM must be a no-op (latch)"
+    finally:
+        signal.signal(signal.SIGTERM, old)

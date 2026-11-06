@@ -285,6 +285,16 @@ terminates any created pod that is not verified gone), but a driver that kills a
 group (for example `uv run` plus its child) depends on all of that and on the process not
 being SIGKILLed. Drivers and operators should call `terminate` and check its exit code.
 
+Termination is bounded: all termination passes of one process share an 8-minute budget
+(each API call is capped at 30 s, including DNS hangs). While it runs, SIGTERM/SIGHUP/
+SIGINT do not interrupt it; each one prints `termination of pod <id> in progress, Ns of
+budget left; kill -9 <pid> to abandon`. When the budget is spent the kit prints
+`COULD NOT VERIFY` with the exact `terminate --pod-id <id> --yes` command and exits 3.
+From the moment the create request is sent until the pod id is known (or known not to
+exist), signals are only recorded, so a Ctrl-C/SIGHUP there cannot orphan a pod. A pod
+absent from the listing counts as gone only if `pod(input)` also returns null or a second
+listing at least 10 s later agrees; HTTP errors are never read as "gone".
+
 ## Debugging a launch
 
 The pod's stdout/stderr (container log) and RunPod's own events (system log: image pull,
