@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import ast
 import dataclasses
+import hashlib
 import io
 import json
 import os
@@ -487,7 +488,11 @@ def build_bundle(
 # Small independent tasks, no planner: each ends in one code edit.
 
 FUNC_PREFIX = "c0s"
+#: A function task graded by fewer tests than this is flagged ``weak``: a wrong
+#: implementation may satisfy so few assertions (the tests are the library's own, and a
+#: helper is only exercised through its callers).
 MAX_LISTED_TESTS = 8
+WEAK_TESTS = 3
 
 
 @dataclasses.dataclass(frozen=True)
@@ -508,9 +513,26 @@ def _is_stub_body(body: list[ast.stmt]) -> bool:
     )
 
 
-def function_spans(source: str) -> dict[str, FuncSpan]:
-    """Top-level functions and methods (``Class.method``) of *source*, by qualname."""
+_NESTED_BODIES = ("body", "orelse", "handlers", "finalbody")
+
+
+def function_spans(source: str, duplicates: list[str] | None = None) -> dict[str, FuncSpan]:
+    """Functions and methods (``Class.method``) of *source*, by qualname.
+
+    Looks inside ``if``/``try``/``with``/``for``/``while`` blocks at module and class level.
+    A qualname defined more than once (a property getter + setter, ``try``/``except``
+    alternatives, ``typing.overload``) is ambiguous: it is left out and listed in
+    *duplicates*.
+    """
     out: dict[str, FuncSpan] = {}
+    dups: set[str] = set()
+
+    def add(qual: str, span: FuncSpan) -> None:
+        if qual in out or qual in dups:
+            out.pop(qual, None)
+            dups.add(qual)
+        else:
+            out[qual] = span
 
     def visit(node: ast.AST, prefix: str) -> None:
         for child in ast.iter_child_nodes(node):
@@ -523,17 +545,26 @@ def function_spans(source: str) -> dict[str, FuncSpan]:
                     and isinstance(body[0].value, ast.Constant)
                 ):
                     body = body[1:]
-                out[prefix + child.name] = FuncSpan(
+                add(
                     prefix + child.name,
-                    start,
-                    child.end_lineno or child.lineno,
-                    tuple(b.lineno for b in body) or (child.lineno,),
-                    _is_stub_body(child.body),
+                    FuncSpan(
+                        prefix + child.name,
+                        start,
+                        child.end_lineno or child.lineno,
+                        tuple(b.lineno for b in body) or (child.lineno,),
+                        _is_stub_body(child.body),
+                    ),
                 )
             elif isinstance(child, ast.ClassDef):
                 visit(child, f"{prefix}{child.name}.")
+            elif isinstance(
+                child, ast.If | ast.Try | ast.With | ast.For | ast.While | ast.ExceptHandler
+            ):
+                visit(child, prefix)
 
     visit(ast.parse(source), "")
+    if duplicates is not None:
+        duplicates.extend(sorted(dups))
     return out
 
 
@@ -573,6 +604,15 @@ def stub_functions(
                 continue
             found.append((rel, rs_))
     return found
+
+
+def _context_test_id(ctx: str) -> str:
+    """The test id of a pytest-cov context (``<id>|run`` / ``|setup`` / ``|teardown``).
+
+    Only a known phase suffix is cut, so a parametrized id such as ``test_x[a|b]`` stays whole.
+    """
+    head, sep, phase = ctx.rpartition("|")
+    return head if sep and phase in ("run", "setup", "teardown") else ctx
 
 
 def coverage_tests(
@@ -617,10 +657,19 @@ def coverage_tests(
         except ValueError:
             continue
         for lineno, ctxs in data.contexts_by_lineno(fname).items():
-            tests = {c.split("|")[0].removeprefix(prefix) for c in ctxs if c.split("|")[0]}
+            tests = {_context_test_id(c).removeprefix(prefix) for c in ctxs if _context_test_id(c)}
             if tests:
                 lines[(rel, lineno)] = tests
     return lines, ids
+
+
+def function_task_id(name: str, rel: str, qualname: str, used: set[str]) -> str:
+    """A unique bundle id (<= 64 chars) for one function task."""
+    tid = f"{FUNC_PREFIX}-{name}-{qualname.replace('.', '_')}"
+    if len(tid) > 64 or tid in used:  # truncation, or `A.run` vs a top-level `A_run`
+        digest = hashlib.sha1(f"{rel}:{qualname}".encode()).hexdigest()[:6]
+        tid = f"{tid[:57].rstrip('-_')}-{digest}"
+    return tid
 
 
 def func_task_spec(row_name: str, rel: str, qualname: str, tests: list[str]) -> str:
@@ -657,17 +706,30 @@ def split_lib(
         funcs = stub_functions(full / "repo", full / "solution", owned)
         if not funcs:
             raise AdapterError(f"{name}: no stubbed function found")
+        summaries: list[dict[str, Any]] = []
+        for rel in owned:  # ambiguous definitions cannot be stubbed one at a time
+            base_file = full / "repo" / rel
+            if base_file.is_file():
+                dups: list[str] = []
+                try:
+                    function_spans(base_file.read_text("utf-8"), dups)
+                except (SyntaxError, UnicodeDecodeError):
+                    continue
+                for q in dups:
+                    log(f"[{name}] {rel}: {q} is defined more than once: skipped")
+                    summaries.append({"id": f"{rel}:{q}", "skipped": "defined more than once"})
         lines, all_ids = coverage_tests(full, owned, tmp / "cov", timeout)
         base_deselect = []
         dfile = full / "hidden" / vb.DESELECT_FILE
         if dfile.is_file():
             base_deselect = [x for x in dfile.read_text("utf-8").splitlines() if x.strip()]
-        summaries: list[dict[str, Any]] = []
+        used_ids: set[str] = set()
         for rel, span in funcs:
             relevant = sorted(
                 {t for ln in span.body_lines for t in lines.get((rel, ln), set())} & all_ids
             )
-            tid = f"{FUNC_PREFIX}-{name}-{span.qualname.replace('.', '_')}"[:64].rstrip("-_")
+            tid = function_task_id(name, rel, span.qualname, used_ids)
+            used_ids.add(tid)
             if not relevant:
                 log(f"[{tid}] skipped: no test executes it")
                 summaries.append({"id": tid, "skipped": "no test executes it"})
@@ -699,7 +761,8 @@ def split_lib(
                 f'hidden_test = "{vb.SUITE_UNIT}"\n\n'
                 f"[source]\nlibrary = {json.dumps(name)}\nfunction = {json.dumps(span.qualname)}\n"
                 f"file = {json.dumps(rel)}\ntests_kept = {len(relevant)}\n"
-                f"parent = {json.dumps(f'c0-{name}')}\n",
+                f"parent = {json.dumps(f'c0-{name}')}\n"
+                f"weak = {'true' if len(relevant) < WEAK_TESTS else 'false'}\n",
                 "utf-8",
             )
             report = vb.validate_bundle(dest, timeout)
@@ -713,6 +776,7 @@ def split_lib(
                     "function": span.qualname,
                     "lines": span.end - span.start + 1,
                     "tests": len(relevant),
+                    "weak": len(relevant) < WEAK_TESTS,
                     "null_passed": (report.null or {}).get("passed"),
                 }
             )
@@ -762,7 +826,10 @@ def _print_split(name: str, rows: list[dict[str, Any]]) -> None:
         if "skipped" in r:
             print(f"  {r['id']:<40} skipped ({r['skipped']})")
         else:
-            print(f"  {r['id']:<40} {r['tests']:>4} tests  {r['lines']:>4} lines  {r['file']}")
+            weak = "  WEAK (<3 tests)" if r.get("weak") else ""
+            print(
+                f"  {r['id']:<40} {r['tests']:>4} tests  {r['lines']:>4} lines  {r['file']}{weak}"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -415,3 +415,85 @@ def test_bundles_accept_fnmatch_patterns(tmp_path: Path) -> None:
     bad = rs.parse_args([*common, "--bundles", "nothing-*"])
     with pytest.raises(rs.UsageError, match="matches no bundle"):
         rs._validate_args(bad)  # pyright: ignore[reportPrivateUsage]
+
+
+# ── audit follow-ups for the function tasks ──────────────────────────────────
+
+_COND_SRC = """\
+try:
+    import fast
+
+    def speed(x):
+        return fast.go(x)
+except ImportError:
+    def speed(x):
+        return x
+
+
+if True:
+
+    def only_here(x):
+        pass
+
+
+class P:
+    @property
+    def value(self):
+        return 1
+
+    @value.setter
+    def value(self, v):
+        pass
+
+    def plain(self):
+        pass
+"""
+
+
+def test_function_spans_see_conditional_definitions_and_flag_ambiguous_ones() -> None:
+    dups: list[str] = []
+    spans = c0.function_spans(_COND_SRC, dups)
+    assert "only_here" in spans and spans["only_here"].is_stub  # inside `if`
+    assert "P.plain" in spans
+    assert sorted(dups) == ["P.value", "speed"]  # getter/setter and try/except alternatives
+    assert "speed" not in spans and "P.value" not in spans
+
+
+def test_context_test_ids_keep_pipes_inside_parametrized_ids() -> None:
+    assert c0._context_test_id("test_a.py::test_x[a|b]|run") == "test_a.py::test_x[a|b]"  # pyright: ignore[reportPrivateUsage]
+    assert c0._context_test_id("test_a.py::test_x|setup") == "test_a.py::test_x"  # pyright: ignore[reportPrivateUsage]
+    assert c0._context_test_id("test_a.py::test_x[a|b]") == "test_a.py::test_x[a|b]"  # pyright: ignore[reportPrivateUsage]
+    assert c0._context_test_id("") == ""  # pyright: ignore[reportPrivateUsage]
+
+
+def test_function_task_ids_are_unique_and_bounded() -> None:
+    used: set[str] = set()
+    first = c0.function_task_id("lib", "a.py", "A.run", used)
+    used.add(first)
+    second = c0.function_task_id("lib", "b.py", "A_run", used)  # same sanitised name
+    assert first != second and len(second) <= 64
+    long_a = c0.function_task_id("lib", "a.py", "X" * 80 + ".one", set())
+    long_b = c0.function_task_id("lib", "a.py", "X" * 80 + ".two", set())
+    assert long_a != long_b and len(long_a) <= 64 and len(long_b) <= 64
+    assert rs.BUNDLE_ID_RE.match(long_a) and rs.BUNDLE_ID_RE.match(second)
+
+
+def test_huge_deselect_lists_do_not_overflow_the_command_line(tmp_path: Path) -> None:
+    """Audit finding: one `--deselect` argv entry per id crashed with ARG_MAX at ~6000 ids."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_x.py").write_text(
+        "def test_a():\n    pass\n\n"
+        "def test_a_long():\n    pass\n\n"
+        "def test_b():\n    assert False\n"
+    )
+    ids = [f"test_x.py::test_{'y' * 100}_{i}" for i in range(9000)]  # ~1 MB of ids
+    (tests / vb.DESELECT_FILE).write_text(
+        "\n".join(["test_x.py::test_a", *ids, "test_x.py::test_b"])
+    )
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    res = vb.run_grader(tree, tests, tmp_path / "scratch", 120)
+    # exact matching: `test_a` is dropped, `test_a_long` (same prefix) still runs
+    assert res.returncode == 0 and (res.passed, res.failed) == (1, 0)
+    assert res.by_file["test_x"]["passed"] == 1

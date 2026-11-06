@@ -54,7 +54,7 @@ INTEGRATION = "test_integration"
 SUITE_UNIT = "hidden"
 ALL_MODULES = "*"
 #: Optional file in a test directory: pytest node ids as the grader's own pytest
-#: reports them, to deselect, one per line.
+#: reports them, to deselect (exact match), one per line.
 DESELECT_FILE = ".deselect"
 BROKEN_SOURCE = "def broken(:  # deliberately not Python (independence check)\n"
 
@@ -90,6 +90,27 @@ if os.path.isdir(_src):
 """
 
 GRADER_INI = "[pytest]\naddopts =\n"
+
+#: pytest plugin (loaded from the grader's _netguard dir): drop the tests listed in
+#: ``C0_DESELECT_FILE``.  Matching is EXACT on the node id with the grader's ``graded_tests/``
+#: prefix ignored (``--deselect`` is a prefix match: ``test_a`` would also drop ``test_a_long``).
+DESELECT_PLUGIN = """
+import os
+
+def pytest_collection_modifyitems(config, items):
+    path = os.environ.get("C0_DESELECT_FILE")
+    if not path:
+        return
+    pre = "graded_tests/"
+    with open(path) as fh:
+        ids = {ln.strip().removeprefix(pre) for ln in fh if ln.strip()}
+    keep, dropped = [], []
+    for item in items:
+        (dropped if item.nodeid.removeprefix(pre) in ids else keep).append(item)
+    if dropped:
+        config.hook.pytest_deselected(items=dropped)
+        items[:] = keep
+"""
 
 
 @dataclass
@@ -197,23 +218,24 @@ def run_grader(
         "http_proxy": "http://127.0.0.1:9",
         "https_proxy": "http://127.0.0.1:9",
     }
-    deselect: list[str] = []
+    plugin_args: list[str] = []
     listed = tests_src / DESELECT_FILE
     if tests_src.is_dir() and listed.is_file():
-        for line in listed.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line:
-                # Node ids are rootdir-relative or not depending on how pytest resolved
-                # the rootdir; passing both forms deselects the same test either way.
-                deselect += ["--deselect", line]
-                if not line.startswith("graded_tests/"):
-                    deselect += ["--deselect", f"graded_tests/{line}"]
+        ids = [ln.strip() for ln in listed.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if ids:
+            # A file read by a plugin, NOT one `--deselect` argv entry per id: a function
+            # task deselects nearly a whole suite and thousands of ids overflow ARG_MAX.
+            (guard / "c0deselect.py").write_text(DESELECT_PLUGIN, encoding="utf-8")
+            ids_file = guard / "c0deselect.txt"
+            ids_file.write_text("\n".join(ids) + "\n", encoding="utf-8")
+            env["C0_DESELECT_FILE"] = str(ids_file)
+            plugin_args = ["-p", "c0deselect"]
     env.update(extra_env or {})
     cmd = [
         sys.executable, "-P", "-m", "pytest", "-q", "-p", "no:cacheprovider",
         "-c", str(ini), "--rootdir", str(grader), "--confcutdir", str(grader),
         "--continue-on-collection-errors",
-        f"--junitxml={report}", *deselect, *extra_args, "graded_tests",
+        f"--junitxml={report}", *plugin_args, *extra_args, "graded_tests",
     ]  # fmt: skip
     try:
         proc = subprocess.run(
