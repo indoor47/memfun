@@ -155,6 +155,10 @@ def build_context_metadata(
     lines.append("- Always use write_file() instead of raw open().")
     lines.append("- Always use run_cmd() instead of subprocess.")
     lines.append(
+        "- sys.exit() (incl. argparse errors/--help) is caught and reported as an"
+        " error; don't run __main__ blocks in the REPL, use run_cmd('python -m ...')."
+    )
+    lines.append(
         "- Use web_search() when you need current information "
         "from the internet (APIs, docs, prices, news, etc.)."
     )
@@ -171,6 +175,18 @@ def build_context_metadata(
 
 
 # ── Local REPL (fallback when no sandbox) ──────────────────────
+
+
+def _system_exit_message(exc: SystemExit) -> str:
+    """Explain a blocked ``sys.exit()`` to the model so it can self-correct."""
+    return (
+        f"\nYour code called sys.exit({exc.code!r}): this would terminate the "
+        "whole program, so it was blocked. argparse calls sys.exit(2) on usage "
+        "errors and sys.exit(0) after --help: wrap parse_args in "
+        "try/except SystemExit, use parse_known_args, or test the function's "
+        "return value directly instead of running the module's __main__ block "
+        "(use run_cmd('python -m ...') to exercise the real CLI).\n"
+    )
 
 
 @dataclass(slots=True)
@@ -211,10 +227,25 @@ class LocalREPL:
 
         Args:
             code: Python source code to execute.
-            timeout: Not enforced in local REPL (for interface compat).
+            timeout: NOT enforced in the local REPL (kept for interface
+                compatibility). ``exec`` runs synchronously on the calling
+                thread -- which is the asyncio event-loop thread when called
+                from ``RLMModule`` -- so an infinite loop or a blocking call
+                in agent code blocks the whole loop and no ``asyncio``
+                timeout can fire. Use a real ``SandboxAdapter`` when that
+                matters.
 
         Returns:
             REPLResult with captured stdout/stderr.
+
+        ``SystemExit`` raised by the executed code (``sys.exit()``,
+        ``exit()``, argparse usage errors and ``--help``) is caught and
+        reported as a failed result: left alone it is a ``BaseException``
+        that escapes ``asyncio.run`` and kills every coroutine in the
+        process. ``KeyboardInterrupt`` (and subclasses such as signal-to-
+        exception adapters) still propagates, so a real Ctrl-C / SIGTERM
+        stops the program. ``os._exit()`` / ``os.abort()`` terminate the
+        process without raising and cannot be intercepted here.
         """
         stdout_buf = io.StringIO()
         stderr_buf = io.StringIO()
@@ -226,6 +257,13 @@ class LocalREPL:
             success = True
         except Exception:
             stderr_buf.write(traceback.format_exc())
+            success = False
+        except SystemExit as exc:
+            # Attributed to the agent code: memfun installs no signal
+            # handler that raises SystemExit (worker.py uses loop callbacks,
+            # the RunPod kit raises a KeyboardInterrupt subclass).
+            stderr_buf.write(traceback.format_exc())
+            stderr_buf.write(_system_exit_message(exc))
             success = False
 
         elapsed_ms = (time.perf_counter() - start) * 1000.0
