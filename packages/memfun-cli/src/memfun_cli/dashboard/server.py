@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import time
 import warnings
@@ -321,6 +322,28 @@ def _update_state(event: dict) -> None:
     _save_state()
 
 
+_POD_RATE_ENV = "MEMFUN_POD_RATE_USD"
+
+
+def pod_rate_default() -> float | None:
+    """Pod cost in USD/hour from ``MEMFUN_POD_RATE_USD``, or ``None``.
+
+    The page uses it to prefill the pod-rate box when the viewer has not
+    typed one (e.g. a phone app that cannot type into the page).
+    """
+    raw = os.environ.get(_POD_RATE_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        logger.warning("Ignoring %s=%r: expected a non-negative number", _POD_RATE_ENV, raw)
+        return None
+    return value
+
+
 def _get_state() -> dict:
     """Current snapshot for newly connected clients."""
     return {
@@ -332,6 +355,7 @@ def _get_state() -> dict:
         "events": _events[-500:],
         "requests": _requests,
         "project": _project_name,
+        "pod_rate": pod_rate_default(),
     }
 
 
@@ -648,13 +672,14 @@ def create_app(
         Only that configured URL is ever fetched; the browser cannot pass one.
         """
         url = os.environ.get("MEMFUN_INFERENCE_METRICS_URL", "").strip()
+        rate = pod_rate_default()
         if not url:
-            return {"enabled": False}
+            return {"enabled": False, "pod_rate": rate}
         try:
             text = await asyncio.to_thread(_fetch_text, url, 2.0)
         except Exception as exc:  # unreachable server must not break the page
-            return {"enabled": True, "ok": False, "error": type(exc).__name__}
-        return {"enabled": True, "ok": True, **parse_inference_metrics(text)}
+            return {"enabled": True, "ok": False, "error": type(exc).__name__, "pod_rate": rate}
+        return {"enabled": True, "ok": True, **parse_inference_metrics(text), "pod_rate": rate}
 
     @app.post("/api/event")
     async def api_ingest_event(body: dict) -> dict:
@@ -1457,6 +1482,7 @@ ws.onmessage = (e) => {
     liveBanner.tokensOut = 0;
     liveBanner.lastAgent = null;
     liveBanner.lastTs = null;
+    applyServerPodRate(msg.pod_rate);
     swarmSeed(workers, tasks, requests);
     (msg.events || []).forEach(ev => {
       allEvents.push(ev);
@@ -2633,6 +2659,14 @@ function podRate() {
   return isFinite(v) && v > 0 ? v : 0;
 }
 
+// Server default ($MEMFUN_POD_RATE_USD) fills the box only while the
+// viewer has no typed/stored rate of their own; a typed value always wins.
+function applyServerPodRate(v) {
+  const el = document.getElementById('pod-rate');
+  if (!el || el.dataset.userSet === '1' || typeof v !== 'number' || !(v >= 0)) return;
+  el.value = String(v);
+}
+
 function fmtDur(s) {
   s = Math.max(0, Math.round(s));
   const m = Math.floor(s / 60), r = s % 60;
@@ -2944,7 +2978,9 @@ setView(activeView);
   if (!el) return;
   try { el.value = localStorage.getItem('memfun.podRate') || '';
     } catch (_e) { /* storage blocked */ }
+  el.dataset.userSet = el.value ? '1' : '';
   el.addEventListener('input', () => {
+    el.dataset.userSet = el.value ? '1' : '';
     try { localStorage.setItem('memfun.podRate', el.value); } catch (_e) { /* storage blocked */ }
     renderSwarmMetrics();
   });
@@ -3013,6 +3049,7 @@ async function pollServerMetrics() {
   try {
     const r = await fetch('/api/server-metrics');
     SW.server = await r.json();
+    applyServerPodRate(SW.server.pod_rate);
   } catch (_e) {
     // Our own server is restarting; keep whatever 'enabled' was.
     SW.server = { enabled: !!(SW.server && SW.server.enabled), ok: false };
