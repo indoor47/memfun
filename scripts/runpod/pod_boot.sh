@@ -52,11 +52,10 @@ KILL_GRACE=$(num_or "${MEMFUN_KILL_GRACE:-15}" 15)
 REMOVE_WAIT=$(num_or "${MEMFUN_REMOVE_WAIT_SEC:-120}" 120)
 GROUP_KILL_WAIT=$(num_or "${MEMFUN_GROUP_KILL_WAIT:-10}" 10)  # TERM -> KILL for a group
 RUN_DIR="${MEMFUN_RUN_DIR:-/workspace/runs/${RUNPOD_POD_ID:-local}}"
-mkdir -p "$RUN_DIR" 2>/dev/null || RUN_DIR=/tmp
 # Scratch files the script itself reads back live on the container disk, never on the
-# (possibly hung) network volume that RUN_DIR / the model dir may be on.
+# (possibly hung) network volume that RUN_DIR / the model dir may be on.  Both dirs are
+# created only AFTER the deadline is armed (section 1), and bounded.
 SCRATCH="${TMPDIR:-/tmp}/memfun-boot.$$"
-mkdir -p "$SCRATCH" 2>/dev/null || SCRATCH=/tmp
 SGLANG_PID=""
 IN_DEADLINE=0
 MIRROR_PID=""
@@ -77,15 +76,19 @@ kill_tree() {
 # group (set -m), so the whole tree can be signalled with `kill -- -PGID`.  The pid
 # (= pgid) is $SPAWNED.  -o/-a redirect stdout+stderr to FILE INSIDE the child, so opening
 # a file on a hung volume blocks the child, never this shell.
+# NO_GROUP=1 (set inside the download monitor) keeps children in the caller's group, so
+# killing the monitor's group also kills its helpers.  Children never inherit `set -m`.
 SPAWNED=""
+NO_GROUP=0
+jc_on() { [ "$NO_GROUP" = 1 ] || set -m; }
 spawn_group() {
   local mode="" file=""
   case "${1:-}" in -o|-a) mode=$1; file=$2; shift 2 ;; esac
-  set -m
+  jc_on
   case "$mode" in
-    -o) ( exec >"$file" 2>&1; "$@" ) & ;;
-    -a) ( exec >>"$file" 2>&1; "$@" ) & ;;
-    *) "$@" & ;;
+    -o) ( set +m; exec >"$file" 2>&1; "$@" ) & ;;
+    -a) ( set +m; exec >>"$file" 2>&1; "$@" ) & ;;
+    *) ( set +m; "$@" ) & ;;
   esac
   SPAWNED=$!
   set +m
@@ -115,8 +118,8 @@ bounded() {
   spawn_group "$@"
   pid=$SPAWNED
   # The watcher has its own group too, so stopping it also stops its `sleep` (no pgrep).
-  set -m
-  ( sleep "$secs"; kill -0 "$pid" 2>/dev/null || exit 0; : >"$flag"
+  jc_on
+  ( set +m; sleep "$secs"; kill -0 "$pid" 2>/dev/null || exit 0; : >"$flag"
     kill -TERM -- "-$pid" 2>/dev/null || kill_tree "$pid" TERM; sleep 5
     kill -KILL -- "-$pid" 2>/dev/null || kill_tree "$pid" KILL ) >/dev/null 2>&1 &
   wd=$!
@@ -124,6 +127,7 @@ bounded() {
   disown "$wd" 2>/dev/null  # no "Killed" job notice when it is stopped below
   wait "$pid"; rc=$?
   kill -KILL -- "-$wd" 2>/dev/null || kill_tree "$wd" KILL
+  wait "$wd" 2>/dev/null  # reap quietly (no "Killed" job notice in the log)
   if [ -f "$flag" ]; then rm -f "$flag"; log "timed out after ${secs}s: $what" >&2; return 124; fi
   return "$rc"
 }
@@ -296,6 +300,13 @@ spawn_group deadline_timer
 trap 'self_terminate "received SIGTERM"' TERM
 trap 'self_terminate "received SIGINT"' INT
 trap die_now USR1
+
+# ---- 1a. directories, only now (a hung volume must not delay the deadline) ----
+mkdir -p "$SCRATCH" 2>/dev/null || SCRATCH=/tmp  # container disk
+if ! bounded 10 mkdir -p "$RUN_DIR"; then
+  log "cannot create $RUN_DIR (volume hung?): using $SCRATCH for run logs"
+  RUN_DIR=$SCRATCH
+fi
 
 # ---- 1b. preflight diagnostics (stdout => RunPod log stream).  Names, never values. ----
 with_timeout() { bounded 10 "$@"; }
@@ -509,7 +520,8 @@ download_weights() {
     spawn_group -a "$pull_log" run_download
     dl=$SPAWNED
     set -m
-    ( t0=$(date +%s); last=-1; still=0; stamp="$SCRATCH/dl_stamp"; : >"$stamp"
+    ( set +m; NO_GROUP=1  # helpers (du/find) stay in this group: killed with the monitor
+      t0=$(date +%s); last=-1; still=0; stamp="$SCRATCH/dl_stamp"; : >"$stamp"
       while sleep "$PROGRESS_SEC"; do
         kill -0 "$dl" 2>/dev/null || exit 0
         kb=$(dl_size_kb)
@@ -538,6 +550,7 @@ download_weights() {
     rc=$?
     kill -KILL -- "-$prog" 2>/dev/null || kill_tree "$prog" KILL
     wait "$prog" 2>/dev/null
+    wait "$dl" 2>/dev/null
     kill -KILL -- "-$dl" 2>/dev/null  # no stray writer of this attempt survives into the next
     if [ "$rc" = 0 ]; then
       kb=$(dl_size_kb)

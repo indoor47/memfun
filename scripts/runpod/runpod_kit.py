@@ -2439,8 +2439,13 @@ def cmd_launch(
             # Still in terminating mode: the finally terminates the pod with no gap.
             raise TerminateRequestedError(f"signal {deferred['last']} during pod create")
         # The pod id is known: from here a first signal starts termination (raises once).
-        _EXIT_SIGNALLED["terminating"] = False
+        # Order matters: re-arm the latch while still terminating (signals keep being
+        # recorded), leave terminating mode, THEN act on anything recorded meanwhile.
         _EXIT_SIGNALLED["seen"] = False
+        _EXIT_SIGNALLED["terminating"] = False
+        if _EXIT_SIGNALLED["recorded"]:
+            enter_terminating()
+            raise TerminateRequestedError(f"signal {_EXIT_SIGNALLED['recorded']} recorded")
         emit(f"pod {pod.id} created ({pod.desired_status}) as {pod_name}")
         # Logs vanish with the pod: follow them into a local file from the start.
         capture = LogCapture.start(ro_rw, pod.id, Path(args.log_dir))

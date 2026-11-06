@@ -374,6 +374,14 @@ costs 60 s, not 65 s. PID 1 is told to stop with SIGUSR1 (no marker file, so a r
 run dir cannot make it run a second removal loop). `terminateAfter` and the local
 watchdog remain the other two stops.
 
+Nothing that could block runs before the deadline is armed: arming uses only shell
+builtins and `date`; `RUN_DIR` (possibly on the volume) is created afterwards, bounded,
+falling back to a `/tmp` scratch dir.
+
+The tests are hermetic: `tests/conftest.py` refuses authenticated urllib requests to real
+hosts and any non-loopback DNS lookup or socket connect (it cannot stop C-level sockets in
+extension modules or subprocesses such as `curl`; the kit uses neither).
+
 `shellcheck` was not available when this was written; the script is covered by the
 hermetic bash tests only.
 

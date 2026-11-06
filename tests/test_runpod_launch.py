@@ -3112,3 +3112,113 @@ def test_socket_level_network_guard() -> None:
         _socket.create_connection(server.getsockname(), timeout=1).close()
     finally:
         server.close()
+
+
+# ---------------------------------------------------------------------------
+# Final re-audit K1: no signal is lost while terminating mode is switched off.
+# ---------------------------------------------------------------------------
+
+
+def _mode_switch_lines() -> list[int]:
+    import inspect
+
+    src, start = inspect.getsourcelines(kit.cmd_launch)
+    first = next(i for i, ln in enumerate(src) if 'if deferred["count"]' in ln)
+    emit_at = next(i for i, ln in enumerate(src) if 'emit(f"pod {pod.id} created' in ln)
+    keep = [
+        start + i
+        for i in range(first, emit_at + 1)
+        if src[i].strip() and not src[i].strip().startswith(("#", "raise", "enter_terminating"))
+    ]
+    return keep
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["TERM", "INT"])
+@pytest.mark.parametrize("offset", range(len(_mode_switch_lines())))
+def test_signal_while_leaving_terminating_mode_is_not_lost(
+    pubkey: str, offset: int, sig: int, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import os as _os
+
+    target = _mode_switch_lines()[offset]
+    code = kit.cmd_launch.__code__
+    fired = {"done": False}
+
+    def tracer(frame: Any, event: str, _arg: Any) -> Any:
+        if frame.f_code is code:
+            if event == "line" and frame.f_lineno == target and not fired["done"]:
+                fired["done"] = True
+                _os.kill(_os.getpid(), sig)
+            return tracer
+        return None
+
+    fake = FakeRunPod()
+    old_trace = sys.gettrace()
+    with _exit_signals_installed():
+        sys.settrace(tracer)
+        try:
+            rc: object = _real_launch(fake, pubkey)
+        except BaseException as exc:  # recorded, then asserted below
+            rc = exc
+        finally:
+            sys.settrace(old_trace)
+    out = capsys.readouterr()
+    assert fired["done"], f"line {target} never reached"
+    assert "terminate" in fake.mutations and fake.pods == {}, rc
+    assert "stopping pod pod1 (deadline)" not in out.out  # the signal was acted on
+
+
+# ---------------------------------------------------------------------------
+# Final re-audit B1/B2: nothing before the deadline is armed can block; the download
+# monitor's helpers die with it.
+# ---------------------------------------------------------------------------
+
+
+@needs_bash
+def test_boot_hung_run_dir_mkdir_cannot_delay_the_deadline(tmp_path: Path) -> None:
+    _write_marker(tmp_path, "a" * 40)
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir(exist_ok=True)
+    (fakebin / "mkdir").write_text(  # RUN_DIR is on a hung volume
+        '#!/bin/sh\nfor a in "$@"; do case "$a" in */run) exec sleep 600 ;; esac; done\n'
+        'exec /bin/mkdir "$@"\n'
+    )
+    (fakebin / "mkdir").chmod(0o755)
+    log, rp, _py = _run_boot(
+        tmp_path,
+        {
+            "MEMFUN_DEADLINE_EPOCH": _soon(3),
+            "FAKE_SGLANG_SLEEP": "600",
+            "MEMFUN_REMOVE_WAIT_SEC": "1",
+        },
+        runpodctl=_rp_script(tmp_path, "echo removed; exit 0"),
+        wait_bound=60,
+    )
+    assert log.index("hard stop armed") < log.index("self-terminate: deadline reached")
+    assert rp == ["remove pod podB"]
+    assert "container shutdown: stopping all processes and exiting PID 1" in log
+
+
+@needs_bash
+def test_boot_download_monitor_helpers_die_with_it(tmp_path: Path) -> None:
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir(exist_ok=True)
+    counter = tmp_path / "du.calls"
+    (fakebin / "du").write_text(  # the monitor's first size probe hangs on the volume
+        f'#!/bin/sh\necho x >> "{counter}"\n'
+        f'[ "$(wc -l < "{counter}")" -eq 1 ] && exec sleep 600\nexec /usr/bin/du "$@"\n'
+    )
+    (fakebin / "du").chmod(0o755)
+    log, _rp, py = _run_boot(
+        tmp_path,
+        {
+            "MEMFUN_ALLOW_PULL": "1",
+            "FAKE_HF_HUB": "1",
+            "FAKE_SNAP_SLEEP": "2",
+            "MEMFUN_PROGRESS_SEC": "1",
+        },
+        wait_bound=90,
+    )
+    assert "download finished via python-api" in log and "--enable-metrics" in py
+    assert BOOT_ORPHANS[str(tmp_path)] == []
+    assert "Killed" not in log  # no job-control notices in the container log

@@ -54,7 +54,10 @@ def _loopback(host: object) -> bool:
 @pytest.fixture(autouse=True)
 def _no_non_loopback_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
     """Socket-level hermetic guard for every test: DNS lookups and connections are only
-    allowed to loopback (127.0.0.0/8, ::1, localhost) and unix sockets."""
+    allowed to loopback (127.0.0.0/8, ::1, localhost) and unix sockets.  Limits: it cannot
+    stop C-level `_socket` connects from extension modules or a subprocess (e.g. `curl`);
+    the RunPod kit uses neither (stdlib urllib only), and its boot-script tests put a fake
+    `curl` on PATH."""
     import socket
 
     real_getaddrinfo = socket.getaddrinfo
