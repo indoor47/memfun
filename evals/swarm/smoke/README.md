@@ -57,6 +57,8 @@ An agent controls its working tree, so grading must not trust it:
    unit does not hide the others.
 
 `validate_bundles.py` grades the oracle, null and independence runs exactly this way.
+`run_smoke.py` grades real swarm output the same way, with the same functions; see
+`../README-run-smoke.md`.
 It also checks **independence**: for each fan-out unit, it replaces that unit's owned
 files with a syntax error and requires that only that unit's hidden tests fail (the
 integration test is exempt). minicli's dispatcher imports only the subcommand being run,

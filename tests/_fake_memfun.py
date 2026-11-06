@@ -1,0 +1,258 @@
+"""A fake ``memfun`` for hermetic tests of ``evals/swarm/run_smoke.py``.
+
+    python _fake_memfun.py --state DIR --bundles-root ROOT [--mode M] [--bundle-mode B=M]
+        [--hold SECONDS] swarm "<spec>" --max-pool N --timeout S --no-push
+    python _fake_memfun.py --state DIR ... dashboard --remote --port P
+
+``swarm`` behaves like ``memfun swarm`` as far as the runner can see: prints the dashboard
+banner (from ``.memfun/dashboard.lock``), creates per-task "worktrees" under
+``.memfun/worktrees/<wf>/<task>``, writes owned files there, and publishes realistic
+dashboard events (``workflow.started``, ``task.*``, ``llm.call`` with tokens) into the
+project's T1 event-bus DB using memfun's own schema and ``DistributedEvent``.  Timestamps
+come from a fake clock (``FAKE_T0`` + offsets) so metrics are deterministic.
+
+``dashboard`` serves ``/api/health`` and records ``POST /api/event`` bodies to
+``<state>/dashboard_events.jsonl``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import http.server
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+from typing import Any
+
+# memfun's own DDL, so the fake's DB has exactly the schema the runner reads.
+from memfun_runtime.backends.sqlite.event_bus import (
+    _CREATE_EVENTS,  # pyright: ignore[reportPrivateUsage]
+    _CREATE_TOPICS,  # pyright: ignore[reportPrivateUsage]
+)
+from memfun_runtime.distributed import EVENT_TOPIC, DistributedEvent
+
+FAKE_T0 = 1_000_000.0
+WF = "wf-fake01"
+
+
+@contextlib.contextmanager
+def _locked(state: Path):
+    with (state / "conc.lock").open("a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _conc(state: Path, delta: int) -> None:
+    with _locked(state):
+        path = state / "conc.json"
+        data = json.loads(path.read_text()) if path.is_file() else {"running": 0, "max": 0}
+        data["running"] += delta
+        data["max"] = max(data["max"], data["running"])
+        path.write_text(json.dumps(data))
+
+
+class Bus:
+    def __init__(self, db: Path) -> None:
+        db.parent.mkdir(parents=True, exist_ok=True)
+        self.con = sqlite3.connect(db)
+        self.con.execute("PRAGMA journal_mode=WAL")
+        self.con.executescript(_CREATE_EVENTS + _CREATE_TOPICS)
+
+    def emit(self, offset: float, event_type: str, **kw: Any) -> None:
+        ev = DistributedEvent(event_type=event_type, ts=FAKE_T0 + offset, **kw)
+        self.con.execute(
+            "INSERT INTO events (id, topic, payload, key, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (os.urandom(8).hex(), EVENT_TOPIC, ev.to_bytes(), None, time.time()),
+        )
+        self.con.commit()
+
+
+def _write(path: Path, content: bytes, mtime: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    os.utime(path, (mtime, mtime))
+
+
+def _worktree(repo: Path, tid: str) -> Path:
+    wt = repo / ".memfun" / "worktrees" / WF / tid
+    shutil.copytree(repo, wt, ignore=shutil.ignore_patterns(".git", ".memfun"), dirs_exist_ok=True)
+    return wt
+
+
+def swarm(args: argparse.Namespace, rest: list[str]) -> int:
+    state = Path(args.state)
+    repo = Path.cwd()
+    project = repo.name
+    bundle_id = project.rsplit("-t", 1)[0]
+    modes = dict(m.split("=", 1) for m in args.bundle_mode)
+    mode = modes.get(bundle_id, args.mode)
+    bundle = Path(args.bundles_root) / bundle_id
+    task = tomllib.loads((bundle / "task.toml").read_text())
+    units = task["units"]
+
+    (state / "calls").mkdir(parents=True, exist_ok=True)
+    (state / "calls" / f"{project}.json").write_text(
+        json.dumps(
+            {
+                "argv": rest,
+                "env": dict(os.environ),
+                "cwd": str(repo),
+                "mode": mode,
+                "pid": os.getpid(),
+            }
+        )
+    )
+    _conc(state, +1)
+    try:
+        lock = repo / ".memfun" / "dashboard.lock"
+        banner = "memfun swarm\nproject: " + str(repo)
+        if lock.is_file():
+            banner += f"\nDashboard: http://localhost:{json.loads(lock.read_text())['port']}"
+        print(banner, flush=True)
+        time.sleep(args.hold)
+
+        if mode == "crash":
+            print("Traceback (most recent call last):\n  boom\nRuntimeError: fake crash")
+            return 3
+        if mode == "hang":
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(600)"],
+            )
+            (state / "hang_child.pid").write_text(str(child.pid))
+            time.sleep(600)
+            return 0
+
+        bus = Bus(repo / ".memfun" / "memfun.db")
+        bus.emit(0, "workflow.started", workflow_id=WF, project=project, detail="spec")
+        bus.emit(
+            1,
+            "llm.call",
+            workflow_id=WF,
+            role="decomposer",
+            model="fake-qwen",
+            prompt_tokens=50,
+            completion_tokens=5,
+            duration_ms=500,
+        )
+        if mode == "warnings":
+            print("WARNING Failed to discover MCP tools: fake")
+            print("WARNING Task decomposition failed: fake (falling back)")
+
+        if mode == "single":
+            groups = [list(range(len(units)))]
+        elif mode == "duplicate":
+            groups = [[0], [0]] + [[i] for i in range(1, len(units))]
+        else:
+            groups = [[i] for i in range(len(units))]
+
+        mtime = time.time() - 1000
+        for n, unit_idxs in enumerate(groups):
+            tid = f"T{n + 1}"
+            full = f"{WF}_{tid}"
+            bus.emit(2, "task.published", task_id=full, agent_name="coder-agent",
+                     workflow_id=WF, project=project)  # fmt: skip
+            bus.emit(2, "task.picked_up", task_id=full, agent_name="coder-agent",
+                     workflow_id=WF, project=project)  # fmt: skip
+            err = None
+            if mode == "server_error":
+                err = "litellm.APIConnectionError: Connection refused"
+            bus.emit(
+                3 + n * 0.1,
+                "llm.call",
+                task_id=full,
+                agent_name="coder-agent",
+                workflow_id=WF,
+                role="worker",
+                model="fake-qwen",
+                prompt_tokens=None if err else 100 * (n + 1),
+                completion_tokens=None if err else 10 * (n + 1),
+                duration_ms=500,
+                error=err,
+            )
+            if mode in ("server_error", "noop"):
+                continue
+            target = repo if mode == "root" else _worktree(repo, tid)
+            for i in unit_idxs:
+                if mode == "missing" and i == len(units) - 1:
+                    continue
+                for rel in units[i]["owns"]:
+                    sol = bundle / "solution" / rel
+                    good = sol.read_bytes() if sol.is_file() else b""
+                    wrong = (mode == "fail_unit" and i == 0) or (mode == "duplicate" and n == 0)
+                    start = bundle / "repo" / rel
+                    bad = (start.read_bytes() if start.is_file() else b"") + b"\n# wrong\n"
+                    mtime += 10
+                    _write(target / rel, bad if wrong else good, mtime)
+            if mode == "tamper":
+                _write(target / "tests" / "conftest.py", b"import pytest\n", mtime)
+                _write(target / "conftest.py", b"raise SystemExit(0)\n", mtime)
+            bus.emit(5 + n, "task.completed", task_id=full, agent_name="coder-agent",
+                     workflow_id=WF, project=project, success=True)  # fmt: skip
+        if mode == "server_error":
+            print("ERROR litellm.APIConnectionError: Connection refused")
+        print("Swarm result\nsuccess True", flush=True)
+        return 0
+    finally:
+        _conc(state, -1)
+
+
+def dashboard(args: argparse.Namespace, rest: list[str]) -> int:
+    state = Path(args.state)
+    port = int(rest[rest.index("--port") + 1])
+    out = state / "dashboard_events.jsonl"
+    (state / "dashboard_argv.json").write_text(json.dumps(rest))
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body = json.dumps({"status": "ok", "project": "fake"}).encode()
+            self.send_response(200 if self.path == "/api/health" else 404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            n = int(self.headers.get("Content-Length", "0"))
+            data = self.rfile.read(n)
+            with out.open("ab") as fh:
+                fh.write(data.replace(b"\n", b" ") + b"\n")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            pass
+
+    http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(allow_abbrev=False)
+    ap.add_argument("--state", required=True)
+    ap.add_argument("--bundles-root", default="")
+    ap.add_argument("--mode", default="pass")
+    ap.add_argument("--bundle-mode", action="append", default=[])
+    ap.add_argument("--hold", type=float, default=0.0)
+    ap.add_argument("command")
+    args, rest = ap.parse_known_args()
+    Path(args.state).mkdir(parents=True, exist_ok=True)
+    if args.command == "swarm":
+        return swarm(args, rest)
+    if args.command == "dashboard":
+        return dashboard(args, rest)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
