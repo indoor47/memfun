@@ -16,7 +16,7 @@ dependencies = [
     "memfun-core",
     "memfun-skills",
     "memfun-agent",
-    "fastmcp>=2.0",
+    "fastmcp>=3.0",  # mount(namespace=...), FastMCP.list_tools()
     "httpx>=0.27",
     "markdownify>=0.14",
     "ddgs>=9.0",

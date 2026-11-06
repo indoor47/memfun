@@ -78,6 +78,26 @@ def _check_in_root(path: Path) -> Path:
     return resolved
 
 
+def _listing_limit(base: Path) -> Path:
+    """Directory that every listed/globbed entry must resolve inside.
+
+    The project root when ``MEMFUN_PROJECT_ROOT`` is set, else *base*
+    (already resolved by :func:`_check_in_root`).  This is a guard against
+    accidental escapes, not a sandbox.
+    """
+    root = _project_root_guard()
+    return root if root is not None else base
+
+
+def _resolves_within(entry: Path, limit: Path) -> bool:
+    """True when *entry*, with symlinks and ``..`` resolved, is inside *limit*."""
+    try:
+        return entry.resolve().is_relative_to(limit)
+    except (OSError, RuntimeError):
+        # Unresolvable (e.g. symlink loop): treat as outside.
+        return False
+
+
 @fs_server.tool()
 async def read_file(path: str, offset: int = 0, limit: int = 2000) -> str:
     """Read a file and return its contents with line numbers.
@@ -167,14 +187,20 @@ async def list_directory(path: str, recursive: bool = False) -> str:
     if not p.is_dir():
         raise NotADirectoryError(f"Not a directory: {path}")
 
+    # Never enumerate through an in-tree symlink that points outside the
+    # listed directory (or the project root, when one is configured).
+    limit = _listing_limit(p)
     entries = []
     if recursive:
-        for item in sorted(p.rglob("*"))[:1000]:
+        inside = (item for item in sorted(p.rglob("*")) if _resolves_within(item, limit))
+        for item in list(inside)[:1000]:
             rel = item.relative_to(p)
             prefix = "d " if item.is_dir() else "f "
             entries.append(f"{prefix}{rel}")
     else:
         for item in sorted(p.iterdir()):
+            if not _resolves_within(item, limit):
+                continue
             prefix = "d " if item.is_dir() else "f "
             if item.is_file():
                 size = item.stat().st_size
@@ -194,19 +220,17 @@ async def glob_files(pattern: str, path: str = ".") -> str:
         path: Base directory to search from.
     """
     base = _check_in_root(Path(path))
-    root = _project_root_guard()
+    # Every match must resolve inside the project root when one is set,
+    # otherwise inside the search base itself.  This applies whether or
+    # not MEMFUN_PROJECT_ROOT is set (production swarms do not set it), so
+    # ``../*``-style patterns and in-tree symlinks pointing elsewhere never
+    # leak names from outside the searched tree.
+    limit = _listing_limit(base)
 
     raw_matches = sorted(base.glob(pattern))
     safe: list[Path] = []
     for m in raw_matches:
-        # Pattern segments like ``../`` and symlinks pointing outside
-        # the root must not leak past the guard, so each match is
-        # resolved and re-checked.
-        try:
-            resolved = m.resolve()
-        except OSError:
-            continue
-        if root is not None and not resolved.is_relative_to(root):
+        if not _resolves_within(m, limit):
             continue
         safe.append(m)
         if len(safe) >= 500:

@@ -87,7 +87,11 @@ class _SpecialistBase(BaseAgent):
             bridge = await create_tool_bridge()
             self._extra_tools = bridge.get_repl_tools()
         except Exception:
-            logger.debug("MCP tool bridge unavailable for %s", self.agent_id)
+            logger.warning(
+                "MCP tool bridge unavailable for %s; running without MCP tools",
+                self.agent_id,
+                exc_info=True,
+            )
 
         self._rlm = RLMModule(
             config=RLMConfig(

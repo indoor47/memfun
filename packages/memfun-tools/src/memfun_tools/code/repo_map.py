@@ -24,8 +24,27 @@ IGNORE_DIRS = {
 IGNORE_EXTS = {".pyc", ".pyo", ".so", ".o", ".a", ".dylib", ".class", ".jar"}
 
 
-def _build_tree(root: Path, max_depth: int = 4, _depth: int = 0) -> list[str]:
-    """Build an indented tree representation."""
+def _within(entry: Path, limit: Path) -> bool:
+    """True when *entry* (symlinks resolved) lies inside *limit*."""
+    try:
+        return entry.resolve().is_relative_to(limit)
+    except (OSError, RuntimeError):
+        return False
+
+
+def _build_tree(
+    root: Path,
+    max_depth: int = 4,
+    _depth: int = 0,
+    _limit: Path | None = None,
+) -> list[str]:
+    """Build an indented tree representation.
+
+    Entries that resolve outside the mapped root (in-tree symlinks
+    pointing elsewhere) are skipped, so the map never enumerates foreign
+    directories.  This is a guard against accidents, not a sandbox.
+    """
+    limit = _limit if _limit is not None else root.resolve()
     if _depth > max_depth:
         return ["  " * _depth + "..."]
 
@@ -38,11 +57,13 @@ def _build_tree(root: Path, max_depth: int = 4, _depth: int = 0) -> list[str]:
     for entry in entries:
         if entry.name.startswith(".") and entry.name not in {".github"}:
             continue
+        if not _within(entry, limit):
+            continue
         if entry.is_dir():
             if entry.name in IGNORE_DIRS:
                 continue
             lines.append("  " * _depth + f"{entry.name}/")
-            lines.extend(_build_tree(entry, max_depth, _depth + 1))
+            lines.extend(_build_tree(entry, max_depth, _depth + 1, limit))
         elif entry.is_file():
             if entry.suffix in IGNORE_EXTS:
                 continue
@@ -90,7 +111,7 @@ async def file_summary(path: str = ".") -> str:
     total_files = 0
 
     for fpath in root.rglob("*"):
-        if not fpath.is_file():
+        if not fpath.is_file() or not _within(fpath, root):
             continue
         if any(part in IGNORE_DIRS for part in fpath.parts):
             continue
