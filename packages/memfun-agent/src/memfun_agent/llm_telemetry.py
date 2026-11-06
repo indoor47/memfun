@@ -26,6 +26,12 @@ Two :class:`~contextvars.ContextVar`'s drive attribution:
 Both default to ``None``.  Callers wrap a region with
 :func:`agent_context` (a context manager that resets on exit, so nested
 calls don't leak attribution to sibling tasks).
+
+Every published ``llm.call`` payload carries ``model`` (the model id the
+call actually used) and ``role`` (the per-role model binding active for
+the call -- ``orchestrator`` / ``decomposer`` / ``worker`` / ``auditor`` /
+``reviewer`` -- or :data:`DEFAULT_ROLE` when no role is bound).  Roles are
+bound with :func:`role_context` (or ``agent_context(role=...)``).
 """
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ from typing import TYPE_CHECKING, Any
 from memfun_core.logging import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator, Iterator
 
     from memfun_runtime.context import RuntimeContext
 
@@ -47,6 +53,11 @@ logger = get_logger("agent.telemetry")
 # Maximum chars for prompt / completion previews stored in the event.
 # Keep these tight: dashboards must never spill sensitive data.
 _MAX_PREVIEW_CHARS = 200
+
+#: ``role`` reported on ``llm.call`` events made outside any role binding.
+DEFAULT_ROLE = "default"
+#: ``model`` reported when neither the LM nor its history names a model.
+UNKNOWN_MODEL = "unknown"
 
 # ── Context vars (per-task attribution + active runtime) ────────────
 
@@ -85,6 +96,7 @@ def agent_context(
     worker_id: str | None = None,
     task_id: str | None = None,
     workflow_id: str | None = None,
+    role: str | None = None,
 ) -> Iterator[None]:
     """Attribute LLM calls inside the ``with`` block to a specific agent.
 
@@ -96,18 +108,47 @@ def agent_context(
     The previous attribution is restored on exit so nested workflows
     (eg. an orchestrator calling a sub-specialist) don't leak the
     inner attribution back to the outer scope.
+
+    ``role`` defaults to the role already bound by an enclosing
+    :func:`role_context` (so an agent started under a role keeps it).
     """
+    outer = _active_agent_context.get() or {}
     payload = {
         "agent_name": agent_name,
         "worker_id": worker_id,
         "task_id": task_id,
         "workflow_id": workflow_id,
+        "role": role if role is not None else outer.get("role"),
     }
     token = _active_agent_context.set(payload)
     try:
         yield
     finally:
         _active_agent_context.reset(token)
+
+
+@contextlib.contextmanager
+def role_context(role: str | None) -> Generator[None]:
+    """Bind *role* for ``llm.call`` attribution, keeping other attribution.
+
+    Unlike :func:`agent_context` this only replaces the ``role`` key, so a
+    decomposer call made inside a specialist's ``agent_context`` keeps its
+    ``agent_name`` / ``task_id``.  Restored on exit.
+    """
+    current = dict(_active_agent_context.get() or {})
+    current["role"] = role
+    token = _active_agent_context.set(current)
+    try:
+        yield
+    finally:
+        _active_agent_context.reset(token)
+
+
+def current_role() -> str:
+    """Return the bound role, or :data:`DEFAULT_ROLE` when none is bound."""
+    ctx = _active_agent_context.get() or {}
+    role = ctx.get("role")
+    return role if isinstance(role, str) and role else DEFAULT_ROLE
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -313,7 +354,8 @@ class MemfunDSPyCallback:
                 "worker_id": ctx.get("worker_id"),
                 "task_id": ctx.get("task_id"),
                 "workflow_id": ctx.get("workflow_id"),
-                "model": model,
+                "model": model or UNKNOWN_MODEL,
+                "role": current_role(),
                 "prompt_preview": start_state.get("prompt_preview", ""),
                 "completion_preview": completion_preview,
                 "prompt_tokens": prompt_tokens,
@@ -419,6 +461,13 @@ def publish_llm_call_event(event_payload: dict[str, Any]) -> None:
     if runtime is None:
         return
 
+    # Contract: every llm.call payload names its model and role.
+    event_payload = dict(event_payload)
+    if not event_payload.get("model"):
+        event_payload["model"] = UNKNOWN_MODEL
+    if not event_payload.get("role"):
+        event_payload["role"] = current_role()
+
     try:
         from memfun_runtime.distributed import (
             EVENT_TOPIC,
@@ -438,6 +487,7 @@ def publish_llm_call_event(event_payload: dict[str, Any]) -> None:
             ts=event_payload.get("ts") or time.time(),
             workflow_id=event_payload.get("workflow_id"),
             model=event_payload.get("model"),
+            role=event_payload.get("role"),
             prompt_preview=event_payload.get("prompt_preview", ""),
             completion_preview=event_payload.get("completion_preview", ""),
             prompt_tokens=event_payload.get("prompt_tokens"),
