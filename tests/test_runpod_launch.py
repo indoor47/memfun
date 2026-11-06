@@ -2932,3 +2932,82 @@ def test_sse_reader_marks_lines_over_1_mib_instead_of_splitting() -> None:
     out, _stats, _clock = _follow(FakeLogs(lines))
     assert any("over 1 MiB" in o for o in out) and "t [cont] after" in out
     assert not any(o.startswith("[raw]") for o in out)
+
+
+# ---------------------------------------------------------------------------
+# Re-audit N1: no hand-over gap between signal-deferral contexts.
+# ---------------------------------------------------------------------------
+
+HANDOVER_POINTS = [
+    "termination_budget",
+    "terminate_guarded",
+    "terminate_and_verify",
+    "_stop_pod",
+    "_could_not_verify",
+    "LogCapture.start",
+    "run_card",
+    "run_watchdog",
+]
+
+
+@contextlib.contextmanager
+def _exit_signals_installed() -> Iterator[None]:
+    saved = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    kit.install_exit_signals()
+    try:
+        yield
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+
+
+def _kill_on_first_call(monkeypatch: pytest.MonkeyPatch, where: str, sig: int) -> dict[str, int]:
+    import os as _os
+
+    owner: Any = kit
+    name = where
+    if "." in where:
+        cls, name = where.split(".")
+        owner = getattr(kit, cls)
+    real = getattr(owner, name)
+    hits = {"n": 0}
+
+    def wrapper(*a: Any, **k: Any) -> Any:
+        hits["n"] += 1
+        if hits["n"] == 1:
+            _os.kill(_os.getpid(), sig)
+        return real(*a, **k)
+
+    monkeypatch.setattr(owner, name, staticmethod(wrapper) if owner is not kit else wrapper)
+    return hits
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["TERM", "INT"])
+@pytest.mark.parametrize("where", HANDOVER_POINTS)
+@pytest.mark.parametrize("first", ["in-deploy-TERM", "in-deploy-INT", "in-watchdog"])
+def test_second_signal_at_every_handover_point_still_terminates(
+    monkeypatch: pytest.MonkeyPatch, pubkey: str, first: str, where: str, sig: int
+) -> None:
+    import os as _os
+
+    fake = FakeRunPod()
+    orig = fake.graphql
+
+    def graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        out = orig(query, variables)
+        if first.startswith("in-deploy") and "podFindAndDeployOnDemand" in query:
+            first_sig = signal.SIGINT if first.endswith("INT") else signal.SIGTERM
+            _os.kill(_os.getpid(), first_sig)  # recorded by the deploy deferral
+        if first == "in-watchdog" and "pod(input" in query:
+            _os.kill(_os.getpid(), signal.SIGTERM)  # interrupts the watchdog loop
+        return out
+
+    fake.graphql = graphql  # type: ignore[method-assign]
+    _kill_on_first_call(monkeypatch, where, sig)
+    rc: object = None
+    with _exit_signals_installed():
+        try:
+            rc = _real_launch(fake, pubkey)
+        except BaseException as exc:  # recorded, then asserted below
+            rc = exc
+    assert "terminate" in fake.mutations and fake.pods == {}, (first, where, sig, rc)

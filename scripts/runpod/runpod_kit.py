@@ -1093,6 +1093,13 @@ class TermBudget:
 
 
 _BUDGET: dict[str, TermBudget] = {}
+#: Exit-signal latch state (see _exit_signal_handler).
+_EXIT_SIGNALLED: dict[str, Any] = {
+    "seen": False,
+    "terminating": False,
+    "recorded": 0,
+    "installed": False,
+}
 
 
 def termination_budget(clock: Clock | None = None) -> TermBudget:
@@ -1134,6 +1141,9 @@ def signals_deferred(note: Callable[[int], str]) -> Generator[dict[str, int]]:
     def handler(signum: int, _frame: object) -> None:
         record["count"] += 1
         record["last"] = signum
+        # A recorded signal counts as THE exit signal: the latch must not raise for a
+        # later one once this context hands over.
+        _EXIT_SIGNALLED["seen"] = True
         with contextlib.suppress(BaseException):
             os.write(2, (REDACT(note(signum)) + "\n").encode())
 
@@ -1250,6 +1260,7 @@ def terminate_guarded(
 ) -> tuple[bool, bool]:
     """terminate_and_verify under the shared budget; signals are reported, not raised;
     repeated if anything escapes it.  Does nothing once the budget is spent."""
+    enter_terminating()
     budget = termination_budget(clock)
     if budget.exhausted:
         _could_not_verify(pod_id, "termination budget already spent")
@@ -1341,6 +1352,7 @@ def run_watchdog(
         reason = "interrupt"
     finally:
         if result is None:
+            enter_terminating()
             result = _stop_pod(t, pod_id, reason, cost_hr, start, clock, sleep,
                                retries, backoff_seconds)  # fmt: skip
     return result
@@ -1357,6 +1369,7 @@ def _stop_pod(
     retries: int,
     backoff_seconds: float,
 ) -> WatchResult:
+    enter_terminating()
     budget = termination_budget(clock)
     with termination_signals(pod_id, budget):
         spent = 0.0
@@ -2404,6 +2417,7 @@ def cmd_launch(
         def deploy_note(signum: int) -> str:
             return f"[kit] signal {signum} recorded: finishing pod create/lookup first"
 
+        enter_terminating()  # a pod may exist from here: signals are only recorded
         with signals_deferred(deploy_note) as deferred:
             try:
                 pod = deploy_pod(rw, plan.payload)
@@ -2421,8 +2435,12 @@ def cmd_launch(
                     f"RunPod did create pod {found} ({pod_name}); terminating it",
                     err=True))  # fmt: skip
                 return 4  # the finally below terminates it
-        if deferred["count"]:
+        if deferred["count"] or _EXIT_SIGNALLED["recorded"]:
+            # Still in terminating mode: the finally terminates the pod with no gap.
             raise TerminateRequestedError(f"signal {deferred['last']} during pod create")
+        # The pod id is known: from here a first signal starts termination (raises once).
+        _EXIT_SIGNALLED["terminating"] = False
+        _EXIT_SIGNALLED["seen"] = False
         emit(f"pod {pod.id} created ({pod.desired_status}) as {pod_name}")
         # Logs vanish with the pod: follow them into a local file from the start.
         capture = LogCapture.start(ro_rw, pod.id, Path(args.log_dir))
@@ -2455,6 +2473,7 @@ def cmd_launch(
     finally:
         # Safety net, independent of handed_to_watchdog: a created pod that was not
         # VERIFIED gone is terminated here, whatever escaped above (e.g. a second signal).
+        enter_terminating()
         if pod_id is not None and pod_id not in VERIFIED_GONE:
             what = "was handed to the watchdog" if handed_to_watchdog else "is not watched yet"
             _quiet(lambda: emit(
@@ -2512,17 +2531,48 @@ class TerminateRequestedError(KeyboardInterrupt):
     on Ctrl-C also terminates on these; ``watch`` tells it apart from a plain Ctrl-C."""
 
 
-_EXIT_SIGNALLED = {"seen": False}
-
-
 def _exit_signal_handler(signum: int, _frame: object) -> None:
-    # Latch: only the FIRST SIGTERM/SIGHUP raises.  A second one (e.g. `uv run` forwarding
-    # plus process-group delivery) would otherwise land between the first one's handler and
-    # the termination path and skip it.  Termination itself also ignores signals.
+    # Latch: only the FIRST SIGTERM/SIGHUP (and SIGINT once a mutating transport exists)
+    # raises.  A second one (e.g. `uv run` forwarding plus process-group delivery) would
+    # otherwise land between the first one's handler and the termination path and skip it.
+    # While "terminating" (a pod may exist and termination is due or running) signals are
+    # only RECORDED, so there is no gap when one deferral context hands over to another.
+    if _EXIT_SIGNALLED["terminating"]:
+        _EXIT_SIGNALLED["recorded"] = signum
+        with contextlib.suppress(BaseException):
+            os.write(2, f"[kit] signal {signum} recorded: pod termination comes first\n".encode())
+        return
     if _EXIT_SIGNALLED["seen"]:
         return
     _EXIT_SIGNALLED["seen"] = True
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
     raise TerminateRequestedError(f"signal {signum}")
+
+
+def enter_terminating() -> None:
+    """From now on every exit signal is only recorded (called BEFORE any pod-may-exist
+    window and at the start of every termination path)."""
+    _EXIT_SIGNALLED["terminating"] = True
+    _EXIT_SIGNALLED["seen"] = True
+
+
+@contextlib.contextmanager
+def sigint_latched() -> Generator[None]:
+    """Route SIGINT through the exit latch while a mutating transport exists (only if the
+    exit-signal handlers are installed and we are on the main thread)."""
+    old: Any = None
+    installed = False
+    if _EXIT_SIGNALLED["installed"] and threading.current_thread() is threading.main_thread():
+        with contextlib.suppress(ValueError, OSError):
+            old = signal.signal(signal.SIGINT, _exit_signal_handler)
+            installed = True
+    try:
+        yield
+    finally:
+        if installed:
+            with contextlib.suppress(ValueError, OSError, TypeError):
+                signal.signal(signal.SIGINT, old if old is not None else signal.SIG_DFL)
 
 
 def install_exit_signals() -> None:
@@ -2532,7 +2582,7 @@ def install_exit_signals() -> None:
     def handler(signum: int, frame: object) -> None:
         _exit_signal_handler(signum, frame)
 
-    _EXIT_SIGNALLED["seen"] = False
+    _EXIT_SIGNALLED.update(seen=False, terminating=False, recorded=0, installed=True)
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, handler)
 
@@ -2553,14 +2603,17 @@ def main(
     LAST_STATUS.clear()
     _ABSENT_SINCE.clear()
     _BUDGET.clear()
+    _EXIT_SIGNALLED.update(seen=False, terminating=False, recorded=0)
     try:
         key = load_api_key(env, key_path)
         if args.cmd == "gpus":
             return cmd_gpus(ReadOnlyTransport(factory(key)), args)
         if args.cmd == "launch":
-            return cmd_launch(
-                key, factory, args, clock=clock, sleep=sleep, now=now or dt.datetime.now(dt.UTC)
-            )
+            with sigint_latched():  # Ctrl-C goes through the same latch as SIGTERM/SIGHUP
+                return cmd_launch(
+                    key, factory, args, clock=clock, sleep=sleep,
+                    now=now or dt.datetime.now(dt.UTC),
+                )  # fmt: skip
         if args.cmd == "status":
             pod = get_pod(ReadOnlyTransport(factory(key)), args.pod_id)
             emit(json.dumps(None if pod is None else dataclasses.asdict(pod), indent=2))
@@ -2574,14 +2627,18 @@ def main(
         if args.cmd == "watchdog":
             deadline = clock() + args.max_minutes * 60
             wt = factory(key)
+            int_latch = sigint_latched()
+            int_latch.__enter__()
             try:
                 run_watchdog(
                     wt, args.pod_id, deadline, clock=clock, sleep=sleep,
                     poll_seconds=args.poll_seconds,
                 )  # fmt: skip
             finally:
+                enter_terminating()
                 if args.pod_id not in VERIFIED_GONE:
                     terminate_guarded(wt, args.pod_id, sleep=sleep, clock=clock)
+                int_latch.__exit__(None, None, None)
             return 0 if args.pod_id in VERIFIED_GONE else 3
         if args.cmd == "terminate":
             return cmd_terminate(factory, key, args, sleep=sleep, clock=clock)
