@@ -37,6 +37,7 @@ bound with :func:`role_context` (or ``agent_context(role=...)``).
 from __future__ import annotations
 
 import contextlib
+import threading
 import time
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
@@ -58,6 +59,54 @@ _MAX_PREVIEW_CHARS = 200
 DEFAULT_ROLE = "default"
 #: ``model`` reported when neither the LM nor its history names a model.
 UNKNOWN_MODEL = "unknown"
+
+#: ``error`` text on the ``llm.call`` event of a response cut off by ``max_tokens``.
+TRUNCATED_ERROR = (
+    "response truncated (finish_reason=length): raise [llm] max_tokens "
+    "(or [llm.roles.<role>].max_tokens)"
+)
+_TRUNCATIONS: dict[str, int] = {}
+_TRUNCATIONS_LOCK = threading.Lock()
+
+
+def truncation_counts() -> dict[str, int]:
+    """Truncated LLM responses seen by this process, by role."""
+    with _TRUNCATIONS_LOCK:
+        return dict(_TRUNCATIONS)
+
+
+def _record_truncation(role: str) -> None:
+    with _TRUNCATIONS_LOCK:
+        _TRUNCATIONS[role] = _TRUNCATIONS.get(role, 0) + 1
+
+
+def _finish_reason(instance: Any, outputs: Any) -> str | None:
+    """``finish_reason`` of the call that just ended (DSPy history, else *outputs*)."""
+    history = getattr(instance, "history", None)
+    if isinstance(history, list) and history:
+        entry = history[-1]
+        if isinstance(entry, dict):
+            response = cast("object", entry.get("response"))
+            choices = getattr(response, "choices", None)
+            if choices is None and isinstance(response, dict):
+                choices = cast("dict[str, Any]", response).get("choices")
+            if isinstance(choices, list) and choices:
+                first = cast("object", choices[0])
+                reason = (
+                    cast("dict[str, Any]", first).get("finish_reason")
+                    if isinstance(first, dict)
+                    else getattr(first, "finish_reason", None)
+                )
+                if isinstance(reason, str):
+                    return reason
+    if isinstance(outputs, list):
+        for item in cast("list[object]", outputs):
+            if isinstance(item, dict):
+                reason = cast("dict[str, Any]", item).get("finish_reason")
+                if isinstance(reason, str):
+                    return reason
+    return None
+
 
 # ── Context vars (per-task attribution + active runtime) ────────────
 
@@ -355,6 +404,20 @@ class MemfunDSPyCallback:
 
             success = exception is None
             error = str(exception) if exception else None
+
+            # A response cut off by max_tokens is a failure, never a silent success.
+            if exception is None and _finish_reason(instance, outputs) == "length":
+                truncated_role = current_role()
+                success = False
+                error = TRUNCATED_ERROR
+                _record_truncation(truncated_role)
+                logger.error(
+                    "LLM RESPONSE TRUNCATED (role=%s, model=%s, %s completion tokens): %s",
+                    truncated_role,
+                    model or UNKNOWN_MODEL,
+                    completion_tokens,
+                    TRUNCATED_ERROR,
+                )
 
             ctx = _active_agent_context.get() or {}
             event_payload = {

@@ -229,6 +229,50 @@ class WorkflowConfig:
     gh_pr: bool = False
 
 
+DEFAULT_STALL_STEPS = 12
+
+
+def _no_iterations() -> dict[str, int]:
+    return {}
+
+
+@dataclass(frozen=True, slots=True)
+class LimitsConfig:
+    """Agent step limits, from ``[limits]`` in ``memfun.toml``.
+
+    Step caps are a backstop, not a budget: the real stop for an agent that is not
+    making progress is stall detection, and a run's overall budget is a wall-clock /
+    cost limit set outside memfun (e.g. the RunPod kit's pod hard stop).
+
+    Attributes:
+        stall_steps: Stop an agent after this many consecutive iterations that
+            did nothing new (only re-read files it already read, re-ran a command
+            with no edit in between, or ran no operations at all).  ``0`` disables
+            stall stopping.
+        iterations: Per-agent iteration caps by agent name, e.g.
+            ``[limits.iterations]`` with ``coder-agent = 80``.  Agents not listed
+            use their built-in default (see ``specialists.py`` / ``coding_agent.py``).
+    """
+
+    stall_steps: int = DEFAULT_STALL_STEPS
+    iterations: dict[str, int] = field(default_factory=lambda: _no_iterations(), hash=False)
+
+
+def _parse_limits(raw: dict[str, Any]) -> LimitsConfig:
+    stall = raw.get("stall_steps", DEFAULT_STALL_STEPS)
+    if isinstance(stall, bool) or not isinstance(stall, int) or stall < 0:
+        raise ConfigError(f"[limits] stall_steps must be an integer >= 0, got {stall!r}")
+    its_raw = raw.get("iterations", {})
+    if not isinstance(its_raw, dict):
+        raise ConfigError("[limits.iterations] must be a table of agent name = integer")
+    its: dict[str, int] = {}
+    for name, val in cast("dict[str, Any]", its_raw).items():
+        if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+            raise ConfigError(f"[limits.iterations] {name} must be an integer >= 1, got {val!r}")
+        its[str(name)] = val
+    return LimitsConfig(stall_steps=stall, iterations=its)
+
+
 @dataclass(frozen=True, slots=True)
 class WebToolsConfig:
     fetch_timeout_seconds: int = 30
@@ -255,6 +299,7 @@ class MemfunConfig:
     sandbox: SandboxBackendConfig = field(default_factory=SandboxBackendConfig)
     web: WebToolsConfig = field(default_factory=WebToolsConfig)
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
+    limits: LimitsConfig = field(default_factory=LimitsConfig)
 
     def llm_for_role(self, role: str) -> LLMConfig:
         """Return the effective LLM config for *role* (see ``LLMConfig.for_role``)."""
@@ -307,6 +352,7 @@ class MemfunConfig:
         sandbox_raw = _section("sandbox")
         web_raw = _section("web")
         workflow_raw = _section("workflow")
+        limits_raw = _section("limits")
 
         def _pick(section: dict[str, Any], dc: type) -> dict[str, Any]:
             names = {f.name for f in dataclasses.fields(dc)}
@@ -322,6 +368,7 @@ class MemfunConfig:
             sandbox=SandboxBackendConfig(**_pick(sandbox_raw, SandboxBackendConfig)),
             web=WebToolsConfig(**_pick(web_raw, WebToolsConfig)),
             workflow=WorkflowConfig(**_pick(workflow_raw, WorkflowConfig)),
+            limits=_parse_limits(limits_raw),
         )
 
 

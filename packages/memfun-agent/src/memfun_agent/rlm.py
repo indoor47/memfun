@@ -284,6 +284,10 @@ class RLMConfig:
     """Configuration for the RLM module."""
 
     max_iterations: int = _DEFAULT_MAX_ITERATIONS
+    #: Stop after this many consecutive iterations that did nothing new (see
+    #: :func:`_made_progress`).  ``0`` disables.  This, not ``max_iterations``, is the
+    #: intended stop for an agent that is stuck.
+    stall_steps: int = 12
     max_output_chars: int = _DEFAULT_MAX_OUTPUT_CHARS
     preview_length: int = _PREVIEW_LENGTH
     max_history_chars: int = _MAX_HISTORY_CHARS
@@ -315,6 +319,44 @@ class RLMResult:
     plan: list[str] = field(default_factory=list)
     ops: list[tuple] = field(default_factory=list)
     files_created: list[str] = field(default_factory=list)
+    #: Why the loop ended without a FINAL answer: ``"stalled: ..."`` or
+    #: ``"max_iterations"``; empty when the agent finished normally.
+    stop_reason: str = ""
+
+
+def _made_progress(
+    new_ops: list[tuple],
+    seen_reads: set[str],
+    cmds_since_edit: set[str],
+) -> bool:
+    """Did these newly recorded operations move the task forward?
+
+    Progress is a write or edit, a command not yet run since the last write/edit, a
+    file not read before, or any other tool call with arguments not seen before.
+    Re-reading a file already read, re-running a command with no edit in between, or
+    running nothing is not progress.  Mutates the two tracking sets.
+    """
+    progress = False
+    for op in new_ops:
+        kind = str(op[0])
+        target = str(op[1]) if len(op) > 1 else ""
+        if kind in ("write", "edit"):
+            progress = True
+            cmds_since_edit.clear()
+        elif kind == "cmd":
+            if target not in cmds_since_edit:
+                progress = True
+                cmds_since_edit.add(target)
+        elif kind == "read":
+            if target not in seen_reads:
+                progress = True
+                seen_reads.add(target)
+        else:
+            key = f"{kind}:{target}"
+            if key not in seen_reads:
+                progress = True
+                seen_reads.add(key)
+    return progress
 
 
 class RLMModule(dspy.Module):
@@ -441,6 +483,11 @@ class RLMModule(dspy.Module):
         error: str | None = None
         success = True
         iteration = 0
+        stop_reason = ""
+        seen_ops = 0
+        idle_steps = 0
+        seen_reads: set[str] = set()
+        cmds_since_edit: set[str] = set()
 
         # ── Planning phase ────────────────────────────────
         plan: list[str] = []
@@ -772,59 +819,31 @@ class RLMModule(dspy.Module):
                     var_name = state["FINAL_VAR"]
                     answer = str(repl.namespace.get(var_name, ""))
                     break
+
+                # Stall stop: nothing new for ``stall_steps`` iterations in a row.
+                if self.config.stall_steps > 0:
+                    ops_now = state.get("_ops", [])
+                    if _made_progress(ops_now[seen_ops:], seen_reads, cmds_since_edit):
+                        idle_steps = 0
+                    else:
+                        idle_steps += 1
+                    seen_ops = len(ops_now)
+                    if idle_steps >= self.config.stall_steps:
+                        stop_reason = (
+                            f"stalled: {idle_steps} consecutive iterations with no new file "
+                            "read, edit, write or command"
+                        )
+                        logger.warning("RLM STOPPED at iteration %d (%s)", iteration, stop_reason)
+                        answer = f"[STOPPED: {stop_reason}]\n" + self._auto_summary(state)
+                        break
             else:
                 # Max iterations reached without FINAL
                 logger.warning(
                     "RLM reached max iterations (%d) without FINAL answer",
                     self.config.max_iterations,
                 )
-                # Build auto-summary from tracked operations
-                state = repl.namespace.get("state", {})
-                ops = state.get("_ops", [])
-                files = state.get("_files", [])
-
-                if ops or files:
-                    summary_parts: list[str] = []
-                    writes = [o for o in ops if o[0] == "write"]
-                    edits = [o for o in ops if o[0] == "edit"]
-                    cmds = [o for o in ops if o[0] == "cmd"]
-                    searches = [o for o in ops if o[0] == "web_search"]
-                    fetches = [o for o in ops if o[0] == "web_fetch"]
-
-                    if searches:
-                        summary_parts.append("**Web searches:**")
-                        for _, query, count in searches:
-                            summary_parts.append(f"- `{query}` ({count} results)")
-                    if fetches:
-                        summary_parts.append("\n**URLs fetched:**")
-                        for _, url, size in fetches:
-                            summary_parts.append(f"- `{url}` ({size})")
-                    if writes:
-                        summary_parts.append("\n**Files created:**")
-                        for _, path, size in writes:
-                            summary_parts.append(f"- `{path}` ({size} chars)")
-                    if edits:
-                        summary_parts.append("\n**Files edited:**")
-                        for _, path, _ in edits:
-                            summary_parts.append(f"- `{path}`")
-                    if cmds:
-                        summary_parts.append("\n**Commands run:**")
-                        for _, cmd, rc in cmds:
-                            status = "ok" if rc == 0 else f"exit {rc}"
-                            summary_parts.append(f"- `{cmd}` {status}")
-
-                    answer = "\n".join(summary_parts)
-                else:
-                    # No tracked ops - try partial_answer
-                    answer = str(
-                        state.get(
-                            "partial_answer",
-                            state.get(
-                                "FINAL",
-                                "(max iterations reached without final answer)",
-                            ),
-                        )
-                    )
+                stop_reason = "max_iterations"
+                answer = self._auto_summary(repl.namespace.get("state", {}))
 
             # Mark remaining plan steps
             if plan and self._on_step_status is not None:
@@ -875,7 +894,56 @@ class RLMModule(dspy.Module):
             plan=plan,
             ops=final_ops,
             files_created=final_files,
+            stop_reason=stop_reason,
         )
+
+    def _auto_summary(self, state: dict[str, Any]) -> str:
+        """Summary of tracked operations for a loop that ended without FINAL."""
+        ops = state.get("_ops", [])
+        files = state.get("_files", [])
+
+        if ops or files:
+            summary_parts: list[str] = []
+            writes = [o for o in ops if o[0] == "write"]
+            edits = [o for o in ops if o[0] == "edit"]
+            cmds = [o for o in ops if o[0] == "cmd"]
+            searches = [o for o in ops if o[0] == "web_search"]
+            fetches = [o for o in ops if o[0] == "web_fetch"]
+
+            if searches:
+                summary_parts.append("**Web searches:**")
+                for _, query, count in searches:
+                    summary_parts.append(f"- `{query}` ({count} results)")
+            if fetches:
+                summary_parts.append("\n**URLs fetched:**")
+                for _, url, size in fetches:
+                    summary_parts.append(f"- `{url}` ({size})")
+            if writes:
+                summary_parts.append("\n**Files created:**")
+                for _, path, size in writes:
+                    summary_parts.append(f"- `{path}` ({size} chars)")
+            if edits:
+                summary_parts.append("\n**Files edited:**")
+                for _, path, _ in edits:
+                    summary_parts.append(f"- `{path}`")
+            if cmds:
+                summary_parts.append("\n**Commands run:**")
+                for _, cmd, rc in cmds:
+                    status = "ok" if rc == 0 else f"exit {rc}"
+                    summary_parts.append(f"- `{cmd}` {status}")
+
+            return "\n".join(summary_parts)
+        else:
+            # No tracked ops - try partial_answer
+            return str(
+                state.get(
+                    "partial_answer",
+                    state.get(
+                        "FINAL",
+                        "(max iterations reached without final answer)",
+                    ),
+                )
+            )
 
     # ── Internal helpers ───────────────────────────────────
 

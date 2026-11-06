@@ -385,3 +385,37 @@ python evals/swarm/run_smoke.py --suite commit0 --commit0-dir ~/.cache/memfun-co
 - The adapter's per-library table shows `stubs` (functions to implement), tests kept and
   deselected, and `null-pass` (tests that already pass on the untouched stub tree: the
   baseline to subtract; large for cachetools).
+
+## Limits (quality over speed)
+
+`run_smoke.py` writes `[llm] max_tokens = 32768` for every role (`--max-tokens`; Qwen3.8-27B
+serves 262144 context), and a truncated response is reported as an error (`llm.call` failed,
+`truncated_responses` in each episode and the aggregate; a truncated decomposer plan fails
+the episode visibly). For `--suite commit0` the defaults are `--episode-timeout 5400` (90
+min), `--task-timeout` equal to it and `--grader-timeout 900`, so the episode cap is the only
+wall-clock limit. Agents have high iteration caps plus stall detection
+(`[limits]` in `memfun.toml`, see `docs/configuration.md`); `stalled_stops` counts agents the
+stall detector stopped. The pod's hard stop and cost cap stay the one global budget.
+
+## Fast iteration on one long-lived pod
+
+Launch the pod once with a long window and rerun the runner against the same tunnel as often
+as you like (each run is a fresh `--run-id`, fresh repos, the pod's SGLang stays up):
+
+```bash
+# once: a 3 h pod, cost cap still applies (see docs/runpod-launch.md)
+uv run python scripts/runpod/launch_pod.py launch ... --max-minutes 180 --max-cost-usd 40 --no-dry-run --yes-spend-money
+uv run python scripts/runpod/launch_pod.py tunnel --pod-id <id> --run     # keep this open
+# once: the dashboard you watch from the phone (real HOME, token); runs reuse and never stop it
+memfun dashboard --remote --port 8081 &
+
+# then, as many times as you want (new run id each time):
+python evals/swarm/run_smoke.py --suite commit0 --commit0-dir ~/.cache/memfun-commit0 \
+    --base-url http://127.0.0.1:<tunnel-port>/v1 --metrics-url http://127.0.0.1:<port>/metrics \
+    --max-agents 1 --parallel-tasks 24 --run-id iter-$(date +%H%M%S)
+```
+
+The runner checks the model server before every run and reuses the dashboard already on
+8081 without stopping it; per-run server token counters come from `--metrics-url`. Change
+the swarm code or `memfun.toml` limits between runs; changing SGLang flags needs a relaunch.
+The pod stops itself at `--max-minutes` regardless of how many runs are in flight.
