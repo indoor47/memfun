@@ -250,6 +250,34 @@ Web tool configuration for URL fetching and web search.
 | `tavily_api_key_env` | string | `"TAVILY_API_KEY"` | Env var for Tavily API key |
 | `searxng_url` | string | `"http://localhost:8888"` | SearXNG instance URL |
 
+### [limits] -- step caps and stall stop
+
+```toml
+[limits]
+stall_steps = 12            # stop an agent after 12 iterations in a row with nothing new
+
+[limits.iterations]         # per-agent iteration caps (backstops), by agent name
+coder-agent = 80
+rlm-coder = 150             # the single-task path (one agent per task)
+```
+
+Step caps are a backstop, not a budget. An agent that is not making progress is stopped by
+**stall detection**: `stall_steps` consecutive iterations that only re-read files it already
+read, re-ran a command with no edit in between, or ran nothing. It then stops with a clear
+reason (`[STOPPED: stalled ...]` at the start of its answer, `RLM STOPPED at iteration N (stalled ...)` in
+the log, `stop_reason` in its result). `stall_steps = 0` turns stall stopping off.
+
+Built-in iteration caps (4x the old ones): `coder-agent` 60, `test-agent` 40, `file-agent` /
+`review-agent` and most other specialists 32, `rlm-coder` 100. The overall budget of a run is
+a wall-clock and cost limit set outside memfun (for RunPod, the pod's hard stop and cost cap).
+
+A response cut off by `max_tokens` is an error, never a silent success: the `llm.call` event
+is marked failed with `response truncated (finish_reason=length)`, memfun logs
+`LLM RESPONSE TRUNCATED` at error level, and a truncated decomposer plan fails the workflow
+instead of falling back to a single task. Raise `[llm] max_tokens` (or
+`[llm.roles.<role>].max_tokens`) if you see it; `evals/swarm/run_smoke.py` defaults to 32768
+for every role.
+
 ## Dashboard Environment Variables
 
 The live dashboard (`memfun dashboard`, or embedded in `memfun chat`) reads these at request time:

@@ -56,6 +56,12 @@ def agent_name_for_type(agent_type: str) -> str:
     return AGENT_TYPE_MAP.get(agent_type, "coder-agent")
 
 
+def _stall_steps() -> int:
+    from memfun_agent.role_models import stall_steps
+
+    return stall_steps()
+
+
 # ── Base specialist ───────────────────────────────────────────
 
 
@@ -63,7 +69,7 @@ class _SpecialistBase(BaseAgent):
     """Shared base for all specialist agents."""
 
     _SPECIALIST_TYPE: str = ""
-    _MAX_ITERATIONS: int = 10
+    _MAX_ITERATIONS: int = 40
     _SYSTEM_PREFIX: str = ""
 
     def __init__(self, context: RuntimeContext) -> None:
@@ -95,7 +101,8 @@ class _SpecialistBase(BaseAgent):
 
         self._rlm = RLMModule(
             config=RLMConfig(
-                max_iterations=self._MAX_ITERATIONS,
+                max_iterations=self.max_iterations,
+                stall_steps=_stall_steps(),
                 verbose=True,
                 enable_planning=False,
             ),
@@ -107,8 +114,15 @@ class _SpecialistBase(BaseAgent):
         logger.info(
             "%s started (max_iter=%d)",
             self.agent_id,
-            self._MAX_ITERATIONS,
+            self.max_iterations,
         )
+
+    @property
+    def max_iterations(self) -> int:
+        """Iteration cap: ``[limits.iterations]`` for this agent, else ``_MAX_ITERATIONS``."""
+        from memfun_agent.role_models import iteration_limit
+
+        return iteration_limit(self.agent_id, self._MAX_ITERATIONS)
 
     @property
     def llm_role(self) -> str:
@@ -218,7 +232,7 @@ class _SpecialistBase(BaseAgent):
         # Create a per-task RLM with a live-activity callback so the
         # CLI spinner can show iteration progress per specialist.
         sub_task_id = payload.get("sub_task_id", task.task_id)
-        max_iter = self._MAX_ITERATIONS
+        max_iter = self.max_iterations
 
         def _on_step(step: Any) -> None:
             """Update AGENT_ACTIVITY with current iteration info."""
@@ -241,6 +255,7 @@ class _SpecialistBase(BaseAgent):
         task_rlm = RLMModule(
             config=RLMConfig(
                 max_iterations=max_iter,
+                stall_steps=_stall_steps(),
                 verbose=True,
                 enable_planning=False,
                 root=rlm_root,
@@ -286,6 +301,7 @@ class _SpecialistBase(BaseAgent):
                 "answer": rlm_result.answer,
                 "method": f"specialist_{self._SPECIALIST_TYPE}",
                 "iterations": rlm_result.iterations,
+                "stop_reason": rlm_result.stop_reason,
                 "ops": [{"type": o[0], "target": o[1], "detail": o[2]} for o in rlm_result.ops],
                 "files_created": rlm_result.files_created,
                 "trajectory_length": len(rlm_result.trajectory),
@@ -333,7 +349,7 @@ class _SpecialistBase(BaseAgent):
         def _update_activity(label: str) -> None:
             AGENT_ACTIVITY[sub_task_id] = {
                 "iteration": rlm_result.iterations,
-                "max_iter": self._MAX_ITERATIONS,
+                "max_iter": self.max_iterations,
                 "last_op": label,
                 "agent_name": self.agent_id,
             }
@@ -456,7 +472,7 @@ class FileAgent(_SpecialistBase):
     """Reads and analyses files — never creates code."""
 
     _SPECIALIST_TYPE = "file"
-    _MAX_ITERATIONS = 8
+    _MAX_ITERATIONS = 32
     _SYSTEM_PREFIX = (
         "You are a FILE ANALYSIS specialist. Your job is to READ and ANALYZE "
         "files, understand codebase structure, discover patterns, and document "
@@ -477,7 +493,7 @@ class CoderAgent(_SpecialistBase):
     """Writes production-quality code."""
 
     _SPECIALIST_TYPE = "coder"
-    _MAX_ITERATIONS = 15
+    _MAX_ITERATIONS = 60
     _SYSTEM_PREFIX = (
         "You are a CODE GENERATION specialist. Your job is to WRITE "
         "production-quality code based on the task description and shared "
@@ -504,7 +520,7 @@ class TestAgent(_SpecialistBase):
     """Writes and runs tests for code from other agents."""
 
     _SPECIALIST_TYPE = "test"
-    _MAX_ITERATIONS = 10
+    _MAX_ITERATIONS = 40
     _SYSTEM_PREFIX = (
         "You are a TESTING specialist. Your job is to WRITE and RUN tests "
         "for code produced by other agents. Read the files created, "
@@ -529,7 +545,7 @@ class ReviewAgent(_SpecialistBase):
     """Reviews code from other agents for quality and consistency."""
 
     _SPECIALIST_TYPE = "review"
-    _MAX_ITERATIONS = 8
+    _MAX_ITERATIONS = 32
     _SYSTEM_PREFIX = (
         "You are a CODE REVIEW specialist. Your job is to REVIEW code "
         "produced by other agents for consistency, quality, security, and "
@@ -558,7 +574,7 @@ class WebSearchAgent(_SpecialistBase):
     """Searches the web for current information, documentation, and APIs."""
 
     _SPECIALIST_TYPE = "web_search"
-    _MAX_ITERATIONS = 8
+    _MAX_ITERATIONS = 32
     _SYSTEM_PREFIX = (
         "You are a WEB SEARCH specialist. Your job is to SEARCH the web "
         "for current information relevant to the task. Use web_search() "
@@ -581,7 +597,7 @@ class WebFetchAgent(_SpecialistBase):
     """Fetches and extracts content from specific URLs."""
 
     _SPECIALIST_TYPE = "web_fetch"
-    _MAX_ITERATIONS = 8
+    _MAX_ITERATIONS = 32
     _SYSTEM_PREFIX = (
         "You are a WEB FETCH specialist. Your job is to FETCH specific "
         "URLs and extract relevant content. Use web_fetch() to retrieve "
@@ -604,7 +620,7 @@ class PlannerAgent(_SpecialistBase):
     """Decomposes sub-problems and creates execution plans."""
 
     _SPECIALIST_TYPE = "planner"
-    _MAX_ITERATIONS = 6
+    _MAX_ITERATIONS = 24
     _SYSTEM_PREFIX = (
         "You are a PLANNING specialist. Your job is to ANALYZE a "
         "sub-problem and produce a structured plan for how to solve it. "
@@ -630,7 +646,7 @@ class DebugAgent(_SpecialistBase):
     """Diagnoses errors, reads logs, and traces issues."""
 
     _SPECIALIST_TYPE = "debug"
-    _MAX_ITERATIONS = 12
+    _MAX_ITERATIONS = 48
     _SYSTEM_PREFIX = (
         "You are a DEBUGGING specialist. Your job is to DIAGNOSE errors, "
         "trace issues, and identify root causes. Read error logs, stack "
@@ -660,7 +676,7 @@ class SecurityAgent(_SpecialistBase):
     """Reviews code for security vulnerabilities and best practices."""
 
     _SPECIALIST_TYPE = "security"
-    _MAX_ITERATIONS = 8
+    _MAX_ITERATIONS = 32
     _SYSTEM_PREFIX = (
         "You are a SECURITY REVIEW specialist. Your job is to analyze "
         "code for security vulnerabilities, unsafe patterns, and "

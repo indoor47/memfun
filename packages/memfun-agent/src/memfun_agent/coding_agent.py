@@ -9,6 +9,7 @@ optimization via MIPROv2/GEPA.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import time
 from typing import TYPE_CHECKING, Any
@@ -124,8 +125,11 @@ class RLMCodingAgent(BaseAgent):
             extra_tools = self._tool_bridge.get_repl_tools()
 
         # Configure RLM module
+        from memfun_agent.role_models import iteration_limit, stall_steps
+
         rlm_config = RLMConfig(
-            max_iterations=_DEFAULT_RLM_ITERATIONS,
+            max_iterations=iteration_limit("rlm-coder", _DEFAULT_RLM_ITERATIONS),
+            stall_steps=stall_steps(),
             verbose=True,
         )
 
@@ -278,24 +282,11 @@ class RLMCodingAgent(BaseAgent):
                 # Enable planning for "task"/"workflow" category;
                 # "web" uses RLM so the agent can call
                 # web_search/web_fetch helpers in the REPL.
-                if category in ("task", "web", "workflow"):
-                    self._rlm.config = RLMConfig(
-                        max_iterations=self._rlm.config.max_iterations,
-                        max_output_chars=self._rlm.config.max_output_chars,
-                        preview_length=self._rlm.config.preview_length,
-                        max_history_chars=self._rlm.config.max_history_chars,
-                        verbose=self._rlm.config.verbose,
-                        enable_planning=True,
-                    )
-                else:
-                    self._rlm.config = RLMConfig(
-                        max_iterations=self._rlm.config.max_iterations,
-                        max_output_chars=self._rlm.config.max_output_chars,
-                        preview_length=self._rlm.config.preview_length,
-                        max_history_chars=self._rlm.config.max_history_chars,
-                        verbose=self._rlm.config.verbose,
-                        enable_planning=False,
-                    )
+                # dataclasses.replace keeps every other RLMConfig field (root, stall_steps).
+                self._rlm.config = dataclasses.replace(
+                    self._rlm.config,
+                    enable_planning=category in ("task", "web", "workflow"),
+                )
                 result_data = await self._handle_rlm(
                     task_type,
                     query,
@@ -426,6 +417,7 @@ class RLMCodingAgent(BaseAgent):
             "task_type": task_type,
             "method": "rlm",
             "iterations": rlm_result.iterations,
+            "stop_reason": rlm_result.stop_reason,
             "trajectory_length": len(rlm_result.trajectory),
             "final_reasoning": rlm_result.final_reasoning,
             "total_tokens": rlm_result.token_usage.total_tokens,
@@ -760,7 +752,9 @@ class RLMCodingAgent(BaseAgent):
 
 # ── Module-level constants ─────────────────────────────────────
 
-_DEFAULT_RLM_ITERATIONS = 25
+#: A backstop only: stall detection (``[limits] stall_steps``) is what stops an agent
+#: that is not making progress.  Override per agent with ``[limits.iterations]``.
+_DEFAULT_RLM_ITERATIONS = 100
 
 
 # ── Utilities ──────────────────────────────────────────────────

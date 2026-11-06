@@ -307,14 +307,14 @@ def test_specialist_max_iterations():
     )
 
     # File/review agents need fewer iterations (read-only)
-    assert FileAgent._MAX_ITERATIONS == 8
-    assert ReviewAgent._MAX_ITERATIONS == 8
+    assert FileAgent._MAX_ITERATIONS == 32
+    assert ReviewAgent._MAX_ITERATIONS == 32
 
     # Test agents need moderate iterations
-    assert TestAgent._MAX_ITERATIONS == 10
+    assert TestAgent._MAX_ITERATIONS == 40
 
     # Coder agents need most iterations
-    assert CoderAgent._MAX_ITERATIONS == 15
+    assert CoderAgent._MAX_ITERATIONS == 60
 
 
 def test_new_specialist_max_iterations():
@@ -327,11 +327,11 @@ def test_new_specialist_max_iterations():
         WebSearchAgent,
     )
 
-    assert WebSearchAgent._MAX_ITERATIONS == 8
-    assert WebFetchAgent._MAX_ITERATIONS == 8
-    assert PlannerAgent._MAX_ITERATIONS == 6
-    assert DebugAgent._MAX_ITERATIONS == 12
-    assert SecurityAgent._MAX_ITERATIONS == 8
+    assert WebSearchAgent._MAX_ITERATIONS == 32
+    assert WebFetchAgent._MAX_ITERATIONS == 32
+    assert PlannerAgent._MAX_ITERATIONS == 24
+    assert DebugAgent._MAX_ITERATIONS == 48
+    assert SecurityAgent._MAX_ITERATIONS == 32
 
 
 def test_specialist_system_prefixes_exist():

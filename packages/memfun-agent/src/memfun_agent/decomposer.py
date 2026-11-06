@@ -37,6 +37,10 @@ class DecompositionError(ValueError):
 # ── Data types ────────────────────────────────────────────────
 
 
+class DecompositionTruncatedError(DecompositionError):
+    """The decomposer's LLM response was cut off by ``max_tokens`` (plan unusable)."""
+
+
 @dataclass(frozen=True, slots=True)
 class SubTask:
     """A single sub-task in a decomposed workflow."""
@@ -676,6 +680,9 @@ class TaskDecomposer(dspy.Module):
             f"{self.config.max_depth} (got {_depth})"
         )
 
+        from memfun_agent.llm_telemetry import truncation_counts
+
+        truncated_before = truncation_counts().get("decomposer", 0)
         try:
             from memfun_agent.role_models import role_scope
 
@@ -773,6 +780,14 @@ class TaskDecomposer(dspy.Module):
             # Termination invariant — re-raise so the test catches it.
             raise
         except Exception as exc:
+            if _depth == 0 and truncation_counts().get("decomposer", 0) > truncated_before:
+                # The plan was cut off by max_tokens: fail visibly instead of quietly
+                # running the whole task as one agent on a bad plan.
+                raise DecompositionTruncatedError(
+                    "decomposer response truncated (finish_reason=length); "
+                    "raise [llm] max_tokens or [llm.roles.decomposer].max_tokens "
+                    f"(parse error: {exc})"
+                ) from exc
             logger.warning(
                 "Task decomposition failed: %s — using single-task fallback",
                 exc,

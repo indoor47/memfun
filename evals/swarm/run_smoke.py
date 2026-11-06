@@ -82,6 +82,15 @@ NO_DASHBOARD_ENV = "MEMFUN_NO_DASHBOARD_AUTOSTART"
 EVENT_TOPIC = "memfun.distributed.events"
 VOID_THRESHOLD = 0.05
 OUTCOMES = ("pass", "partial", "model_failure", "harness_error")
+#: Per-call output limit for every role: well inside the served model's context (262144
+#: for Qwen3.8-27B) and large enough for a whole module or a big decomposition plan.
+DEFAULT_MAX_TOKENS = 32768
+SMOKE_EPISODE_TIMEOUT = 2400.0
+COMMIT0_EPISODE_TIMEOUT = 5400.0  # 90 min: tasks should finish, not be cut off
+COMMIT0_GRADER_TIMEOUT = 900.0
+#: The worker's own truncation report and the stall stop, as logged by memfun.
+TRUNCATED_LOG_RE = re.compile(r"LLM RESPONSE TRUNCATED")
+STALL_LOG_RE = re.compile(r"RLM STOPPED at iteration \d+ \(stalled")
 SPEC_SUFFIX = (
     "Implement this in the existing stub modules of this repository (create a module the "
     "spec names if it does not exist yet). Do not modify anything under tests/: hidden "
@@ -1234,6 +1243,8 @@ def log_signals(text: str) -> dict[str, Any]:
     ]
     return {
         "reviewer_json_rejections": len(REVIEWER_REJECT_RE.findall(text)),
+        "truncated_responses": len(TRUNCATED_LOG_RE.findall(text)),
+        "stalled_stops": len(STALL_LOG_RE.findall(text)),
         "warnings": warnings[:50],
         "server_error_lines": server[:20],
         "server_error_line_count": len(server),
@@ -1549,6 +1560,8 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
         rec["server_errors"] = server_errors
         rec["server_error_lines"] = signals["server_error_lines"]
         rec["reviewer_json_rejections"] = signals["reviewer_json_rejections"]
+        rec["truncated_responses"] = signals["truncated_responses"]
+        rec["stalled_stops"] = signals["stalled_stops"]
         swarm_doc, swarm_problem = load_swarm_result(plan.ep_dir, metrics["workflow_ids"])
         usage = tool_usage(swarm_doc, swarm_problem)
         rec["tool_usage"] = usage
@@ -1722,6 +1735,8 @@ def aggregate(episodes: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str,
             "agents_used_max": max((m["agents_used"] for m in mets), default=0),
             "peak_concurrency": max((m["peak_concurrency"] for m in mets), default=0),
             "reviewer_json_rejections": sum(e.get("reviewer_json_rejections", 0) for e in eps),
+            "truncated_responses": sum(e.get("truncated_responses", 0) for e in eps),
+            "stalled_stops": sum(e.get("stalled_stops", 0) for e in eps),
             "flags": sorted({f for e in eps for f in e.get("flags", [])}),
             "tool_usage": _tool_block(eps),
         }
@@ -1868,10 +1883,33 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--trials", type=int, default=1)
     ap.add_argument("--max-agents", type=int, default=4, help="memfun swarm --max-pool")
     ap.add_argument("--parallel-tasks", type=int, default=1, help="episodes run at once")
-    ap.add_argument("--episode-timeout", type=float, default=2400.0, help="hard cap, seconds")
-    ap.add_argument("--task-timeout", type=int, default=900, help="memfun swarm --timeout")
-    ap.add_argument("--grader-timeout", type=float, default=300.0, help="per unit test file")
-    ap.add_argument("--max-tokens", type=int, default=8192, help="[llm] max_tokens")
+    ap.add_argument(
+        "--episode-timeout",
+        type=float,
+        default=None,
+        help=f"hard cap, seconds (default {SMOKE_EPISODE_TIMEOUT:g}; "
+        f"{COMMIT0_EPISODE_TIMEOUT:g} = 90 min for --suite commit0)",
+    )
+    ap.add_argument(
+        "--task-timeout",
+        type=int,
+        default=None,
+        help="memfun swarm --timeout (default 900; --suite commit0: the episode timeout, "
+        "so the episode cap is the only wall-clock limit)",
+    )
+    ap.add_argument(
+        "--grader-timeout",
+        type=float,
+        default=None,
+        help="per unit test run, seconds (default 300; --suite commit0: 900)",
+    )
+    ap.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="[llm] max_tokens for EVERY role (per call); a truncated response is reported "
+        "as an error, never silently accepted",
+    )
     ap.add_argument("--memfun-cmd", default="memfun", help="memfun executable (shell-split)")
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--run-id", default="")
@@ -1890,7 +1928,18 @@ def _bounded(value: int, lo: int, hi: int, flag: str) -> None:
         raise UsageError(f"{flag} must be in {lo}..{hi}, got {value}")
 
 
+def _apply_suite_defaults(args: argparse.Namespace) -> None:
+    commit0 = args.suite == "commit0"
+    if args.episode_timeout is None:
+        args.episode_timeout = COMMIT0_EPISODE_TIMEOUT if commit0 else SMOKE_EPISODE_TIMEOUT
+    if args.task_timeout is None:
+        args.task_timeout = int(args.episode_timeout) if commit0 else 900
+    if args.grader_timeout is None:
+        args.grader_timeout = COMMIT0_GRADER_TIMEOUT if commit0 else 300.0
+
+
 def _validate_args(args: argparse.Namespace) -> None:
+    _apply_suite_defaults(args)
     args.base_url = check_base_url(args.base_url)
     check_port(args.dashboard_port, "--dashboard-port")
     _bounded(args.trials, 1, MAX_TRIALS, "--trials")

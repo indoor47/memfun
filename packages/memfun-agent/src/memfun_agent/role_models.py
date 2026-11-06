@@ -279,6 +279,20 @@ def get_role_config() -> MemfunConfig | None:
     return _role_config
 
 
+def iteration_limit(agent_name: str, default: int) -> int:
+    """Max iterations for *agent_name*: ``[limits.iterations]`` override, else *default*."""
+    cfg = get_role_config()
+    if cfg is not None:
+        return cfg.limits.iterations.get(agent_name, default)
+    return default
+
+
+def stall_steps(default: int = 12) -> int:
+    """Consecutive no-progress iterations before an agent is stopped (``[limits]``)."""
+    cfg = get_role_config()
+    return cfg.limits.stall_steps if cfg is not None else default
+
+
 def role_for_agent(agent_name: str, default: str | None = "worker") -> str | None:
     """Return the role an agent's LLM calls run under."""
     return AGENT_ROLE_MAP.get(agent_name, default)
