@@ -7,6 +7,7 @@ Subcommands::
     watch    local watchdog: live $ spent, terminate at deadline / Ctrl-C / error
     tunnel   SSH-forward a local port to the pod's SGLang port (read-only API)
     status   show one pod                                     (read-only)
+    logs     stream a pod's container/system log (REST SSE)  (read-only)
 
 Safety model (see ``docs/runpod-launch.md``):
 
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import dataclasses
 import datetime as dt
 import json
@@ -39,11 +41,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -54,6 +58,17 @@ from typing import Any, Protocol, cast
 
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 REST_URL = "https://rest.runpod.io/v1"
+#: Pod log stream (Server-Sent Events, GET + Bearer auth).  Params: source=container|system,
+#: tail<=5000, since; header Last-Event-ID.  Returns 404 once the pod is gone (logs vanish).
+LOGS_URL = "https://api.runpod.io/v2/pods/{pod_id}/logs"
+DEFAULT_LOG_DIR = Path("~/.cache/memfun/runpod-logs")
+POD_ID_RE = re.compile(r"[A-Za-z0-9]{1,64}")
+MAX_LOG_TAIL = 5000
+#: Docker image-pull progress lines from the system log; hidden unless --raw.
+PULL_NOISE = re.compile(
+    r"^[0-9a-f]{12} (Extracting|Downloading|Pulling fs layer|Waiting|Verifying Checksum"
+    r"|Download complete|Pull complete|Already exists)\s*$"
+)
 KEY_PATH = Path("~/.config/runpod/key")
 KEY_ENV = "RUNPOD_API_KEY"
 #: Name of the dummy env var memfun's [llm] api_key_env points at (SGLang ignores it).
@@ -104,6 +119,24 @@ class KitError(Exception):
 
 class MutationRefusedError(KitError):
     """A read-only transport was asked to mutate."""
+
+
+class LogStreamError(KitError):
+    """The pod log stream failed.  ``status`` is the HTTP code (None for I/O errors);
+    ``idle`` means the read timed out with the connection still open (no new lines)."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        retry_after: float | None = None,
+        idle: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+        self.idle = idle
 
 
 def _d(value: Any) -> dict[str, Any]:
@@ -307,13 +340,39 @@ class ReadOnlyTransport:
             raise MutationRefusedError(f"read-only transport refused REST {method.upper()}")
         return self._inner.rest(method, path, None)
 
+    def log_stream(self) -> LogStream | None:
+        """The inner transport's GET-only log streamer, or None if it has none."""
+        return log_stream_for(self._inner)
+
+
+type LogStream = Callable[[str, dict[str, str], str | None, float], Iterator[str]]
+
+
+def log_stream_for(t: object) -> LogStream | None:
+    """A transport's ``stream_logs`` (GET only by construction), or None."""
+    if isinstance(t, ReadOnlyTransport):
+        return t.log_stream()
+    fn = getattr(t, "stream_logs", None)
+    return cast("LogStream", fn) if callable(fn) else None
+
+
+def _retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
 
 class HttpTransport:
     """Real RunPod transport.  The key only ever goes into the Authorization header."""
 
-    def __init__(self, key: Secret, *, timeout: float = 30.0) -> None:
+    def __init__(self, key: Secret, *, timeout: float = 30.0, logs_url: str = LOGS_URL) -> None:
         self._key = key
         self._timeout = timeout
+        self._logs_url = logs_url
 
     def _request(self, method: str, url: str, body: dict[str, Any] | None) -> Any:
         data = None if body is None else json.dumps(body).encode()
@@ -361,6 +420,47 @@ class HttpTransport:
 
     def rest(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         return self._request(method.upper(), REST_URL + path, body)
+
+    def stream_logs(
+        self, pod_id: str, params: dict[str, str], last_event_id: str | None, timeout: float
+    ) -> Iterator[str]:
+        """GET the pod's SSE log stream and yield its raw text lines.  Read-only."""
+        if not POD_ID_RE.fullmatch(pod_id):
+            raise KitError(f"invalid pod id {pod_id!r}")
+        url = self._logs_url.format(pod_id=pod_id)
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {self._key.reveal()}")
+        req.add_header("Accept", "text/event-stream")
+        req.add_header("User-Agent", "memfun-runpod-kit/1")
+        if last_event_id and re.fullmatch(r"[\x20-\x7e]{1,256}", last_event_id):
+            req.add_header("Last-Event-ID", last_event_id)
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read(2000).decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            ra = _retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+            msg = REDACT(f"log stream HTTP {exc.code}: {detail}")[:400]
+            raise LogStreamError(msg, status=int(exc.code), retry_after=ra) from None
+        except Exception as exc:
+            msg = REDACT(f"log stream request failed: {type(exc).__name__}: {exc}")[:400]
+            raise LogStreamError(msg) from None
+        with resp:
+            while True:
+                try:
+                    raw = resp.readline()
+                except TimeoutError:
+                    raise LogStreamError("log stream idle (read timeout)", idle=True) from None
+                except Exception as exc:
+                    msg = REDACT(f"log stream read failed: {type(exc).__name__}: {exc}")[:400]
+                    raise LogStreamError(msg) from None
+                if not raw:
+                    return
+                yield raw.decode("utf-8", "replace").rstrip("\r\n")
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +1058,308 @@ def run_watchdog(
 
 
 # ---------------------------------------------------------------------------
+# Pod logs (REST SSE).  Survive the pod only if captured locally while it runs.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SseEvent:
+    data: str
+    event_id: str | None
+
+
+class SseParser:
+    """Line-fed Server-Sent Events parser.  ``data:`` lines accumulate until a blank line,
+    or dispatch at once when the accumulated data is already complete JSON (RunPod sends
+    one JSON object per event)."""
+
+    def __init__(self) -> None:
+        self._data: list[str] = []
+        self.last_id: str | None = None
+
+    def _dispatch(self) -> list[SseEvent]:
+        if not self._data:
+            return []
+        ev = SseEvent("\n".join(self._data), self.last_id)
+        self._data = []
+        return [ev]
+
+    def feed(self, line: str) -> list[SseEvent]:
+        if line == "":
+            return self._dispatch()
+        if line.startswith(":"):
+            return []  # comment / keep-alive
+        name, _, value = line.partition(":")
+        value = value.removeprefix(" ")
+        if name == "id":
+            if "\x00" not in value:
+                self.last_id = value
+            return []
+        if name == "data":
+            self._data.append(value)
+            try:
+                json.loads("\n".join(self._data))
+            except ValueError:
+                return []
+            return self._dispatch()
+        return []  # event:, retry:, unknown fields
+
+    def flush(self) -> list[SseEvent]:
+        return self._dispatch()
+
+
+def format_log_event(ev: SseEvent) -> tuple[str, bool]:
+    """(printable line, is image-pull noise).  Bad JSON is shown raw, never dropped."""
+    try:
+        obj = json.loads(ev.data)
+    except ValueError:
+        return f"[raw] {ev.data}", False
+    if not isinstance(obj, dict):
+        return f"[raw] {ev.data}", False
+    d = _d(obj)
+    line = str(d.get("line", ""))
+    src = str(d.get("source", "?"))[:4]
+    return f"{d.get('ts', '')} [{src}] {line}", bool(PULL_NOISE.match(line))
+
+
+@dataclass
+class LogStats:
+    events: int = 0
+    hidden: int = 0
+    reconnects: int = 0
+    outcome: str = ""
+
+
+def follow_logs(
+    stream: LogStream,
+    pod_id: str,
+    sink: Callable[[str], None],
+    *,
+    follow: bool,
+    source: str = "both",
+    tail: int = 2000,
+    raw: bool = False,
+    clock: Clock = time.time,
+    sleep: Sleeper = time.sleep,
+    overall_timeout: float = 30.0,
+    read_timeout: float = 15.0,
+    max_errors: int = 5,
+    backoff: float = 5.0,
+    stop: threading.Event | None = None,
+) -> LogStats:
+    """Read the pod log stream into ``sink`` (each line redacted first).
+
+    Outcomes: ``gone`` (404: pod removed), ``ended`` (backlog read, non-follow),
+    ``timeout`` (non-follow hard cap), ``stopped`` (``stop`` set), ``error`` (bounded
+    consecutive failures).  Reconnects send Last-Event-ID and skip already-seen events.
+    """
+    params = {"tail": str(max(1, min(int(tail), MAX_LOG_TAIL)))}
+    if source != "both":
+        params["source"] = source
+    parser = SseParser()
+    stats = LogStats()
+    seen: set[str] = set()
+    errors = 0
+    start = clock()
+
+    def out(text: str) -> None:
+        sink(REDACT(text))
+
+    replay = {"on": False}  # after a reconnect, skip the replayed backlog we already saw
+
+    def handle(ev: SseEvent) -> None:
+        text, noise = format_log_event(ev)
+        if ev.event_id is not None:
+            if ev.event_id in seen:
+                return
+            key = "id:" + ev.event_id
+        else:
+            key = "tx:" + text
+            if replay["on"] and key in seen:
+                return
+            replay["on"] = False  # first new line: no more replay skipping
+        if len(seen) < 50_000:
+            seen.add(ev.event_id if ev.event_id is not None else key)
+        stats.events += 1
+        if noise and not raw:
+            stats.hidden += 1
+            return
+        out(text)
+
+    def done(outcome: str) -> LogStats:
+        stats.outcome = outcome
+        return stats
+
+    while True:
+        if stop is not None and stop.is_set():
+            return done("stopped")
+        if not follow and clock() - start >= overall_timeout:
+            return done("timeout")
+        replay["on"] = stats.reconnects > 0
+        try:
+            for line in stream(pod_id, params, parser.last_id, read_timeout):
+                for ev in parser.feed(line):
+                    handle(ev)
+                    errors = 0
+                if stop is not None and stop.is_set():
+                    return done("stopped")
+                if not follow and clock() - start >= overall_timeout:
+                    return done("timeout")
+            for ev in parser.flush():
+                handle(ev)
+            if not follow:
+                return done("ended")
+            stats.reconnects += 1
+            sleep(backoff)
+            continue
+        except LogStreamError as exc:
+            for ev in parser.flush():
+                handle(ev)
+            if exc.status == 404:
+                return done("gone")
+            if exc.idle:
+                if not follow:
+                    return done("ended")
+                stats.reconnects += 1
+                continue
+            errors += 1
+            if exc.status == 429:
+                wait = exc.retry_after if exc.retry_after is not None else backoff * errors
+                wait = max(1.0, min(wait, 300.0))
+                out(f"# log stream rate-limited (429); retrying in {wait:g}s")
+            else:
+                wait = backoff * errors
+                out(f"# log stream error {errors}/{max_errors}: {exc}")
+        except Exception as exc:  # a fake/buggy stream must never kill the caller
+            errors += 1
+            wait = backoff * errors
+            out(f"# log stream error {errors}/{max_errors}: {type(exc).__name__}: {exc}")
+        if errors >= max_errors:
+            return done("error")
+        stats.reconnects += 1
+        sleep(wait)
+
+
+def _check_pod_id(pod_id: str) -> str:
+    if not POD_ID_RE.fullmatch(pod_id):
+        raise KitError(f"invalid pod id {pod_id!r}")
+    return pod_id
+
+
+_NEW_FILE_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def open_new_private_file(path: Path) -> int:
+    """Create ``path`` 0600; refuse anything already there (incl. a planted symlink)."""
+    try:
+        return os.open(path, _NEW_FILE_FLAGS, 0o600)
+    except FileExistsError:
+        what = "a symlink" if path.is_symlink() else "an existing file"
+        raise KitError(f"refusing to write {path}: it is {what}") from None
+    except OSError as exc:
+        raise KitError(f"cannot create {path}: {exc.strerror}") from None
+
+
+def open_capture_file(out_dir: Path, pod_id: str) -> tuple[Path, int]:
+    """``<out_dir>/pod-<id>.log`` (or ``pod-<id>.N.log`` if taken), created 0600 O_EXCL."""
+    _check_pod_id(pod_id)
+    out_dir = out_dir.expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for n in range(20):
+        path = out_dir / (f"pod-{pod_id}.log" if n == 0 else f"pod-{pod_id}.{n}.log")
+        try:
+            return path, open_new_private_file(path)
+        except KitError as exc:
+            if path.is_symlink():
+                emit(f"warning: {exc}; not following it", err=True)
+            continue
+    raise KitError(f"no free log file name for pod {pod_id} in {out_dir}")
+
+
+class LogCapture:
+    """Daemon thread that follows a pod's log stream into a local 0600 file until the
+    pod is gone.  Nothing here may affect the watchdog: every failure is swallowed."""
+
+    #: Seconds between reconnects (and the base of the error backoff).
+    backoff: float = 5.0
+
+    def __init__(self, stream: LogStream, pod_id: str, path: Path, fd: int) -> None:
+        self.path = path
+        self.stats: LogStats | None = None
+        self._stream = stream
+        self._pod_id = pod_id
+        self._fh = os.fdopen(fd, "w", encoding="utf-8", buffering=1)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name=f"podlogs-{pod_id}", daemon=True)
+
+    @classmethod
+    def start(cls, transport: object, pod_id: str, out_dir: Path) -> LogCapture | None:
+        try:
+            stream = log_stream_for(transport)
+            if stream is None:
+                emit("log capture: this transport cannot stream pod logs (skipped)")
+                return None
+            path, fd = open_capture_file(out_dir, pod_id)
+            cap = cls(stream, pod_id, path, fd)
+            cap._thread.start()
+            return cap
+        except Exception as exc:
+            emit(f"log capture disabled: {REDACT(str(exc))}", err=True)
+            return None
+
+    def _write(self, text: str) -> None:
+        with self._lock:
+            if not self._fh.closed:
+                self._fh.write(REDACT(text) + "\n")
+
+    def _run(self) -> None:
+        try:
+            self.stats = follow_logs(
+                self._stream, self._pod_id, self._write, follow=True, stop=self._stop,
+                read_timeout=60.0, backoff=self.backoff, max_errors=20,
+            )  # fmt: skip
+            self._write(f"# capture ended: {self.stats.outcome} ({self.stats.events} events)")
+        except BaseException as exc:  # the thread must never raise
+            with contextlib.suppress(Exception):
+                self._write(f"# capture failed: {type(exc).__name__}: {exc}")
+        finally:
+            with self._lock, contextlib.suppress(Exception):
+                self._fh.close()
+
+    def finish(self, wait: float = 5.0) -> None:
+        """Give the stream ``wait`` s to deliver the last lines (404 ends it), then stop."""
+        with contextlib.suppress(Exception):
+            self._thread.join(wait)
+            self._stop.set()
+
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
+
+def logs_command(pod_id: str) -> str:
+    return f"{KIT_CMD} logs --pod-id {pod_id} --follow"
+
+
+def no_ssh_endpoint_message(pod: PodInfo) -> str:
+    up = pod.uptime_seconds
+    uptime = f"{up // 60}m{up % 60:02d}s" if up is not None else "n/a (not started)"
+    return (
+        f"pod {pod.id} has no public TCP 22 mapping yet: it is still initializing "
+        f"(status {pod.desired_status}, uptime {uptime}). RunPod leaves the port mapping "
+        "empty until the container starts, and the image pull alone can take 10+ minutes "
+        f"on some hosts. Watch the boot with: {logs_command(pod.id)}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tunnel.
 # ---------------------------------------------------------------------------
 
@@ -1115,6 +1517,16 @@ def _grace_minutes(text: str) -> int:
     return value
 
 
+def _log_tail(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--tail must be an integer, got {text!r}") from None
+    if not 1 <= value <= MAX_LOG_TAIL:
+        raise argparse.ArgumentTypeError(f"--tail must be 1..{MAX_LOG_TAIL}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="runpod_kit", description=(__doc__ or "").split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1199,6 +1611,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("status", help="show a pod (read-only)")
     st.add_argument("--pod-id", required=True)
+
+    lg = sub.add_parser(
+        "logs", help="print a pod's container/system log (read-only; gone with the pod)"
+    )
+    lg.add_argument("--pod-id", required=True)
+    lg.add_argument("--follow", action="store_true", help="keep streaming until the pod is gone")
+    lg.add_argument("--out", default=None, help="also write to this NEW file (0600)")
+    lg.add_argument("--source", choices=("container", "system", "both"), default="both")
+    lg.add_argument("--tail", type=_log_tail, default=2000, help=f"1..{MAX_LOG_TAIL}")
+    lg.add_argument("--raw", action="store_true", help="show image-pull progress lines too")
+    lg.add_argument("--timeout", type=float, default=30.0, help="non-follow overall cap (s)")
+    for sp_ in (la, wa):
+        sp_.add_argument(
+            "--log-dir", default=str(DEFAULT_LOG_DIR), help="local pod-log capture directory"
+        )
     return p
 
 
@@ -1253,12 +1680,13 @@ def run_card(
     deadline_utc: dt.datetime,
     minutes: int,
     local_port: int = DEFAULT_LOCAL_PORT,
+    log_file: Path | None = None,
 ) -> list[str]:
     """The launch printout.  Contains no secrets by construction (no key is passed in)."""
     dry = pod_id is None
     pid = pod_id or "<POD_ID>"
     local = deadline_utc.astimezone()
-    return [
+    lines = [
         "=== DRY RUN: run card (nothing created) ===" if dry else "=== run card ===",
         f"pod id     : {'<none: dry run>' if dry else pod_id}",
         f"GPU        : {gpu_count} x {gpu_id}",
@@ -1269,8 +1697,49 @@ def run_card(
         f"watch      : {KIT_CMD} watch --pod-id {pid} -- memfun chat",
         f"env        : export {METRICS_ENV}={metrics_url(local_port)}",
         f"             export {RATE_ENV}={format_rate(rate_per_hr)}",
+        f"pod logs   : {logs_command(pid)}   (gone once the pod is removed)",
+    ]
+    if log_file is not None:
+        lines.append(f"log file   : {log_file}  (captured locally; survives the pod)")
+    lines += [
+        "note       : 'no public TCP 22 mapping yet' = pod still initializing (image pull can",
+        "             take 10+ min on some hosts); the hard stop counts from LAUNCH time",
         "dashboard: watch in the Swarm app",
     ]
+    return lines
+
+
+def cmd_logs(
+    ro: ReadOnlyTransport, args: argparse.Namespace, *, clock: Clock, sleep: Sleeper
+) -> int:
+    pod_id = _check_pod_id(args.pod_id)
+    stream = ro.log_stream()
+    if stream is None:
+        raise KitError("this transport cannot stream pod logs")
+    fh: Any = None
+    if args.out:
+        fh = os.fdopen(open_new_private_file(Path(args.out).expanduser()), "w", encoding="utf-8")
+
+    def sink(text: str) -> None:
+        emit(text)
+        if fh is not None:
+            fh.write(REDACT(text) + "\n")
+            fh.flush()
+
+    try:
+        stats = follow_logs(
+            stream, pod_id, sink, follow=args.follow, source=args.source, tail=args.tail,
+            raw=args.raw, clock=clock, sleep=sleep, overall_timeout=args.timeout,
+        )  # fmt: skip
+    finally:
+        if fh is not None:
+            fh.close()
+    hidden = f" ({stats.hidden} image-pull progress lines hidden; --raw shows them)"
+    emit(f"# {stats.events} log events{hidden if stats.hidden else ''}; end: {stats.outcome}")
+    if stats.outcome == "gone":
+        emit(f"# pod {pod_id} is gone (HTTP 404): RunPod deleted its logs with it")
+        return 0
+    return 1 if stats.outcome == "error" else 0
 
 
 def cmd_spend(ro: ReadOnlyTransport, pod_id: str) -> int:
@@ -1366,7 +1835,10 @@ def cmd_watch(ro: ReadOnlyTransport, args: argparse.Namespace, deps: WatchDeps) 
         raise KitError(f"pod {args.pod_id} not found")
     endpoint = pod.ssh_endpoint()
     if endpoint is None:
-        raise KitError("pod has no public TCP 22 mapping yet (still starting?)")
+        raise KitError(no_ssh_endpoint_message(pod))
+    capture = LogCapture.start(ro, args.pod_id, Path(args.log_dir))
+    if capture is not None:
+        emit(f"pod log capture: {capture.path}")
     command = list(args.command)
     if command and command[0] == "--":
         command = command[1:]  # only the first separator belongs to us
@@ -1428,6 +1900,8 @@ def cmd_watch(ro: ReadOnlyTransport, args: argparse.Namespace, deps: WatchDeps) 
             if proc is not None and proc.poll() is None:
                 proc.terminate()
         shutil.rmtree(run_dir, ignore_errors=True)
+        if capture is not None:
+            capture.finish(wait=0.5)
 
 
 def cmd_launch(
@@ -1504,6 +1978,7 @@ def cmd_launch(
     deadline = started + plan.max_minutes * 60
     pod_id: str | None = None
     handed_to_watchdog = False
+    capture: LogCapture | None = None
     try:
         try:
             pod = deploy_pod(rw, plan.payload)
@@ -1519,6 +1994,8 @@ def cmd_launch(
             emit(f"RunPod did create pod {pod_id} ({pod_name}); terminating it", err=True)
             return 4
         emit(f"pod {pod.id} created ({pod.desired_status}) as {pod_name}")
+        # Logs vanish with the pod: follow them into a local file from the start.
+        capture = LogCapture.start(ro_rw, pod.id, Path(args.log_dir))
         if pod.cost_per_hr is None:
             fresh = get_pod(rw, pod.id)
             pod = dataclasses.replace(pod, cost_per_hr=fresh.cost_per_hr if fresh else None)
@@ -1533,6 +2010,7 @@ def cmd_launch(
             rate_source="reported by RunPod for this pod" if reported else "plan estimate",
             deadline_utc=now + dt.timedelta(minutes=plan.max_minutes),
             minutes=plan.max_minutes,
+            log_file=capture.path if capture is not None else None,
         )
         for line in card:
             emit(line)
@@ -1548,6 +2026,9 @@ def cmd_launch(
         if pod_id is not None and not handed_to_watchdog:
             emit(f"[launch] pod {pod_id} exists but is not watched yet: terminating it", err=True)
             terminate_and_verify(rw, pod_id, sleep=sleep)
+        if capture is not None:
+            capture.finish()
+            emit(f"pod log saved: {capture.path}")
 
 
 def find_pod_id_by_name(
@@ -1628,6 +2109,8 @@ def main(
             pod = get_pod(ReadOnlyTransport(factory(key)), args.pod_id)
             emit(json.dumps(None if pod is None else dataclasses.asdict(pod), indent=2))
             return 0 if pod else 1
+        if args.cmd == "logs":
+            return cmd_logs(ReadOnlyTransport(factory(key)), args, clock=clock, sleep=sleep)
         if args.cmd == "spend":
             return cmd_spend(ReadOnlyTransport(factory(key)), args.pod_id)
         if args.cmd == "watch":
@@ -1646,7 +2129,7 @@ def main(
                 raise KitError(f"pod {args.pod_id} not found")
             endpoint = pod.ssh_endpoint()
             if endpoint is None:
-                raise KitError("pod has no public TCP 22 mapping yet (still starting?)")
+                raise KitError(no_ssh_endpoint_message(pod))
             hosts_file = default_known_hosts(args.pod_id)
             cmd = build_ssh_command(
                 endpoint[0],

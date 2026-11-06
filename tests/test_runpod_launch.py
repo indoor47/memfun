@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -1794,3 +1794,269 @@ def test_fail_grace_flag_reaches_pod_env(capsys: pytest.CaptureFixture[str], pub
     }
     with pytest.raises(SystemExit):
         kit.build_parser().parse_args(["launch", "--fail-grace-minutes", "-1"])
+
+
+# ---------------------------------------------------------------------------
+# Pod logs: SSE parsing, noise filter, retries, capture file, messages.
+# ---------------------------------------------------------------------------
+
+
+def _ev(line: str, source: str = "container", ts: str = "t") -> str:
+    return "data: " + json.dumps({"ts": ts, "source": source, "line": line})
+
+
+class FakeLogs:
+    """Scripted log stream: each connection is a list of lines and/or an exception."""
+
+    def __init__(self, *connections: list[Any] | BaseException) -> None:
+        self.connections = list(connections)
+        self.calls: list[tuple[str, dict[str, str], str | None]] = []
+
+    def __call__(
+        self, pod_id: str, params: dict[str, str], last_id: str | None, timeout: float
+    ) -> Iterator[str]:
+        self.calls.append((pod_id, dict(params), last_id))
+        conn = self.connections.pop(0) if self.connections else kit.LogStreamError("x", status=404)
+        if isinstance(conn, BaseException):
+            raise conn
+        for item in conn:
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+
+@pytest.fixture(autouse=True)
+def _fast_capture_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(kit.LogCapture, "backoff", 0.01)
+
+
+class FakeRunPodWithLogs(FakeRunPod):
+    def __init__(self, logs: Any, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.stream_logs = logs
+
+
+def _follow(logs: FakeLogs, **kw: Any) -> tuple[list[str], kit.LogStats, FakeClock]:
+    out: list[str] = []
+    clock = FakeClock()
+    kw.setdefault("follow", False)
+    stats = kit.follow_logs(logs, "pod1", out.append, clock=clock, sleep=clock.sleep, **kw)
+    return out, stats, clock
+
+
+def test_sse_parser_multiline_comments_ids_and_bad_json() -> None:
+    p = kit.SseParser()
+    got: list[kit.SseEvent] = []
+    for line in [": keep-alive", "id: 7", 'data: {"line":', 'data: "a"}', "event: log",
+                 "data: plain one", "data: plain two", "", "data: {bad json", ""]:  # fmt: skip
+        got += p.feed(line)
+    assert [e.data for e in got] == ['{"line":\n"a"}', "plain one\nplain two", "{bad json"]
+    assert got[0].event_id == "7" and p.last_id == "7"
+    assert kit.format_log_event(got[2]) == ("[raw] {bad json", False)
+    text, noise = kit.format_log_event(kit.SseEvent(_ev("hi", "system", "T1")[6:], None))
+    assert text == "T1 [syst] hi" and not noise
+
+
+def test_log_noise_filter_hides_pull_progress_unless_raw() -> None:
+    lines = [_ev("9f8e7d6c5b4a Extracting", "system"), _ev("abcdef012345 Pull complete ")]
+    lines += [_ev("[memfun-boot] hard stop armed"), _ev("9f8e7d6c5b4a Extracting more")]
+    out, stats, _ = _follow(FakeLogs(lines))
+    assert out == [
+        "t [cont] [memfun-boot] hard stop armed",
+        "t [cont] 9f8e7d6c5b4a Extracting more",
+    ]
+    assert stats.hidden == 2 and stats.events == 4 and stats.outcome == "ended"
+    out, stats, _ = _follow(FakeLogs(lines), raw=True)
+    assert len(out) == 4 and stats.hidden == 0
+
+
+def test_logs_404_means_pod_gone_and_exits_cleanly(capsys: pytest.CaptureFixture[str]) -> None:
+    logs = FakeLogs([_ev("last words")], kit.LogStreamError("HTTP 404", status=404))
+    fake = FakeRunPodWithLogs(logs, allow_mutations=False)
+    assert run(["logs", "--pod-id", "pod1", "--follow"], fake) == 0
+    out = capsys.readouterr().out
+    assert "last words" in out and "pod pod1 is gone (HTTP 404)" in out
+    assert fake.mutations == [] and logs.calls[0][1] == {"tail": "2000"}
+    assert run(["logs", "--pod-id", "pod1", "--source", "system", "--tail", "50"], fake) == 0
+    assert logs.calls[-1][1] == {"tail": "50", "source": "system"}
+
+
+def test_logs_429_honours_retry_after_with_fake_clock() -> None:
+    logs = FakeLogs(kit.LogStreamError("HTTP 429", status=429, retry_after=7.0), [_ev("ok")])
+    out, stats, clock = _follow(logs, follow=True)
+    assert 7.0 in clock.sleeps and "t [cont] ok" in out
+    assert any("rate-limited (429); retrying in 7s" in o for o in out)
+    assert stats.outcome == "gone"  # the scripted stream then 404s
+
+
+def test_logs_reconnect_sends_last_event_id_and_skips_duplicates() -> None:
+    conn1: list[Any] = ["id: 1", _ev("one"), "", "id: 2", _ev("two"), ""]
+    conn1.append(kit.LogStreamError("connection reset"))
+    conn2 = ["id: 2", _ev("two"), "", "id: 3", _ev("three"), ""]
+    logs = FakeLogs(conn1, conn2)
+    out, stats, _ = _follow(logs, follow=True)
+    assert [c[2] for c in logs.calls[:2]] == [None, "2"]
+    assert out.count("t [cont] two") == 1 and "t [cont] three" in out
+    assert stats.outcome == "gone"
+
+
+def test_logs_errors_are_bounded() -> None:
+    logs = FakeLogs(*[kit.LogStreamError("HTTP 502", status=502) for _ in range(10)])
+    out, stats, clock = _follow(logs, follow=True, max_errors=3)
+    assert stats.outcome == "error" and len(logs.calls) == 3 and len(clock.sleeps) == 2
+    assert out[-1].startswith("# log stream error 3/3")
+
+
+def test_logs_non_follow_has_hard_overall_timeout() -> None:
+    class Endless:
+        calls = 0
+
+        def __call__(self, *_a: Any) -> Iterator[str]:
+            self.calls += 1
+            while True:
+                clock.t += 1.0
+                yield _ev("spam")
+
+    clock = FakeClock()
+    out: list[str] = []
+    stats = kit.follow_logs(
+        Endless(), "pod1", out.append, follow=False, clock=clock, sleep=clock.sleep,
+        overall_timeout=10.0,
+    )  # fmt: skip
+    assert stats.outcome == "timeout" and 5 <= len(out) <= 11
+
+
+def test_logs_redact_key_in_lines_and_errors(capsys: pytest.CaptureFixture[str]) -> None:
+    logs = FakeLogs(
+        [_ev(f"echo {FAKE_KEY} and prefix {FAKE_KEY[:12]}")],
+        kit.LogStreamError(f"HTTP 500 body says Bearer {FAKE_KEY}", status=500),
+        kit.LogStreamError("gone", status=404),
+    )
+    fake = FakeRunPodWithLogs(logs)
+    assert run(["logs", "--pod-id", "pod1", "--follow"], fake, FakeClock()) == 0
+    cap = capsys.readouterr()
+    _assert_clean(cap.out + cap.err, FAKE_KEY)
+    assert "echo *** and prefix ***" in cap.out
+
+
+def test_logs_out_file_is_private_and_refuses_existing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "pod.log"
+    fake = FakeRunPodWithLogs(FakeLogs([_ev("hello")]))
+    assert run(["logs", "--pod-id", "pod1", "--out", str(out)], fake) == 0
+    assert out.stat().st_mode & 0o777 == 0o600 and "t [cont] hello" in out.read_text()
+    assert run(["logs", "--pod-id", "pod1", "--out", str(out)], fake) == 1
+    assert "refusing to write" in capsys.readouterr().err
+    assert run(["logs", "--pod-id", "../etc"], fake) == 1
+
+
+def test_log_capture_writes_0600_file_and_refuses_planted_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "victim.txt"
+    target.write_text("original\n")
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    (logs_dir / "pod-pod1.log").symlink_to(target)
+    logs = FakeLogs([_ev(f"boot line {FAKE_KEY}")], kit.LogStreamError("x", status=404))
+    cap = kit.LogCapture.start(FakeRunPodWithLogs(logs), "pod1", logs_dir)
+    assert cap is not None
+    cap.finish(wait=10)
+    assert cap.path == logs_dir / "pod-pod1.1.log"
+    assert target.read_text() == "original\n"  # never written through the symlink
+    assert cap.path.stat().st_mode & 0o777 == 0o600
+    text = cap.path.read_text()
+    assert "boot line ***" in text and "# capture ended: gone" in text and FAKE_KEY not in text
+
+
+def test_launch_captures_logs_and_prints_path_in_run_card(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], pubkey: str
+) -> None:
+    logs = FakeLogs(["data: " + json.dumps({"ts": "T", "source": "container", "line": "hi"})])
+    fake = FakeRunPodWithLogs(logs)
+    assert _real_launch(fake, pubkey, "--log-dir", str(tmp_path / "L")) == 0
+    out = capsys.readouterr().out
+    path = tmp_path / "L" / "pod-pod1.log"
+    assert f"log file   : {path}" in out and f"pod log saved: {path}" in out
+    assert "logs --pod-id pod1 --follow" in out and "still initializing" in out
+    assert "T [cont] hi" in path.read_text()
+    assert fake.mutations == ["deploy", "terminate"] and fake.pods == {}
+
+
+def test_log_capture_failure_never_breaks_termination(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], pubkey: str
+) -> None:
+    fake = FakeRunPodWithLogs(FakeLogs(RuntimeError("stream exploded")))
+    assert _real_launch(fake, pubkey, "--log-dir", str(tmp_path / "L")) == 0
+    assert fake.mutations == ["deploy", "terminate"] and fake.pods == {}
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    fake = FakeRunPodWithLogs(FakeLogs())
+    assert _real_launch(fake, pubkey, "--log-dir", str(blocker)) == 0
+    assert "log capture disabled" in capsys.readouterr().err
+    assert fake.mutations == ["deploy", "terminate"] and fake.pods == {}
+
+
+def test_no_ssh_mapping_message_says_initializing(capsys: pytest.CaptureFixture[str]) -> None:
+    fake = _fake_with_pod()
+    fake.pods["pod1"]["runtime"] = {"uptimeInSeconds": None, "ports": []}
+    assert run(["tunnel", "--pod-id", "pod1", "--local-port", str(_free_port())], fake) == 1
+    err = capsys.readouterr().err
+    assert "still initializing" in err and "status RUNNING" in err
+    assert "10+ minutes" in err and "logs --pod-id pod1 --follow" in err
+    system = FakeSystem(caffeinate=None)
+    assert _watch(["watch", "--pod-id", "pod1", "--local-port", str(_free_port())], fake, system)
+    assert "still initializing" in capsys.readouterr().err
+
+
+def test_http_stream_logs_against_local_sse_server() -> None:
+    import http.server
+    import threading
+
+    seen: list[dict[str, str]] = []
+    plan = ["sse", "429", "404"]
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_a: Any) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            seen.append({"path": self.path, **{k.lower(): v for k, v in self.headers.items()}})
+            mode = plan.pop(0)
+            if mode == "sse":
+                body = f"id: 9\n{_ev('srv line ' + FAKE_KEY)}\n\n: ping\n".encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+            elif mode == "429":
+                body = f"slow down {FAKE_KEY}".encode()
+                self.send_response(429)
+                self.send_header("Retry-After", "3")
+            else:
+                body = b"not found"
+                self.send_response(404)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/v2/pods/{{pod_id}}/logs"
+        kit.REDACT.add(kit.Secret(FAKE_KEY))
+        t = kit.HttpTransport(kit.Secret(FAKE_KEY), logs_url=url)
+        assert kit.log_stream_for(kit.ReadOnlyTransport(t)) is not None
+        out: list[str] = []
+        clock = FakeClock()
+        stats = kit.follow_logs(
+            t.stream_logs, "podA", out.append, follow=True, clock=clock, sleep=clock.sleep,
+            read_timeout=5.0,
+        )  # fmt: skip
+    finally:
+        srv.shutdown()
+    assert stats.outcome == "gone"
+    assert out[0] == "t [cont] srv line ***"
+    assert seen[0]["authorization"] == f"Bearer {FAKE_KEY}"
+    assert seen[0]["accept"] == "text/event-stream" and seen[0]["path"].endswith("tail=2000")
+    assert seen[1]["last-event-id"] == "9"  # reconnect resumes after the last event
+    assert 3.0 in clock.sleeps
+    assert not any(FAKE_KEY in o for o in out)
