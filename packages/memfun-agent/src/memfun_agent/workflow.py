@@ -16,7 +16,7 @@ import os
 import subprocess
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -647,6 +647,7 @@ class WorkflowEngine:
             elapsed,
             require_per_task_review=self._pair_with_reviewer,
             project_root=self._project_root,
+            worktrees=self._worktrees.get(state.workflow_id, {}),
         )
 
         # ── Phase 6: AUTO-COMMIT (issue #37) ─────────────────
@@ -2192,6 +2193,8 @@ class WorkflowEngine:
                 state,
                 tid,
                 require_per_task_review=self._pair_with_reviewer,
+                project_root=self._project_root,
+                worktrees=wt_map,
             )
             if reason is not None:
                 # Never lift unaccepted output to a PR — it could
@@ -2868,8 +2871,12 @@ class WorkflowEngine:
         *,
         require_per_task_review: bool,
         project_root: Path | None = None,
+        worktrees: Mapping[str, Path] | None = None,
     ) -> str | None:
         """Why sub-task *tid* is not accepted, or ``None`` if it is.
+
+        ``worktrees`` maps sub-task ids to their git worktrees: a ``cmd``-only run is
+        judged by ``git status`` THERE (its edits are in its worktree, not the repo root).
 
         A sub-task is accepted only when its coder result exists and
         succeeded AND — when per-task review is required (pairing on)
@@ -2881,7 +2888,8 @@ class WorkflowEngine:
             return "no result (agent never ran or result was lost)"
         if not sub_status.result.success:
             return f"coder failed: {sub_status.result.error or 'unknown error'}"
-        no_edit = no_edit_reason(sub_status.agent_name, sub_status.result.result, project_root)
+        where = (worktrees or {}).get(tid) or project_root
+        no_edit = no_edit_reason(sub_status.agent_name, sub_status.result.result, where)
         if no_edit:
             return no_edit
         review = state.per_task_reviews.get(tid)
@@ -2901,6 +2909,7 @@ class WorkflowEngine:
         *,
         require_per_task_review: bool = False,
         project_root: Path | None = None,
+        worktrees: Mapping[str, Path] | None = None,
     ) -> WorkflowResult:
         """Aggregate all sub-task results into WorkflowResult.
 
@@ -2950,9 +2959,12 @@ class WorkflowEngine:
 
         no_edit_subtasks = sum(
             1
-            for ss in state.sub_task_statuses.values()
+            for tid_, ss in state.sub_task_statuses.items()
             if ss.result is not None
-            and no_edit_reason(ss.agent_name, ss.result.result, project_root) is not None
+            and no_edit_reason(
+                ss.agent_name, ss.result.result, (worktrees or {}).get(tid_) or project_root
+            )
+            is not None
         )
 
         if none_count:
@@ -2974,6 +2986,7 @@ class WorkflowEngine:
                 tid,
                 require_per_task_review=require_per_task_review,
                 project_root=project_root,
+                worktrees=worktrees,
             )
             if reason is not None:
                 unaccepted.append(tid)

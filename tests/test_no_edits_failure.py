@@ -92,6 +92,31 @@ def _build(state: WorkflowState) -> WorkflowResult:
     )
 
 
+def test_cmd_only_subtask_is_judged_in_its_own_worktree(tmp_path: Path) -> None:
+    """Audit finding: with worktrees a cmd-only sub-task edits its worktree, not the root."""
+    root, wt = tmp_path / "root", tmp_path / "wt"
+    for d in (root, wt):
+        d.mkdir()
+        subprocess.run(("git", "init", "-q"), cwd=d, check=True)
+    cmd_only = {"ops": [{"type": "cmd", "target": "sed -i s/a/b/ f.py", "detail": 0}]}
+    (wt / "f.py").write_text("b\n")  # the sub-task's change lives in its worktree
+    state = _state("coder-agent", "coder", cmd_only)
+    kw: dict[str, Any] = {"require_per_task_review": False, "project_root": root}
+    # clean root, changed worktree: accepted (was a false failure when judged in the root)
+    assert WorkflowEngine._unaccepted_reason(state, "T1", worktrees={"T1": wt}, **kw) is None
+    res = WorkflowEngine._build_result(
+        state, ReviewResult(approved=True, issues=[], summary=""), 1.0,
+        project_root=root, worktrees={"T1": wt},
+    )  # fmt: skip
+    assert res.success is True and res.no_edit_subtasks == 0
+    # dirty root, untouched worktree: still a no-edit failure (was a false success)
+    (root / "other.py").write_text("x\n")
+    (wt / "f.py").unlink()
+    assert WorkflowEngine._unaccepted_reason(state, "T1", worktrees={"T1": wt}, **kw) is not None
+    # no worktree for the task: falls back to the root
+    assert WorkflowEngine._unaccepted_reason(state, "T1", **kw) is None
+
+
 def test_zero_op_coder_subtask_fails_workflow() -> None:
     res = _build(_state("coder-agent", "coder", {"answer": "done", "ops": [], "iterations": 5}))
     assert res.success is False and res.no_edits is True and res.no_edit_subtasks == 1
