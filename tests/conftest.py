@@ -34,6 +34,58 @@ def _no_authenticated_requests_to_real_hosts(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", guarded)
 
 
+class HermeticNetworkError(OSError):
+    """A test tried to reach a non-loopback host."""
+
+
+def _loopback(host: object) -> bool:
+    import ipaddress
+
+    if not isinstance(host, str):
+        return False
+    if host in _LOCAL_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%")[0]).is_loopback
+    except ValueError:
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _no_non_loopback_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Socket-level hermetic guard for every test: DNS lookups and connections are only
+    allowed to loopback (127.0.0.0/8, ::1, localhost) and unix sockets."""
+    import socket
+
+    real_getaddrinfo = socket.getaddrinfo
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+
+    def getaddrinfo(host, *a, **k):  # type: ignore[no-untyped-def]
+        if host is None or _loopback(host.decode() if isinstance(host, bytes) else host):
+            return real_getaddrinfo(host, *a, **k)
+        raise HermeticNetworkError(f"hermetic test guard: DNS lookup of {host!r}")
+
+    def check(address: object) -> None:
+        if isinstance(address, (str, bytes)):  # AF_UNIX
+            return
+        if isinstance(address, tuple) and address and _loopback(address[0]):
+            return
+        raise HermeticNetworkError(f"hermetic test guard: connect to {address!r}")
+
+    def connect(self, address):  # type: ignore[no-untyped-def]
+        check(address)
+        return real_connect(self, address)
+
+    def connect_ex(self, address):  # type: ignore[no-untyped-def]
+        check(address)
+        return real_connect_ex(self, address)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     loop = asyncio.new_event_loop()

@@ -53,6 +53,10 @@ REMOVE_WAIT=$(num_or "${MEMFUN_REMOVE_WAIT_SEC:-120}" 120)
 GROUP_KILL_WAIT=$(num_or "${MEMFUN_GROUP_KILL_WAIT:-10}" 10)  # TERM -> KILL for a group
 RUN_DIR="${MEMFUN_RUN_DIR:-/workspace/runs/${RUNPOD_POD_ID:-local}}"
 mkdir -p "$RUN_DIR" 2>/dev/null || RUN_DIR=/tmp
+# Scratch files the script itself reads back live on the container disk, never on the
+# (possibly hung) network volume that RUN_DIR / the model dir may be on.
+SCRATCH="${TMPDIR:-/tmp}/memfun-boot.$$"
+mkdir -p "$SCRATCH" 2>/dev/null || SCRATCH=/tmp
 SGLANG_PID=""
 IN_DEADLINE=0
 MIRROR_PID=""
@@ -69,12 +73,20 @@ kill_tree() {
   kill -"$sig" "$p" 2>/dev/null
 }
 
-# spawn_group CMD...: start CMD in the background in its OWN process group (set -m), so
-# the whole tree can be signalled with `kill -- -PGID`.  The pid (= pgid) is $SPAWNED.
+# spawn_group [-o FILE|-a FILE] CMD...: start CMD in the background in its OWN process
+# group (set -m), so the whole tree can be signalled with `kill -- -PGID`.  The pid
+# (= pgid) is $SPAWNED.  -o/-a redirect stdout+stderr to FILE INSIDE the child, so opening
+# a file on a hung volume blocks the child, never this shell.
 SPAWNED=""
 spawn_group() {
+  local mode="" file=""
+  case "${1:-}" in -o|-a) mode=$1; file=$2; shift 2 ;; esac
   set -m
-  "$@" &
+  case "$mode" in
+    -o) ( exec >"$file" 2>&1; "$@" ) & ;;
+    -a) ( exec >>"$file" 2>&1; "$@" ) & ;;
+    *) "$@" & ;;
+  esac
   SPAWNED=$!
   set +m
 }
@@ -95,19 +107,24 @@ kill_group() {
 # this shell stays in `wait`, where TERM traps run immediately (bash defers traps while a
 # FOREGROUND child runs).  The watcher writes nothing, so $(bounded ...) never blocks on it.
 bounded() {
-  local secs=$1 pid wd rc flag
+  local secs=$1 pid wd rc flag what
   shift
-  flag="$RUN_DIR/.timeout.$$.$RANDOM"
+  what=$1
+  case "$what" in -o|-a) what=${3:-} ;; esac
+  flag="$SCRATCH/.timeout.$$.$RANDOM"
   spawn_group "$@"
   pid=$SPAWNED
+  # The watcher has its own group too, so stopping it also stops its `sleep` (no pgrep).
+  set -m
   ( sleep "$secs"; kill -0 "$pid" 2>/dev/null || exit 0; : >"$flag"
     kill -TERM -- "-$pid" 2>/dev/null || kill_tree "$pid" TERM; sleep 5
     kill -KILL -- "-$pid" 2>/dev/null || kill_tree "$pid" KILL ) >/dev/null 2>&1 &
   wd=$!
+  set +m
   disown "$wd" 2>/dev/null  # no "Killed" job notice when it is stopped below
   wait "$pid"; rc=$?
-  kill_tree "$wd" KILL 2>/dev/null
-  if [ -f "$flag" ]; then rm -f "$flag"; log "timed out after ${secs}s: $1" >&2; return 124; fi
+  kill -KILL -- "-$wd" 2>/dev/null || kill_tree "$wd" KILL
+  if [ -f "$flag" ]; then rm -f "$flag"; log "timed out after ${secs}s: $what" >&2; return 124; fi
   return "$rc"
 }
 
@@ -117,10 +134,11 @@ dump_logs() {
   [ "$LOGS_DUMPED" = 1 ] && return 0
   LOGS_DUMPED=1
   local f
+  # Every read of RUN_DIR is bounded (it may be on a hung network volume).
   for f in pull apt sglang; do
-    if [ -s "$RUN_DIR/$f.log" ]; then
+    if bounded 10 test -s "$RUN_DIR/$f.log"; then
       log "---- last 40 lines of $RUN_DIR/$f.log ----"
-      tail -n 40 "$RUN_DIR/$f.log" 2>/dev/null
+      bounded 10 tail -n 40 "$RUN_DIR/$f.log" 2>/dev/null
       log "---- end of $f.log ----"
     fi
   done
@@ -181,6 +199,14 @@ die_now() {
   exit 1
 }
 
+# Main shell, before it exits for any reason: stop the deadline timer, the download
+# group, SGLang and the log mirror, so nothing outlives PID 1.
+stop_children() {
+  local j
+  for j in $(jobs -p); do kill -TERM -- "-$j" 2>/dev/null; kill_tree "$j" TERM; done
+  [ -n "$SGLANG_PID" ] && { kill -TERM -- "-$SGLANG_PID" 2>/dev/null; kill_tree "$SGLANG_PID" TERM; }
+}
+
 # Is the main shell (PID 1) still running?  A zombie (exited, not yet reaped) is not.
 main_alive() {
   kill -0 "$$" 2>/dev/null || return 1
@@ -199,12 +225,12 @@ self_terminate() {
   trap '' TERM INT
   to_console
   log "self-terminate: $1"
-  dump_logs
   stop_mirror
   local i
   for i in $(seq 1 "$TERM_ATTEMPTS"); do
     if command -v runpodctl >/dev/null 2>&1 && [ -n "${RUNPOD_POD_ID:-}" ]; then
       if runpodctl_remove; then
+        dump_logs  # best effort, AFTER removal (bounded reads; the volume may hang)
         if [ "$IN_DEADLINE" = 1 ]; then
           # A 0 exit is not proof: if the container still runs after REMOVE_WAIT, stop it.
           local w=0
@@ -217,6 +243,7 @@ self_terminate() {
             stop_container
           fi
         fi
+        [ "$IN_DEADLINE" = 0 ] && stop_children
         exit 0
       fi
     else
@@ -225,6 +252,7 @@ self_terminate() {
     fi
     [ "$i" -lt "$TERM_ATTEMPTS" ] && sleep "$TERM_RETRY_SLEEP"
   done
+  dump_logs
   log "pod-scoped termination failed: stopping SGLang and exiting PID 1 (billing may continue;"
   log "the local watchdog / terminateAfter must terminate the pod)"
   [ -n "$SGLANG_PID" ] && kill -TERM "$SGLANG_PID" 2>/dev/null
@@ -232,10 +260,11 @@ self_terminate() {
   sleep "$KILL_GRACE"
   pkill -KILL -f sglang.launch_server 2>/dev/null
   # From the deadline subshell, also take down the main script (PID 1) so the container
-  # exits.  Every long step in the main shell runs under `bounded`/`wait`, so its TERM
-  # trap runs at once; the marker makes it skip runpodctl and just stop (die_now).  KILL
-  # follows for a non-PID-1 main shell (PID 1 ignores KILL from inside its namespace).
+  # exits: SIGUSR1 makes PID 1 run die_now at once (every long step in the main shell
+  # runs under `bounded`/`wait`, where traps run immediately).  KILL follows for a
+  # non-PID-1 main shell (PID 1 ignores KILL from inside its namespace).
   [ "$IN_DEADLINE" = 1 ] && stop_container
+  [ "$IN_DEADLINE" = 0 ] && stop_children
   exit 1
 }
 
@@ -261,7 +290,9 @@ remaining=$(( by_epoch < by_minutes ? by_epoch : by_minutes ))
 log "hard stop armed: ${remaining}s from now"
 DEADLINE_AT=$(( now + remaining ))
 # IN_DEADLINE marks the timer subshell explicitly ($BASHPID does not exist in bash 3.2).
-( IN_DEADLINE=1; sleep "$remaining"; self_terminate "deadline reached" ) &
+# Own process group, so stop_children/die_now can stop it (and its sleep) without pgrep.
+deadline_timer() { IN_DEADLINE=1; sleep "$remaining"; self_terminate "deadline reached"; }
+spawn_group deadline_timer
 trap 'self_terminate "received SIGTERM"' TERM
 trap 'self_terminate "received SIGINT"' INT
 trap die_now USR1
@@ -270,7 +301,7 @@ trap die_now USR1
 with_timeout() { bounded 10 "$@"; }
 # probe SECS CMD...: first line of CMD's output, bounded, run in THIS shell (not in a
 # command substitution, where a pending TERM trap would wait for it).
-PROBE_OUT="$RUN_DIR/.probe.$$"
+PROBE_OUT="$SCRATCH/probe"
 probe() {
   local secs=$1
   shift
@@ -340,7 +371,7 @@ if [ -n "${PUBLIC_KEY:-}" ]; then
     apt_sshd() {
       apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server
     }
-    bounded 900 apt_sshd >"$RUN_DIR/apt.log" 2>&1 || log "openssh-server install failed (see apt.log)"
+    bounded 900 -o "$RUN_DIR/apt.log" apt_sshd || log "openssh-server install failed (see apt.log)"
   fi
   mkdir -p /root/.ssh /run/sshd && chmod 700 /root/.ssh
   printf '%s\n' "$PUBLIC_KEY" >/root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
@@ -374,11 +405,13 @@ esac
 [[ "$MODEL_DIR" != *..* ]] || fail "MEMFUN_MODEL_DIR contains .."
 
 MARKER="$MODEL_DIR/.memfun_verified"
+MARKER_COPY="$SCRATCH/marker.json"  # parsed locally: the marker may be on a hung volume
 marker_field() {  # one-line JSON written by verify_weights.py / this script
-  sed -n "s/.*\"$1\": *\"\([^\"]*\)\".*/\1/p" "$MARKER" 2>/dev/null | head -n 1
+  sed -n "s/.*\"$1\": *\"\([^\"]*\)\".*/\1/p" "$MARKER_COPY" 2>/dev/null | head -n 1
 }
 weights_ok() {
-  [ -f "$MARKER" ] || { log "no $MARKER"; return 1; }
+  rm -f "$MARKER_COPY"
+  bounded 10 cp "$MARKER" "$MARKER_COPY" 2>/dev/null || { log "no $MARKER"; return 1; }
   [ "$(marker_field repo)" = "$MODEL_REPO" ] || { log "marker repo != $MODEL_REPO"; return 1; }
   if [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]; then  # pinned commit: must be exactly that one
     [ "$(marker_field sha)" = "$REVISION" ] || { log "marker sha != pinned $REVISION"; return 1; }
@@ -412,9 +445,8 @@ pick_download_method() {
   DL_MISSING="$DL_MISSING python3:huggingface_hub"
   if command -v python3 >/dev/null 2>&1; then
     log "huggingface_hub not importable: trying pip install -q huggingface_hub"
-    { bounded "$PIP_TIMEOUT" python3 -m pip install -q huggingface_hub \
-        || bounded "$PIP_TIMEOUT" pip install -q huggingface_hub; } \
-      >>"$RUN_DIR/pull.log" 2>&1
+    bounded "$PIP_TIMEOUT" -a "$RUN_DIR/pull.log" python3 -m pip install -q huggingface_hub \
+      || bounded "$PIP_TIMEOUT" -a "$RUN_DIR/pull.log" pip install -q huggingface_hub
     if py_has huggingface_hub; then DL_METHOD=python-api-pip; return 0; fi
     DL_MISSING="$DL_MISSING pip-install-failed"
   else
@@ -457,10 +489,10 @@ dl_touched_since() {
 
 download_weights() {
   local pull_log="$RUN_DIR/pull.log" attempt rc=1 start prog dl cap
-  : >"$pull_log"
+  bounded 10 -o "$pull_log" true || log "cannot write $pull_log (volume hung?)"
   if ! pick_download_method; then
     log "no way to download weights: missing:$DL_MISSING"
-    log "---- last 30 lines of $pull_log ----"; tail -n 30 "$pull_log"
+    log "---- last 30 lines of $pull_log ----"; bounded 10 tail -n 30 "$pull_log"
     return 1
   fi
   [ -n "$DL_MISSING" ] && log "not available:$DL_MISSING"
@@ -474,9 +506,10 @@ download_weights() {
     [ "$cap" -lt 1 ] && cap=1
     # Background + wait (not foreground) so the TERM trap / deadline can always act.
     # Own process group: a stall/cap kill reaches every process the downloader started.
-    spawn_group run_download >>"$pull_log" 2>&1
+    spawn_group -a "$pull_log" run_download
     dl=$SPAWNED
-    ( t0=$(date +%s); last=-1; still=0; stamp="$RUN_DIR/.dl_stamp"; : >"$stamp"
+    set -m
+    ( t0=$(date +%s); last=-1; still=0; stamp="$SCRATCH/dl_stamp"; : >"$stamp"
       while sleep "$PROGRESS_SEC"; do
         kill -0 "$dl" 2>/dev/null || exit 0
         kb=$(dl_size_kb)
@@ -500,9 +533,11 @@ download_weights() {
         fi
       done ) &
     prog=$!
+    set +m
     wait "$dl"
     rc=$?
-    kill_tree "$prog" KILL; wait "$prog" 2>/dev/null
+    kill -KILL -- "-$prog" 2>/dev/null || kill_tree "$prog" KILL
+    wait "$prog" 2>/dev/null
     kill -KILL -- "-$dl" 2>/dev/null  # no stray writer of this attempt survives into the next
     if [ "$rc" = 0 ]; then
       kb=$(dl_size_kb)
@@ -515,7 +550,7 @@ download_weights() {
   done
   log "all $PULL_RETRIES download attempts via $DL_METHOD failed;" \
     "not available:${DL_MISSING:- (none)}"
-  log "---- last 30 lines of $pull_log ----"; tail -n 30 "$pull_log"
+  log "---- last 30 lines of $pull_log ----"; bounded 10 tail -n 30 "$pull_log"
   return 1
 }
 
@@ -529,8 +564,9 @@ if ! weights_ok; then
     # prepull_weights.sh's job (verify_weights.py is not shipped into the pod).
     sha=""
     [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] && sha="$REVISION"
-    printf '{"repo": "%s", "sha": "%s", "revision": "%s", "source": "in-pod pull"}\n' \
-      "$MODEL_REPO" "$sha" "$REVISION" >"$MARKER"
+    bounded 30 -o "$MARKER" printf \
+      '{"repo": "%s", "sha": "%s", "revision": "%s", "source": "in-pod pull"}\n' \
+      "$MODEL_REPO" "$sha" "$REVISION" || fail "cannot write $MARKER (volume hung?)"
   else
     fail "weights missing/unverified at $MODEL_DIR (run prepull_weights.sh first)"
   fi
@@ -541,9 +577,12 @@ fi
 # references/production_metrics); the memfun dashboard strip polls it via the tunnel.
 log "starting SGLang: $MODEL_DIR as $SERVED_NAME on 127.0.0.1:$PORT $EXTRA_ARGS"
 # shellcheck disable=SC2086  # EXTRA_ARGS is intentionally word-split
-python3 -m sglang.launch_server --model-path "$MODEL_DIR" --served-model-name "$SERVED_NAME" \
-  --host 127.0.0.1 --port "$PORT" --enable-metrics $EXTRA_ARGS >"$RUN_DIR/sglang.log" 2>&1 &
-SGLANG_PID=$!
+# Own process group (a group-wide signal to PID 1's group cannot reach it, and vice versa);
+# the log file is opened by the child, so a hung volume cannot block this shell.
+spawn_group -o "$RUN_DIR/sglang.log" python3 -m sglang.launch_server \
+  --model-path "$MODEL_DIR" --served-model-name "$SERVED_NAME" \
+  --host 127.0.0.1 --port "$PORT" --enable-metrics $EXTRA_ARGS
+SGLANG_PID=$SPAWNED
 # Mirror SGLang's log to stdout so the RunPod log stream shows startup and crashes.
 tail -n +1 -F "$RUN_DIR/sglang.log" 2>/dev/null &
 MIRROR_PID=$!

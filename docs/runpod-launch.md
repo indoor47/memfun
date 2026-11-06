@@ -359,6 +359,11 @@ in the main shell, so the TERM/USR1 traps always run within seconds. A download 
 in its own process group; a stall/cap kill sends TERM to the whole group, then KILL after
 10 s (no `pgrep` needed). Progress counts a size change OR any file modified under the model
 dir or the HF/xet caches, so a preallocated file being filled is not a stall.
+A hung network volume cannot block removal either: removal is tried before any log dump,
+every read of `RUN_DIR` (log tails, the weights marker) is bounded, files the script reads
+back live under `/tmp`, and log files are opened by the child process, never by PID 1.
+SGLang, downloads and the deadline timer each run in their own process group, and
+nothing outlives PID 1.
 If `runpodctl` reports success but PID 1 still runs 120 s later, the deadline path stops
 the container anyway (a 0 exit is not proof the pod is gone).
 

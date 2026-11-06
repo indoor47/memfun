@@ -1448,6 +1448,7 @@ D="@DIR@"
 if [ "$1" = "-m" ] && [ "$2" = "sglang.launch_server" ]; then
   for a in "$@"; do printf "%s\n" "$a"; done >> "$D/python3.log"
   [ -n "${FAKE_SGLANG_OUT:-}" ] && echo "$FAKE_SGLANG_OUT"
+  ps -o pgid= -p $$ | tr -d ' ' > "$D/sglang.pgid"
   [ -n "${FAKE_SGLANG_SLEEP:-}" ] && sleep "$FAKE_SGLANG_SLEEP"
   exit 0
 fi
@@ -1471,6 +1472,7 @@ case "$1" in
       "import "*) exit 1 ;;
       *snapshot_download*)
         shift 2; echo "$*" >> "$D/snapshot.log"
+        [ -n "${FAKE_SNAP_PRELINE:-}" ] && echo "$FAKE_SNAP_PRELINE"
         if [ "${FAKE_SNAP_TRAP:-0}" = 1 ]; then  # ignores TERM, never grows
           trap "" TERM; while :; do sleep 1; done
         fi
@@ -1493,6 +1495,7 @@ exit 1
 
 
 BOOT_ORPHANS: dict[str, list[str]] = {}
+BOOT_PIDS: dict[str, int] = {}
 
 
 def _run_boot(
@@ -1547,18 +1550,27 @@ def _run_boot(
             cwd=tmp_path,
         )
         try:
+            BOOT_PIDS[str(tmp_path)] = proc.pid
             proc.wait(timeout=wait_bound)  # liveness bound: TimeoutExpired = PID 1 hung
-            # Orphans the script left (other process groups survive the killpg below).
-            probe = subprocess.run(
-                ["pgrep", "-f", str(models)], capture_output=True, text=True, check=False
+            # Orphans the script left: anything still in its process group, or any process
+            # mentioning the model dir (other process groups survive the killpg below).
+            found: set[str] = set()
+            probes = (
+                ["pgrep", "-f", str(models)],
+                ["pgrep", "-g", str(proc.pid)],
+                ["pgrep", "-f", str(kit.BOOT_SCRIPT)],  # forks of the script (e.g. its timer)
             )
-            BOOT_ORPHANS[str(tmp_path)] = probe.stdout.split()
+            for argv in probes:
+                out = subprocess.run(argv, capture_output=True, text=True, check=False)
+                found.update(out.stdout.split())
+            BOOT_ORPHANS[str(tmp_path)] = sorted(found)
         finally:  # the armed deadline subshell is still sleeping: kill the whole group
             import os as _os
 
             with contextlib.suppress(ProcessLookupError):
                 _os.killpg(proc.pid, signal.SIGKILL)
             subprocess.run(["pkill", "-KILL", "-f", str(models)], check=False)
+            subprocess.run(["pkill", "-KILL", "-f", str(kit.BOOT_SCRIPT)], check=False)
     rp = rp_log.read_text().splitlines() if rp_log.exists() else []
     py = py_log.read_text().splitlines() if py_log.exists() else []
     return out_file.read_text(), rp, py
@@ -3011,3 +3023,92 @@ def test_second_signal_at_every_handover_point_still_terminates(
         except BaseException as exc:  # recorded, then asserted below
             rc = exc
     assert "terminate" in fake.mutations and fake.pods == {}, (first, where, sig, rc)
+
+
+# ---------------------------------------------------------------------------
+# Re-audit R1-R4: a hung network volume (RUN_DIR / model dir) cannot block removal.
+# ---------------------------------------------------------------------------
+
+
+@needs_bash
+def test_boot_hung_log_tail_on_volume_cannot_block_removal(tmp_path: Path) -> None:
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "tail").write_text(  # reading a log on the hung volume never returns
+        '#!/bin/sh\n[ "$1" = "-n" ] && [ "$2" = "40" ] && exec sleep 600\n'
+        'exec /usr/bin/tail "$@"\n'
+    )
+    (fakebin / "tail").chmod(0o755)
+    log, rp, _py = _run_boot(
+        tmp_path,
+        {
+            "MEMFUN_DEADLINE_EPOCH": _soon(3),
+            "MEMFUN_ALLOW_PULL": "1",
+            "FAKE_HF_HUB": "1",
+            "FAKE_SNAP_PRELINE": "one line, then the download hangs",
+            "FAKE_SNAP_SLEEP": "600",
+            "MEMFUN_REMOVE_WAIT_SEC": "1",
+        },
+        runpodctl=_rp_script(tmp_path, "echo removed; exit 0"),
+        wait_bound=60,
+    )
+    assert rp == ["remove pod podB"], log  # removal is tried first, before any log dump
+    assert "container shutdown: stopping all processes and exiting PID 1" in log
+
+
+@needs_bash
+def test_boot_hung_marker_read_cannot_block_pid1(tmp_path: Path) -> None:
+    _write_marker(tmp_path, "a" * 40)
+    fakebin = tmp_path / "bin"
+    (fakebin / "sed").parent.mkdir(exist_ok=True)
+    (fakebin / "sed").write_text(
+        '#!/bin/sh\ncase "$*" in *memfun_verified*) exec sleep 600 ;; esac\n'
+        'exec /usr/bin/sed "$@"\n'
+    )
+    (fakebin / "sed").chmod(0o755)
+    log, _rp, _py = _run_boot(
+        tmp_path,
+        {"MEMFUN_DEADLINE_EPOCH": _soon(3), "FAKE_SGLANG_SLEEP": "600", **FAIL_FAST},
+        runpodctl=_rp_script(tmp_path, "exit 1"),
+        wait_bound=60,
+    )
+    assert "container shutdown: stopping all processes and exiting PID 1" in log
+
+
+@needs_bash
+def test_boot_self_terminate_leaves_no_survivors(tmp_path: Path) -> None:
+    log, rp, _py = _run_boot(tmp_path, {}, wait_bound=60)  # no weights -> fail -> removal
+    assert rp == ["remove pod podB"] and "terminated via 'runpodctl remove pod'" in log
+    assert BOOT_ORPHANS[str(tmp_path)] == []  # deadline timer etc. are gone too
+
+
+@needs_bash
+def test_boot_sglang_runs_in_its_own_process_group(tmp_path: Path) -> None:
+    _write_marker(tmp_path, "a" * 40)
+    _log, _rp, py = _run_boot(tmp_path, {}, wait_bound=60)
+    assert "--enable-metrics" in py
+    pgid = int((tmp_path / "sglang.pgid").read_text().strip())
+    assert pgid != BOOT_PIDS[str(tmp_path)]  # a group-wide USR1 cannot reach PID 1 via it
+
+
+def test_socket_level_network_guard() -> None:
+    import http.client
+    import socket as _socket
+
+    with pytest.raises(OSError, match="hermetic"):
+        http.client.HTTPSConnection("api.runpod.io", timeout=1).connect()
+    raw = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        with pytest.raises(OSError, match="hermetic"):
+            raw.connect(("1.1.1.1", 443))
+    finally:
+        raw.close()
+    with pytest.raises(OSError, match="hermetic"):
+        _socket.create_connection(("example.com", 80), timeout=1)
+    server = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    try:  # loopback stays allowed
+        _socket.create_connection(server.getsockname(), timeout=1).close()
+    finally:
+        server.close()
