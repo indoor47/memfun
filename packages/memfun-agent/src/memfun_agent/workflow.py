@@ -283,6 +283,10 @@ OnSubTaskStatus = Callable[[str, SubTaskStatus], None]
 # ── Workflow engine ───────────────────────────────────────────
 
 
+#: Longest reviewer answer given to the constrained extractor (it is never truncated).
+MAX_EXTRACT_ANSWER_CHARS = 20_000
+
+
 class WorkflowEngine:
     """Orchestrates multi-agent task execution.
 
@@ -1374,14 +1378,23 @@ class WorkflowEngine:
     async def _constrained_verdict_fallback(
         tid: str, result: TaskResult, *, review_id: str
     ) -> TaskResult:
-        """Recover an unparseable review via ONE grammar-constrained call.
+        """Recover a REJECTION from an unparseable review via ONE constrained call.
 
         Only when ``[llm] constrained_json`` is effective for the auditor
         role, the reviewer task succeeded, and its answer has no valid
-        findings block for *review_id*.  The extraction yields findings JSON
-        that replaces the answer and then goes through the SAME fail-closed
-        parser (nonce check, code-computed verdict) as any reviewer answer;
-        if extraction fails the original result is returned unchanged and
+        findings block for *review_id*.  Fail-closed rules (audit of PR #70):
+
+        * the extraction can only REJECT.  Findings it transcribes from the reviewer's
+          prose go through the same nonce parser and code-computed verdict, but an
+          extraction that yields no blocking finding (empty, or LOW only) is NOT
+          accepted: approval always needs the reviewer's own nonce-bearing block, never
+          an LLM's reading of prose (the nonce is supplied by this code, so it proves
+          nothing about the extractor's input);
+        * it is skipped when the answer already contains block-like JSON the parser
+          rejected (stale/wrong ``review_id``, malformed findings), and when the answer
+          is longer than the extractor's input limit (no silent truncation of findings).
+
+        If extraction is skipped or refused the original result is returned unchanged and
         the review errors exactly as before.
         """
         from memfun_agent.constrained_json import extract_review_block, role_constrained
@@ -1394,10 +1407,27 @@ class WorkflowEngine:
                 return result
         except Exception:
             pass  # unparseable: fall through to extraction (parser re-checks)
+        if (
+            len(answer) > MAX_EXTRACT_ANSWER_CHARS
+            or '"review_id"' in answer
+            or '"findings"' in answer
+        ):
+            logger.info(
+                "Per-task review %s: constrained extraction skipped (block-like/long)", tid
+            )
+            return result
         block = await extract_review_block(answer, review_id)
         if block is None:
             return result
-        logger.info("Per-task review %s: recovered verdict via constrained extraction", tid)
+        parsed = parse_review_output(block, review_id=review_id)
+        if parsed is None or not parsed.blocking:
+            logger.info(
+                "Per-task review %s: constrained extraction found no blocking finding; "
+                "an extraction can only reject, so the review stays an error",
+                tid,
+            )
+            return result
+        logger.info("Per-task review %s: recovered a rejection via constrained extraction", tid)
         return dataclasses.replace(result, result={**(result.result or {}), "answer": block})
 
     @staticmethod
