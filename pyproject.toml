@@ -46,7 +46,17 @@ typeCheckingMode = "strict"
 reportMissingTypeStubs = false
 # evals/ depends heavily on untyped third-party libs (dspy, swebench, datasets);
 # strict mode produces hundreds of unactionable errors. Excluded from CI typecheck.
-exclude = ["evals", ".claude/worktrees", ".memfun/worktrees"]
+# A custom `exclude` REPLACES pyright's defaults (**/node_modules,
+# **/__pycache__, **/.*), so they must be restated here. Without `**/.*`
+# pyright analyses all of .venv/site-packages (~13.8k files) and hangs.
+exclude = [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*",
+    "evals",
+    ".claude/worktrees",
+    ".memfun/worktrees",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
