@@ -186,13 +186,39 @@ def test_repl_tools_read_and_list_real_files(project_root: Path) -> None:
     assert "[tool error" not in matches
 
 
-async def test_repl_tool_call_from_running_loop(project_root: Path) -> None:
-    """Inside a running loop (the RLM case): wrappers use a worker thread."""
+async def test_repl_tool_call_from_worker_thread_without_loop(project_root: Path) -> None:
+    """From a worker thread (no running loop there): the ``asyncio.run`` branch."""
     bridge = await create_tool_bridge()
     read_file = bridge.get_repl_tools()["read_file"]
 
     content = await asyncio.to_thread(read_file, path=str(project_root / "hello.txt"))
     assert content.splitlines()[0].endswith("hello from the bridge")
+
+
+async def test_repl_tool_call_on_running_loop_thread(
+    project_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Called directly on the loop thread (how the RLM REPL runs it): the
+    wrapper must take its thread-pool branch and return without deadlock."""
+    import concurrent.futures
+
+    pools: list[int] = []
+    real_pool = concurrent.futures.ThreadPoolExecutor
+
+    class CountingPool(real_pool):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pools.append(1)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", CountingPool)
+
+    bridge = await create_tool_bridge()
+    read_file = bridge.get_repl_tools()["read_file"]
+    asyncio.get_running_loop()  # we really are on a running loop
+
+    content = read_file(path=str(project_root / "hello.txt"))
+    assert content.splitlines()[0].endswith("hello from the bridge")
+    assert pools == [1]
 
 
 async def test_call_tool_reports_tool_errors(project_root: Path) -> None:
