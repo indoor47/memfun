@@ -93,3 +93,18 @@ def test_page_ships_the_three_views_without_arrow_chain() -> None:
     assert 'id="swarm-canvas"' in html and 'id="timeline-canvas"' in html
     # Sibling sub-tasks run in parallel; the old flow joined them with arrows.
     assert "task-arrow" not in html.split("<script>", 1)[1]
+
+
+def test_trailing_prometheus_timestamp_is_not_the_value() -> None:
+    m = parse_inference_metrics('sglang:num_running_reqs{model_name="q"} 3 1700000000000\n')
+    assert m["running"] == 3.0
+
+
+def test_escaping_covers_quotes_for_attribute_contexts() -> None:
+    # Task details and request descriptions land in title="..." attributes;
+    # an unescaped quote there is an attribute-breakout XSS.
+    html = TestClient(create_app()).get("/").text
+    js = html.split("<script>", 1)[1]
+    body = js[js.index("function escHtml") : js.index("function escHtml") + 400]
+    assert "&quot;" in body and "&#39;" in body
+    assert 'data-wfid="${escHtml(r.workflow_id)}"' in js

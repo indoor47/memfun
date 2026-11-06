@@ -369,8 +369,11 @@ def parse_inference_metrics(text: str) -> dict[str, float | None]:
         field = _INFERENCE_METRICS.get(name)
         if field is None:
             continue
+        # "<name>{labels} <value> [timestamp]" -- the value is the first
+        # token after the labels; an optional trailing timestamp is ignored.
+        rest = line.rsplit("}", 1)[1] if "}" in line else line[len(name) :]
         try:
-            value = float(line.rsplit(" ", 1)[1])
+            value = float(rest.split()[0])
         except (IndexError, ValueError):
             continue
         sums[field] = sums.get(field, 0.0) + value
@@ -1255,7 +1258,7 @@ ws.onmessage = (e) => {
     liveBanner.tokensOut = 0;
     liveBanner.lastAgent = null;
     liveBanner.lastTs = null;
-    swarmSeed(workers, tasks);
+    swarmSeed(workers, tasks, requests);
     (msg.events || []).forEach(ev => {
       allEvents.push(ev);
       ingestForTabs(ev);
@@ -1623,10 +1626,11 @@ function renderSparkCards() {
   '</div>';
 }
 
+// Safe for element text AND quoted attribute values (title="...", data-*).
 function escHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
-  return d.innerHTML;
+  return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // ── Event handling ────────────────────────────────────────
@@ -1772,7 +1776,8 @@ function renderRequests() {
       ? ` (${r.completed_count || 0}/${r.task_count})`
       : '';
     return `<div class="request-item${isActive ? ' active' : ''}"
-                data-wfid="${r.workflow_id}" title="${escHtml(r.description || r.workflow_id)}">
+                data-wfid="${escHtml(r.workflow_id)}"
+                title="${escHtml(r.description || r.workflow_id)}">
       <span class="req-time">${t}</span>
       <span class="req-status ${r.status}">${r.status}${counts}</span>
       ${desc}
@@ -1821,7 +1826,9 @@ function renderTasks() {
       '<div class="empty">No tasks yet</div>';
     return;
   }
-  // Lanes by parallelism group when events carry one, else by status.
+  // Lanes by parallelism group when task.published events carry an optional
+  // `group` field (the simulator does; the runtime does not emit it yet),
+  // else by status.
   // Never draw arrows between sibling sub-tasks: they run in parallel.
   const chip = tid => {
     const t = ft[tid];
@@ -2288,7 +2295,18 @@ function swarmIngest(ev) {
   const ts = ev.ts || swNow();
   if (SW.t0 === null) SW.t0 = ts;
   SW.dirty = true;
-  if (et === 'workflow.started') { SW.request = ev.detail || ''; return; }
+  if (et === 'workflow.started') {
+    SW.request = ev.detail || '';
+    // A new request with nothing in flight starts a fresh run: reset the
+    // origin so elapsed time, cost and the timeline cover this run only.
+    const busy = Object.values(SW.spans).some(sp => sp.end === null);
+    if (!busy) {
+      for (const k of Object.keys(SW.tasks)) delete SW.tasks[k];
+      for (const k of Object.keys(SW.spans)) delete SW.spans[k];
+      SW.calls.length = 0; SW.firstPick = null; SW.t0 = ts;
+    }
+    return;
+  }
   if (et === 'worker.online') { swAgent(ev); return; }
   if (et === 'worker.offline') {
     const a = SW.agents[swKey(ev)];
@@ -2331,14 +2349,26 @@ function swarmIngest(ev) {
     a.pulse = 1;
     SW.calls.push({ ts: ts, key: a.key, tok: ev.completion_tokens || 0 });
     if (SW.calls.length > SW_MAX_CALLS) SW.calls.splice(0, SW.calls.length - SW_MAX_CALLS);
-    swParticles.push({ key: a.key, t: 0 });
+    if (activeView === 'swarm' && !reduceMotion && swParticles.length < 500) {
+      swParticles.push({ key: a.key, t: 0 });
+    }
   }
 }
 
 // A (re)connecting page gets a snapshot of workers and tasks plus only
 // the most recent events; seed the swarm model from the snapshot so tasks
 // published before that window still appear.
-function swarmSeed(snapWorkers, snapTasks) {
+function swarmSeed(snapWorkers, snapTasks, snapRequests) {
+  // The server persists tasks across sessions and never prunes them, so
+  // only the current run is seeded: tasks since the earliest still-running
+  // request, else since the newest request.
+  const reqs = Object.values(snapRequests || {});
+  const running = reqs.filter(r => r.status === 'running').map(r => r.ts || 0);
+  const cutoff = running.length ? Math.min(...running)
+    : reqs.length ? Math.max(...reqs.map(r => r.ts || 0)) : 0;
+  const current = Object.fromEntries(Object.entries(snapTasks || {})
+    .filter(([_tid, t]) => (t.ts || 0) >= cutoff - 1));
+  snapTasks = current;
   for (const k of Object.keys(SW.agents)) delete SW.agents[k];
   for (const k of Object.keys(SW.tasks)) delete SW.tasks[k];
   for (const k of Object.keys(SW.spans)) delete SW.spans[k];
@@ -2732,6 +2762,14 @@ setView(activeView);
   cv.addEventListener('mouseleave', () => { tip.style.display = 'none'; swHover = null; });
 })();
 
+if (window.ResizeObserver) {
+  const ro = new ResizeObserver(() => { SW.dirty = true; });
+  ['swarm-canvas', 'timeline-canvas'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) ro.observe(el);
+  });
+}
+
 let swLastFrame = performance.now();
 function swFrame(t) {
   const dt = Math.min(0.1, (t - swLastFrame) / 1000);
@@ -2759,7 +2797,9 @@ async function pollServerMetrics() {
     const r = await fetch('/api/server-metrics');
     SW.server = await r.json();
   } catch (_e) {
-    SW.server = { enabled: true, ok: false };
+    // Our own server is restarting; keep whatever 'enabled' was.
+    SW.server = { enabled: !!(SW.server && SW.server.enabled), ok: false };
+    if (!SW.server.enabled) { setTimeout(pollServerMetrics, 10000); return; }
   }
   if (SW.server && SW.server.enabled) setTimeout(pollServerMetrics, 3000);
 }
