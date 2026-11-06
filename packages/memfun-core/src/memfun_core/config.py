@@ -29,7 +29,7 @@ LLM_ROLES: tuple[str, ...] = (
 
 # An env var NAME (never a value).  Rejecting anything else catches the
 # common mistake of pasting the API key itself into ``api_key_env``.
-_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_VAR_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -66,7 +66,9 @@ class LLMRoleConfig:
 
     Every field is optional; ``None`` means "inherit from ``[llm]``".
     For ``base_url`` an explicit empty string in TOML means "no base URL"
-    (clears an inherited one) and is stored as ``""``.
+    (clears an inherited one) and is stored as ``""``.  ``api_key_env``
+    is inherited only when the role keeps ``[llm]``'s provider AND
+    base_url; ``api_key_env = ""`` means "no key".
     """
 
     provider: str | None = None
@@ -120,6 +122,14 @@ class LLMConfig:
                 updates["base_url"] = None
                 continue
             updates[f.name] = val
+        # Never send [llm]'s key to a different endpoint: api_key_env is
+        # inherited only when provider AND base_url resolve to [llm]'s.
+        if "api_key_env" not in updates:
+            same_endpoint = updates.get("provider", self.provider) == self.provider and (
+                updates.get("base_url", self.base_url) == self.base_url
+            )
+            if not same_endpoint:
+                updates["api_key_env"] = ""
         return dataclasses.replace(self, roles={}, **updates)
 
 
@@ -319,7 +329,9 @@ def _validate_role_value(role: str, key: str, val: Any) -> Any:
         if key in ("provider", "model") and not val.strip():
             msg = f"{where} must not be empty"
             raise ConfigError(msg)
-        if key == "api_key_env" and not _ENV_VAR_NAME_RE.match(val):
+        # "" = explicitly no key; otherwise the WHOLE value must be a name
+        # (fullmatch: "$" alone would accept a trailing newline).
+        if key == "api_key_env" and val and not _ENV_VAR_NAME_RE.fullmatch(val):
             msg = (
                 f"{where} must be the NAME of an environment variable "
                 "(e.g. ANTHROPIC_API_KEY), not a key value"

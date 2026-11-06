@@ -14,18 +14,26 @@ only its own override, so concurrent agents running different roles
 never clobber each other -- unlike ``dspy.configure``, which mutates a
 process-wide global.
 
-Backward compatibility: :func:`role_scope` only overrides the LM when
-the role has an explicit ``[llm.roles.<role>]`` table.  Without one the
-globally configured ``[llm]`` LM is used exactly as before; the role is
-still recorded for ``llm.call`` telemetry.
+Binding rules for :func:`role_scope`:
+
+* No ``[llm.roles]`` tables at all: no LM is bound; the globally
+  configured ``[llm]`` LM is used exactly as before (the role is still
+  recorded for ``llm.call`` telemetry).
+* Any ``[llm.roles]`` table present: EVERY scope binds its role's
+  resolved LM explicitly -- a role without a table binds the ``[llm]``
+  LM.  Nested scopes therefore never inherit an enclosing role's model
+  (e.g. a worker dispatched inside the orchestrator scope).
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import ipaddress
 import os
 import threading
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from memfun_core.config import LLM_ROLES, LLMConfig, MemfunConfig
 from memfun_core.errors import ConfigError
@@ -70,19 +78,50 @@ def litellm_model_name(provider: str, model: str) -> str:
     return model
 
 
+def is_local_base_url(url: str | None) -> bool:
+    """``True`` when *url*'s host is loopback / private / link-local.
+
+    Accepts ``localhost``, ``*.local``, and IP literals in 127.0.0.0/8,
+    ::1, 10/8, 172.16/12, 192.168/16 and link-local ranges.  The host is
+    taken from the parsed URL (so ``http://127.0.0.1@evil.com`` is
+    ``evil.com``); look-alike names such as ``localhost.evil.com`` or
+    ``127.0.0.1.evil.com`` are NOT local.
+    """
+    if not url:
+        return False
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    host = host.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local
+
+
 def resolve_api_key(llm: LLMConfig) -> str:
     """Read the API key from the env var NAMED by ``llm.api_key_env``.
 
-    Returns ``""`` when unset, except for keyless local providers which
-    get a placeholder: ``ollama``, ``openai-compat``, and ``openai`` with
-    an explicit ``base_url`` (a self-hosted OpenAI-compatible server).
+    Returns ``""`` when unset, except for keyless local servers which get
+    a placeholder: ``ollama``, ``openai-compat``, and ``openai`` whose
+    ``base_url`` is a loopback / private host (:func:`is_local_base_url`).
+    A hosted ``base_url`` without a key returns ``""`` so the missing key
+    is reported instead of hidden behind a placeholder.
     """
     if llm.provider == "ollama":
         return "ollama"
     key = os.environ.get(llm.api_key_env, "") if llm.api_key_env else ""
     if key:
         return key
-    if llm.provider == "openai-compat" or (llm.provider == "openai" and llm.base_url):
+    if llm.provider == "openai-compat":
+        return LOCAL_PLACEHOLDER_KEY
+    if llm.provider == "openai" and is_local_base_url(llm.base_url):
         return LOCAL_PLACEHOLDER_KEY
     return ""
 
@@ -111,13 +150,6 @@ def build_lm(llm: LLMConfig) -> Any:
     import dspy
 
     name, kwargs = lm_settings(llm)
-    if "api_key" not in kwargs:
-        logger.warning(
-            "No API key for %s (set %s); calls with model %s will fail",
-            llm.provider,
-            llm.api_key_env,
-            llm.model,
-        )
     return dspy.LM(name, **kwargs)
 
 
@@ -139,20 +171,28 @@ def _cache_key(llm: LLMConfig) -> tuple[Any, ...]:
     )
 
 
+def _cached_lm(llm: LLMConfig) -> Any:
+    key = _cache_key(llm)
+    with _LM_CACHE_LOCK:
+        lm = _LM_CACHE.get(key)
+        if lm is None:
+            lm = build_lm(llm)
+            _LM_CACHE[key] = lm
+        return lm
+
+
 def lm_for_role(config: MemfunConfig, role: str) -> Any:
     """Return the (cached) ``dspy.LM`` for *role* under *config*.
 
     Roles that resolve to the same effective settings share one LM
     instance.  Raises :class:`ConfigError` for an unknown role.
     """
-    resolved = config.llm_for_role(role)
-    key = _cache_key(resolved)
-    with _LM_CACHE_LOCK:
-        lm = _LM_CACHE.get(key)
-        if lm is None:
-            lm = build_lm(resolved)
-            _LM_CACHE[key] = lm
-        return lm
+    return _cached_lm(config.llm_for_role(role))
+
+
+def default_lm(config: MemfunConfig) -> Any:
+    """Return the (cached) ``dspy.LM`` for plain ``[llm]`` (no role)."""
+    return _cached_lm(dataclasses.replace(config.llm, roles={}))
 
 
 def clear_lm_cache() -> None:
@@ -170,9 +210,47 @@ _role_config: MemfunConfig | None = None
 
 
 def set_role_config(config: MemfunConfig | None) -> None:
-    """Register the config whose ``[llm.roles]`` drive :func:`role_scope`."""
+    """Register the config whose ``[llm.roles]`` drive :func:`role_scope`.
+
+    Runs a startup preflight: one WARNING per configured role whose API
+    key is missing or whose LM cannot be built, so a dead role config is
+    visible at startup rather than as a failure mid-swarm.
+    """
     global _role_config
     _role_config = config
+    if config is not None:
+        preflight_roles(config)
+
+
+def preflight_roles(config: MemfunConfig) -> list[str]:
+    """Check every ``[llm.roles.<role>]``; return the roles with problems.
+
+    Never raises.  Logs the env var NAME, never a key value.
+    """
+    bad: list[str] = []
+    for role in LLM_ROLES:
+        if not config.has_role_override(role):
+            continue
+        try:
+            resolved = config.llm_for_role(role)
+            if not resolve_api_key(resolved):
+                bad.append(role)
+                logger.warning(
+                    "LLM role %r has no API key: %s is %s for provider %r at %s; "
+                    "calls on this role will fail. Set [llm.roles.%s].api_key_env.",
+                    role,
+                    resolved.api_key_env or "(api_key_env not set)",
+                    "unset" if resolved.api_key_env else "not configured",
+                    resolved.provider,
+                    resolved.base_url or "the provider's default endpoint",
+                    role,
+                )
+                continue
+            lm_for_role(config, role)
+        except Exception:
+            bad.append(role)
+            logger.warning("LLM role %r: cannot build its LM", role, exc_info=True)
+    return bad
 
 
 def get_role_config() -> MemfunConfig | None:
@@ -190,9 +268,15 @@ def role_scope(role: str, config: MemfunConfig | None = None) -> Generator[None]
     """Run the ``with`` body under *role*.
 
     * Telemetry: ``llm.call`` events inside the block report ``role``.
-    * Model: when ``[llm.roles.<role>]`` is configured, DSPy calls inside
-      the block use that role's LM via ``dspy.context`` (task-local).
-      Otherwise the global ``[llm]`` LM is left untouched.
+    * Model: when the config has ANY ``[llm.roles]`` table, DSPy calls
+      inside the block use this role's resolved LM via ``dspy.context``
+      (task-local) -- the ``[llm]`` LM for a role without its own table,
+      never an enclosing scope's LM.  With no role tables at all nothing
+      is bound and the global ``[llm]`` LM is used as before.
+
+    If the role's LM cannot be built, the plain ``[llm]`` LM is bound
+    explicitly (WARNING names the role); if that fails too, the error
+    propagates rather than running on some other role's model.
 
     *config* defaults to the one registered with :func:`set_role_config`.
     Raises :class:`ConfigError` for an unknown role name.
@@ -203,18 +287,16 @@ def role_scope(role: str, config: MemfunConfig | None = None) -> Generator[None]
 
     cfg = config if config is not None else _role_config
     lm: Any = None
-    if cfg is not None and cfg.has_role_override(role):
+    if cfg is not None and cfg.llm.roles:
         try:
             lm = lm_for_role(cfg, role)
         except Exception:
-            # Never let a bad role LM take the agent down silently on
-            # the wrong model: log loudly and fall back to [llm].
             logger.warning(
-                "Could not build LM for role %r; falling back to [llm]",
+                "Could not build LM for role %r; binding the [llm] LM instead",
                 role,
                 exc_info=True,
             )
-            lm = None
+            lm = default_lm(cfg)
 
     with role_context(role):
         if lm is None:

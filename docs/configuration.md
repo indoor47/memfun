@@ -92,7 +92,7 @@ is exactly as before: everything runs on `[llm]`.
 |------|--------------------|
 | `orchestrator` | The workflow engine itself (`memfun swarm`, chat workflow runs): any LLM call not bound to a narrower role |
 | `decomposer` | `TaskDecomposer` (task -> sub-task DAG), including hierarchical recursion |
-| `worker` | Specialist agents (`coder-agent`, `test-agent`, `file-agent`, ...) |
+| `worker` | Specialist agents (`coder-agent`, `test-agent`, `file-agent`, ...) and the single-task `rlm-coder` dispatch of a workflow |
 | `auditor` | Per-task `review-agent` dispatches |
 | `reviewer` | The `pr-reviewer` agent at the PR layer |
 
@@ -101,7 +101,14 @@ Allowed keys per role: `provider`, `model`, `base_url`, `api_key_env`,
 ignored with a warning. Wrong value types raise a configuration error, and
 so does an `api_key_env` that is not a valid environment variable *name*:
 this field names the variable that holds the key and never holds the key
-itself. `base_url = ""` clears an inherited `[llm].base_url`.
+itself; `api_key_env = ""` means "no key". `base_url = ""` clears an
+inherited `[llm].base_url`.
+
+`api_key_env` is the one exception to field-by-field fallback: a role
+inherits `[llm].api_key_env` only when its `provider` **and** `base_url`
+both resolve to the same values as `[llm]`'s. A role that changes either
+gets no key unless it sets its own `api_key_env`, so the `[llm]` key is
+never sent to a different endpoint.
 
 Example: orchestrator and decomposer on Claude Opus 5.5 through the
 Anthropic API; workers and auditors on a self-hosted OpenAI-compatible
@@ -144,12 +151,23 @@ Open the tunnel before starting the swarm, e.g.
 
 Notes:
 
-- `provider = "openai"` with a `base_url` and an unset key variable sends
-  the placeholder key `sk-local`, since self-hosted servers usually run
-  without auth.
+- `provider = "openai"` with an unset key variable sends the placeholder
+  key `sk-local` only when `base_url` is a loopback / private / link-local
+  host (`localhost`, `*.local`, 127.0.0.0/8, ::1, 10/8, 172.16/12,
+  192.168/16), since self-hosted servers usually run without auth. A hosted
+  `base_url` with no key gets no placeholder: memfun warns instead.
+- At startup memfun logs one warning per configured role whose key is
+  missing or whose model cannot be set up.
+- Once any `[llm.roles.*]` table exists, every role binds its own resolved
+  model explicitly; a role without a table runs on `[llm]`, never on the
+  model of an enclosing role (for example a worker dispatched by the
+  orchestrator).
 - Field-by-field fallback means a role that switches `provider` still
-  inherits `[llm].base_url` and `[llm].api_key_env` unless it sets them.
-  Set both explicitly when a role uses a different provider than `[llm]`.
+  inherits `[llm].base_url` unless it sets `base_url` (use `base_url = ""`
+  to clear it).
+- Chat requests answered outside a multi-agent workflow (direct answers,
+  the single-agent and context-first paths) run as role `default` on
+  `[llm]`.
 - Each role's model is bound per call with a task-local `dspy.context`, so
   concurrent agents running different roles do not interfere.
 - Every `llm.call` telemetry event carries `model` (the model id used) and

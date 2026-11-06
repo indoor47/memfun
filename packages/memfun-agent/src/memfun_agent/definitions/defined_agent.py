@@ -59,18 +59,23 @@ class DefinedAgent(BaseAgent):
         Builds a prompt from the definition instructions and task payload,
         then returns the result.  Delegation to sub-agents is performed
         via the orchestrator when ``delegates-to`` is configured.
-        """
-        from memfun_core.types import TaskResult as TaskRes
 
+        The whole body runs under the agent's LLM role (e.g.
+        ``pr-reviewer`` -> ``reviewer``) so any LLM call made on its
+        behalf uses that role's model.
+        """
         from memfun_agent.role_models import role_for_agent, role_scope
+
+        role = role_for_agent(self._definition.name, default=None)
+        with role_scope(role) if role else contextlib.nullcontext():
+            return await self._handle_impl(task)
+
+    async def _handle_impl(self, task: TaskMessage) -> TaskResult:
+        from memfun_core.types import TaskResult as TaskRes
 
         start = time.monotonic()
 
-        # Bind the agent's role (e.g. ``pr-reviewer`` -> ``reviewer``) so
-        # any LLM call made on its behalf uses ``[llm.roles.<role>]``.
-        role = role_for_agent(self._definition.name, default=None)
-        with role_scope(role) if role else contextlib.nullcontext():
-            prompt = self._build_prompt(task)
+        prompt = self._build_prompt(task)
 
         # Build the result payload with all definition metadata
         result_payload: dict[str, object] = {

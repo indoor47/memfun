@@ -361,13 +361,37 @@ def test_role_scope_overrides_and_restores(tmp_path: Path, fake_lms: dict[str, _
                 assert current_role() == "decomposer"
             assert dspy.settings.lm is fake_lms["qwen3.8-27b"]
             assert current_role() == "worker"
-        # Unconfigured role (reviewer) falls back to the global [llm] LM.
+        # Role without a table binds the [llm] LM explicitly (not the
+        # enclosing context's LM) once any role table exists.
         with role_scope("reviewer"):
-            assert dspy.settings.lm is global_lm
+            assert dspy.settings.lm is fake_lms["claude-sonnet-4-6"]
         assert dspy.settings.lm is global_lm
 
 
-def test_role_scope_build_failure_falls_back(
+def test_role_scope_build_failure_binds_llm_not_enclosing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """C1: a role whose LM can't be built runs on [llm], never on the
+    enclosing (orchestrator) LM, and the WARNING names the role."""
+    built: dict[str, _NamedLM] = {}
+
+    def _build(llm: LLMConfig) -> _NamedLM:
+        if llm.model == "qwen3.8-27b":
+            raise RuntimeError("cannot build")
+        built.setdefault(llm.model, _NamedLM(llm.model))
+        return built[llm.model]
+
+    monkeypatch.setattr(role_models, "build_lm", _build)
+    set_role_config(_cfg(SWARM_TOML, tmp_path))
+    with caplog.at_level(logging.WARNING), role_scope("orchestrator"):
+        assert dspy.settings.lm is built["claude-opus-5-5"]
+        with role_scope("worker"):
+            assert dspy.settings.lm is built["claude-sonnet-4-6"]  # [llm]
+            assert current_role() == "worker"
+    assert any("'worker'" in r.getMessage() for r in caplog.records)
+
+
+def test_role_scope_fails_closed_when_llm_lm_also_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def _boom(llm: LLMConfig) -> Any:
@@ -376,8 +400,8 @@ def test_role_scope_build_failure_falls_back(
     monkeypatch.setattr(role_models, "build_lm", _boom)
     set_role_config(_cfg(SWARM_TOML, tmp_path))
     global_lm = _NamedLM("global")
-    with dspy.context(lm=global_lm), role_scope("worker"):
-        assert dspy.settings.lm is global_lm
+    with dspy.context(lm=global_lm), pytest.raises(RuntimeError), role_scope("worker"):
+        pass
 
 
 async def test_concurrent_roles_are_isolated_under_gather(
@@ -609,3 +633,333 @@ def test_distributed_event_roundtrips_role() -> None:
     # Old payloads without a role still parse.
     legacy = json.dumps({"event_type": "llm.call", "model": "m"}).encode()
     assert DistributedEvent.from_bytes(legacy).role is None
+
+
+# ── C1: partial config never leaks the enclosing role's model ────────
+
+PARTIAL_TOML = """
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[llm.roles.orchestrator]
+model = "claude-opus-5-5"
+"""
+
+
+class _FakeManager:
+    """AgentOrchestrator only needs is_running / get_agent."""
+
+    def __init__(self, agents: dict[str, Any]) -> None:
+        self._agents = agents
+
+    def is_running(self, name: str) -> bool:
+        return name in self._agents
+
+    def get_agent(self, name: str) -> Any:
+        return self._agents[name]
+
+    async def start_agent(self, name: str) -> str:
+        return name
+
+
+def _orchestrator(agents: dict[str, Any]) -> Any:
+    from types import SimpleNamespace
+
+    from memfun_runtime.backends.memory import InProcessEventBus
+    from memfun_runtime.orchestrator import AgentOrchestrator
+
+    return AgentOrchestrator(
+        context=SimpleNamespace(event_bus=InProcessEventBus()),  # type: ignore[arg-type]
+        manager=_FakeManager(agents),  # type: ignore[arg-type]
+    )
+
+
+def test_partial_config_nested_scopes_use_llm_lm(
+    tmp_path: Path, fake_lms: dict[str, _NamedLM]
+) -> None:
+    set_role_config(_cfg(PARTIAL_TOML, tmp_path))
+    with role_scope("orchestrator"):
+        assert dspy.settings.lm is fake_lms["claude-opus-5-5"]
+        for role in ("worker", "decomposer", "auditor", "reviewer"):
+            with role_scope(role):
+                assert dspy.settings.lm is fake_lms["claude-sonnet-4-6"], role
+                assert current_role() == role
+
+
+async def test_partial_config_dispatch_inside_orchestrator_uses_llm_lm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_lms: dict[str, _NamedLM]
+) -> None:
+    """Agents dispatched in-process from the orchestrator scope (context is
+    copied by asyncio.wait_for) run on [llm], not the orchestrator model."""
+    from memfun_agent.decomposer import DecompositionConfig, TaskDecomposer
+    from memfun_agent.definitions.defined_agent import DefinedAgent
+    from memfun_agent.definitions.types import AgentDefinition
+    from memfun_agent.specialists import CoderAgent, ReviewAgent
+    from memfun_core.types import TaskResult
+
+    set_role_config(_cfg(PARTIAL_TOML, tmp_path))
+    seen: dict[str, tuple[str, str]] = {}
+
+    def _record(name: str) -> None:
+        pred = dspy.Predict("question -> answer")(question=name)
+        seen[name] = (str(pred.answer), current_role())
+
+    coder, review = CoderAgent(MagicMock()), ReviewAgent(MagicMock())
+    for agent in (coder, review):
+
+        def _mk(a: Any) -> Any:
+            async def _impl(task: TaskMessage) -> TaskResult:
+                await asyncio.to_thread(_record, a.agent_id)
+                return TaskResult(task_id=task.task_id, agent_id=a.agent_id, success=True)
+
+            return _impl
+
+        agent._handle_impl = _mk(agent)  # type: ignore[method-assign]
+
+    pr = DefinedAgent(MagicMock(), AgentDefinition(name="pr-reviewer", description="d"))
+
+    def _spy_prompt(self: DefinedAgent, task: TaskMessage) -> str:
+        _record("pr-reviewer")
+        return "p"
+
+    monkeypatch.setattr(DefinedAgent, "_build_prompt", _spy_prompt)
+    orch = _orchestrator({"coder-agent": coder, "review-agent": review, "pr-reviewer": pr})
+
+    dec = TaskDecomposer(DecompositionConfig(enable_hierarchical=False))
+
+    def _fake_predict(**kwargs: Any) -> Any:
+        _record("decomposer")
+        return dspy.Prediction(sub_tasks=[], shared_spec="", parallelism_groups=[])
+
+    dec.decomposer = _fake_predict  # type: ignore[assignment]
+
+    with role_scope("orchestrator"):
+        await dec.adecompose("x", "ctx")
+        for name in ("coder-agent", "review-agent", "pr-reviewer"):
+            await orch.dispatch(_task(name), name)
+        _record("orchestrator")
+
+    base = "from claude-sonnet-4-6"
+    assert seen == {
+        "decomposer": (base, "decomposer"),
+        "coder-agent": (base, "worker"),
+        "review-agent": (base, "auditor"),
+        "pr-reviewer": (base, "reviewer"),
+        "orchestrator": ("from claude-opus-5-5", "orchestrator"),
+    }
+
+
+# ── C2: single-task workflow path runs the coder on the worker role ──
+
+
+class _RecordingCoder:
+    """Stands in for RLMCodingAgent (which binds no role itself)."""
+
+    agent_id = "rlm-coder"
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[str, str]] = []
+
+    async def handle(self, task: TaskMessage) -> Any:
+        from memfun_core.types import TaskResult
+
+        def _call() -> str:
+            return str(dspy.Predict("question -> answer")(question="code").answer)
+
+        answer = await asyncio.to_thread(_call)
+        self.seen.append((answer, current_role()))
+        return TaskResult(
+            task_id=task.task_id, agent_id="rlm-coder", success=True, result={"answer": answer}
+        )
+
+
+async def test_single_task_workflow_dispatch_uses_worker_role(
+    tmp_path: Path, fake_lms: dict[str, _NamedLM]
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from memfun_agent.decomposer import DecompositionResult, SubTask
+    from memfun_agent.workflow import WorkflowEngine
+
+    set_role_config(_cfg(SWARM_TOML, tmp_path))
+    coder = _RecordingCoder()
+    orch = _orchestrator({"rlm-coder": coder})
+    state_store = AsyncMock()
+    state_store.get.return_value = None
+    ctx = SimpleNamespace(state_store=state_store, event_bus=orch._context.event_bus)
+    engine = WorkflowEngine(ctx, orch, _FakeManager({"rlm-coder": coder}))  # type: ignore[arg-type]
+    single = DecompositionResult(
+        sub_tasks=[SubTask(id="T1", description="Fix", agent_type="coder")],
+        shared_spec="",
+        parallelism_groups=[["T1"]],
+        is_single_task=True,
+    )
+
+    bus = _FakeEventBus()
+    set_active_runtime(_FakeRuntime(event_bus=bus))  # type: ignore[arg-type]
+    with (
+        dspy.context(callbacks=[make_dspy_callback()]),
+        patch.object(engine._decomposer, "adecompose", return_value=single),  # pyright: ignore[reportPrivateUsage]
+        role_scope("orchestrator"),
+    ):
+        result = await engine.execute_workflow("Fix the bug", "ctx", None)
+
+    assert result.success is True
+    assert coder.seen == [("from qwen3.8-27b", "worker")]
+    events = [e for e in _events(bus) if e["event_type"] == "llm.call"]
+    assert [(e["model"], e["role"]) for e in events] == [("qwen3.8-27b", "worker")]
+
+
+async def test_direct_coder_path_outside_workflow_stays_default(
+    tmp_path: Path, fake_lms: dict[str, _NamedLM]
+) -> None:
+    """Plain chat / direct RLM dispatch is unchanged: role=default on [llm]."""
+    set_role_config(_cfg(SWARM_TOML, tmp_path))
+    coder = _RecordingCoder()
+    global_lm = _NamedLM("global-llm")
+    with dspy.context(lm=global_lm):
+        await _orchestrator({"rlm-coder": coder}).dispatch(_task("rlm-coder"), "rlm-coder")
+    assert coder.seen == [("from global-llm", DEFAULT_ROLE)]
+
+
+# ── C3: [llm]'s key never follows a role to another endpoint ─────────
+
+
+@pytest.mark.parametrize(
+    ("role_body", "inherits"),
+    [
+        ('provider = "openai"', False),  # provider change alone
+        ('base_url = "http://127.0.0.1:18000/v1"', False),  # base_url change alone
+        ('provider = "openai"\nbase_url = "http://127.0.0.1:18000/v1"', False),  # both
+        ('model = "other"', True),  # neither
+        ('provider = "anthropic"\nmodel = "m"', True),  # same provider restated
+    ],
+)
+def test_api_key_env_inherited_only_for_same_endpoint(
+    tmp_path: Path, role_body: str, inherits: bool
+) -> None:
+    cfg = _cfg(
+        '[llm]\nprovider = "anthropic"\napi_key_env = "ANTHROPIC_API_KEY"\n'
+        f"[llm.roles.worker]\n{role_body}\n",
+        tmp_path,
+    )
+    expected = "ANTHROPIC_API_KEY" if inherits else ""
+    assert cfg.llm_for_role("worker").api_key_env == expected
+
+
+def test_explicit_role_api_key_env_is_kept_on_endpoint_change(tmp_path: Path) -> None:
+    cfg = _cfg(
+        '[llm]\nprovider = "anthropic"\n'
+        '[llm.roles.worker]\nprovider = "openai"\napi_key_env = "MEMFUN_WORKER_API_KEY"\n',
+        tmp_path,
+    )
+    assert cfg.llm_for_role("worker").api_key_env == "MEMFUN_WORKER_API_KEY"
+
+
+@pytest.mark.parametrize(
+    "base_url", ["https://api.hosted.example/v1", "http://127.0.0.1:18000/v1"]
+)
+def test_llm_key_value_never_reaches_other_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base_url: str
+) -> None:
+    secret = "test-anthropic-secret-value"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    cfg = _cfg(
+        '[llm]\nprovider = "anthropic"\napi_key_env = "ANTHROPIC_API_KEY"\n'
+        f'[llm.roles.worker]\nprovider = "openai"\nmodel = "q"\nbase_url = "{base_url}"\n',
+        tmp_path,
+    )
+    _, kw = lm_settings(cfg.llm_for_role("worker"))
+    assert kw.get("api_key") != secret
+    lm = role_models.build_lm(cfg.llm_for_role("worker"))
+    assert secret not in repr(lm.kwargs)
+    # The [llm] LM itself still gets its key.
+    assert lm_settings(cfg.llm)[1]["api_key"] == secret
+
+
+# ── A2: placeholder key only for local hosts + startup preflight ─────
+
+
+@pytest.mark.parametrize(
+    ("url", "local"),
+    [
+        ("http://localhost:18000/v1", True),
+        ("http://LOCALHOST/v1", True),
+        ("http://127.0.0.1:18000/v1", True),
+        ("http://127.5.6.7/v1", True),
+        ("http://[::1]:18000/v1", True),
+        ("http://10.1.2.3/v1", True),
+        ("http://172.16.0.1/v1", True),
+        ("http://172.31.255.255/v1", True),
+        ("http://192.168.1.10/v1", True),
+        ("http://169.254.1.1/v1", True),
+        ("http://gpu-box.local:8000/v1", True),
+        ("http://172.32.0.1/v1", False),
+        ("https://api.openai.com/v1", False),
+        ("https://openrouter.ai/api/v1", False),
+        ("http://127.0.0.1.evil.com/v1", False),
+        ("http://localhost.evil.com/v1", False),
+        ("http://127.0.0.1@evil.com/v1", False),
+        ("http://evil.com/127.0.0.1", False),
+        ("not a url", False),
+        ("", False),
+    ],
+)
+def test_is_local_base_url(url: str, local: bool) -> None:
+    assert role_models.is_local_base_url(url) is local
+
+
+def test_hosted_base_url_without_key_gets_no_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("NOPE_KEY", raising=False)
+    hosted = LLMConfig(
+        provider="openai", model="m", base_url="https://api.openai.com/v1", api_key_env="NOPE_KEY"
+    )
+    assert "api_key" not in lm_settings(hosted)[1]
+    tricky = LLMConfig(
+        provider="openai", model="m", base_url="http://127.0.0.1@evil.com/v1", api_key_env="NOPE"
+    )
+    assert "api_key" not in lm_settings(tricky)[1]
+
+
+def test_preflight_warns_per_broken_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fake_lms: dict[str, _NamedLM],
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic")
+    monkeypatch.delenv("MEMFUN_WORKER_API_KEY", raising=False)
+    cfg = _cfg(
+        '[llm]\nprovider = "anthropic"\n'
+        '[llm.roles.orchestrator]\nmodel = "claude-opus-5-5"\n'
+        '[llm.roles.worker]\nprovider = "openai"\nmodel = "q"\n'
+        'base_url = "http://127.0.0.1:18000/v1"\n'
+        '[llm.roles.auditor]\nprovider = "openai"\nmodel = "q"\n'
+        'base_url = "https://api.hosted.example/v1"\n',
+        tmp_path,
+    )
+    with caplog.at_level(logging.WARNING):
+        set_role_config(cfg)
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(msgs) == 1
+    assert "'auditor'" in msgs[0]
+    assert role_models.preflight_roles(cfg) == ["auditor"]
+
+
+# ── A5: api_key_env must be a whole env var name ─────────────────────
+
+
+@pytest.mark.parametrize("value", ["TRAILING\n", "A B", "1ABC", "X;rm"])
+def test_api_key_env_rejects_non_names(tmp_path: Path, value: str) -> None:
+    path = tmp_path / "memfun.toml"
+    path.write_text(f"[llm.roles.worker]\napi_key_env = {json.dumps(value)}\n")
+    with pytest.raises(ConfigError):
+        MemfunConfig.from_toml(path)
+
+
+def test_api_key_env_empty_means_no_key(tmp_path: Path) -> None:
+    cfg = _cfg('[llm.roles.worker]\napi_key_env = ""\n', tmp_path)
+    assert cfg.llm_for_role("worker").api_key_env == ""
