@@ -7,6 +7,8 @@ dspy.Predict / dspy.ChainOfThought calls (for simpler tasks).
 
 from __future__ import annotations
 
+from typing import Any
+
 import dspy
 
 # ── Code Analysis ──────────────────────────────────────────────
@@ -362,7 +364,7 @@ class TaskDecomposition(dspy.Signature):
     project_context: str = dspy.InputField(
         desc=("Project structure, existing files, conventions, and any relevant code snippets")
     )
-    sub_tasks: list[str] = dspy.OutputField(
+    sub_tasks: list[dict[str, Any]] = dspy.OutputField(
         desc=(
             "JSON array of sub-task objects. Return 1 for simple tasks, "
             "3+ for complex ones. Each object has: "
