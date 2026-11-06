@@ -111,8 +111,13 @@ ls pyproject.toml ruff.toml .eslintrc* tsconfig.json 2>/dev/null
 
 # Python projects (memfun-style): run each on its own and read its EXIT CODE.
 uv run ruff check packages tests; echo "ruff exit=$?"
+# Type-check ONLY the files the PR changes, under a time limit.
+# Full-project pyright is known to hang here — never run it without file arguments.
+perl -e 'alarm 300; exec @ARGV' uv run pyright $(gh pr diff <pr_number> --name-only | grep '\.py$'); echo "pyright exit=$?"
 uv run pytest -q; echo "pytest exit=$?"
 ```
+
+If the PR changes no `.py` files, skip the pyright step (never call `uv run pyright` with an empty file list — that type-checks the whole project).
 
 Gate on the real exit code. Never pipe a check through `tail`/`head` and then treat the pipeline's status as the check's status, and never mask failures with `|| true`.
 

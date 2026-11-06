@@ -9,6 +9,7 @@ Uses the existing :class:`AgentOrchestrator` for dispatch/fan-out and
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dataclasses
 import os
@@ -40,9 +41,7 @@ from memfun_agent.git_committer import (
 )
 from memfun_agent.review_findings import (
     ReviewFinding,
-    compute_verdict,
-    findings_from_object,
-    iter_json_objects,
+    compute_pr_verdict,
     parse_review_output,
 )
 from memfun_agent.shared_spec import SharedSpec, SharedSpecStore
@@ -231,6 +230,9 @@ class SubTaskPRState:
     # ``gh pr merge --match-head-commit`` so a head that changed after
     # review can never be merged.  ``None`` blocks the merge.
     head_sha: str | None = None
+    # Set when a Phase 4 cross-task revision re-ran this sub-task after
+    # its PR was pushed; such a PR is never merged (stale head).
+    revised_after_push: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,35 +590,42 @@ class WorkflowEngine:
         # whole succeeded (every sub-task accepted, cross-task review
         # approved).  A failed workflow leaves approved PRs open for
         # a human rather than merging part of an unverified whole.
-        if self._gh_pr and state.pr_states and not result.success:
-            logger.warning(
-                "gh_pr: workflow not successful — skipping merge of %d PR(s)",
-                len(state.pr_states),
-            )
-        if self._gh_pr and state.pr_states and result.success:
-            merged_count, merge_failures = await self._merge_approved_prs(
-                state=state,
-                groups=(
-                    state.decomposition.parallelism_groups
-                    if state.decomposition is not None
-                    else []
-                ),
-            )
-            # Surface merge failures as a workflow failure so the
-            # caller can exit non-zero — a silent `success=True` with
-            # un-merged PRs hides the most common real-world failure
-            # mode (the second PR conflicting with the first one's
-            # merge).  Approved PRs that conflict are left OPEN on
+        if self._gh_pr and state.pr_states:
+            merged_count = 0
+            if result.success:
+                merged_count, _ = await self._merge_approved_prs(
+                    state=state,
+                    groups=(
+                        state.decomposition.parallelism_groups
+                        if state.decomposition is not None
+                        else []
+                    ),
+                )
+            else:
+                logger.warning(
+                    "gh_pr: workflow not successful — skipping merge of %d PR(s)",
+                    len(state.pr_states),
+                )
+            # Every PR the flow touched must end up merged.  A PR left
+            # in draft (pr-reviewer request-changes / comment), not
+            # mergeable, stale, never opened (commit/push/open failure)
+            # or whose merge failed is surfaced as a workflow failure
+            # so the caller exits non-zero.  Such PRs are left OPEN on
             # GitHub for human inspection.
-            if merge_failures:
-                summary = ", ".join(f"#{pr} ({err})" for pr, err in merge_failures)
+            unmerged = [
+                f"{self._pr_label(ps)} ({self._pr_unmerged_reason(ps, result.success)})"
+                for ps in state.pr_states.values()
+                if not ps.merged
+            ]
+            if unmerged:
+                pr_error = (
+                    f"{merged_count}/{len(state.pr_states)} PRs merged;"
+                    f" not merged: {', '.join(unmerged)}"
+                )
                 result = dataclasses.replace(
                     result,
                     success=False,
-                    error=(
-                        f"{merged_count}/{merged_count + len(merge_failures)} "
-                        f"PRs merged; failures: {summary}"
-                    ),
+                    error=f"{result.error}; {pr_error}" if result.error else pr_error,
                 )
         return result
 
@@ -630,7 +639,14 @@ class WorkflowEngine:
         history: list[dict[str, Any]] | None,
         start: float,
     ) -> WorkflowResult:
-        """Fallback: dispatch to rlm-coder via orchestrator."""
+        """Fallback: dispatch to rlm-coder via orchestrator.
+
+        AUDITOR EXEMPTION (deliberate): the single-task fast path runs
+        no per-task review, no cross-task review and no PR layer — it
+        is a direct ``rlm-coder`` dispatch, and ``success`` is the
+        coder's own result.  None of the fail-closed auditor gates in
+        this module apply here.
+        """
         if not self._manager.is_running("rlm-coder"):
             try:
                 await self._manager.start_agent("rlm-coder")
@@ -1559,10 +1575,12 @@ class WorkflowEngine:
 
         if not review_parts:
             logger.warning("No sub-task results found for review (all results are None)")
+            # Nothing to review is not an approval.
             return ReviewResult(
-                approved=True,
+                approved=False,
+                status=REVIEW_ERROR,
                 issues=[],
-                summary="No sub-task results available",
+                summary="No sub-task results available to review",
             )
 
         contract = (
@@ -1657,7 +1675,37 @@ class WorkflowEngine:
                 summary=f"Cross-task review dispatch failed: {exc}",
             )
 
-        return self._parse_review_result(result)
+        return self._reject_unroutable(
+            self._parse_review_result(result),
+            set(state.sub_task_statuses),
+        )
+
+    @staticmethod
+    def _reject_unroutable(review: ReviewResult, known_tids: set[str]) -> ReviewResult:
+        """Turn a rejection with unroutable blocking findings into ``error``.
+
+        A blocking cross-task finding must name a known sub-task
+        (``task_id``); otherwise no coder can be revised and the
+        revision loop would burn rounds re-reviewing identical output.
+        Such a review violates the output contract, so it is an
+        ``error`` (retried once, then not approved) rather than a
+        ``rejected`` that drives a pointless revision.
+        """
+        if review.status != REVIEW_REJECTED:
+            return review
+        unroutable = [f for f in review.findings if f.blocking and f.task_id not in known_tids]
+        if not unroutable:
+            return review
+        detail = "; ".join(f.render().removeprefix("- ") for f in unroutable)[:300]
+        return dataclasses.replace(
+            review,
+            approved=False,
+            status=REVIEW_ERROR,
+            summary=(
+                f"Cross-task review has {len(unroutable)} blocking finding(s) without a"
+                f" known task_id (cannot route a revision): {detail}"
+            ),
+        )
 
     async def _run_revision(
         self,
@@ -1724,6 +1772,11 @@ class WorkflowEngine:
         )
 
         for tid, result in zip(revision_tids, results, strict=False):
+            # The revision rewrote this sub-task's worktree: any PR
+            # pushed earlier now points at a stale, unreviewed head.
+            pr_state = state.pr_states.get(tid)
+            if pr_state is not None and not pr_state.merged:
+                pr_state.revised_after_push = True
             sub_status = state.sub_task_statuses.get(tid)
             if sub_status is not None:
                 sub_status.result = result
@@ -2145,7 +2198,9 @@ class WorkflowEngine:
             # An unmergeable PR gets no CI runs, so "no checks" would
             # look like passing.  Check mergeability (pinned to the
             # pushed head) BEFORE marking ready.
-            mergeability = check_pr_mergeable(
+            # Off the event loop: the UNKNOWN re-check sleeps.
+            mergeability = await asyncio.to_thread(
+                check_pr_mergeable,
                 repo,
                 open_res.pr_number,
                 expected_head_sha=pr_state.head_sha,
@@ -2367,41 +2422,34 @@ class WorkflowEngine:
     def _parse_pr_verdict(answer: str) -> str:
         """Extract the verdict from the pr-reviewer's final answer.
 
-        The AGENT.md protocol asks the reviewer to emit a JSON block
-        with a ``verdict`` field as its final output.  We parse the
-        LAST valid JSON object containing a ``verdict`` key rather
-        than substring-matching the whole text — a substring match
-        can be fooled by a diff fragment containing the literal
-        ``"verdict": "approve"`` string (e.g. when reviewing tests
-        for this very function) and would lead to unsafe auto-approve.
-
-        Returns one of ``approve`` / ``request-changes`` / ``comment``.
-        Defaults to ``comment`` on parse failure — we never auto-merge
-        an ambiguous review.  Prose ("LGTM") is never read as a verdict.
-
-        The reviewer's own verdict can only be made STRICTER in code:
-        an ``approve`` whose ``findings`` contain any blocking severity
-        (HIGH/MEDIUM, incl. the ``CRITICAL``/``WARNING`` aliases) is
-        downgraded to ``request-changes``; an ``approve`` with a
-        malformed ``findings`` field becomes ``comment``.
+        Returns one of ``approve`` / ``request-changes`` / ``comment``
+        via :func:`memfun_agent.review_findings.compute_pr_verdict`:
+        most severe wins across EVERY verdict/findings JSON object in
+        the answer, so a quoted ``{"verdict": "approve"}`` (from a diff,
+        a fixture, echoed text) can never override a real
+        ``request-changes`` or a blocking finding.  ``approve`` without
+        a ``findings`` key, malformed/truncated JSON, or prose such as
+        "LGTM" all yield ``comment`` — we never auto-merge an ambiguous
+        review.
         """
-        # Nested-aware scan (findings carry nested objects, which a
-        # flat bracket regex cannot match).
-        for obj in reversed(iter_json_objects(answer or "")):
-            verdict = obj.get("verdict")
-            if verdict not in {"approve", "request-changes", "comment"}:
-                continue
-            if verdict != "approve":
-                return str(verdict)
-            if "findings" not in obj:
-                return "approve"
-            findings = findings_from_object(obj)
-            if findings is None:
-                return "comment"
-            if compute_verdict(findings) == "CHANGES_REQUESTED":
-                return "request-changes"
-            return "approve"
-        return "comment"
+        return compute_pr_verdict(answer)
+
+    @staticmethod
+    def _pr_label(pr_state: SubTaskPRState) -> str:
+        if pr_state.pr_number is not None:
+            return f"#{pr_state.pr_number}"
+        return f"{pr_state.task_id} (no PR)"
+
+    @staticmethod
+    def _pr_unmerged_reason(pr_state: SubTaskPRState, workflow_ok: bool) -> str:
+        """Why a PR did not get merged (for the workflow ``error``)."""
+        if pr_state.error:
+            return pr_state.error
+        if not pr_state.approved:
+            return f"pr-reviewer verdict {pr_state.verdict or 'unknown'}; left in draft"
+        if not workflow_ok:
+            return "workflow not successful; merge skipped"
+        return "not merged"
 
     async def _merge_approved_prs(
         self,
@@ -2461,10 +2509,19 @@ class WorkflowEngine:
             # ``merge_pr`` then pins ``--match-head-commit`` and
             # verifies the PR state is MERGED afterwards.
             err: str | None = None
-            if not pr_state.head_sha:
+            if pr_state.revised_after_push:
+                # A Phase 4 cross-task revision rewrote the worktree
+                # after this PR was pushed and reviewed: the PR head is
+                # stale.  Re-push + re-review is out of scope — refuse.
+                err = (
+                    "sub-task was revised after its PR was pushed; PR head is"
+                    " stale and was not re-reviewed — refusing to merge"
+                )
+            elif not pr_state.head_sha:
                 err = "head SHA not recorded at push time; refusing unpinned merge"
             else:
-                mergeability = check_pr_mergeable(
+                mergeability = await asyncio.to_thread(
+                    check_pr_mergeable,
                     repo,
                     pr_state.pr_number,
                     expected_head_sha=pr_state.head_sha,
@@ -2738,6 +2795,8 @@ class WorkflowEngine:
             review_errors += 1
 
         error_parts: list[str] = []
+        if not state.sub_task_statuses:
+            error_parts.append("decomposition produced no sub-tasks; nothing was done")
         if reasons:
             error_parts.append("unaccepted sub-tasks: " + "; ".join(reasons))
         if not review.approved:

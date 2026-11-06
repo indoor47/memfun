@@ -114,28 +114,113 @@ def compute_verdict(findings: tuple[ReviewFinding, ...] | list[ReviewFinding]) -
     return "APPROVED"
 
 
-def iter_json_objects(text: str) -> list[dict[str, Any]]:
-    """Return top-level JSON objects embedded in *text*, in order.
+class _DuplicateKeyError(ValueError):
+    """Raised for a JSON object with a repeated key (ambiguous verdict)."""
 
-    Scans for ``{`` and attempts :meth:`json.JSONDecoder.raw_decode`
-    at each candidate.  Works for objects inside fenced code blocks
-    and for nested structures (unlike a flat bracket regex).  After a
-    successful decode the scan resumes past the decoded object, so
-    inner objects are not reported separately.
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            msg = f"duplicate key {key!r}"
+            raise _DuplicateKeyError(msg)
+        out[key] = value
+    return out
+
+
+_DECODER = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)
+
+
+def _looks_like_json_object(text: str, idx: int) -> bool:
+    """``{`` followed (after whitespace) by ``"`` or ``}``."""
+    j = idx + 1
+    while j < len(text) and text[j] in " \t\r\n":
+        j += 1
+    return j < len(text) and text[j] in '"}'
+
+
+def _balanced_end(text: str, idx: int) -> int:
+    """Index just past the ``}`` matching ``text[idx]``; ``-1`` if unbalanced.
+
+    String-aware (quotes and backslash escapes), so braces inside JSON
+    strings do not count.
     """
-    decoder = json.JSONDecoder()
-    out: list[dict[str, Any]] = []
+    depth = 0
+    in_string = False
+    escaped = False
+    for j in range(idx, len(text)):
+        ch = text[j]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return -1
+
+
+@dataclass(frozen=True, slots=True)
+class JsonScan:
+    """Top-level JSON objects found in a text, plus undecodable ones.
+
+    ``malformed`` holds the raw text of every JSON-looking object that
+    failed to decode (syntax error, duplicate key, or truncated — in
+    which case it runs to the end of the text).  Their contents are
+    NEVER searched for nested objects.
+    """
+
+    objects: tuple[dict[str, Any], ...]
+    malformed: tuple[str, ...]
+
+
+def scan_json_objects(text: str) -> JsonScan:
+    """Scan *text* for top-level JSON objects, in order.
+
+    * A decodable object is reported and the scan resumes past its end,
+      so inner objects are never reported separately.
+    * A JSON-looking object (``{"`` or ``{}``) that fails to decode is
+      recorded in ``malformed`` and skipped as a whole (balanced-brace
+      extent); when it is truncated the rest of the text is consumed.
+      This prevents falling back to nested objects of a broken outer
+      object (e.g. an inner ``"evidence": {"findings": []}``).
+    * Any other ``{`` (prose) is skipped.
+    """
+    objects: list[dict[str, Any]] = []
+    malformed: list[str] = []
     idx = text.find("{")
     while idx != -1:
         try:
-            obj, end = decoder.raw_decode(text, idx)
+            obj, end = _DECODER.raw_decode(text, idx)
         except (json.JSONDecodeError, ValueError):
-            idx = text.find("{", idx + 1)
+            if not _looks_like_json_object(text, idx):
+                idx = text.find("{", idx + 1)
+                continue
+            end = _balanced_end(text, idx)
+            if end == -1:
+                malformed.append(text[idx:])
+                break
+            malformed.append(text[idx:end])
+            idx = text.find("{", end)
             continue
         if isinstance(obj, dict):
-            out.append(cast("dict[str, Any]", obj))
+            objects.append(cast("dict[str, Any]", obj))
         idx = text.find("{", end)
-    return out
+    return JsonScan(objects=tuple(objects), malformed=tuple(malformed))
+
+
+def iter_json_objects(text: str) -> list[dict[str, Any]]:
+    """Decodable top-level JSON objects in *text* (see :func:`scan_json_objects`)."""
+    return list(scan_json_objects(text).objects)
 
 
 def _coerce_line(raw: object) -> int | None:
@@ -186,27 +271,85 @@ def findings_from_object(obj: dict[str, Any]) -> tuple[ReviewFinding, ...] | Non
 
 
 def parse_review_output(answer: str) -> ParsedReview | None:
-    """Extract the LAST valid JSON object with a ``findings`` list.
+    """Aggregate findings from EVERY findings-bearing JSON object.
 
-    Returns ``None`` when no such object exists (prose-only answer,
-    truncated JSON, malformed findings).  Callers MUST treat ``None``
-    as a reviewer error — never as an approval.
+    Verdict aggregation rule: **most severe wins**.  All top-level JSON
+    objects with a ``findings`` key are collected and their findings
+    merged; the verdict is computed over the union, so one blocking
+    finding anywhere means changes requested.  Text appended after the
+    reviewer's real block (a quoted diff line, an echoed fixture, a
+    LOW-only object) can therefore only ADD findings, never cancel a
+    blocking one — injection can make a review stricter, never laxer.
+
+    Returns ``None`` (reviewer error, never approval) when:
+
+    * no findings-bearing object exists (prose-only answer);
+    * any findings-bearing object has a malformed ``findings`` value;
+    * any JSON-looking object that mentions ``findings`` fails to decode
+      (truncated, syntax error, duplicate keys such as
+      ``"findings": [HIGH], "findings": []``).
     """
-    for obj in reversed(iter_json_objects(answer or "")):
-        if "findings" not in obj:
-            continue
+    scan = scan_json_objects(answer or "")
+    if any('"findings"' in blob for blob in scan.malformed):
+        return None
+    bearing = [obj for obj in scan.objects if "findings" in obj]
+    if not bearing:
+        return None
+    merged: list[ReviewFinding] = []
+    for obj in bearing:
         findings = findings_from_object(obj)
         if findings is None:
-            # The last findings-bearing block is malformed: fail closed
-            # rather than falling back to an earlier (possibly quoted)
-            # block.
             return None
-        summary = obj.get("summary")
-        claimed = obj.get("verdict")
-        return ParsedReview(
-            findings=findings,
-            summary=summary.strip() if isinstance(summary, str) else "",
-            claimed_verdict=claimed if isinstance(claimed, str) else "",
-            raw=obj,
-        )
-    return None
+        merged.extend(findings)
+    last = bearing[-1]
+    summary = last.get("summary")
+    claimed = last.get("verdict")
+    return ParsedReview(
+        # Dedupe identical findings (e.g. the same block quoted twice).
+        findings=tuple(dict.fromkeys(merged)),
+        summary=summary.strip() if isinstance(summary, str) else "",
+        claimed_verdict=claimed if isinstance(claimed, str) else "",
+        raw=last,
+    )
+
+
+PrVerdict = Literal["approve", "request-changes", "comment"]
+_PR_VERDICTS = ("approve", "request-changes", "comment")
+
+
+def compute_pr_verdict(answer: str) -> PrVerdict:
+    """Fail-closed PR-layer verdict over EVERY verdict/findings object.
+
+    Most severe wins (``request-changes`` > ``comment`` > ``approve``):
+
+    * any object with ``"verdict": "request-changes"``, or any blocking
+      (HIGH/MEDIUM, incl. CRITICAL/WARNING) finding in any object, ->
+      ``request-changes``;
+    * otherwise any ``comment`` verdict, any unknown verdict value, any
+      malformed ``findings`` value, any undecodable JSON-looking object
+      mentioning ``verdict``/``findings``, or an ``approve`` WITHOUT a
+      ``findings`` key -> ``comment``;
+    * ``approve`` only when every verdict object approves with a
+      well-formed, non-blocking ``findings`` list;
+    * no verdict object at all (prose such as "LGTM") -> ``comment``.
+    """
+    scan = scan_json_objects(answer or "")
+    relevant = [o for o in scan.objects if "verdict" in o or "findings" in o]
+    verdict_objs = [o for o in relevant if "verdict" in o]
+    downgrade = any('"verdict"' in b or '"findings"' in b for b in scan.malformed)
+    if not verdict_objs:
+        return "comment"
+    for obj in relevant:
+        if obj.get("verdict") == "request-changes":
+            return "request-changes"
+        if "findings" in obj:
+            findings = findings_from_object(obj)
+            if findings is None:
+                downgrade = True
+            elif compute_verdict(findings) == "CHANGES_REQUESTED":
+                return "request-changes"
+    for obj in verdict_objs:
+        verdict = obj.get("verdict")
+        if verdict not in _PR_VERDICTS or verdict == "comment" or "findings" not in obj:
+            downgrade = True
+    return "comment" if downgrade else "approve"

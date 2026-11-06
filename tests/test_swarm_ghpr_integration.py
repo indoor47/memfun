@@ -449,7 +449,11 @@ async def test_gh_pr_changes_requested_skips_merge(
     ):
         result = await engine.execute_workflow("do thing", "ctx", None)
 
-    assert result.success is True
+    # A PR left in draft by the pr-reviewer is a workflow failure
+    # (was: success=True with the PR silently unmerged).
+    assert result.success is False
+    assert "#303" in (result.error or "")
+    assert "request-changes" in (result.error or "")
     # Rejected → never marked ready, never merged.
     assert mark_ready.call_count == 0
     assert merge.call_count == 0
@@ -575,7 +579,10 @@ async def test_gh_pr_push_failure_does_not_open_pr(
     ):
         result = await engine.execute_workflow("do thing", "ctx", None)
 
-    assert result.success is True
+    # A sub-task whose PR could not be delivered is a workflow failure
+    # (was: success=True).
+    assert result.success is False
+    assert "push failed" in (result.error or "")
     assert push.call_count == 1
     assert open_pr.call_count == 0
 
@@ -603,12 +610,14 @@ def test_parse_pr_verdict_ignores_substring_in_diff() -> None:
     assert WorkflowEngine._parse_pr_verdict(answer) == "request-changes"
 
 
-def test_parse_pr_verdict_takes_last_json_block() -> None:
-    """When multiple verdict blocks exist, the LAST one wins."""
+def test_parse_pr_verdict_most_severe_block_wins() -> None:
+    """With several verdict blocks the MOST SEVERE wins, not the last
+    (was: last block wins → approve).  A later ``approve`` (which also
+    lacks a ``findings`` key) cannot override an earlier ``comment``."""
     from memfun_agent.workflow import WorkflowEngine
 
     answer = '{"verdict": "comment"}\n...then on re-review...\n{"verdict": "approve"}\n'
-    assert WorkflowEngine._parse_pr_verdict(answer) == "approve"
+    assert WorkflowEngine._parse_pr_verdict(answer) == "comment"
 
 
 def test_parse_pr_verdict_defaults_to_comment_on_no_json() -> None:
