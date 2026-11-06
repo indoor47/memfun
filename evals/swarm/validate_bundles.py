@@ -40,10 +40,22 @@ import tomllib
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_ROOT = HERE / "smoke"
 INTEGRATION = "test_integration"
+#: A unit whose ``hidden_test`` is exactly this names the whole ``hidden/`` directory as
+#: its test suite (Commit0 libraries ship many test files plus conftest/helpers).  Such
+#: a unit is graded over every collected test, not one module.
+SUITE_UNIT = "hidden"
+ALL_MODULES = "*"
+#: Optional file in a test directory: pytest node ids as the grader's own pytest
+#: reports them, to deselect, one per line.
+DESELECT_FILE = ".deselect"
 BROKEN_SOURCE = "def broken(:  # deliberately not Python (independence check)\n"
 
 NETGUARD = """
@@ -72,6 +84,9 @@ import sys
 # The graded tree goes AFTER site-packages/stdlib: it can provide the task's packages but
 # cannot shadow pytest, the stdlib or this grader.
 sys.path.append(os.environ["BUNDLE_GRADED_TREE"])
+_src = os.path.join(os.environ["BUNDLE_GRADED_TREE"], "src")  # src-layout libraries
+if os.path.isdir(_src):
+    sys.path.append(_src)
 """
 
 GRADER_INI = "[pytest]\naddopts =\n"
@@ -139,8 +154,26 @@ def graded_tree(bundle: Path, owned: list[str], candidate: Path | None, dest: Pa
     return dest
 
 
-def run_grader(tree: Path, tests_src: Path, scratch: Path, timeout: float) -> RunResult:
-    """Run the tests in ``tests_src`` against ``tree`` from an isolated grader dir."""
+def unit_module(hidden_test: str) -> str:
+    """Module name a unit is graded by: the test file's stem, or ALL_MODULES for a suite."""
+    if hidden_test.rstrip("/") == SUITE_UNIT:
+        return ALL_MODULES
+    return Path(hidden_test).stem
+
+
+def run_grader(
+    tree: Path,
+    tests_src: Path,
+    scratch: Path,
+    timeout: float,
+    extra_args: Sequence[str] = (),
+    extra_env: Mapping[str, str] | None = None,
+) -> RunResult:
+    """Run the tests in ``tests_src`` against ``tree`` from an isolated grader dir.
+
+    ``extra_args`` / ``extra_env`` are for tooling (e.g. a recording plugin importable
+    from ``scratch/_netguard``); grading itself passes neither.
+    """
     grader = scratch / "grader"
     shutil.rmtree(grader, ignore_errors=True)
     grader.mkdir(parents=True)
@@ -164,11 +197,23 @@ def run_grader(tree: Path, tests_src: Path, scratch: Path, timeout: float) -> Ru
         "http_proxy": "http://127.0.0.1:9",
         "https_proxy": "http://127.0.0.1:9",
     }
+    deselect: list[str] = []
+    listed = tests_src / DESELECT_FILE
+    if tests_src.is_dir() and listed.is_file():
+        for line in listed.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                # Node ids are rootdir-relative or not depending on how pytest resolved
+                # the rootdir; passing both forms deselects the same test either way.
+                deselect += ["--deselect", line]
+                if not line.startswith("graded_tests/"):
+                    deselect += ["--deselect", f"graded_tests/{line}"]
+    env.update(extra_env or {})
     cmd = [
         sys.executable, "-P", "-m", "pytest", "-q", "-p", "no:cacheprovider",
         "-c", str(ini), "--rootdir", str(grader), "--confcutdir", str(grader),
         "--continue-on-collection-errors",
-        f"--junitxml={report}", "graded_tests",
+        f"--junitxml={report}", *deselect, *extra_args, "graded_tests",
     ]  # fmt: skip
     try:
         proc = subprocess.run(
@@ -205,7 +250,12 @@ def schema_problems(bundle: Path, task: dict[str, object]) -> list[str]:
             problems.append(f"duplicate unit id {uid}")
         seen_ids.add(uid)
         hidden = unit.get("hidden_test")
-        if not isinstance(hidden, str) or not (bundle / hidden).is_file():
+        if not isinstance(hidden, str):
+            problems.append(f"unit {uid}: hidden_test {hidden!r} not found")
+        elif hidden.rstrip("/") == SUITE_UNIT:
+            if not any((bundle / SUITE_UNIT).rglob("test*.py")):
+                problems.append(f"unit {uid}: hidden/ holds no test*.py")
+        elif not (bundle / hidden).is_file():
             problems.append(f"unit {uid}: hidden_test {hidden!r} not found")
         owns = unit.get("owns")
         if not isinstance(owns, list) or not owns:
@@ -236,7 +286,12 @@ def schema_problems(bundle: Path, task: dict[str, object]) -> list[str]:
 
 
 def unit_fails(res: RunResult, module: str) -> bool:
-    """True unless ``module`` collected tests and all of them passed."""
+    """True unless ``module`` collected tests and all of them passed.
+
+    ``ALL_MODULES`` means the whole run: it must have collected tests, none failed.
+    """
+    if module == ALL_MODULES:
+        return res.passed == 0 or res.failed > 0
     stats = res.by_file.get(module)
     # No testcases under that module name (collection error) counts as failing.
     return stats is None or stats["failed"] > 0 or stats["passed"] == 0
@@ -253,7 +308,7 @@ def validate_bundle(bundle: Path, timeout: float) -> BundleReport:
     if report.problems:
         return report
     units: list[dict[str, object]] = task["units"]
-    unit_modules = {str(u["id"]): Path(str(u["hidden_test"])).stem for u in units}
+    unit_modules = {str(u["id"]): unit_module(str(u["hidden_test"])) for u in units}
     unit_owns = {str(u["id"]): [str(p) for p in u["owns"]] for u in units}  # type: ignore[union-attr]
     all_owned = [p for owns in unit_owns.values() for p in owns]
     hidden = bundle / "hidden"
@@ -270,7 +325,10 @@ def validate_bundle(bundle: Path, timeout: float) -> BundleReport:
         missing = [m for m in unit_modules.values() if unit_fails(res, m)]
         if missing:
             report.problems.append(f"oracle: no passing tests collected from {missing}")
-        if (bundle / "repo" / "tests").is_dir():
+        # Suite (Commit0) bundles keep the library's own tests visible, and some of those
+        # fail against the reference on purpose (deselected in hidden/), so skip this.
+        suite = ALL_MODULES in unit_modules.values()
+        if (bundle / "repo" / "tests").is_dir() and not suite:
             vis = run_grader(tree, bundle / "repo" / "tests", tmp / "oracle-visible", timeout)
             if vis.returncode != 0:
                 report.problems.append(f"oracle fails visible tests:\n{vis.output_tail}")

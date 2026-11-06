@@ -280,7 +280,11 @@ The owner's phone app watches that one dashboard. Each episode shows up as its o
 --remote` creates the token file if it is missing, and the runner never reads or prints it.
 The dashboard process gets the real `HOME` plus `MEMFUN_DASHBOARD_TOKEN`,
 `MEMFUN_INFERENCE_METRICS_URL` and `MEMFUN_POD_RATE_USD` when they are set. With
-`--no-dashboard`, nothing is shared and each swarm may start its own embedded dashboard.
+`--no-dashboard`, nothing is shared. Either way episodes run with
+`MEMFUN_NO_DASHBOARD_AUTOSTART=1`: a swarm never starts a dashboard of its own (it would run
+under the episode's throwaway `HOME`, without the token, and could take the port); it only
+reuses the one named by its `.memfun/dashboard.lock`. The token is never passed to episodes.
+The runner starts its dashboard and waits for it to answer before the first episode.
 
 ## results.json (`"schema_version": 1`)
 
@@ -346,3 +350,35 @@ with a fake memfun (`tests/_fake_memfun.py`, given via `--memfun-cmd`) and a loo
   lockfile)
 - port 8434 refusal
 - `--dry-plan`
+
+## Commit0 suite (`--suite commit0`)
+
+Real library-rebuild tasks from [Commit0](https://github.com/commit-0/commit0) (MIT):
+the library's function bodies are `pass`, the docs are in `SPEC.txt`, and the library's own
+unit tests grade the result. No Docker or Modal: `commit0_adapter.py` clones
+`commit-0/<lib>`, reads the pinned commits from the public dataset
+(`wentingzhao/commit0_combined`) and writes ordinary bundles (one control unit that owns
+every source file, `hidden_test = "hidden"` meaning the whole test tree).
+
+```bash
+# interpreter needs pytest, pypdf and the libraries' test dependencies
+python evals/swarm/commit0_adapter.py build tinydb parsel pyjwt imapclient wcwidth cachetools \
+    --cache ~/.cache/memfun-commit0
+python evals/swarm/run_smoke.py --suite commit0 --commit0-dir ~/.cache/memfun-commit0 \
+    --base-url http://127.0.0.1:8441/v1 --max-agents 1 --parallel-tasks 6 \
+    --episode-timeout 3600 --task-timeout 3500 --grader-timeout 900
+```
+
+- **Metric**: `hidden_passed / (hidden_passed + hidden_failed)` over the tests that pass
+  against the reference solution twice in the grader. Tests that fail, skip or flake against
+  the reference are listed in `hidden/.deselect`; a test file that cannot be collected is
+  dropped (`files_dropped` in `task.toml`). `[source] tests_kept` is the denominator.
+- Code the agent leaves unimportable (pytest exit 2/4/5) is a model failure, not a harness
+  crash.
+- The tests stay visible in `repo/` (as in Commit0); the grader uses its own copy from
+  `hidden/`, and edits under the test directory are reported as `tests_modified`.
+- Each episode result and the aggregate carry `reviewer_json_rejections`: how often the
+  fail-closed review parser rejected an auditor answer for lacking its findings JSON.
+- The adapter's per-library table shows `stubs` (functions to implement), tests kept and
+  deselected, and `null-pass` (tests that already pass on the untouched stub tree: the
+  baseline to subtract; large for cachetools).
