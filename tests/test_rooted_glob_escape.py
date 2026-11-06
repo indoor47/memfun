@@ -7,8 +7,10 @@ production gateway + ``create_tool_bridge()`` + rooted wrapper.
 
 Two layers are exercised:
 
-* the rooted wrapper rejects an absolute or ``..``-bearing ``pattern``
-  (``glob_files``), ``glob`` (``grep``) or ``file`` (``git_diff``);
+* the bridge's REPL wrappers (``MCPToolBridge.get_repl_tools``) reject
+  an absolute or ``..``-bearing ``pattern`` (``glob_files``), ``glob``
+  (``grep``) or ``file`` (``git_diff``) -- the rooted wrapper only
+  rewrites ``path``, so this check lives in the bridge;
 * ``fs_glob_files`` / ``fs_list_directory`` / ``repo_repo_map`` drop
   every entry resolving outside their base, which also covers in-root
   symlinks pointing out.
@@ -91,14 +93,14 @@ def _assert_no_outside(out: str) -> None:
 )
 def test_glob_rejects_escaping_patterns(layout: Layout, pattern: str) -> None:
     out = layout.tools["glob_files"](pattern=pattern)
-    assert out.startswith("[tool error: glob_files]"), out
+    assert out.startswith("[tool error: fs_glob_files]"), out
     assert "must not contain '..'" in out
     _assert_no_outside(out)
 
 
 def test_glob_rejects_absolute_pattern_into_outside_dir(layout: Layout) -> None:
     out = layout.tools["glob_files"](pattern=f"{layout.base}/*")
-    assert out.startswith("[tool error: glob_files]"), out
+    assert out.startswith("[tool error: fs_glob_files]"), out
     _assert_no_outside(out)
     # The rejected value is not echoed back.
     assert str(layout.base) not in out
@@ -152,7 +154,9 @@ def test_list_directory_does_not_descend_through_symlink(layout: Layout) -> None
 def test_list_directory_of_symlink_itself_rejected(layout: Layout) -> None:
     out = layout.tools["list_directory"](path="link_out")
     assert out.startswith("[tool error: list_directory]")
-    _assert_no_outside(out)
+    # Nothing inside the symlink target is listed.  (The rooted wrapper's
+    # PathOutsideRootError message does name the resolved target path.)
+    assert "id_rsa_FAKE" not in out
 
 
 def test_repo_map_skips_symlinks_pointing_outside(layout: Layout) -> None:
@@ -167,13 +171,13 @@ def test_repo_map_skips_symlinks_pointing_outside(layout: Layout) -> None:
 @pytest.mark.parametrize("glob", ["../**", "/etc/*", "pkg/../../*"])
 def test_grep_glob_escape_rejected(layout: Layout, glob: str) -> None:
     out = layout.tools["grep"](pattern="OUTSIDE", glob=glob)
-    assert out.startswith("[tool error: grep]"), out
+    assert out.startswith("[tool error: search_grep]"), out
     assert "'glob' must be relative" in out
 
 
 def test_git_diff_file_escape_rejected(layout: Layout) -> None:
     out = layout.tools["git_diff"](file="../outside_note.txt")
-    assert out.startswith("[tool error: git_diff]"), out
+    assert out.startswith("[tool error: git_git_diff]"), out
     assert "'file' must be relative" in out
     _assert_no_outside(out)
 
@@ -185,3 +189,21 @@ def test_in_root_pattern_args_pass_through(layout: Layout) -> None:
     assert "must be relative" not in grep_out
     diff_out = layout.tools["git_diff"](file="inside.py")
     assert "must be relative" not in diff_out
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs"),
+    [
+        ("glob_files", {"pattern": "../*"}),
+        ("glob_files", {"pattern": "/etc/*"}),
+        ("grep", {"pattern": "x", "glob": "!../**"}),
+        ("git_diff", {"file": "../outside_note.txt"}),
+    ],
+)
+def test_unrooted_bridge_wrappers_reject_escaping_args(
+    layout: Layout, tool: str, kwargs: dict[str, Any]
+) -> None:
+    """The check is in the bridge, so it holds without the rooted wrapper."""
+    out = layout.bridge.get_repl_tools()[tool](path=str(layout.root), **kwargs)
+    assert out.startswith("[tool error: "), out
+    assert "must be relative to the search path" in out

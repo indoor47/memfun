@@ -211,6 +211,7 @@ class MCPToolBridge:
         tools["glob_files"] = self._make_sync_tool(
             "fs_glob_files",
             "Glob for files. Args: pattern (str), path (str)='.'",
+            pattern_args=("pattern",),
         )
 
         # Search tools
@@ -219,6 +220,7 @@ class MCPToolBridge:
             "Search file contents with ripgrep. Args: "
             "pattern (str), path (str)='.', glob (str|None), "
             "case_insensitive (bool)=False",
+            pattern_args=("glob",),
         )
 
         # Git tools
@@ -229,6 +231,7 @@ class MCPToolBridge:
         tools["git_diff"] = self._make_sync_tool(
             "git_git_diff",
             "Git diff. Args: path (str)='.', staged (bool)=False, file (str|None)=None",
+            pattern_args=("file",),
         )
         tools["git_log"] = self._make_sync_tool(
             "git_git_log",
@@ -247,16 +250,33 @@ class MCPToolBridge:
         self,
         tool_name: str,
         docstring: str,
+        pattern_args: tuple[str, ...] = (),
     ) -> Callable[..., str]:
         """Create a synchronous wrapper for an MCP tool.
 
         The wrapper runs the async ``call_tool`` in a new event loop
         or uses the existing one via a thread-safe mechanism.
+
+        *pattern_args* name keyword arguments the tool resolves relative
+        to its ``path`` (a glob pattern, a file inside the repo).  A value
+        that is absolute or has a ``..`` component would step outside
+        that base -- and outside the RLM's per-task root, which only
+        rewrites ``path`` -- so it is rejected before the call.  Together
+        with the tools' own bounds this guards against ACCIDENTAL escapes;
+        it is not a sandbox (the REPL keeps full builtins and ``run_cmd``).
         """
         bridge = self
 
         def tool_wrapper(**kwargs: Any) -> str:
             """Invoke an MCP tool synchronously."""
+            for arg in pattern_args:
+                value = kwargs.get(arg)
+                if value is not None and _escapes_base(str(value)):
+                    # The value is not echoed back; the message says what to fix.
+                    return (
+                        f"[tool error: {tool_name}]: {arg!r} must be relative to the "
+                        "search path and must not contain '..' components"
+                    )
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
@@ -326,6 +346,23 @@ def _render_tool_result(result: Any) -> tuple[str, bool]:
             parts.append(text if isinstance(text, str) else str(item))
         return "\n".join(parts), is_error
     return str(cast("object", blocks)), is_error
+
+
+def _escapes_base(value: str) -> bool:
+    """True if *value* is absolute or has a ``..`` path component.
+
+    ``/`` and ``\\`` both count as separators so a Windows-style value
+    cannot hide a ``..``; a leading ``!`` (ripgrep's negated glob) is
+    ignored for the absolute-path test.
+    """
+    import os
+
+    bare = value[1:] if value.startswith("!") else value
+    if not bare:
+        return False
+    if os.path.isabs(bare) or bare.startswith(("/", "\\")):
+        return True
+    return ".." in bare.replace("\\", "/").split("/")
 
 
 # MCP tool names the ``get_repl_tools`` wrappers call.  Kept in one place
