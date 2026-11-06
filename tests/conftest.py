@@ -9,6 +9,85 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+@pytest.fixture(autouse=True)
+def _no_authenticated_requests_to_real_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermetic guard for every test: any urllib request (urlopen or a custom opener such
+    as the RunPod kit's) that carries an Authorization header may only reach localhost."""
+    import urllib.parse
+    import urllib.request
+
+    real_open = urllib.request.OpenerDirector.open
+
+    def guarded(self: urllib.request.OpenerDirector, fullurl, data=None, timeout=None):  # type: ignore[no-untyped-def]
+        req = fullurl if isinstance(fullurl, urllib.request.Request) else None
+        if req is not None and req.has_header("Authorization"):
+            host = urllib.parse.urlsplit(req.full_url).hostname or ""
+            if host not in _LOCAL_HOSTS:
+                raise RuntimeError(f"hermetic test guard: authenticated request to {host}")
+        if timeout is None:
+            return real_open(self, fullurl, data)
+        return real_open(self, fullurl, data, timeout)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", guarded)
+
+
+class HermeticNetworkError(OSError):
+    """A test tried to reach a non-loopback host."""
+
+
+def _loopback(host: object) -> bool:
+    import ipaddress
+
+    if not isinstance(host, str):
+        return False
+    if host in _LOCAL_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%")[0]).is_loopback
+    except ValueError:
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _no_non_loopback_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Socket-level hermetic guard for every test: DNS lookups and connections are only
+    allowed to loopback (127.0.0.0/8, ::1, localhost) and unix sockets.  Limits: it cannot
+    stop C-level `_socket` connects from extension modules or a subprocess (e.g. `curl`);
+    the RunPod kit uses neither (stdlib urllib only), and its boot-script tests put a fake
+    `curl` on PATH."""
+    import socket
+
+    real_getaddrinfo = socket.getaddrinfo
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+
+    def getaddrinfo(host, *a, **k):  # type: ignore[no-untyped-def]
+        if host is None or _loopback(host.decode() if isinstance(host, bytes) else host):
+            return real_getaddrinfo(host, *a, **k)
+        raise HermeticNetworkError(f"hermetic test guard: DNS lookup of {host!r}")
+
+    def check(address: object) -> None:
+        if isinstance(address, (str, bytes)):  # AF_UNIX
+            return
+        if isinstance(address, tuple) and address and _loopback(address[0]):
+            return
+        raise HermeticNetworkError(f"hermetic test guard: connect to {address!r}")
+
+    def connect(self, address):  # type: ignore[no-untyped-def]
+        check(address)
+        return real_connect(self, address)
+
+    def connect_ex(self, address):  # type: ignore[no-untyped-def]
+        check(address)
+        return real_connect_ex(self, address)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+
 
 @pytest.fixture(scope="session")
 def event_loop():

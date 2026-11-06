@@ -2,7 +2,7 @@
 """Plan (default, read-only) or rent a RunPod GPU pod.  See docs/runpod-launch.md.
 
 ``launch_pod.py [launch flags]`` plans/launches; ``launch_pod.py <subcommand> ...`` runs any
-other kit subcommand (spend, watch, tunnel, watchdog, gpus, status).
+other kit subcommand (spend, watch, tunnel, watchdog, gpus, status, logs, terminate).
 """
 
 from __future__ import annotations
@@ -11,7 +11,17 @@ import sys
 
 from runpod_kit import install_exit_signals, main
 
-SUBCOMMANDS = {"launch", "spend", "watch", "tunnel", "watchdog", "gpus", "status"}
+SUBCOMMANDS = {
+    "launch",
+    "spend",
+    "watch",
+    "tunnel",
+    "watchdog",
+    "gpus",
+    "status",
+    "logs",
+    "terminate",
+}
 
 if __name__ == "__main__":
     install_exit_signals()
