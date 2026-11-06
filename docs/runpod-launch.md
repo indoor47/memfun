@@ -13,7 +13,7 @@ is too old.
 
 | file | what it does |
 |---|---|
-| `scripts/runpod/runpod_kit.py` | library and CLI: `gpus`, `launch`, `spend`, `watch`, `tunnel`, `watchdog`, `status`, `logs` |
+| `scripts/runpod/runpod_kit.py` | library and CLI: `gpus`, `launch`, `spend`, `watch`, `tunnel`, `watchdog`, `status`, `logs`, `terminate` |
 | `scripts/runpod/launch_pod.py` | `launch` by default; `launch_pod.py <subcommand> ...` runs any other subcommand |
 | `scripts/runpod/watchdog.py`, `tunnel.py` | shortcuts for `watchdog` and `tunnel` |
 | `scripts/runpod/pod_boot.sh` | in-pod boot (sent base64 in the pod env): hard stop, preflight diagnostics, sshd, weights check/download, SGLang (log mirrored to stdout) |
@@ -263,6 +263,27 @@ URL). See the "Remote access: token auth" section of
 The watchdog terminates the pod at the deadline, or press Ctrl-C in the launch terminal. It
 prints `verified: pod <id> is gone`; if it prints `COULD NOT VERIFY`, terminate the pod in
 the console. Network volume storage is billed until you delete the volume.
+
+**To stop a pod on purpose, use `terminate`, not a signal:**
+
+```bash
+uv run python scripts/runpod/launch_pod.py terminate --pod-id <id> --yes
+```
+
+It needs `--yes`, accepts only a well-formed pod id, terminates only that pod (retried),
+verifies it, prints the final state, and exits 0 **only** when the pod is verified gone;
+otherwise 3. "Gone" means absent from the account's `myself { pods }` listing or listed
+with `desiredStatus` TERMINATED. A pod listed with any other status is NOT gone: RunPod
+can keep a pod `RUNNING` (and billing) after its container has exited, so a frozen uptime
+or a stopped container proves nothing. If the listing call fails, `pod(input)` is the
+fallback; an unknown answer never counts as gone.
+
+Stopping the `launch` process with SIGTERM is **not** a substitute. The kit does handle it
+(the first SIGTERM/SIGHUP starts termination; later ones are ignored, and SIGTERM/SIGHUP/
+SIGINT are ignored while termination runs; a final safety net in `launch` and `watchdog`
+terminates any created pod that is not verified gone), but a driver that kills a process
+group (for example `uv run` plus its child) depends on all of that and on the process not
+being SIGKILLed. Drivers and operators should call `terminate` and check its exit code.
 
 ## Debugging a launch
 

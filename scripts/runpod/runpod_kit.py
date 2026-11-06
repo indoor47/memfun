@@ -7,6 +7,7 @@ Subcommands::
     watch    local watchdog: live $ spent, terminate at deadline / Ctrl-C / error
     tunnel   SSH-forward a local port to the pod's SGLang port (read-only API)
     status   show one pod                                     (read-only)
+    terminate  terminate ONE pod and verify it is gone (needs --yes)
     logs     stream a pod's container/system log (REST SSE)  (read-only)
 
 Safety model (see ``docs/runpod-launch.md``):
@@ -47,7 +48,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -944,14 +945,67 @@ class WatchResult:
 
 _GONE_ERR = re.compile(r"not\s*found|does not exist|no pod", re.IGNORECASE)
 
+#: Pods this process has VERIFIED gone (absent from ``myself.pods`` or TERMINATED).
+VERIFIED_GONE: set[str] = set()
+#: Last desiredStatus seen for a pod that is still listed (for loud reporting).
+LAST_STATUS: dict[str, str] = {}
+POD_LIST_QUERY = "query { myself { pods { id desiredStatus } } }"
+
 
 def _pod_gone(t: Transport, pod_id: str) -> bool | None:
-    """True gone, False still there, None unknown."""
+    """True gone, False still there, None unknown.
+
+    Authoritative check: the account's ``myself { pods }`` listing.  Absent, or
+    desiredStatus TERMINATED => gone; listed with ANY other status (RUNNING with a stopped
+    container, EXITED, ERROR...) => NOT gone (it can keep billing).  Only if the listing
+    fails is ``pod(input)`` used; a failed/unknown lookup is never "gone".
+    """
+    try:
+        data = t.graphql(POD_LIST_QUERY)
+        myself = data.get("myself")
+        pods = _d(myself).get("pods")
+        if isinstance(myself, dict) and isinstance(pods, list):
+            for raw in map(_d, _l(pods)):
+                if str(raw.get("id")) == pod_id:
+                    status = str(raw.get("desiredStatus"))
+                    if status.upper() == "TERMINATED":
+                        return True
+                    LAST_STATUS[pod_id] = status
+                    return False
+            return True
+    except Exception as exc:
+        emit(f"[watchdog] pod listing failed ({type(exc).__name__}); falling back", err=True)
     try:
         pod = get_pod(t, pod_id)
     except Exception as exc:
         return True if isinstance(exc, KitError) and _GONE_ERR.search(str(exc)) else None
+    if pod is not None and pod.desired_status.upper() != "TERMINATED":
+        LAST_STATUS[pod_id] = pod.desired_status
     return pod is None or pod.desired_status.upper() == "TERMINATED"
+
+
+@contextlib.contextmanager
+def signals_ignored() -> Generator[None]:
+    """Ignore SIGTERM/SIGHUP/SIGINT while termination runs (restored afterwards).  A
+    no-op outside the main thread (signal handlers can only be changed there)."""
+    saved: dict[int, Any] = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            with contextlib.suppress(ValueError, OSError):
+                saved[sig] = signal.signal(sig, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        for sig, handler in saved.items():
+            with contextlib.suppress(ValueError, OSError, TypeError):
+                signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
+
+
+def _quiet(fn: Callable[[], object]) -> None:
+    """Run a side step (print, sleep) that must never abort termination (this includes
+    a KeyboardInterrupt injected or delivered mid-termination)."""
+    with contextlib.suppress(BaseException):
+        fn()
 
 
 def terminate_and_verify(
@@ -963,35 +1017,70 @@ def terminate_and_verify(
     backoff_seconds: float = 10.0,
     verify_polls: int = 3,
 ) -> tuple[bool, bool]:
-    """Terminate with retries; return (terminate call succeeded once, verified gone)."""
+    """Terminate with retries; return (terminate call succeeded once, verified gone).
+
+    Survives a KeyboardInterrupt (or any exception) at every line: each step is guarded,
+    and the caller should run it inside :func:`signals_ignored`.
+    """
     called = False
+    gone: bool | None = None
     for attempt in range(1, retries + 1):
         try:
+            terminate_pod(t, pod_id)
+            called = True
+            _quiet(lambda a=attempt: emit(
+                f"[watchdog] terminate request {a}/{retries} accepted for {pod_id}"))  # fmt: skip
+        except BaseException as exc:
+            _quiet(lambda a=attempt, e=exc: emit(
+                f"[watchdog] terminate attempt {a}/{retries} failed: {type(e).__name__}: {e}",
+                err=True))  # fmt: skip
+        for _ in range(verify_polls):
             try:
-                terminate_pod(t, pod_id)
-                called = True
-                emit(f"[watchdog] terminate request {attempt}/{retries} accepted for {pod_id}")
-            except Exception as exc:
-                emit(
-                    f"[watchdog] terminate attempt {attempt}/{retries} failed: "
-                    f"{type(exc).__name__}: {exc}",
-                    err=True,
-                )
-            for _ in range(verify_polls):
                 gone = _pod_gone(t, pod_id)
-                if gone:
-                    emit(f"[watchdog] verified: pod {pod_id} is gone")
-                    return called, True
-                sleep(backoff_seconds)
-        except KeyboardInterrupt:
-            emit(
-                "[watchdog] termination in progress; Ctrl-C ignored until it is verified", err=True
-            )
-    emit(
-        f"[watchdog] !!! COULD NOT VERIFY POD {pod_id} IS TERMINATED. Terminate it now at "
-        "https://console.runpod.io/pods !!!",
-        err=True,
-    )
+            except BaseException:
+                gone = None
+            if gone:
+                VERIFIED_GONE.add(pod_id)
+                _quiet(lambda: emit(f"[watchdog] verified: pod {pod_id} is gone"))
+                return called, True
+            _quiet(lambda: sleep(backoff_seconds))
+        if gone is False:
+            status = LAST_STATUS.get(pod_id, "?")
+            _quiet(lambda st=status: emit(
+                f"[watchdog] pod {pod_id} is still listed with desiredStatus={st} (NOT gone; "
+                "it may still bill even if its container exited); retrying podTerminate",
+                err=True))  # fmt: skip
+    _quiet(lambda: emit(
+        f"[watchdog] !!! COULD NOT VERIFY POD {pod_id} IS TERMINATED (last status "
+        f"{LAST_STATUS.get(pod_id, 'unknown')}). Terminate it now at "
+        "https://console.runpod.io/pods or: launch_pod.py terminate --pod-id "
+        f"{pod_id} --yes !!!",
+        err=True))  # fmt: skip
+    return called, False
+
+
+def terminate_guarded(
+    t: Transport,
+    pod_id: str,
+    *,
+    sleep: Sleeper,
+    retries: int = 6,
+    backoff_seconds: float = 10.0,
+) -> tuple[bool, bool]:
+    """terminate_and_verify with signals ignored, repeated if anything escapes it."""
+    called = False
+    with signals_ignored():
+        for _ in range(3):
+            try:
+                c, gone = terminate_and_verify(
+                    t, pod_id, sleep=sleep, retries=retries, backoff_seconds=backoff_seconds
+                )
+            except BaseException:
+                continue
+            called = called or c
+            if gone:
+                return called, True
+            break
     return called, False
 
 
@@ -1008,52 +1097,91 @@ def run_watchdog(
     backoff_seconds: float = 10.0,
     max_poll_errors: int = 5,
 ) -> WatchResult:
-    """Poll the pod, print live spend, and terminate at the deadline or on any exit path."""
-    start = clock() if started_at is None else started_at
+    """Poll the pod, print live spend, and terminate at the deadline or on any exit path.
+
+    Termination sits in a ``finally``: no exception (a second signal inside an ``except``
+    handler, a failing print...) can skip it.  It only returns without terminating when
+    the pod was VERIFIED gone already.
+    """
+    start = started_at if started_at is not None else 0.0
     spent = 0.0
     cost_hr: float | None = None
     reason = "unknown"
-    poll_errors = 0
+    result: WatchResult | None = None
     try:
-        while True:
-            now = clock()
-            if now >= deadline:
-                reason = "deadline"
-                break
-            try:
-                pod = get_pod(t, pod_id)
-            except KitError as exc:
-                poll_errors += 1
-                emit(f"[watchdog] poll error {poll_errors}/{max_poll_errors}: {exc}", err=True)
-                if poll_errors >= max_poll_errors:
-                    raise
-                sleep(max(0.0, min(poll_seconds, deadline - now)))
-                continue
+        try:
+            start = clock() if started_at is None else started_at
             poll_errors = 0
-            if pod is None or pod.desired_status.upper() == "TERMINATED":
-                emit(f"[watchdog] pod {pod_id} is already gone")
-                return WatchResult("already-gone", False, True, spent)
-            if pod.cost_per_hr is not None:
-                cost_hr = pod.cost_per_hr
-            if cost_hr is not None:
-                spent = round(cost_hr * (now - start) / 3600.0, 4)
-            left = deadline - now
-            rate = f"${cost_hr:.2f}/h" if cost_hr is not None else "rate n/a"
-            emit(
-                f"[watchdog] {pod_id} {pod.desired_status} | {rate} | spent ${spent:.2f} "
-                f"| {int(left // 60)}m{int(left % 60):02d}s to hard stop"
-            )
-            sleep(max(0.0, min(poll_seconds, left)))
-    except KeyboardInterrupt:
+            while True:
+                now = clock()
+                if now >= deadline:
+                    reason = "deadline"
+                    break
+                try:
+                    pod = get_pod(t, pod_id)
+                except KitError as exc:
+                    poll_errors += 1
+                    emit(f"[watchdog] poll error {poll_errors}/{max_poll_errors}: {exc}", err=True)
+                    if poll_errors >= max_poll_errors:
+                        raise
+                    sleep(max(0.0, min(poll_seconds, deadline - now)))
+                    continue
+                poll_errors = 0
+                if pod is None or pod.desired_status.upper() == "TERMINATED":
+                    if _pod_gone(t, pod_id) is True:  # confirm with the listing
+                        VERIFIED_GONE.add(pod_id)
+                        emit(f"[watchdog] pod {pod_id} is already gone")
+                        result = WatchResult("already-gone", False, True, spent)
+                        return result
+                    reason = "pod state unclear"
+                    break
+                if pod.cost_per_hr is not None:
+                    cost_hr = pod.cost_per_hr
+                if cost_hr is not None:
+                    spent = round(cost_hr * (now - start) / 3600.0, 4)
+                left = deadline - now
+                rate = f"${cost_hr:.2f}/h" if cost_hr is not None else "rate n/a"
+                emit(
+                    f"[watchdog] {pod_id} {pod.desired_status} | {rate} | spent ${spent:.2f} "
+                    f"| {int(left // 60)}m{int(left % 60):02d}s to hard stop"
+                )
+                sleep(max(0.0, min(poll_seconds, left)))
+        except KeyboardInterrupt:
+            reason = "interrupt"
+        except Exception as exc:
+            reason = f"error: {REDACT(str(exc))}"
+    except BaseException:  # a second signal while handling the first
         reason = "interrupt"
-    except Exception as exc:
-        reason = f"error: {REDACT(str(exc))}"
-    if cost_hr is not None:
-        spent = round(cost_hr * (clock() - start) / 3600.0, 4)
-    emit(f"[watchdog] stopping pod {pod_id} ({reason}); spent so far ~${spent:.2f}")
-    called, gone = terminate_and_verify(
-        t, pod_id, sleep=sleep, retries=retries, backoff_seconds=backoff_seconds
-    )
+    finally:
+        if result is None:
+            result = _stop_pod(t, pod_id, reason, cost_hr, start, clock, sleep,
+                               retries, backoff_seconds)  # fmt: skip
+    return result
+
+
+def _stop_pod(
+    t: Transport,
+    pod_id: str,
+    reason: str,
+    cost_hr: float | None,
+    start: float,
+    clock: Clock,
+    sleep: Sleeper,
+    retries: int,
+    backoff_seconds: float,
+) -> WatchResult:
+    with signals_ignored():
+        spent = 0.0
+        try:
+            if cost_hr is not None:
+                spent = round(cost_hr * (clock() - start) / 3600.0, 4)
+        except BaseException:
+            pass
+        msg = f"[watchdog] stopping pod {pod_id} ({reason}); spent so far ~${spent:.2f}"
+        _quiet(lambda: emit(msg))
+        called, gone = terminate_guarded(
+            t, pod_id, sleep=sleep, retries=retries, backoff_seconds=backoff_seconds
+        )
     return WatchResult(reason, called, gone, spent)
 
 
@@ -1609,6 +1737,10 @@ def build_parser() -> argparse.ArgumentParser:
         "command", nargs=argparse.REMAINDER, help="memfun command after --; default: memfun chat"
     )
 
+    te = sub.add_parser("terminate", help="terminate ONE pod and verify it is gone (destructive)")
+    te.add_argument("--pod-id", required=True)
+    te.add_argument("--yes", action="store_true", help="required: really terminate it")
+
     st = sub.add_parser("status", help="show a pod (read-only)")
     st.add_argument("--pod-id", required=True)
 
@@ -1740,6 +1872,27 @@ def cmd_logs(
         emit(f"# pod {pod_id} is gone (HTTP 404): RunPod deleted its logs with it")
         return 0
     return 1 if stats.outcome == "error" else 0
+
+
+def cmd_terminate(
+    factory: TransportFactory, key: Secret, args: argparse.Namespace, *, sleep: Sleeper
+) -> int:
+    """Deliberate, explicit termination of ONE pod.  Needs --yes; exit 0 only if verified."""
+    pod_id = _check_pod_id(args.pod_id)
+    if not args.yes:
+        emit(f"refusing: terminating pod {pod_id} is destructive; add --yes", err=True)
+        return 2
+    t = factory(key)  # mutating transport only after the explicit --yes
+    VERIFIED_GONE.discard(pod_id)
+    called, gone = terminate_guarded(t, pod_id, sleep=sleep)
+    last = LAST_STATUS.get(pod_id, "unknown")
+    state = (
+        "gone (absent from the pod list or TERMINATED)"
+        if gone
+        else f"NOT verified gone (last desiredStatus {last})"
+    )
+    emit(f"terminate {pod_id}: request accepted={called}; final state: {state}")
+    return 0 if gone else 3
 
 
 def cmd_spend(ro: ReadOnlyTransport, pod_id: str) -> int:
@@ -2023,9 +2176,14 @@ def cmd_launch(
         emit(f"done: {result.reason}; ~${result.spent_usd:.2f} spent; gone={result.verified_gone}")
         return 0 if result.verified_gone else 3
     finally:
-        if pod_id is not None and not handed_to_watchdog:
-            emit(f"[launch] pod {pod_id} exists but is not watched yet: terminating it", err=True)
-            terminate_and_verify(rw, pod_id, sleep=sleep)
+        # Safety net, independent of handed_to_watchdog: a created pod that was not
+        # VERIFIED gone is terminated here, whatever escaped above (e.g. a second signal).
+        if pod_id is not None and pod_id not in VERIFIED_GONE:
+            what = "was handed to the watchdog" if handed_to_watchdog else "is not watched yet"
+            _quiet(lambda: emit(
+                f"[launch] pod {pod_id} {what} but is not verified gone: terminating it",
+                err=True))  # fmt: skip
+            terminate_guarded(rw, pod_id, sleep=sleep)
         if capture is not None:
             capture.finish()
             emit(f"pod log saved: {capture.path}")
@@ -2070,7 +2228,16 @@ class TerminateRequestedError(KeyboardInterrupt):
     on Ctrl-C also terminates on these; ``watch`` tells it apart from a plain Ctrl-C."""
 
 
+_EXIT_SIGNALLED = {"seen": False}
+
+
 def _exit_signal_handler(signum: int, _frame: object) -> None:
+    # Latch: only the FIRST SIGTERM/SIGHUP raises.  A second one (e.g. `uv run` forwarding
+    # plus process-group delivery) would otherwise land between the first one's handler and
+    # the termination path and skip it.  Termination itself also ignores signals.
+    if _EXIT_SIGNALLED["seen"]:
+        return
+    _EXIT_SIGNALLED["seen"] = True
     raise TerminateRequestedError(f"signal {signum}")
 
 
@@ -2081,6 +2248,7 @@ def install_exit_signals() -> None:
     def handler(signum: int, frame: object) -> None:
         _exit_signal_handler(signum, frame)
 
+    _EXIT_SIGNALLED["seen"] = False
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, handler)
 
@@ -2097,6 +2265,8 @@ def main(
     now: dt.datetime | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
+    VERIFIED_GONE.clear()  # per invocation (tests call main() repeatedly in one process)
+    LAST_STATUS.clear()
     try:
         key = load_api_key(env, key_path)
         if args.cmd == "gpus":
@@ -2117,11 +2287,18 @@ def main(
             return cmd_watch(ReadOnlyTransport(factory(key)), args, watch_deps or WatchDeps())
         if args.cmd == "watchdog":
             deadline = clock() + args.max_minutes * 60
-            result = run_watchdog(
-                factory(key), args.pod_id, deadline, clock=clock, sleep=sleep,
-                poll_seconds=args.poll_seconds,
-            )  # fmt: skip
-            return 0 if result.verified_gone else 3
+            wt = factory(key)
+            try:
+                run_watchdog(
+                    wt, args.pod_id, deadline, clock=clock, sleep=sleep,
+                    poll_seconds=args.poll_seconds,
+                )  # fmt: skip
+            finally:
+                if args.pod_id not in VERIFIED_GONE:
+                    terminate_guarded(wt, args.pod_id, sleep=sleep)
+            return 0 if args.pod_id in VERIFIED_GONE else 3
+        if args.cmd == "terminate":
+            return cmd_terminate(factory, key, args, sleep=sleep)
         if args.cmd == "tunnel":
             check_local_port(args.local_port)
             pod = get_pod(ReadOnlyTransport(factory(key)), args.pod_id)

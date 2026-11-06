@@ -198,7 +198,12 @@ class FakeRunPod:
             if self.lookup_fails:
                 raise kit.KitError("RunPod HTTP 503: unavailable")
             return {
-                "myself": {"pods": [{"id": k, "name": v["name"]} for k, v in self.pods.items()]}
+                "myself": {
+                    "pods": [
+                        {"id": k, "name": v["name"], "desiredStatus": v.get("desiredStatus")}
+                        for k, v in self.pods.items()
+                    ]
+                }
             }
         if "myself" in query:
             return {"myself": {"clientBalance": 50.0, "networkVolumes": self.volumes}}
@@ -2070,3 +2075,251 @@ def test_launch_pod_wrapper_knows_every_kit_subcommand() -> None:
     parser = kit.build_parser()
     sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))  # pyright: ignore[reportPrivateUsage]
     assert wrapper == set(sub.choices)
+
+
+# ---------------------------------------------------------------------------
+# Signal-proof termination (incident: a second SIGTERM skipped terminate_and_verify).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_termination_state() -> Iterator[None]:
+    def reset() -> None:
+        for name in ("VERIFIED_GONE", "LAST_STATUS"):
+            state = getattr(kit, name, None)
+            if state is not None:
+                state.clear()
+
+    reset()
+    yield
+    reset()
+
+
+class ChaosClock(FakeClock):
+    """FakeClock whose clock()/sleep() raise on chosen call numbers (1-based)."""
+
+    def __init__(self, clock_raise: set[int], sleep_raise: dict[int, type[BaseException]]):
+        super().__init__()
+        self.clock_raise, self.sleep_raise = clock_raise, sleep_raise
+        self.n_clock = self.n_sleep = 0
+
+    def __call__(self) -> float:
+        self.n_clock += 1
+        if self.n_clock in self.clock_raise:
+            raise KeyboardInterrupt("second signal in clock()")
+        return super().__call__()
+
+    def sleep(self, seconds: float) -> None:
+        self.n_sleep += 1
+        exc = self.sleep_raise.get(self.n_sleep)
+        if exc is not None:
+            raise exc("signal during sleep")
+        super().sleep(seconds)
+
+
+SECOND_SIGNAL_POINTS = [
+    # (name, emit substring that raises once, clock calls that raise, extra sleep raises,
+    #  terminate failures)
+    ("emit-stopping-pod", "stopping pod", set(), {}, 0),  # the incident window
+    ("spent-computation", None, {4}, {}, 0),  # call 1 is the test computing the deadline
+    ("emit-terminate-accepted", "terminate request 1/6 accepted", set(), {}, 0),
+    ("emit-verified", "verified: pod", set(), {}, 0),
+    ("verify-sleep", None, set(), {2: KeyboardInterrupt}, 1),
+    ("between-retries-emit", "terminate attempt 1/6 failed", set(), {}, 1),
+    ("still-listed-emit", "still listed", set(), {}, 1),
+    ("terminate-call-itself", None, set(), {}, -1),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "emit_match", "clock_raise", "sleep_raise", "term_fail"),
+    SECOND_SIGNAL_POINTS,
+    ids=[p[0] for p in SECOND_SIGNAL_POINTS],
+)
+def test_second_signal_anywhere_in_shutdown_still_terminates(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    emit_match: str | None,
+    clock_raise: set[int],
+    sleep_raise: dict[int, type[BaseException]],
+    term_fail: int,
+) -> None:
+    fake = _fake_with_pod()
+    fake.terminate_failures = max(term_fail, 0)
+    if term_fail < 0:  # the first podTerminate call is interrupted by a signal
+        orig = fake.graphql
+        state = {"hit": False}
+
+        def graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+            if "podTerminate" in query and not state["hit"]:
+                state["hit"] = True
+                raise KeyboardInterrupt("second signal during podTerminate")
+            return orig(query, variables)
+
+        fake.graphql = graphql  # type: ignore[method-assign]
+    # First signal: during the first poll's sleep (cost is known by then).
+    clock = ChaosClock(clock_raise, {1: kit.TerminateRequestedError, **sleep_raise})
+    real_emit = kit.emit
+    fired = {"done": False}
+
+    def chaos_emit(message: str = "", *, err: bool = False) -> None:
+        if emit_match and emit_match in message and not fired["done"]:
+            fired["done"] = True
+            raise KeyboardInterrupt("second signal inside emit")
+        real_emit(message, err=err)
+
+    monkeypatch.setattr(kit, "emit", chaos_emit)
+    try:
+        result = kit.run_watchdog(
+            fake, "pod1", clock() + 3600, clock=clock, sleep=clock.sleep, poll_seconds=30
+        )
+        assert result.verified_gone
+    except KeyboardInterrupt:
+        pass  # allowed to propagate AFTER termination; the pod must be gone either way
+    assert emit_match is None or fired["done"], "injection point never reached"
+    assert clock.n_clock >= max(clock_raise, default=0), "clock injection never reached"
+    assert clock.n_sleep >= max(sleep_raise, default=1), "sleep injection never reached"
+    assert fake.pods == {}, name  # terminated and verified (the fake pops it)
+    assert "terminate" in fake.mutations
+
+
+def test_launch_finally_terminates_when_watchdog_raises(
+    monkeypatch: pytest.MonkeyPatch, pubkey: str
+) -> None:
+    def broken_watchdog(*_a: Any, **_k: Any) -> kit.WatchResult:
+        raise KeyboardInterrupt("escaped run_watchdog")
+
+    monkeypatch.setattr(kit, "run_watchdog", broken_watchdog)
+    fake = FakeRunPod()
+    assert _real_launch(fake, pubkey) == 130
+    assert fake.mutations == ["deploy", "terminate"] and fake.pods == {}
+
+
+def test_watchdog_subcommand_finally_terminates(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_watchdog(*_a: Any, **_k: Any) -> kit.WatchResult:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(kit, "run_watchdog", broken_watchdog)
+    fake = _fake_with_pod()
+    assert run(["watchdog", "--pod-id", "pod1", "--max-minutes", "5"], fake) == 1
+    assert fake.pods == {} and fake.mutations == ["terminate"]
+
+
+def test_listed_pod_with_any_live_status_is_not_gone(capsys: pytest.CaptureFixture[str]) -> None:
+    fake = _fake_with_pod()
+    fake.never_gone = True
+    fake.pods["pod1"]["desiredStatus"] = "EXITED"  # container stopped, pod still billing
+    assert kit._pod_gone(fake, "pod1") is False  # pyright: ignore[reportPrivateUsage]
+    called, gone = kit.terminate_and_verify(fake, "pod1", sleep=lambda _s: None, retries=4)
+    assert called and not gone and fake.terminate_calls == 4  # keeps calling podTerminate
+    err = capsys.readouterr().err
+    assert "still listed with desiredStatus=EXITED" in err and "COULD NOT VERIFY" in err
+    fake.pods["pod1"]["desiredStatus"] = "RUNNING"
+    assert kit._pod_gone(fake, "pod1") is False  # pyright: ignore[reportPrivateUsage]
+    fake.pods["pod1"]["desiredStatus"] = "TERMINATED"
+    assert kit._pod_gone(fake, "pod1") is True  # pyright: ignore[reportPrivateUsage]
+    assert kit._pod_gone(fake, "absent1") is True  # pyright: ignore[reportPrivateUsage]
+
+
+def test_listing_failure_falls_back_and_unknown_is_not_gone() -> None:
+    gone = kit._pod_gone  # pyright: ignore[reportPrivateUsage]
+    fake = _fake_with_pod()
+    fake.lookup_fails = True
+    assert gone(fake, "pod1") is False  # fallback pod(input): still there
+    fake.pods.clear()
+    assert gone(fake, "pod1") is True  # fallback: pod is null
+    fake.pod_errors = 1
+    assert gone(fake, "pod1") is None  # both failed: unknown, never "gone"
+
+
+def test_terminate_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+    spy = _fake_with_pod()
+    spy.allow_mutations = False
+    assert run(["terminate", "--pod-id", "pod1"], spy) == 2
+    assert "add --yes" in capsys.readouterr().err and spy.mutations == []
+    assert run(["terminate", "--pod-id", "pod-1;rm", "--yes"], spy) == 1
+    fake = _fake_with_pod()
+    assert run(["terminate", "--pod-id", "pod1", "--yes"], fake) == 0
+    assert fake.pods == {} and "final state: gone" in capsys.readouterr().out
+    stuck = _fake_with_pod()
+    stuck.never_gone = True
+    assert run(["terminate", "--pod-id", "pod1", "--yes"], stuck) == 3
+    out = capsys.readouterr()
+    assert "NOT verified gone (last desiredStatus RUNNING)" in out.out
+    echo = _fake_with_pod()
+    echo.raise_any = lambda: kit.KitError(f"HTTP 500 Bearer {FAKE_KEY}")
+    assert run(["terminate", "--pod-id", "pod1", "--yes"], echo) == 3
+    cap = capsys.readouterr()
+    _assert_clean(cap.out + cap.err, FAKE_KEY)
+
+
+CHILD = r"""
+import sys, time
+sys.path.insert(0, sys.argv[1])
+from scripts.runpod import runpod_kit as kit
+marker = sys.argv[2]
+
+class Fake:
+    def __init__(self):
+        self.pods = {"podX": "RUNNING"}
+    def graphql(self, q, v=None):
+        if "podTerminate" in q:
+            open(marker, "a").write("terminate\n")
+            time.sleep(0.3)  # a slow API call: the window for further signals
+            self.pods.clear()
+            return {"podTerminate": None}
+        if "myself { pods" in q:
+            pods = [{"id": k, "desiredStatus": s} for k, s in self.pods.items()]
+            return {"myself": {"pods": pods}}
+        if "pod(input" in q:
+            open(marker + ".ready", "w").write("1")
+            if not self.pods:
+                return {"pod": None}
+            return {"pod": {"id": "podX", "name": "x", "desiredStatus": "RUNNING",
+                            "costPerHr": 9.0, "runtime": {"uptimeInSeconds": 1, "ports": []}}}
+        raise AssertionError(q)
+    def rest(self, *a):
+        raise AssertionError(a)
+
+kit.install_exit_signals()
+fake = Fake()
+argv = ["watchdog", "--pod-id", "podX", "--max-minutes", "30", "--poll-seconds", "0.1"]
+env = {"RUNPOD_API_KEY": "rpa_FAKEKEY_0123456789abcdefSECRET"}
+rc = kit.main(argv, factory=lambda _k: fake, env=env)
+open(marker + ".rc", "w").write(str(rc) + " " + ("gone" if not fake.pods else "ALIVE"))
+"""
+
+WRAPPER = r"""
+import signal, subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", sys.argv[1], *sys.argv[2:]])
+def fwd(signum, _f):
+    child.send_signal(signum)  # like `uv run`: forward, on top of process-group delivery
+    time.sleep(0.05)
+    child.send_signal(signum)  # and once more, landing inside the shutdown path
+signal.signal(signal.SIGTERM, fwd)
+sys.exit(child.wait())
+"""
+
+
+def test_killpg_wrapper_plus_kit_double_sigterm_still_terminates(tmp_path: Path) -> None:
+    import os as _os
+    import time as _time
+
+    marker = tmp_path / "events"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", WRAPPER, CHILD, str(REPO_ROOT), str(marker)],
+        start_new_session=True,
+    )
+    try:
+        for _ in range(400):
+            if (tmp_path / "events.ready").exists():
+                break
+            _time.sleep(0.05)
+        assert (tmp_path / "events.ready").exists(), "kit never polled"
+        _os.killpg(proc.pid, signal.SIGTERM)  # group delivery + the wrapper's forwards
+        proc.wait(timeout=60)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            _os.killpg(proc.pid, signal.SIGKILL)
+    assert (tmp_path / "events.rc").read_text().split()[1] == "gone"
+    assert "terminate" in marker.read_text()
