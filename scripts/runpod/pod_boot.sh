@@ -269,11 +269,12 @@ fi
 # Names are validated by the kit too; re-check here so the pod never builds a path from
 # an unvalidated string (no "..", no absolute paths).
 valid_name() {
-  [[ "$1" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$ ]] && [[ "$1" != *..* ]]
+  [[ "$1" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$ ]] && [[ "$1" != *..* ]] \
+    && [[ "$1" != -* ]] && [[ "$1" != */-* ]]  # never an option to hf/pip
 }
 valid_name "$MODEL_REPO" || fail "invalid MEMFUN_MODEL_REPO"
 valid_name "$SERVED_NAME" || fail "invalid MEMFUN_SERVED_NAME"
-[[ "$REVISION" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$REVISION" != *..* ]] \
+[[ "$REVISION" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$REVISION" != *..* ]] && [[ "$REVISION" != -* ]] \
   || fail "invalid MEMFUN_MODEL_REVISION"
 MODELS_ROOT="${MEMFUN_MODELS_ROOT:-/workspace/models}"
 case "$MODEL_DIR" in

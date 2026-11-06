@@ -331,6 +331,20 @@ pull (1.5 to ~10 min observed) plus the ~31 GB weights download (3-5 min) both c
 `--max-minutes` before SGLang serves anything, so give `--max-minutes` at least 15 minutes
 of margin over the time you need SGLang up.
 
+**SGLang's log is public to anyone with the pod's logs:** `pod_boot.sh` mirrors the full
+`sglang.log` to stdout, so it lands in RunPod's container log and in the local capture
+file. Nothing secret is in it today (SGLang runs without `--api-key`); if one is ever
+added, keep it out of SGLang's printed arguments or stop the mirror.
+
+**Hangs are bounded:** every long step in `pod_boot.sh` (download attempts, pip, apt,
+`runpodctl`, `df`) runs in the background under a timeout and the script `wait`s for it,
+so the TERM trap and the deadline always act (bash defers traps behind a foreground
+command). A download attempt is also killed when `du -sk` of the model dir has not grown
+for 5 minutes (stall) or after min(time left, 25 min); it is then retried (resumable). If
+the deadline's `runpodctl` removal fails, PID 1 is told to stop all processes and exit.
+`shellcheck` was not available when this was written; the script is covered by the
+hermetic bash tests only.
+
 **SSH on a custom image:** RunPod starts sshd only for its own templates; with a custom
 start command (as here) the container must start it, which `pod_boot.sh` does (installs
 `openssh-server` with apt if missing, key-only auth). The port mapping appears only after

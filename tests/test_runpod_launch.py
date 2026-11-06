@@ -1902,7 +1902,7 @@ def test_logs_404_means_pod_gone_and_exits_cleanly(capsys: pytest.CaptureFixture
     fake = FakeRunPodWithLogs(logs, allow_mutations=False)
     assert run(["logs", "--pod-id", "pod1", "--follow"], fake) == 0
     out = capsys.readouterr().out
-    assert "last words" in out and "pod pod1 is gone (HTTP 404)" in out
+    assert "last words" in out and "pod pod1 is gone or does not exist (HTTP 404" in out
     assert fake.mutations == [] and logs.calls[0][1] == {"tail": "2000"}
     assert run(["logs", "--pod-id", "pod1", "--source", "system", "--tail", "50"], fake) == 0
     assert logs.calls[-1][1] == {"tail": "50", "source": "system"}
@@ -2507,3 +2507,73 @@ def test_api_key_never_sent_to_redirect_target(monkeypatch: pytest.MonkeyPatch) 
     for msg in errors:
         assert "refusing HTTP 302 redirect" in msg
         _assert_clean(msg, FAKE_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Audit advisories: 404 confirmation, capture cap, bounded --timeout, no "-" names.
+# ---------------------------------------------------------------------------
+
+
+def test_logs_404_while_pod_exists_is_not_gone(capsys: pytest.CaptureFixture[str]) -> None:
+    fake = _fake_with_pod()
+    calls = {"n": 0}
+
+    def stream(*_a: Any) -> Iterator[str]:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            yield _ev("container finally logging")
+            fake.pods.clear()  # then the pod goes away
+        raise kit.LogStreamError("HTTP 404", status=404)
+
+    fake_l = FakeRunPodWithLogs(stream)
+    fake_l.pods = fake.pods
+    assert run(["logs", "--pod-id", "pod1"], fake_l) == 0  # non-follow: says so, exits
+    assert "still exists: no logs yet" in capsys.readouterr().out
+    calls["n"] = 1
+    assert run(["logs", "--pod-id", "pod1", "--follow"], fake_l) == 0
+    out = capsys.readouterr().out
+    assert "waiting for its logs" in out and "container finally logging" in out
+    assert "is gone or does not exist" in out
+
+
+def test_logs_404_with_unknown_pod_state_is_bounded(capsys: pytest.CaptureFixture[str]) -> None:
+    fake = FakeRunPodWithLogs(FakeLogs(*[kit.LogStreamError("x", status=404) for _ in range(9)]))
+    fake.lookup_fails = True
+    fake.pod_errors = 99
+    assert run(["logs", "--pod-id", "pod1", "--follow"], fake) == 1
+    assert "pod state is unknown (5/5)" in capsys.readouterr().out
+
+
+def test_log_capture_file_size_is_capped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(kit.LogCapture, "max_bytes", 200)
+    logs = FakeLogs([_ev("x" * 60) for _ in range(20)])
+    cap = kit.LogCapture.start(FakeRunPodWithLogs(logs), "pod1", tmp_path)
+    assert cap is not None
+    cap.finish(wait=10)
+    text = cap.path.read_text()
+    assert "capture stopped: file reached its 200 byte cap" in text
+    assert len(text.encode()) < 400
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "0", "-5", "99999"])
+def test_logs_timeout_must_be_finite_and_bounded(value: str) -> None:
+    with pytest.raises(SystemExit):
+        kit.build_parser().parse_args(["logs", "--pod-id", "p1", "--timeout", value])
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [["--model-repo", "-rf"], ["--model-repo", "org/-x"], ["--model-revision", "--help"]],
+)
+def test_names_starting_with_dash_refused(extra: list[str], pubkey: str) -> None:
+    spy = FakeRunPod(allow_mutations=False)
+    assert run(["launch", "--ssh-public-key", pubkey, *[f"{extra[0]}={extra[1]}"]], spy) == 1
+    assert spy.calls == []
+
+
+@needs_bash
+def test_boot_refuses_names_starting_with_dash(tmp_path: Path) -> None:
+    log, _rp, py = _run_boot(tmp_path, {"MEMFUN_MODEL_REVISION": "--help"})
+    assert "invalid MEMFUN_MODEL_REVISION" in log and py == []
+    log, _rp, py = _run_boot(tmp_path, {"MEMFUN_MODEL_REPO": "Qwen/-x"})
+    assert "invalid MEMFUN_MODEL_REPO" in log and py == []

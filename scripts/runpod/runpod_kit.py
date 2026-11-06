@@ -479,7 +479,7 @@ class HttpTransport:
         with resp:
             while True:
                 try:
-                    raw = resp.readline()
+                    raw = resp.readline(1 << 20)  # one line is at most 1 MiB
                 except TimeoutError:
                     raise LogStreamError("log stream idle (read timeout)", idle=True) from None
                 except Exception as exc:
@@ -1300,6 +1300,7 @@ def follow_logs(
     max_errors: int = 5,
     backoff: float = 5.0,
     stop: threading.Event | None = None,
+    is_gone: Callable[[], bool | None] | None = None,
 ) -> LogStats:
     """Read the pod log stream into ``sink`` (each line redacted first).
 
@@ -1314,6 +1315,7 @@ def follow_logs(
     stats = LogStats()
     seen: set[str] = set()
     errors = 0
+    not_yet = 0
     start = clock()
 
     def out(text: str) -> None:
@@ -1370,7 +1372,25 @@ def follow_logs(
             for ev in parser.flush():
                 handle(ev)
             if exc.status == 404:
-                return done("gone")
+                # Confirm before giving up: a pod that is still initializing (no container
+                # log yet) or a lookup hiccup also 404s.  Without a checker, trust the 404.
+                state = True if is_gone is None else _safe_state(is_gone)
+                if state is True:
+                    return done("gone")
+                if not follow:
+                    out("# HTTP 404 but the pod still exists: no logs yet (still initializing?)")
+                    return done("no-logs-yet")
+                not_yet += 1
+                if state is None:
+                    errors += 1
+                    out(f"# HTTP 404 and the pod state is unknown ({errors}/{max_errors})")
+                    if errors >= max_errors:
+                        return done("error")
+                elif not_yet == 1:
+                    out("# HTTP 404 but the pod still exists: waiting for its logs")
+                stats.reconnects += 1
+                sleep(min(backoff * not_yet, 30.0))
+                continue
             if exc.idle:
                 if not follow:
                     return done("ended")
@@ -1392,6 +1412,13 @@ def follow_logs(
             return done("error")
         stats.reconnects += 1
         sleep(wait)
+
+
+def _safe_state(is_gone: Callable[[], bool | None]) -> bool | None:
+    try:
+        return is_gone()
+    except Exception:
+        return None
 
 
 def _check_pod_id(pod_id: str) -> str:
@@ -1442,9 +1469,20 @@ class LogCapture:
 
     #: Seconds between reconnects (and the base of the error backoff).
     backoff: float = 5.0
+    #: Local file size cap; the capture stops with a final line when reached.
+    max_bytes: int = 200 * 1024 * 1024
 
-    def __init__(self, stream: LogStream, pod_id: str, path: Path, fd: int) -> None:
+    def __init__(
+        self,
+        stream: LogStream,
+        pod_id: str,
+        path: Path,
+        fd: int,
+        is_gone: Callable[[], bool | None] | None = None,
+    ) -> None:
         self.path = path
+        self._is_gone = is_gone
+        self._written = 0
         self.stats: LogStats | None = None
         self._stream = stream
         self._pod_id = pod_id
@@ -1461,7 +1499,11 @@ class LogCapture:
                 emit("log capture: this transport cannot stream pod logs (skipped)")
                 return None
             path, fd = open_capture_file(out_dir, pod_id)
-            cap = cls(stream, pod_id, path, fd)
+            graphql = getattr(transport, "graphql", None)
+            checker = (
+                (lambda: _pod_gone(cast("Transport", transport), pod_id)) if graphql else None
+            )
+            cap = cls(stream, pod_id, path, fd, checker)
             cap._thread.start()
             return cap
         except Exception as exc:
@@ -1470,13 +1512,24 @@ class LogCapture:
 
     def _write(self, text: str) -> None:
         with self._lock:
-            if not self._fh.closed:
-                self._fh.write(REDACT(text) + "\n")
+            if self._fh.closed or self._written >= self.max_bytes:
+                return
+            line = REDACT(text) + "\n"
+            self._written += len(line.encode("utf-8", "replace"))
+            if self._written >= self.max_bytes:
+                self._fh.write(
+                    f"# capture stopped: file reached its {self.max_bytes} byte cap "
+                    f"(use the logs command for the rest)\n"
+                )
+                self._stop.set()
+                return
+            self._fh.write(line)
 
     def _run(self) -> None:
         try:
             self.stats = follow_logs(
                 self._stream, self._pod_id, self._write, follow=True, stop=self._stop,
+                is_gone=self._is_gone,
                 read_timeout=60.0, backoff=self.backoff, max_errors=20,
             )  # fmt: skip
             self._write(f"# capture ended: {self.stats.outcome} ({self.stats.events} events)")
@@ -1627,6 +1680,8 @@ def _cost_cap(text: str) -> float:
 def _check_name(value: str, what: str) -> str:
     if (
         not REPO_NAME_RE.fullmatch(value)
+        or value.startswith("-")
+        or any(part.startswith("-") for part in value.split("/"))
         or any(part in (".", "..") for part in value.split("/"))
         or ".." in value
     ):
@@ -1645,7 +1700,8 @@ def validate_launch_args(args: argparse.Namespace) -> None:
         raise KitError("--max-cost-usd must be finite and > 0")
     _check_name(args.model_repo, "--model-repo")
     _check_name(args.served_name, "--served-name")
-    if not REVISION_RE.fullmatch(args.model_revision) or ".." in args.model_revision:
+    rev = args.model_revision
+    if not REVISION_RE.fullmatch(rev) or ".." in rev or rev.startswith("-"):
         raise KitError("--model-revision must be a branch, tag or commit sha")
 
 
@@ -1668,6 +1724,16 @@ def _grace_minutes(text: str) -> int:
         raise argparse.ArgumentTypeError(f"grace must be an integer, got {text!r}") from None
     if not 0 <= value <= 60:
         raise argparse.ArgumentTypeError("grace must be 0..60 minutes")
+    return value
+
+
+def _log_timeout(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--timeout must be a number, got {text!r}") from None
+    if not (math.isfinite(value) and 1 <= value <= 3600):
+        raise argparse.ArgumentTypeError("--timeout must be finite, 1..3600 seconds")
     return value
 
 
@@ -1779,7 +1845,9 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("--source", choices=("container", "system", "both"), default="both")
     lg.add_argument("--tail", type=_log_tail, default=2000, help=f"1..{MAX_LOG_TAIL}")
     lg.add_argument("--raw", action="store_true", help="show image-pull progress lines too")
-    lg.add_argument("--timeout", type=float, default=30.0, help="non-follow overall cap (s)")
+    lg.add_argument(
+        "--timeout", type=_log_timeout, default=30.0, help="non-follow overall cap, 1..3600 s"
+    )
     for sp_ in (la, wa):
         sp_.add_argument(
             "--log-dir", default=str(DEFAULT_LOG_DIR), help="local pod-log capture directory"
@@ -1888,6 +1956,7 @@ def cmd_logs(
         stats = follow_logs(
             stream, pod_id, sink, follow=args.follow, source=args.source, tail=args.tail,
             raw=args.raw, clock=clock, sleep=sleep, overall_timeout=args.timeout,
+            is_gone=lambda: _pod_gone(ro, pod_id),
         )  # fmt: skip
     finally:
         if fh is not None:
@@ -1895,7 +1964,10 @@ def cmd_logs(
     hidden = f" ({stats.hidden} image-pull progress lines hidden; --raw shows them)"
     emit(f"# {stats.events} log events{hidden if stats.hidden else ''}; end: {stats.outcome}")
     if stats.outcome == "gone":
-        emit(f"# pod {pod_id} is gone (HTTP 404): RunPod deleted its logs with it")
+        emit(
+            f"# pod {pod_id} is gone or does not exist (HTTP 404, and not in the pod list): "
+            "RunPod deletes a pod's logs with it"
+        )
         return 0
     return 1 if stats.outcome == "error" else 0
 
