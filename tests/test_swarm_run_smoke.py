@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -91,6 +92,89 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+# ── leak guard: every fake process carries a per-test token and records its pgid ──
+
+_CURRENT: dict[str, str] = {"token": "", "track": ""}
+_SESSION_TOKENS: list[str] = []
+#: Tests that deliberately SIGKILL the runner clean up via its pgids.txt themselves.
+_ORPHANS_EXPECTED = {"test_partial_results_and_pgids_survive_a_sigkilled_runner"}
+
+
+def _cmdline(pid: int) -> str:
+    proc = subprocess.run(
+        ["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, check=False
+    )
+    return proc.stdout
+
+
+def _live_tracked(track: Path, token: str) -> list[tuple[int, int]]:
+    """``(pid, pgid)`` of recorded fake processes still alive AND still carrying ``token``."""
+    out: list[tuple[int, int]] = []
+    for rec in sorted(track.glob("*")) if track.is_dir() else []:
+        pgid_s, _, tok = rec.read_text().partition(" ")
+        pid = int(rec.name)
+        if tok != token or token not in _cmdline(pid):  # guards against pid reuse
+            continue
+        with contextlib.suppress(ProcessLookupError):
+            if os.getpgid(pid) == int(pgid_s):
+                out.append((pid, int(pgid_s)))
+    return out
+
+
+def _live_by_token(tokens: list[str]) -> list[tuple[int, int]]:
+    """``(pid, pgid)`` of ANY process whose command line carries one of ``tokens``.
+
+    Catches fakes that died off before recording themselves (killed during startup).
+    """
+    listing = subprocess.run(
+        ["ps", "-axo", "pid=,pgid=,command="], capture_output=True, text=True, check=False
+    ).stdout
+    out: list[tuple[int, int]] = []
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and any(t in parts[2] for t in tokens) and int(parts[0]) != os.getpid():
+            out.append((int(parts[0]), int(parts[1])))
+    return out
+
+
+def _kill_leaked(leaked: list[tuple[int, int]]) -> list[str]:
+    """Describe, then SIGKILL the groups of ``leaked`` (token-verified pids), then wait."""
+    details = [f"{pid} (pgid {pgid}): {_cmdline(pid).strip()[:200]}" for pid, pgid in leaked]
+    for _pid, pgid in leaked:
+        if pgid > 1 and pgid != os.getpgid(0):  # never our own group
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pgid, signal.SIGKILL)
+    for pid, _pgid in leaked:
+        _wait_dead(pid)
+    return details
+
+
+@pytest.fixture(autouse=True)
+def fake_process_guard(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[str]:
+    """Kill (by process group, token-verified) any fake the test left alive, and fail."""
+    token = f"rstok-{uuid.uuid4().hex}"
+    track = tmp_path_factory.mktemp("fake-track")
+    _CURRENT.update(token=token, track=str(track))
+    _SESSION_TOKENS.append(token)
+    try:
+        yield token
+    finally:
+        _CURRENT.update(token="", track="")
+        leaked = sorted(set(_live_tracked(track, token)) | set(_live_by_token([token])))
+        details = _kill_leaked(leaked)
+        if leaked and request.node.originalname not in _ORPHANS_EXPECTED:
+            pytest.fail(f"test leaked fake memfun processes (killed in teardown): {details}")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def no_fake_survivors() -> Iterator[None]:
+    yield
+    alive = _kill_leaked(_live_by_token(_SESSION_TOKENS))
+    assert not alive, f"processes from this test session were still alive (killed): {alive}"
+
+
 def _fake_cmd(
     state: Path,
     modes: dict[str, str] | None = None,
@@ -98,6 +182,8 @@ def _fake_cmd(
     result_modes: dict[str, str] | None = None,
 ) -> str:
     cmd = [sys.executable, str(FAKE), "--state", str(state), "--bundles-root", str(SMOKE)]
+    if _CURRENT["token"]:
+        cmd += ["--fake-token", _CURRENT["token"], "--track-dir", _CURRENT["track"]]
     for bundle, mode in (modes or {}).items():
         cmd += ["--bundle-mode", f"{bundle}={mode}"]
     for bundle, mode in (result_modes or {}).items():
@@ -523,6 +609,7 @@ def test_runner_starts_one_dashboard_and_forwards_all_episodes(
         assert lock["port"] == port
         assert f"Dashboard: http://localhost:{port}" in (Path(ep["dir"]) / "swarm.log").read_text()
     assert not rs.dashboard_health(port)  # the runner stopped the dashboard it started
+    assert _wait_dead(int((state / "dashboard.pid").read_text()))  # the process, not the port
 
 
 def test_memfun_swarm_reuses_the_shared_dashboard_from_the_lockfile(
@@ -546,6 +633,7 @@ def test_memfun_swarm_reuses_the_shared_dashboard_from_the_lockfile(
         assert got == (port, False)  # reused, not a second dashboard
     finally:
         dash.stop()
+    assert dash.proc is not None and _wait_dead(dash.proc.pid)
 
 
 def test_existing_dashboard_is_reused_and_left_running(
@@ -569,10 +657,12 @@ def test_existing_dashboard_is_reused_and_left_running(
         assert results["dashboard"] == {"port": port, "started_by_runner": False}
         assert results["episodes"][0]["outcome"] == "pass"
         assert owner.poll() is None and rs.dashboard_health(port)  # not ours: left alone
+        os.kill(int((other_state / "dashboard.pid").read_text()), 0)  # process still alive
         assert (other_state / "dashboard_events.jsonl").read_text().strip()
     finally:
         owner.send_signal(signal.SIGKILL)
         owner.wait()
+    assert _wait_dead(owner.pid)
 
 
 def test_dashboard_port_busy_with_something_else_is_a_harness_error(
@@ -979,7 +1069,9 @@ def test_signal_during_dashboard_startup_leaves_no_dashboard(
         dash_pid = int(pidfile.read_text())
         runner.send_signal(sig)
         assert runner.wait(timeout=120) == 130
-        assert _wait_dead(dash_pid)
+        assert _wait_dead(dash_pid)  # the process itself is gone, not just the port
+        pgids = (tmp_path / "runs" / "r1" / "pgids.txt").read_text()
+        assert f"{dash_pid} _dashboard" in pgids
         assert not (state / "calls").exists()
     finally:
         with contextlib.suppress(ProcessLookupError):
@@ -1221,3 +1313,50 @@ def test_result_file_with_a_foreign_workflow_id_is_ignored(tmp_path: Path) -> No
     assert doc is None and "not in the episode's events" in problem
     doc, problem = rs.load_swarm_result(tmp_path, [])
     assert doc is not None and problem == ""
+
+
+# ── runner: no orphan window between spawning the dashboard and registering it ─
+
+
+def test_signal_right_after_dashboard_spawn_still_stops_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGTERM arrives the instant Popen returns (before register): no orphan."""
+    state = tmp_path / "state"
+    spawned: list[int] = []
+    real_popen = subprocess.Popen
+
+    def popen_then_sigterm(*args: Any, **kwargs: Any) -> Any:
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc.pid)
+        os.kill(os.getpid(), signal.SIGTERM)  # handled at the next bytecode boundary
+        return proc
+
+    previous = rs._install_signals()  # pyright: ignore[reportPrivateUsage]
+    started: list[rs.SharedDashboard] = []
+    try:
+        monkeypatch.setattr(rs.subprocess, "Popen", popen_then_sigterm)
+        with pytest.raises(SystemExit):
+            rs.start_dashboard(
+                shlex.split(_fake_cmd(state)), _free_port(), tmp_path / "d",
+                register=started.append,
+            )  # fmt: skip
+    finally:
+        monkeypatch.undo()
+        rs._restore_signals(previous)  # pyright: ignore[reportPrivateUsage]
+        for dash in started:  # what run()'s finally does
+            dash.stop()
+    assert spawned and started and started[0].lock_pid == spawned[0]
+    assert _wait_dead(spawned[0])
+
+
+def test_dashboard_child_does_not_inherit_blocked_signals(tmp_path: Path) -> None:
+    """The deferral is parent-side only: SIGTERM alone still stops the dashboard."""
+    state = tmp_path / "state"
+    dash = rs.start_dashboard(shlex.split(_fake_cmd(state)), _free_port(), tmp_path / "d")
+    assert dash.error == "" and dash.proc is not None
+    try:
+        os.kill(dash.proc.pid, signal.SIGTERM)  # just SIGTERM, no group kill, no SIGKILL
+        assert dash.proc.wait(timeout=30) == -signal.SIGTERM
+    finally:
+        dash.stop()

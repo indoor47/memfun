@@ -187,9 +187,16 @@ def swarm(args: argparse.Namespace, rest: list[str]) -> int:
                     _write(wt / rel, (bundle / "solution" / rel).read_bytes(), time.time())
             mode = "hang"
         if mode == "hang":
+            # The token in argv lets the test teardown identify (and only then kill) it.
             child = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(600)"],
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(600)",
+                    f"fake-token={args.fake_token}",
+                ],
             )
+            _track(args, child.pid)
             (state / "hang_child.pid").write_text(str(child.pid))
             time.sleep(600)
             return 0
@@ -308,6 +315,16 @@ def dashboard(args: argparse.Namespace, rest: list[str]) -> int:
     return 0
 
 
+def _track(args: argparse.Namespace, pid: int) -> None:
+    """Record ``<pid>`` -> ``<pgid> <token>`` so the test fixture can clean up leaks."""
+    if not args.track_dir:
+        return
+    track = Path(args.track_dir)
+    track.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(ProcessLookupError):
+        (track / str(pid)).write_text(f"{os.getpgid(pid)} {args.fake_token}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--state", required=True)
@@ -317,9 +334,12 @@ def main() -> int:
     ap.add_argument("--hold", type=float, default=0.0)
     ap.add_argument("--dash-delay", type=float, default=0.0)
     ap.add_argument("--result-mode", action="append", default=[])
+    ap.add_argument("--fake-token", default="")
+    ap.add_argument("--track-dir", default="")
     ap.add_argument("command")
     args, rest = ap.parse_known_args()
     Path(args.state).mkdir(parents=True, exist_ok=True)
+    _track(args, os.getpid())
     if args.command == "swarm":
         return swarm(args, rest)
     if args.command == "dashboard":
