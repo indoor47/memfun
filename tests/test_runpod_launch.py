@@ -234,20 +234,6 @@ class FakeRunPod:
         raise SpyError(f"unexpected rest {method} {path}")
 
 
-@pytest.fixture(autouse=True)
-def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Hermetic guard: authenticated requests may only reach local test servers."""
-    real_open = kit._AUTH_OPENER.open  # pyright: ignore[reportPrivateUsage]
-
-    def guarded(req: Any, *a: Any, **k: Any) -> Any:
-        url = req.full_url if hasattr(req, "full_url") else str(req)
-        if not url.startswith("http://127.0.0.1:"):
-            raise SpyError(f"test tried a real network request to {url}")
-        return real_open(req, *a, **k)
-
-    monkeypatch.setattr(kit._AUTH_OPENER, "open", guarded)  # pyright: ignore[reportPrivateUsage]
-
-
 class FakeClock:
     def __init__(self, start: float = 1_000_000.0) -> None:
         self.t = start
@@ -1462,10 +1448,13 @@ D="@DIR@"
 if [ "$1" = "-m" ] && [ "$2" = "sglang.launch_server" ]; then
   for a in "$@"; do printf "%s\n" "$a"; done >> "$D/python3.log"
   [ -n "${FAKE_SGLANG_OUT:-}" ] && echo "$FAKE_SGLANG_OUT"
+  [ -n "${FAKE_SGLANG_SLEEP:-}" ] && sleep "$FAKE_SGLANG_SLEEP"
   exit 0
 fi
 case "$1" in
-  --version) echo "Python 3.12.99-fake"; exit 0 ;;
+  --version)
+    [ "${FAKE_PY_VERSION_HANG:-0}" = 1 ] && sleep 600
+    echo "Python 3.12.99-fake"; exit 0 ;;
   -m)
     if [ "$2" = pip ]; then
       echo "$*" >> "$D/pip.log"
@@ -1477,10 +1466,22 @@ case "$1" in
   -c)
     case "$2" in
       "import huggingface_hub")
+        [ "${FAKE_IMPORT_HANG:-0}" = 1 ] && sleep 600
         [ "${FAKE_HF_HUB:-0}" = 1 ] || [ -f "$D/hub_installed" ]; exit $? ;;
       "import "*) exit 1 ;;
       *snapshot_download*)
         shift 2; echo "$*" >> "$D/snapshot.log"
+        if [ "${FAKE_SNAP_TRAP:-0}" = 1 ]; then  # ignores TERM, never grows
+          trap "" TERM; while :; do sleep 1; done
+        fi
+        if [ "${FAKE_SNAP_PREALLOC:-0}" = 1 ]; then  # full size first, then fill in place
+          dd if=/dev/zero of="$3/big.bin" bs=1024 count=256 2>/dev/null
+          i=0
+          while [ $i -lt 8 ]; do
+            printf x | dd of="$3/big.bin" bs=1 seek=$i conv=notrunc 2>/dev/null
+            sleep 0.5; i=$((i + 1))
+          done
+        fi
         [ -n "${FAKE_SNAP_SLEEP:-}" ] && sleep "$FAKE_SNAP_SLEEP"
         echo "fake snapshot output line"
         exit "${FAKE_SNAP_RC:-0}" ;;
@@ -1491,12 +1492,16 @@ exit 1
 """
 
 
+BOOT_ORPHANS: dict[str, list[str]] = {}
+
+
 def _run_boot(
     tmp_path: Path,
     extra_env: dict[str, str],
     *,
     runpodctl: str | None = None,
     wait_bound: float = 120,
+    path: str | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Run pod_boot.sh with fake runpodctl/python3/curl/pip; return (log, runpodctl, python3)."""
     fakebin = tmp_path / "bin"
@@ -1516,7 +1521,7 @@ def _run_boot(
         f.chmod(0o755)
     models = tmp_path / "models"
     env = {
-        "PATH": f"{fakebin}:/usr/bin:/bin",
+        "PATH": f"{fakebin}:{path or '/usr/bin:/bin'}",
         "MEMFUN_MAX_MINUTES": "60",
         "MEMFUN_DEADLINE_EPOCH": "9999999999",
         "MEMFUN_MODELS_ROOT": str(models),
@@ -1543,11 +1548,17 @@ def _run_boot(
         )
         try:
             proc.wait(timeout=wait_bound)  # liveness bound: TimeoutExpired = PID 1 hung
+            # Orphans the script left (other process groups survive the killpg below).
+            probe = subprocess.run(
+                ["pgrep", "-f", str(models)], capture_output=True, text=True, check=False
+            )
+            BOOT_ORPHANS[str(tmp_path)] = probe.stdout.split()
         finally:  # the armed deadline subshell is still sleeping: kill the whole group
             import os as _os
 
             with contextlib.suppress(ProcessLookupError):
                 _os.killpg(proc.pid, signal.SIGKILL)
+            subprocess.run(["pkill", "-KILL", "-f", str(models)], check=False)
     rp = rp_log.read_text().splitlines() if rp_log.exists() else []
     py = py_log.read_text().splitlines() if py_log.exists() else []
     return out_file.read_text(), rp, py
@@ -2412,7 +2423,7 @@ def test_boot_download_stall_detection_retries(tmp_path: Path) -> None:
         },
         wait_bound=60,
     )
-    assert log.count("download stalled: no growth") == 2
+    assert log.count("download stalled: no progress") == 2
     assert len(_lines(tmp_path / "snapshot.log")) == 2
     assert "all 2 download attempts via python-api failed" in log
     assert py == [] and rp == ["remove pod podB"]
@@ -2759,3 +2770,165 @@ def test_second_sigterm_after_the_first_is_a_no_op() -> None:
         assert not second_raised, "a second SIGTERM must be a no-op (latch)"
     finally:
         signal.signal(signal.SIGTERM, old)
+
+
+# ---------------------------------------------------------------------------
+# Audit round 2, boot script: no foreground step may block PID 1's trap.
+# ---------------------------------------------------------------------------
+
+FAIL_FAST = {
+    "MEMFUN_TERM_ATTEMPTS": "1",
+    "MEMFUN_TERM_RETRY_SLEEP": "0",
+    "MEMFUN_KILL_GRACE": "0",
+}
+
+
+@needs_bash
+def test_boot_hung_python_version_cannot_block_pid1(tmp_path: Path) -> None:
+    log, rp, _py = _run_boot(
+        tmp_path,
+        {"MEMFUN_DEADLINE_EPOCH": _soon(3), "FAKE_PY_VERSION_HANG": "1", **FAIL_FAST},
+        runpodctl=_rp_script(tmp_path, "exit 1"),
+        wait_bound=60,
+    )
+    assert rp == ["remove pod podB", "pod delete podB"]
+    assert "container shutdown: stopping all processes and exiting PID 1" in log
+
+
+@needs_bash
+def test_boot_hung_import_probe_cannot_block_pid1(tmp_path: Path) -> None:
+    log, _rp, _py = _run_boot(
+        tmp_path,
+        {
+            "MEMFUN_DEADLINE_EPOCH": _soon(3),
+            "MEMFUN_ALLOW_PULL": "1",
+            "FAKE_IMPORT_HANG": "1",
+            **FAIL_FAST,
+        },
+        runpodctl=_rp_script(tmp_path, "exit 1"),
+        wait_bound=60,
+    )
+    assert "container shutdown: stopping all processes and exiting PID 1" in log
+
+
+@needs_bash
+def test_boot_runpodctl_success_but_container_alive_is_stopped(tmp_path: Path) -> None:
+    _write_marker(tmp_path, "a" * 40)
+    log, rp, py = _run_boot(
+        tmp_path,
+        {
+            "MEMFUN_DEADLINE_EPOCH": _soon(3),
+            "FAKE_SGLANG_SLEEP": "600",  # SGLang keeps serving
+            "MEMFUN_REMOVE_WAIT_SEC": "1",
+        },
+        runpodctl=_rp_script(tmp_path, "echo ok; exit 0"),  # "succeeds", pod survives
+        wait_bound=60,
+    )
+    assert "--enable-metrics" in py and rp == ["remove pod podB"]
+    assert "runpodctl reported success but PID 1 still runs" in log
+    assert "container shutdown: stopping all processes and exiting PID 1" in log
+
+
+@needs_bash
+def test_boot_stall_kills_whole_group_even_if_downloader_ignores_term(tmp_path: Path) -> None:
+    log, _rp, _py = _run_boot(
+        tmp_path,
+        {
+            "MEMFUN_ALLOW_PULL": "1",
+            "FAKE_HF_HUB": "1",
+            "FAKE_SNAP_TRAP": "1",
+            "MEMFUN_PROGRESS_SEC": "1",
+            "MEMFUN_STALL_SEC": "2",
+            "MEMFUN_PULL_RETRIES": "1",
+            "MEMFUN_GROUP_KILL_WAIT": "1",
+        },
+        wait_bound=60,
+    )
+    assert "download stalled" in log
+    assert BOOT_ORPHANS[str(tmp_path)] == []  # no stray writer survived
+
+
+@needs_bash
+def test_boot_stall_kill_without_pgrep_leaves_no_orphans(tmp_path: Path) -> None:
+    restricted = tmp_path / "sysbin"
+    restricted.mkdir()
+    for d in ("/usr/bin", "/bin"):
+        for f in Path(d).iterdir():
+            if f.name not in ("pgrep", "pkill") and not (restricted / f.name).exists():
+                with contextlib.suppress(OSError):
+                    (restricted / f.name).symlink_to(f)
+    log, _rp, _py = _run_boot(
+        tmp_path,
+        {
+            "MEMFUN_ALLOW_PULL": "1",
+            "FAKE_HF_HUB": "1",
+            "FAKE_SNAP_TRAP": "1",
+            "MEMFUN_PROGRESS_SEC": "1",
+            "MEMFUN_STALL_SEC": "2",
+            "MEMFUN_PULL_RETRIES": "1",
+            "MEMFUN_GROUP_KILL_WAIT": "1",
+        },
+        wait_bound=60,
+        path=str(restricted),
+    )
+    assert "tool pgrep: MISSING" in log and "download stalled" in log
+    assert BOOT_ORPHANS[str(tmp_path)] == []
+
+
+@needs_bash
+def test_boot_preallocated_file_is_not_a_stall(tmp_path: Path) -> None:
+    log, _rp, py = _run_boot(
+        tmp_path,
+        {
+            "MEMFUN_ALLOW_PULL": "1",
+            "FAKE_HF_HUB": "1",
+            "FAKE_SNAP_PREALLOC": "1",
+            "MEMFUN_PROGRESS_SEC": "1",
+            "MEMFUN_STALL_SEC": "2",
+        },
+        wait_bound=60,
+    )
+    assert "download stalled" not in log
+    assert "download finished via python-api" in log and "--enable-metrics" in py
+
+
+def test_conftest_guard_blocks_authenticated_requests_to_real_hosts() -> None:
+    import urllib.request
+
+    req = urllib.request.Request("https://api.runpod.io/graphql", method="GET")
+    req.add_unredirected_header("Authorization", "Bearer x")
+    with pytest.raises(RuntimeError, match="hermetic"):
+        urllib.request.urlopen(req, timeout=1)
+    with pytest.raises(RuntimeError, match="hermetic"):
+        kit._auth_open(req, 1.0)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_sse_reader_marks_lines_over_1_mib_instead_of_splitting() -> None:
+    import http.server
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_a: Any) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            big = "data: " + json.dumps(
+                {"ts": "t", "source": "container", "line": "x" * (2 << 20)}
+            )
+            body = (big + "\n\n" + _ev("after") + "\n\n").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv, port = _start_server(H)
+    try:
+        t = kit.HttpTransport(
+            kit.Secret(FAKE_KEY), logs_url=f"http://127.0.0.1:{port}/v2/pods/{{pod_id}}/logs"
+        )
+        lines = list(t.stream_logs("pod1", {}, None, 5.0))
+    finally:
+        srv.shutdown()
+    assert all(len(line) < (1 << 20) + 16 for line in lines)
+    out, _stats, _clock = _follow(FakeLogs(lines))
+    assert any("over 1 MiB" in o for o in out) and "t [cont] after" in out
+    assert not any(o.startswith("[raw]") for o in out)

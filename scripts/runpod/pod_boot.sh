@@ -15,6 +15,10 @@ set -u
 set -f  # no globbing: $MEMFUN_SGLANG_ARGS is word-split on purpose but must never glob
 
 log() { echo "[memfun-boot] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+# The container's real stdout/stderr, so a trap that fires while a step's output is
+# redirected (e.g. `bounded ... >apt.log`) still reports to the RunPod log stream.
+exec 8>&1 9>&2
+to_console() { exec 1>&8 2>&9; }
 
 MAX_MIN="${MEMFUN_MAX_MINUTES:?MEMFUN_MAX_MINUTES unset}"
 DEADLINE_EPOCH="${MEMFUN_DEADLINE_EPOCH:?MEMFUN_DEADLINE_EPOCH unset}"
@@ -43,20 +47,47 @@ RPC_TIMEOUT=$(num_or "${MEMFUN_RUNPODCTL_TIMEOUT:-60}" 60)  # per runpodctl call
 TERM_ATTEMPTS=$(num_or "${MEMFUN_TERM_ATTEMPTS:-5}" 5)
 TERM_RETRY_SLEEP=$(num_or "${MEMFUN_TERM_RETRY_SLEEP:-10}" 10)
 KILL_GRACE=$(num_or "${MEMFUN_KILL_GRACE:-15}" 15)
+# After runpodctl REPORTS success, give RunPod this long to actually stop the container;
+# if it is still running, stop it from inside (H2: a 0 exit is not proof).
+REMOVE_WAIT=$(num_or "${MEMFUN_REMOVE_WAIT_SEC:-120}" 120)
+GROUP_KILL_WAIT=$(num_or "${MEMFUN_GROUP_KILL_WAIT:-10}" 10)  # TERM -> KILL for a group
 RUN_DIR="${MEMFUN_RUN_DIR:-/workspace/runs/${RUNPOD_POD_ID:-local}}"
 mkdir -p "$RUN_DIR" 2>/dev/null || RUN_DIR=/tmp
-DYING="$RUN_DIR/.memfun_dying"
-rm -f "$DYING"
 SGLANG_PID=""
 IN_DEADLINE=0
 MIRROR_PID=""
 LOGS_DUMPED=0
 
-# Kill a process and all its descendants (children first).
+# Kill a process and all its descendants (children first).  Needs pgrep for the
+# descendants; without it only the process itself (callers that start a process in its
+# own group kill the whole group instead, which needs no pgrep).
 kill_tree() {
   local p=$1 sig=${2:-TERM} c
-  for c in $(pgrep -P "$p" 2>/dev/null); do kill_tree "$c" "$sig"; done
+  if command -v pgrep >/dev/null 2>&1; then
+    for c in $(pgrep -P "$p" 2>/dev/null); do kill_tree "$c" "$sig"; done
+  fi
   kill -"$sig" "$p" 2>/dev/null
+}
+
+# spawn_group CMD...: start CMD in the background in its OWN process group (set -m), so
+# the whole tree can be signalled with `kill -- -PGID`.  The pid (= pgid) is $SPAWNED.
+SPAWNED=""
+spawn_group() {
+  set -m
+  "$@" &
+  SPAWNED=$!
+  set +m
+}
+
+# kill_group PGID: TERM the group, wait up to GROUP_KILL_WAIT s, then KILL it.
+kill_group() {
+  local g=$1 i
+  kill -TERM -- "-$g" 2>/dev/null || kill_tree "$g" TERM
+  for i in $(seq 1 "$GROUP_KILL_WAIT"); do
+    kill -0 -- "-$g" 2>/dev/null || return 0
+    sleep 1
+  done
+  kill -KILL -- "-$g" 2>/dev/null || kill_tree "$g" KILL
 }
 
 # bounded SECS CMD...: run CMD in the background and `wait` for it, so (a) a hang is cut
@@ -67,11 +98,13 @@ bounded() {
   local secs=$1 pid wd rc flag
   shift
   flag="$RUN_DIR/.timeout.$$.$RANDOM"
-  "$@" &
-  pid=$!
+  spawn_group "$@"
+  pid=$SPAWNED
   ( sleep "$secs"; kill -0 "$pid" 2>/dev/null || exit 0; : >"$flag"
-    kill_tree "$pid" TERM; sleep 5; kill_tree "$pid" KILL ) >/dev/null 2>&1 &
+    kill -TERM -- "-$pid" 2>/dev/null || kill_tree "$pid" TERM; sleep 5
+    kill -KILL -- "-$pid" 2>/dev/null || kill_tree "$pid" KILL ) >/dev/null 2>&1 &
   wd=$!
+  disown "$wd" 2>/dev/null  # no "Killed" job notice when it is stopped below
   wait "$pid"; rc=$?
   kill_tree "$wd" KILL 2>/dev/null
   if [ -f "$flag" ]; then rm -f "$flag"; log "timed out after ${secs}s: $1" >&2; return 124; fi
@@ -101,19 +134,23 @@ stop_mirror() {
   fi
 }
 
+# Run runpodctl with default TERM/INT handling (self_terminate ignores them, and ignored
+# signals are inherited), so a timeout's TERM takes effect at once (L1).
+runpodctl_untrapped() { trap - TERM INT; exec runpodctl "$@"; }
+
 # One pod-scoped termination attempt.  The in-pod runpodctl is the OLDER CLI (observed
 # 2026-11-06: `Error: unknown command "pod"`; `remove pod` worked), so try that first
 # and keep the newer `pod delete` as a fallback.  Their stderr noise is not printed.
 runpodctl_remove() {
   local out rc
-  out=$(bounded "$RPC_TIMEOUT" runpodctl remove pod "$RUNPOD_POD_ID" 2>&1); rc=$?
+  out=$(bounded "$RPC_TIMEOUT" runpodctl_untrapped remove pod "$RUNPOD_POD_ID" 2>&1); rc=$?
   if [ "$rc" = 0 ]; then
     log "terminated via 'runpodctl remove pod': $(printf '%s' "$out" | head -n 1)"
     return 0
   fi
   [ "$rc" = 124 ] && log "'runpodctl remove pod' timed out after ${RPC_TIMEOUT}s"
   log "'runpodctl remove pod' failed (rc=$rc); trying 'runpodctl pod delete'"
-  out=$(bounded "$RPC_TIMEOUT" runpodctl pod delete "$RUNPOD_POD_ID" 2>&1); rc=$?
+  out=$(bounded "$RPC_TIMEOUT" runpodctl_untrapped pod delete "$RUNPOD_POD_ID" 2>&1); rc=$?
   if [ "$rc" = 0 ]; then
     log "terminated via 'runpodctl pod delete': $(printf '%s' "$out" | head -n 1)"
     return 0
@@ -123,27 +160,65 @@ runpodctl_remove() {
   return 1
 }
 
-# Main shell, after the deadline subshell gave up on runpodctl: stop everything, exit PID 1.
+# Main shell, on SIGUSR1 from the deadline subshell (removal failed, or "succeeded" but
+# the container is still running): stop everything and exit PID 1.  USR1 needs no marker
+# file (a read-only RUN_DIR cannot break it) and is never ignored by self_terminate.
 die_now() {
-  local c
+  trap '' TERM INT USR1
+  to_console
+  local c j
   log "container shutdown: stopping all processes and exiting PID 1"
-  for c in $(pgrep -P "$$" 2>/dev/null); do kill_tree "$c" TERM; done
+  for j in $(jobs -p); do kill -TERM -- "-$j" 2>/dev/null; kill_tree "$j" TERM; done
+  if command -v pgrep >/dev/null 2>&1; then
+    for c in $(pgrep -P "$$" 2>/dev/null); do kill_tree "$c" TERM; done
+  fi
   [ -n "$SGLANG_PID" ] && kill_tree "$SGLANG_PID" TERM
   sleep 2
-  for c in $(pgrep -P "$$" 2>/dev/null); do kill_tree "$c" KILL; done
+  for j in $(jobs -p); do kill -KILL -- "-$j" 2>/dev/null; kill_tree "$j" KILL; done
+  if command -v pgrep >/dev/null 2>&1; then
+    for c in $(pgrep -P "$$" 2>/dev/null); do kill_tree "$c" KILL; done
+  fi
   exit 1
+}
+
+# Is the main shell (PID 1) still running?  A zombie (exited, not yet reaped) is not.
+main_alive() {
+  kill -0 "$$" 2>/dev/null || return 1
+  case "$(ps -o stat= -p "$$" 2>/dev/null)" in Z*) return 1 ;; esac
+  return 0
+}
+
+# Deadline subshell only: make PID 1 stop the container.
+stop_container() {
+  kill -USR1 "$$" 2>/dev/null
+  sleep 10
+  kill -KILL "$$" 2>/dev/null  # effective only when not PID 1 (PID 1 ignores it)
 }
 
 self_terminate() {
   trap '' TERM INT
-  if [ "$IN_DEADLINE" = 0 ] && [ -f "$DYING" ]; then die_now; fi
+  to_console
   log "self-terminate: $1"
   dump_logs
   stop_mirror
   local i
   for i in $(seq 1 "$TERM_ATTEMPTS"); do
     if command -v runpodctl >/dev/null 2>&1 && [ -n "${RUNPOD_POD_ID:-}" ]; then
-      runpodctl_remove && exit 0
+      if runpodctl_remove; then
+        if [ "$IN_DEADLINE" = 1 ]; then
+          # A 0 exit is not proof: if the container still runs after REMOVE_WAIT, stop it.
+          local w=0
+          while [ "$w" -lt "$REMOVE_WAIT" ] && main_alive; do
+            sleep 1; w=$(( w + 1 ))
+          done
+          if main_alive; then
+            log "runpodctl reported success but PID 1 still runs after ${REMOVE_WAIT}s:" \
+              "stopping the container"
+            stop_container
+          fi
+        fi
+        exit 0
+      fi
     else
       log "runpodctl or RUNPOD_POD_ID unavailable"
       break
@@ -160,12 +235,7 @@ self_terminate() {
   # exits.  Every long step in the main shell runs under `bounded`/`wait`, so its TERM
   # trap runs at once; the marker makes it skip runpodctl and just stop (die_now).  KILL
   # follows for a non-PID-1 main shell (PID 1 ignores KILL from inside its namespace).
-  if [ "$IN_DEADLINE" = 1 ]; then
-    : >"$DYING"
-    kill -TERM "$$" 2>/dev/null
-    sleep 10
-    kill -KILL "$$" 2>/dev/null
-  fi
+  [ "$IN_DEADLINE" = 1 ] && stop_container
   exit 1
 }
 
@@ -194,45 +264,61 @@ DEADLINE_AT=$(( now + remaining ))
 ( IN_DEADLINE=1; sleep "$remaining"; self_terminate "deadline reached" ) &
 trap 'self_terminate "received SIGTERM"' TERM
 trap 'self_terminate "received SIGINT"' INT
+trap die_now USR1
 
 # ---- 1b. preflight diagnostics (stdout => RunPod log stream).  Names, never values. ----
 with_timeout() { bounded 10 "$@"; }
+# probe SECS CMD...: first line of CMD's output, bounded, run in THIS shell (not in a
+# command substitution, where a pending TERM trap would wait for it).
+PROBE_OUT="$RUN_DIR/.probe.$$"
+probe() {
+  local secs=$1
+  shift
+  bounded "$secs" "$@" >"$PROBE_OUT" 2>&1 || echo "(failed or timed out)" >>"$PROBE_OUT"
+  PROBE=$(head -n 1 "$PROBE_OUT" 2>/dev/null)
+}
 preflight() {
   log "---- preflight ----"
   echo "date: $(date -u)"
   echo "uname: $(uname -a 2>&1)"
   if command -v nvidia-smi >/dev/null 2>&1; then
-    echo "gpu: $(with_timeout nvidia-smi --query-gpu=name,driver_version,memory.total \
-      --format=csv,noheader 2>&1 | tr '\n' ';')"
+    bounded 10 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader \
+      >"$PROBE_OUT" 2>&1
+    echo "gpu: $(tr '\n' ';' <"$PROBE_OUT")"
   else
     echo "gpu: nvidia-smi not found"
   fi
-  echo "disk:"; with_timeout df -h / "${MEMFUN_MODELS_ROOT:-/workspace}" 2>&1 | sed 's/^/  /'
+  echo "disk:"
+  bounded 10 df -h / "${MEMFUN_MODELS_ROOT:-/workspace}" >"$PROBE_OUT" 2>&1
+  sed 's/^/  /' "$PROBE_OUT"
   if command -v free >/dev/null 2>&1; then
-    echo "memory: $(free -h 2>&1 | sed -n 2p)"
+    bounded 10 free -h >"$PROBE_OUT" 2>&1
+    echo "memory: $(sed -n 2p "$PROBE_OUT")"
   elif [ -r /proc/meminfo ]; then
     echo "memory: $(head -n 2 /proc/meminfo | tr -s ' ' | tr '\n' ';')"
   else
     echo "memory: unknown"
   fi
   if command -v python3 >/dev/null 2>&1; then
-    echo "python3: $(python3 --version 2>&1 | head -n 1)"
-    with_timeout python3 -c '
+    probe 10 python3 --version
+    echo "python3: $PROBE"
+    bounded 20 python3 -c '
 import importlib
 for m in ("sglang", "torch", "transformers", "huggingface_hub", "flashinfer", "hf_transfer"):
     try:
         print("  py %s %s" % (m, getattr(importlib.import_module(m), "__version__", "?")))
     except Exception as e:
         print("  py %s MISSING (%s)" % (m, type(e).__name__))
-' 2>&1 | head -n 12
+' >"$PROBE_OUT" 2>&1
+    head -n 12 "$PROBE_OUT"
   else
     echo "python3: MISSING"
   fi
   local t v
-  for t in hf huggingface-cli runpodctl curl wget git apt-get; do
+  for t in hf huggingface-cli runpodctl curl wget git apt-get pgrep pkill; do
     if command -v "$t" >/dev/null 2>&1; then
       v=""  # runpodctl is never run here: it is only for termination
-      [ "$t" != runpodctl ] && v=$(with_timeout "$t" --version 2>&1 | head -n 1)
+      case "$t" in runpodctl|pgrep|pkill) ;; *) probe 10 "$t" --version; v=$PROBE ;; esac
       echo "tool $t: $(command -v "$t") ${v:0:80}"
     else
       echo "tool $t: MISSING"
@@ -258,9 +344,13 @@ if [ -n "${PUBLIC_KEY:-}" ]; then
   fi
   mkdir -p /root/.ssh /run/sshd && chmod 700 /root/.ssh
   printf '%s\n' "$PUBLIC_KEY" >/root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
-  ssh-keygen -A >/dev/null 2>&1
-  /usr/sbin/sshd -o PasswordAuthentication=no -o PermitRootLogin=prohibit-password \
-    && log "sshd started" || log "sshd failed to start"
+  bounded 60 ssh-keygen -A >/dev/null 2>&1 || log "ssh-keygen -A failed or timed out"
+  if bounded 30 /usr/sbin/sshd -o PasswordAuthentication=no \
+      -o PermitRootLogin=prohibit-password; then
+    log "sshd started"
+  else
+    log "sshd failed to start (or timed out): skipped"
+  fi
 else
   log "no PUBLIC_KEY: sshd not started (tunnel impossible)"
 fi
@@ -310,7 +400,9 @@ print("snapshot_download finished:", path)
 '
 DL_METHOD=""
 DL_MISSING=""
-py_has() { command -v python3 >/dev/null 2>&1 && python3 -c "import $1" >/dev/null 2>&1; }
+py_has() {
+  command -v python3 >/dev/null 2>&1 && bounded 60 python3 -c "import $1" >/dev/null 2>&1
+}
 pick_download_method() {
   if command -v hf >/dev/null 2>&1; then DL_METHOD=hf; return 0; fi
   DL_MISSING="$DL_MISSING hf"
@@ -339,6 +431,30 @@ run_download() {
     *) return 1 ;;
   esac
 }
+# Directories a download writes to: the target plus the Hugging Face / xet caches.
+dl_dirs() {
+  local d
+  for d in "$MODEL_DIR" "${HF_HOME:-${HOME:-/root}/.cache/huggingface}" "${HF_XET_CACHE:-}"; do
+    [ -n "$d" ] && [ -d "$d" ] && printf '%s\n' "$d"
+  done
+}
+# Total KB of the download dirs (apparent size where du supports it), bounded.
+dl_size_kb() {
+  local dirs
+  dirs=$(dl_dirs)
+  [ -z "$dirs" ] && { echo 0; return; }
+  # shellcheck disable=SC2086  # dirs are newline-separated paths without spaces by validation
+  { bounded 30 du -sk --apparent-size $dirs 2>/dev/null || bounded 30 du -skA $dirs 2>/dev/null \
+      || bounded 30 du -sk $dirs 2>/dev/null; } | awk '{s += $1} END {print s + 0}'
+}
+dl_touched_since() {
+  local dirs
+  dirs=$(dl_dirs)
+  [ -z "$dirs" ] && return 0
+  # shellcheck disable=SC2086
+  bounded 30 find $dirs -type f -newer "$1" -print 2>/dev/null | head -n 1
+}
+
 download_weights() {
   local pull_log="$RUN_DIR/pull.log" attempt rc=1 start prog dl cap
   : >"$pull_log"
@@ -357,32 +473,41 @@ download_weights() {
     [ "$cap" -gt "$PULL_ATTEMPT_SEC" ] && cap=$PULL_ATTEMPT_SEC
     [ "$cap" -lt 1 ] && cap=1
     # Background + wait (not foreground) so the TERM trap / deadline can always act.
-    run_download >>"$pull_log" 2>&1 &
-    dl=$!
-    ( t0=$(date +%s); last=-1; still=0
+    # Own process group: a stall/cap kill reaches every process the downloader started.
+    spawn_group run_download >>"$pull_log" 2>&1
+    dl=$SPAWNED
+    ( t0=$(date +%s); last=-1; still=0; stamp="$RUN_DIR/.dl_stamp"; : >"$stamp"
       while sleep "$PROGRESS_SEC"; do
         kill -0 "$dl" 2>/dev/null || exit 0
-        kb=$(du -sk "$MODEL_DIR" 2>/dev/null | cut -f1)
-        log "download progress: $(du -sh "$MODEL_DIR" 2>/dev/null | cut -f1) in $MODEL_DIR," \
+        kb=$(dl_size_kb)
+        log "download progress: $(( ${kb:-0} / 1024 )) MiB in $MODEL_DIR," \
           "$(( $(date +%s) - start ))s elapsed ($DL_METHOD)"
-        if [ "${kb:-0}" = "$last" ]; then still=$(( still + PROGRESS_SEC )); else still=0; fi
-        last=${kb:-0}
+        # Progress = the size changed OR any file under the model dir / HF caches was
+        # modified since the last check (preallocated files keep the size flat).
+        if [ "${kb:-0}" != "$last" ] || [ -n "$(dl_touched_since "$stamp")" ]; then
+          still=0
+        else
+          still=$(( still + PROGRESS_SEC ))
+        fi
+        last=${kb:-0}; : >"$stamp"
         if [ "$STALL_SEC" -gt 0 ] && [ "$still" -ge "$STALL_SEC" ]; then
-          log "download stalled: no growth for ${still}s; killing this attempt"
-          kill_tree "$dl"; exit 0
+          log "download stalled: no progress for ${still}s; killing this attempt"
+          kill_group "$dl"; exit 0
         fi
         if [ $(( $(date +%s) - t0 )) -ge "$cap" ]; then
           log "download attempt hit its ${cap}s cap; killing it"
-          kill_tree "$dl"; exit 0
+          kill_group "$dl"; exit 0
         fi
       done ) &
     prog=$!
     wait "$dl"
     rc=$?
     kill_tree "$prog" KILL; wait "$prog" 2>/dev/null
+    kill -KILL -- "-$dl" 2>/dev/null  # no stray writer of this attempt survives into the next
     if [ "$rc" = 0 ]; then
+      kb=$(dl_size_kb)
       log "download finished via $DL_METHOD in $(( $(date +%s) - start ))s:" \
-        "$(du -sh "$MODEL_DIR" 2>/dev/null | cut -f1)"
+        "$(( ${kb:-0} / 1024 )) MiB"
       return 0
     fi
     log "download attempt $attempt/$PULL_RETRIES failed (rc=$rc); resumable: files kept"
@@ -397,8 +522,8 @@ download_weights() {
 if ! weights_ok; then
   if [ "$ALLOW_PULL" = "1" ] && [ -n "$MODEL_REPO" ]; then
     log "weights not verified at $MODEL_DIR: downloading $MODEL_REPO@$REVISION (GPU time is burning)"
-    rm -f "$MARKER"
-    mkdir -p "$MODEL_DIR"
+    bounded 60 rm -f "$MARKER" || fail "cannot remove $MARKER (volume hung?)"
+    bounded 60 mkdir -p "$MODEL_DIR" || fail "cannot create $MODEL_DIR (volume hung?)"
     download_weights || fail "weight download failed (see the reason above)"
     # The Hub client checks transfer integrity; full Hub-checksum verification is
     # prepull_weights.sh's job (verify_weights.py is not shipped into the pod).

@@ -65,6 +65,7 @@ LOGS_URL = "https://api.runpod.io/v2/pods/{pod_id}/logs"
 DEFAULT_LOG_DIR = Path("~/.cache/memfun/runpod-logs")
 POD_ID_RE = re.compile(r"[A-Za-z0-9]{1,64}")
 MAX_LOG_TAIL = 5000
+MAX_SSE_LINE = 1 << 20  # bytes; longer log lines are dropped with a visible marker
 #: Docker image-pull progress lines from the system log; hidden unless --raw.
 PULL_NOISE = re.compile(
     r"^[0-9a-f]{12} (Extracting|Downloading|Pulling fs layer|Waiting|Verifying Checksum"
@@ -479,7 +480,7 @@ class HttpTransport:
         with resp:
             while True:
                 try:
-                    raw = resp.readline(1 << 20)  # one line is at most 1 MiB
+                    raw = resp.readline(MAX_SSE_LINE)
                 except TimeoutError:
                     raise LogStreamError("log stream idle (read timeout)", idle=True) from None
                 except Exception as exc:
@@ -487,6 +488,21 @@ class HttpTransport:
                     raise LogStreamError(msg) from None
                 if not raw:
                     return
+                if len(raw) >= MAX_SSE_LINE and not raw.endswith(b"\n"):
+                    # Over-long line: drop it (and its continuation) and say so, instead of
+                    # yielding fragments that would parse as garbage events.
+                    while raw and not raw.endswith(b"\n"):
+                        try:
+                            raw = resp.readline(MAX_SSE_LINE)
+                        except Exception:
+                            raw = b""
+                    yield ""  # end any event the dropped line belonged to
+                    note = json.dumps(
+                        {"source": "kit", "line": "[a log line over 1 MiB was dropped]"}
+                    )
+                    yield "data: " + note
+                    yield ""
+                    continue
                 yield raw.decode("utf-8", "replace").rstrip("\r\n")
 
 

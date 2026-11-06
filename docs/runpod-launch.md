@@ -352,6 +352,23 @@ so the TERM trap and the deadline always act (bash defers traps behind a foregro
 command). A download attempt is also killed when `du -sk` of the model dir has not grown
 for 5 minutes (stall) or after min(time left, 25 min); it is then retried (resumable). If
 the deadline's `runpodctl` removal fails, PID 1 is told to stop all processes and exit.
+Every other step after the deadline is armed that could block (python/tool probes,
+`free`, `df`, `ssh-keygen`, `sshd`, `import` probes, `du`/`find` on the volume, `mkdir`/`rm`
+of the model dir) is bounded the same way and is never run inside a command substitution
+in the main shell, so the TERM/USR1 traps always run within seconds. A download attempt runs
+in its own process group; a stall/cap kill sends TERM to the whole group, then KILL after
+10 s (no `pgrep` needed). Progress counts a size change OR any file modified under the model
+dir or the HF/xet caches, so a preallocated file being filled is not a stall.
+If `runpodctl` reports success but PID 1 still runs 120 s later, the deadline path stops
+the container anyway (a 0 exit is not proof the pod is gone).
+
+**Worst case past the deadline** (defaults, `runpodctl` hanging every time): 5 attempts x
+2 forms x 60 s, plus 4 x 10 s between attempts, plus 15 s SGLang grace, plus 10 s for
+PID 1 to stop ~= 11 min; `runpodctl` now gets default signal handling, so each timeout
+costs 60 s, not 65 s. PID 1 is told to stop with SIGUSR1 (no marker file, so a read-only
+run dir cannot make it run a second removal loop). `terminateAfter` and the local
+watchdog remain the other two stops.
+
 `shellcheck` was not available when this was written; the script is covered by the
 hermetic bash tests only.
 

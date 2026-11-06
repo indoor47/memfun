@@ -9,6 +9,30 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+@pytest.fixture(autouse=True)
+def _no_authenticated_requests_to_real_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermetic guard for every test: any urllib request (urlopen or a custom opener such
+    as the RunPod kit's) that carries an Authorization header may only reach localhost."""
+    import urllib.parse
+    import urllib.request
+
+    real_open = urllib.request.OpenerDirector.open
+
+    def guarded(self: urllib.request.OpenerDirector, fullurl, data=None, timeout=None):  # type: ignore[no-untyped-def]
+        req = fullurl if isinstance(fullurl, urllib.request.Request) else None
+        if req is not None and req.has_header("Authorization"):
+            host = urllib.parse.urlsplit(req.full_url).hostname or ""
+            if host not in _LOCAL_HOSTS:
+                raise RuntimeError(f"hermetic test guard: authenticated request to {host}")
+        if timeout is None:
+            return real_open(self, fullurl, data)
+        return real_open(self, fullurl, data, timeout)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", guarded)
+
 
 @pytest.fixture(scope="session")
 def event_loop():
