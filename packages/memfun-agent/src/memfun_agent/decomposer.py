@@ -27,6 +27,22 @@ logger = get_logger("agent.decomposer")
 # ── Errors ────────────────────────────────────────────────────
 
 
+_SCHEMA_REJECTION_MARKERS = (
+    "badrequest",
+    "400",
+    "response_format",
+    "json_schema",
+    "unsupported schema",
+    "grammar",
+)
+
+
+def _is_schema_rejection(exc: BaseException) -> bool:
+    """Does *exc* look like the server refusing a constrained-decoding request?"""
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(m in text for m in _SCHEMA_REJECTION_MARKERS)
+
+
 class DecompositionError(ValueError):
     """Raised when a decomposition is structurally invalid.
 
@@ -703,7 +719,23 @@ class TaskDecomposer(dspy.Module):
                     if role_constrained("decomposer")
                     else contextlib.nullcontext()
                 )
-                with adapter_ctx:
+                try:
+                    with adapter_ctx:
+                        result = await asyncio.to_thread(
+                            self.decomposer,
+                            task_description=task_description,
+                            project_context=project_context[:4000],
+                        )
+                except Exception as exc:
+                    if not (role_constrained("decomposer") and _is_schema_rejection(exc)):
+                        raise
+                    # The server refused the grammar (e.g. an unsupported keyword): one
+                    # plain, unconstrained retry instead of silently degrading to a
+                    # single-task fallback on every decomposition.
+                    logger.warning(
+                        "server rejected the constrained plan schema (%s); retrying unconstrained",
+                        str(exc)[:200],
+                    )
                     result = await asyncio.to_thread(
                         self.decomposer,
                         task_description=task_description,
