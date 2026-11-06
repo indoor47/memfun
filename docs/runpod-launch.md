@@ -13,10 +13,10 @@ is too old.
 
 | file | what it does |
 |---|---|
-| `scripts/runpod/runpod_kit.py` | library and CLI: `gpus`, `launch`, `spend`, `watch`, `tunnel`, `watchdog`, `status` |
+| `scripts/runpod/runpod_kit.py` | library and CLI: `gpus`, `launch`, `spend`, `watch`, `tunnel`, `watchdog`, `status`, `logs` |
 | `scripts/runpod/launch_pod.py` | `launch` by default; `launch_pod.py <subcommand> ...` runs any other subcommand |
 | `scripts/runpod/watchdog.py`, `tunnel.py` | shortcuts for `watchdog` and `tunnel` |
-| `scripts/runpod/pod_boot.sh` | in-pod boot (sent base64 in the pod env): hard stop, sshd, weights check, SGLang |
+| `scripts/runpod/pod_boot.sh` | in-pod boot (sent base64 in the pod env): hard stop, preflight diagnostics, sshd, weights check/download, SGLang (log mirrored to stdout) |
 | `scripts/runpod/prepull_weights.sh` | download weights onto the network volume, then verify them |
 | `scripts/runpod/verify_weights.py` | check every file against the Hub's sha256 / git blob sha1 |
 | `tests/test_runpod_launch.py` | hermetic tests (fake transport, fake clock, spy that raises on mutation) |
@@ -56,11 +56,13 @@ is too old.
    leaves it out if RunPod rejects the field.
 2. **In the pod (`pod_boot.sh`):** the first thing the boot script does is start a timer for
    min(`--max-minutes` from boot, the absolute deadline). When it fires, the pod deletes
-   itself with the in-pod `runpodctl pod delete $RUNPOD_POD_ID` (falling back to the older
-   `runpodctl remove pod`). This uses the **Pod-scoped** API key that RunPod injects as
-   `RUNPOD_API_KEY` in every pod, not the account key. The same path runs when the weights
-   are missing or unverified (fail fast before burning GPU time), and 10 minutes
-   (`--crash-grace-minutes`) after SGLang exits.
+   itself with the in-pod `runpodctl remove pod $RUNPOD_POD_ID` (the in-pod CLI is the
+   older one; `runpodctl pod delete` is the fallback). This uses the **Pod-scoped** API key
+   that RunPod injects as `RUNPOD_API_KEY` in every pod, not the account key. The same path
+   runs when the weights are missing, unverified or cannot be downloaded (after a short
+   `--fail-grace-minutes`, default 2, so the logs can be read), and 10 minutes
+   (`--crash-grace-minutes`) after SGLang exits. The deadline itself has no grace, and it
+   still fires during either grace period.
    *Limit:* if `runpodctl` is missing or fails, the fallback can only stop SGLang and exit
    PID 1. That frees the GPU from work but **may not stop billing** (RunPod can restart the
    container). That is why layers 1 and 3 exist.
@@ -90,10 +92,12 @@ Network volumes survive termination (weights and runs stay); container disk does
 | GraphQL: `podFindAndDeployOnDemand`, `podTerminate` (no selection set), `pod(input:{podId})`, `gpuTypes`, `myself { clientBalance networkVolumes }`; input has `networkVolumeId`, `dataCenterIds`, `terminateAfter`, `ports`, `env [{key,value}]`, `dockerArgs` | [docs.runpod.io GraphQL manage pods](https://docs.runpod.io/sdks/graphql/manage-pods), [graphql-spec.runpod.io](https://graphql-spec.runpod.io/) |
 | Network volume create: `POST https://rest.runpod.io/v1/networkvolumes {name, size, dataCenterId}` | [REST reference](https://docs.runpod.io/api-reference/network-volumes/POST/networkvolumes) |
 | In-pod env: `RUNPOD_POD_ID` "Unique Pod identifier", `RUNPOD_API_KEY` "Pod-scoped API key" | [Pod environment variables](https://docs.runpod.io/pods/templates/environment-variables) |
-| Every Pod "comes preinstalled with `runpodctl` and a Pod-scoped API key"; delete: `runpodctl pod delete $RUNPOD_POD_ID` (older: `runpodctl remove pod`) | [runpodctl overview](https://docs.runpod.io/runpodctl/overview), [Manage Pods](https://docs.runpod.io/pods/manage-pods) |
-| Full SSH needs TCP 22 exposed and sshd running in the container (the SGLang image has none, so `pod_boot.sh` installs it) | [Use SSH](https://docs.runpod.io/pods/configuration/use-ssh) |
+| Every Pod "comes preinstalled with `runpodctl` and a Pod-scoped API key"; delete: `runpodctl pod delete $RUNPOD_POD_ID` (older: `runpodctl remove pod`). **Observed in a pod (2026-11-06): the preinstalled CLI is the older one** (`Error: unknown command "pod"`, then `runpodctl remove pod` worked), so `pod_boot.sh` tries `remove pod` first | [runpodctl overview](https://docs.runpod.io/runpodctl/overview), [Manage Pods](https://docs.runpod.io/pods/manage-pods) |
+| Full SSH needs TCP 22 exposed and sshd running in the container. RunPod only starts sshd for its own templates; a custom image/start command must start it itself (the SGLang image has none, so `pod_boot.sh` installs and starts it: ~8 s observed). `portMappings`/`publicIp` stay empty while the pod is initializing, image pull included | [Use SSH](https://docs.runpod.io/pods/configuration/use-ssh) |
 | SGLang image `lmsysorg/sglang:v0.5.23-cu130-runtime` (pushed 2026-10-30); the docs recommend the cu130 images for B300/GB300 (SM103) / CUDA 13 | [Docker Hub tags](https://hub.docker.com/r/lmsysorg/sglang/tags), [SGLang install](https://sgl-project.github.io/get_started/install.html) |
 | SGLang default `--port` 30000; `--enable-metrics` "Enable log prometheus metrics." (default off); metrics are served at `/metrics` on the serving port | [Server arguments](https://docs.sglang.io/advanced_features/server_arguments.html), [Production metrics](https://docs.sglang.io/references/production_metrics.html) |
+| The `lmsysorg/sglang:v0.5.23-cu130-runtime` image has **neither `hf` nor `huggingface-cli`** (this made the first B300 launch self-terminate at boot); `pod_boot.sh` falls back to `huggingface_hub.snapshot_download` | pod logs, RTX PRO 6000 diagnostic pod, 2026-11-06 |
+| Pod log stream: `GET https://api.runpod.io/v2/pods/{id}/logs` (SSE, Bearer auth; `source=container\|system`, `tail<=5000`, `since`, `Last-Event-ID`); returns 404 once the pod is removed, so logs vanish with the pod | used by hand on the diagnostic pod, 2026-11-06 |
 | `Qwen/Qwen3.8-27B-FP8` exists, not gated, 81 files, 30.9 GB (sha `017b9c7a`) | HF API `GET /api/models/Qwen/Qwen3.8-27B-FP8` |
 
 **Verify before launch:** the image tag (re-check Docker Hub), that SGLang supports the
@@ -141,7 +145,10 @@ refuses to serve without `.memfun_verified` and terminates itself straight away.
 marker must name the same repo, and when `--model-revision` is a 40-hex commit sha the
 marker's sha must equal it; an in-pod pull uses `--revision` of that pin. (Pulling on
 the GPU pod is possible with `--pull-in-pod`, but costs GPU minutes and only gets
-`hf download`'s own integrity checks.)
+the Hub client's own integrity checks. In the pod the download uses, in order: `hf`,
+`huggingface-cli`, `python3 -c 'huggingface_hub.snapshot_download(...)'`, and as a last
+resort `pip install huggingface_hub` then the Python API; 3 resumable attempts, a progress
+line every 20 s, and a clear reason plus the tail of `pull.log` if all fail.)
 
 ### 3. Dry run (default, read-only)
 
@@ -256,6 +263,57 @@ URL). See the "Remote access: token auth" section of
 The watchdog terminates the pod at the deadline, or press Ctrl-C in the launch terminal. It
 prints `verified: pod <id> is gone`; if it prints `COULD NOT VERIFY`, terminate the pod in
 the console. Network volume storage is billed until you delete the volume.
+
+## Debugging a launch
+
+The pod's stdout/stderr (container log) and RunPod's own events (system log: image pull,
+container create/remove) are only readable **while the pod exists**: after removal the log
+endpoint returns 404. So `launch` (real path) and `watch` follow the log stream into a
+local file from the moment the pod exists, and the run card prints its path:
+
+```
+log file   : ~/.cache/memfun/runpod-logs/pod-<id>.log  (captured locally; survives the pod)
+```
+
+The file is created `0600` with `O_EXCL|O_NOFOLLOW` (an existing file or planted symlink is
+refused; the next free `pod-<id>.N.log` is used); every line is redacted. Capture failures
+never affect the watchdog. `--log-dir` changes the directory. Read the log by hand:
+
+```bash
+uv run python scripts/runpod/launch_pod.py logs --pod-id <id>              # backlog, then exit
+uv run python scripts/runpod/launch_pod.py logs --pod-id <id> --follow     # until the pod is gone
+uv run python scripts/runpod/launch_pod.py logs --pod-id <id> --source system --tail 500
+uv run python scripts/runpod/launch_pod.py logs --pod-id <id> --follow --out pod.log --raw
+```
+
+Read-only (GET); image-pull progress lines (`<12 hex> Extracting` ...) are hidden unless
+`--raw` (a count is printed); 404 means the pod is gone (exit 0); 429 waits `Retry-After`;
+reconnects resume with `Last-Event-ID`; without `--follow` it stops after `--timeout` s.
+
+What to look for (`[memfun-boot]` lines come from `pod_boot.sh`):
+
+| pattern | meaning |
+|---|---|
+| system log `still fetching image` / layer lines, no container lines yet | image pull. 14.5 GB: ~1.5 min on one host, **~10 min** on the B300 host. The tunnel reports "no public TCP 22 mapping yet: still initializing" meanwhile; that is normal |
+| `hard stop armed: Ns from now` | boot script started; N is what is left of the launch-time deadline |
+| `---- preflight ----` block | GPU/driver, disk, python packages (sglang, torch, transformers, huggingface_hub, flashinfer), tools present, huggingface.co reachability, env var **names** (never values) |
+| `sshd started` | tunnel possible from now (once RunPod publishes the port mapping) |
+| `download attempt k/3 via <method>`, `download progress: <size>` | in-pod weights pull (`--pull-in-pod`) |
+| `no way to download weights: missing: ...` / `all 3 download attempts ... failed` + `pull.log` tail | weights could not be fetched; the pod stays `--fail-grace-minutes` then removes itself |
+| SGLang's own output (mirrored from `sglang.log`), then `SGLang exited rc=N` | SGLang crashed; `--crash-grace-minutes` to ssh in, then removal |
+| `self-terminate: <reason>` + `---- last 40 lines of ...log ----` | why the pod is going away, with the tail of `pull/apt/sglang.log` |
+| `terminated via 'runpodctl remove pod'` | the pod removed itself (pod-scoped key) |
+
+**Image pull and download time eat the deadline.** The in-pod deadline and `terminateAfter`
+both count from **launch** time, not from container start. In `--no-volume` mode the image
+pull (1.5 to ~10 min observed) plus the ~31 GB weights download (3-5 min) both come out of
+`--max-minutes` before SGLang serves anything, so give `--max-minutes` at least 15 minutes
+of margin over the time you need SGLang up.
+
+**SSH on a custom image:** RunPod starts sshd only for its own templates; with a custom
+start command (as here) the container must start it, which `pod_boot.sh` does (installs
+`openssh-server` with apt if missing, key-only auth). The port mapping appears only after
+the container is running.
 
 ## Smoke tasks and grading
 

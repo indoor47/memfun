@@ -2060,3 +2060,13 @@ def test_http_stream_logs_against_local_sse_server() -> None:
     assert seen[1]["last-event-id"] == "9"  # reconnect resumes after the last event
     assert 3.0 in clock.sleeps
     assert not any(FAKE_KEY in o for o in out)
+
+
+def test_launch_pod_wrapper_knows_every_kit_subcommand() -> None:
+    text = (REPO_ROOT / "scripts" / "runpod" / "launch_pod.py").read_text()
+    names = re.search(r"SUBCOMMANDS = \{([^}]*)\}", text)
+    assert names
+    wrapper = set(re.findall(r'"([a-z]+)"', names.group(1)))
+    parser = kit.build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))  # pyright: ignore[reportPrivateUsage]
+    assert wrapper == set(sub.choices)
