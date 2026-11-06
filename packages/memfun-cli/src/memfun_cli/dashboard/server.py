@@ -327,13 +327,70 @@ def _get_state() -> dict:
         "type": "state",
         "workers": _workers,
         "tasks": _tasks,
-        "events": _events[-50:],
+        # Enough history for the swarm/timeline views to rebuild a run
+        # in progress when a page (re)connects.
+        "events": _events[-500:],
         "requests": _requests,
         "project": _project_name,
     }
 
 
 # ── FastAPI app ───────────────────────────────────────────────────
+
+
+# ── Inference-server metrics (SGLang / vLLM Prometheus text) ─────────
+
+# metric family -> output field.  Values are summed across label sets
+# (e.g. one series per model or per DP rank).  SGLang and vLLM names
+# differ; whichever the server exports is used.
+_INFERENCE_METRICS: dict[str, str] = {
+    "sglang:num_running_reqs": "running",
+    "sglang:num_queue_reqs": "queued",
+    "sglang:token_usage": "kv_usage",
+    "sglang:cache_hit_rate": "cache_hit_rate",
+    "sglang:gen_throughput": "gen_tps",
+    "vllm:num_requests_running": "running",
+    "vllm:num_requests_waiting": "queued",
+    "vllm:gpu_cache_usage_perc": "kv_usage",
+    "vllm:kv_cache_usage_perc": "kv_usage",
+}
+# Ratios are averaged across series instead of summed.
+_RATIO_FIELDS = frozenset({"kv_usage", "cache_hit_rate"})
+
+
+def parse_inference_metrics(text: str) -> dict[str, float | None]:
+    """Extract the swarm-relevant gauges from Prometheus exposition text."""
+    sums: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        field = _INFERENCE_METRICS.get(name)
+        if field is None:
+            continue
+        try:
+            value = float(line.rsplit(" ", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        sums[field] = sums.get(field, 0.0) + value
+        counts[field] = counts.get(field, 0) + 1
+    out: dict[str, float | None] = {}
+    for field in ("running", "queued", "kv_usage", "cache_hit_rate", "gen_tps"):
+        if field not in sums:
+            out[field] = None
+        elif field in _RATIO_FIELDS:
+            out[field] = sums[field] / counts[field]
+        else:
+            out[field] = sums[field]
+    return out
+
+
+def _fetch_text(url: str, timeout: float) -> str:
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
 
 
 def create_app(
@@ -398,6 +455,23 @@ def create_app(
     @app.get("/api/health")
     async def api_health() -> dict:
         return {"status": "ok", "project": _project_name}
+
+    @app.get("/api/server-metrics")
+    async def api_server_metrics() -> dict[str, object]:
+        """Inference-server load for the swarm view (SGLang / vLLM).
+
+        Reads the Prometheus endpoint named by ``MEMFUN_INFERENCE_METRICS_URL``
+        (e.g. ``http://127.0.0.1:30000/metrics`` through an SSH tunnel).
+        Only that configured URL is ever fetched; the browser cannot pass one.
+        """
+        url = os.environ.get("MEMFUN_INFERENCE_METRICS_URL", "").strip()
+        if not url:
+            return {"enabled": False}
+        try:
+            text = await asyncio.to_thread(_fetch_text, url, 2.0)
+        except Exception as exc:  # unreachable server must not break the page
+            return {"enabled": True, "ok": False, "error": type(exc).__name__}
+        return {"enabled": True, "ok": True, **parse_inference_metrics(text)}
 
     @app.post("/api/event")
     async def api_ingest_event(body: dict) -> dict:
@@ -534,7 +608,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     flex: 1; min-height: 120px;
     display: grid;
     grid-template-columns: 220px 1fr 220px;
-    grid-template-rows: 1fr 1fr;
+    grid-template-rows: 1.6fr 1fr;
     gap: 1px; background: var(--border);
     overflow: hidden;
   }
@@ -701,6 +775,61 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     font-weight: 600;
     border-bottom: 2px solid var(--accent);
   }
+
+  /* ── Swarm / Timeline / Tasks views (centre panel) ─────────── */
+  .view-bar { display: flex; gap: 4px; padding: 4px 8px; align-items: center; }
+  .view-btn {
+    background: transparent; border: none; color: var(--muted);
+    font-family: inherit; font-size: 11px; font-weight: 500;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    padding: 6px 12px; border-radius: 6px 6px 0 0; cursor: pointer;
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .view-btn:hover { background: rgba(255,255,255,0.04); color: var(--text); }
+  .view-btn.active { color: var(--text); font-weight: 600; border-bottom: 2px solid var(--accent);
+    }
+  .view-bar .cost-ctl {
+    margin-left: auto; font-size: 11px; color: var(--muted);
+    text-transform: none; letter-spacing: 0; font-weight: 400;
+  }
+  .view-bar .cost-ctl input {
+    width: 64px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    font-family: inherit; font-size: 11px; padding: 2px 4px; margin-left: 4px;
+  }
+  .swarm-metrics {
+    display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 6px 12px;
+    font-size: 11px; color: var(--muted); border-bottom: 1px solid var(--border);
+    font-variant-numeric: tabular-nums; flex-shrink: 0;
+  }
+  .swarm-metrics b { color: var(--text); font-weight: 600; }
+  .swarm-metrics .warn b { color: var(--yellow); }
+  .swarm-metrics .srv { color: var(--accent); }
+  .view-pane { display: none; flex: 1; min-height: 0; position: relative; }
+  .view-pane.active { display: block; }
+  .view-pane canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .swarm-legend {
+    position: absolute; left: 10px; bottom: 8px; display: flex; gap: 12px;
+    font-size: 10px; color: var(--muted); pointer-events: none;
+  }
+  .swarm-legend i {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 4px; vertical-align: -1px;
+  }
+  .swarm-tip {
+    position: absolute; display: none; pointer-events: none; z-index: 3;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 8px; font-size: 11px; line-height: 1.5; white-space: nowrap;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  }
+  .task-lanes { display: flex; gap: 8px; align-items: flex-start; padding: 8px; }
+  .task-lane { flex: 1; min-width: 120px; }
+  .task-lane h4 {
+    font-size: 10px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px;
+  }
+  .task-lane .task-node { display: block; margin: 0 0 4px 0; }
+  .worker .sub { display: block; font-size: 10px; color: var(--muted); margin-top: 1px; }
   .tab-pane { display: none; }
   .tab-pane.active { display: block; }
 
@@ -952,10 +1081,33 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Middle top: Task Flow -->
+    <!-- Middle top: Swarm / Timeline / Tasks -->
     <div class="panel">
-      <div class="panel-title">Task Flow</div>
-      <div class="panel-content padded" id="tasks">
+      <div class="panel-title view-bar" role="tablist">
+        <button class="view-btn active" data-view="swarm" type="button">Swarm</button>
+        <button class="view-btn" data-view="timeline" type="button">Timeline</button>
+        <button class="view-btn" data-view="tasks" type="button">Tasks</button>
+        <label class="cost-ctl"
+          title="GPU pod price per hour (enables the cost meter)">pod $/h<input
+          id="pod-rate" type="number" min="0" step="0.01" placeholder="0"></label>
+      </div>
+      <div class="swarm-metrics" id="swarm-metrics"></div>
+      <div class="view-pane active" data-view="swarm">
+        <canvas id="swarm-canvas" aria-label="Live swarm map"></canvas>
+        <div class="swarm-legend">
+          <span><i style="background:#d29922"></i>working</span>
+          <span><i style="background:#bc8cff"></i>auditing</span>
+          <span><i style="background:#8b949e"></i>idle</span>
+          <span><i style="background:#3fb950"></i>done</span>
+          <span><i style="background:#f85149"></i>failed</span>
+          <span><i style="background:#58a6ff"></i>LLM call</span>
+        </div>
+        <div class="swarm-tip" id="swarm-tip"></div>
+      </div>
+      <div class="view-pane" data-view="timeline">
+        <canvas id="timeline-canvas" aria-label="Agent timeline"></canvas>
+      </div>
+      <div class="view-pane panel-content padded" data-view="tasks" id="tasks">
         <div class="empty">No tasks yet</div>
       </div>
     </div>
@@ -1103,6 +1255,7 @@ ws.onmessage = (e) => {
     liveBanner.tokensOut = 0;
     liveBanner.lastAgent = null;
     liveBanner.lastTs = null;
+    swarmSeed(workers, tasks);
     (msg.events || []).forEach(ev => {
       allEvents.push(ev);
       ingestForTabs(ev);
@@ -1125,6 +1278,7 @@ function ingestForTabs(ev) {
   }
   ingestSpark(ev);
   if (et === 'llm.call') recordLlmCallForBanner(ev);
+  swarmIngest(ev);
 }
 
 // ── Live banner ───────────────────────────────────────────
@@ -1618,7 +1772,7 @@ function renderRequests() {
       ? ` (${r.completed_count || 0}/${r.task_count})`
       : '';
     return `<div class="request-item${isActive ? ' active' : ''}"
-                data-wfid="${r.workflow_id}">
+                data-wfid="${r.workflow_id}" title="${escHtml(r.description || r.workflow_id)}">
       <span class="req-time">${t}</span>
       <span class="req-status ${r.status}">${r.status}${counts}</span>
       ${desc}
@@ -1643,9 +1797,16 @@ function renderWorkers() {
   } else {
     workersEl.innerHTML = wkeys.map(wid => {
       const w = workers[wid];
+      const a = SW.agents[wid];
+      const sub = a ? [
+        a.task ? 'task ' + a.task.substring(0, 8) : null,
+        a.model ? a.model.split('/').pop().slice(0, 18) : null,
+        a.tokens ? (a.tokens / 1000).toFixed(1) + 'k tok' : null,
+      ].filter(Boolean).join(' · ') : '';
       return `<div class="worker">
         <div class="dot ${w.status}"></div>
-        <span class="name">${escHtml(w.agent_name || wid)}</span>
+        <span class="name">${escHtml(w.agent_name || wid)}
+          ${sub ? `<span class="sub">${escHtml(sub)}</span>` : ''}</span>
         <span class="info">${w.status} (${w.tasks_done || 0})</span>
       </div>`;
     }).join('');
@@ -1658,21 +1819,31 @@ function renderTasks() {
   if (tkeys.length === 0) {
     tasksEl.innerHTML =
       '<div class="empty">No tasks yet</div>';
-  } else {
-    tasksEl.innerHTML =
-      '<div class="task-flow">' +
-      tkeys.slice(-30).map(tid => {
-        const t = ft[tid];
-        const d = t.duration_ms
-          ? ` ${(t.duration_ms/1000).toFixed(1)}s`
-          : '';
-        return `<div class="task-node ${t.status}"` +
-          ` title="${escHtml(tid)}">` +
-          `${escHtml(t.agent_name || '?')}: ` +
-          `${tid.substring(0,8)}${d}</div>`;
-      }).join('<span class="task-arrow">&rarr;</span>') +
-      '</div>';
+    return;
   }
+  // Lanes by parallelism group when events carry one, else by status.
+  // Never draw arrows between sibling sub-tasks: they run in parallel.
+  const chip = tid => {
+    const t = ft[tid];
+    const d = t.duration_ms ? ` ${(t.duration_ms/1000).toFixed(1)}s` : '';
+    return `<div class="task-node ${t.status}" title="${escHtml(t.detail || tid)}">` +
+      `${escHtml(t.agent_name || '?')}: ${escHtml(tid.substring(0,8))}${d}</div>`;
+  };
+  const lanes = {};
+  const grouped = tkeys.some(tid => SW.tasks[tid] && SW.tasks[tid].group !== null);
+  const statusOrder = ['running', 'pending', 'completed', 'failed'];
+  tkeys.forEach(tid => {
+    const g = grouped
+      ? 'group ' + ((SW.tasks[tid] && SW.tasks[tid].group) || '?')
+      : (ft[tid].status || 'pending');
+    (lanes[g] = lanes[g] || []).push(tid);
+  });
+  const names = grouped ? Object.keys(lanes).sort()
+    : statusOrder.filter(k => lanes[k])
+        .concat(Object.keys(lanes).filter(k => !statusOrder.includes(k)));
+  tasksEl.innerHTML = '<div class="task-lanes">' + names.map(n =>
+    `<div class="task-lane"><h4>${escHtml(n)} (${lanes[n].length})</h4>` +
+    lanes[n].slice(-40).map(chip).join('') + '</div>').join('') + '</div>';
 }
 
 function renderEvents() {
@@ -2064,6 +2235,535 @@ showAllBtn.addEventListener('click', () => {
   showAllBtn.classList.add('active');
   renderAll();
 });
+
+
+// ── Swarm model (feeds the Swarm / Timeline / Tasks views) ───────
+// One record per agent (keyed by worker_id, else agent_name:task_id),
+// one span per picked-up task, and a rolling list of llm.call ticks.
+// Fed from ingestForTabs() so the state replay and live events share
+// the same path.
+const SW = {
+  agents: {},        // key -> agent record
+  order: [],         // agent keys in first-seen order (timeline rows)
+  tasks: {},         // task_id -> {name, detail, status, group, ts}
+  spans: {},         // task_id -> {key, start, end, status}
+  calls: [],         // {ts, key, tok}
+  t0: null,          // first event ts (cost + timeline origin)
+  firstPick: null,   // first task pick-up ts (parallelism origin)
+  request: '',
+  server: null,      // latest /api/server-metrics payload
+  dirty: true,
+};
+const SW_MAX_CALLS = 5000;
+const SW_STATUS_COLOR = {
+  idle: '#8b949e', busy: '#d29922', auditing: '#bc8cff',
+  done: '#3fb950', failed: '#f85149', gone: '#30363d',
+};
+const reduceMotion = window.matchMedia &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function swNow() { return Date.now() / 1000; }
+function swIsAuditor(name) { return /review|audit|critic|verif/i.test(name || ''); }
+function swShort(name) { return (name || '?').replace(/-agent$/, ''); }
+function swKey(ev) {
+  return ev.worker_id || ((ev.agent_name || 'agent') + ':' + (ev.task_id || ''));
+}
+function swAgent(ev) {
+  const k = swKey(ev);
+  let a = SW.agents[k];
+  if (!a) {
+    a = SW.agents[k] = {
+      key: k, name: ev.agent_name || k, status: 'idle', task: null,
+      lastTask: null, calls: 0, tokens: 0, model: null, lastCall: null,
+      x: null, y: null, pulse: 0, flash: null, flashT: 0, alpha: 0,
+    };
+    SW.order.push(k);
+  }
+  if (ev.agent_name && a.name === k) a.name = ev.agent_name;
+  return a;
+}
+
+function swarmIngest(ev) {
+  const et = ev.event_type || '';
+  const ts = ev.ts || swNow();
+  if (SW.t0 === null) SW.t0 = ts;
+  SW.dirty = true;
+  if (et === 'workflow.started') { SW.request = ev.detail || ''; return; }
+  if (et === 'worker.online') { swAgent(ev); return; }
+  if (et === 'worker.offline') {
+    const a = SW.agents[swKey(ev)];
+    if (a) a.status = 'gone';
+    return;
+  }
+  if (et === 'task.published' && ev.task_id) {
+    SW.tasks[ev.task_id] = {
+      name: ev.agent_name, detail: ev.detail || '', status: 'pending',
+      group: (ev.group !== undefined && ev.group !== null) ? String(ev.group) : null, ts: ts,
+    };
+    return;
+  }
+  if (et === 'task.picked_up' && ev.task_id) {
+    const a = swAgent(ev);
+    a.status = swIsAuditor(a.name) ? 'auditing' : 'busy';
+    a.task = ev.task_id; a.lastTask = ev.task_id;
+    SW.spans[ev.task_id] = { key: a.key, start: ts, end: null, status: 'running' };
+    if (SW.tasks[ev.task_id]) SW.tasks[ev.task_id].status = 'running';
+    if (SW.firstPick === null) SW.firstPick = ts;
+    return;
+  }
+  if (et === 'task.completed' && ev.task_id) {
+    const sp = SW.spans[ev.task_id];
+    if (sp) { sp.end = ts; sp.status = ev.success ? 'done' : 'failed'; }
+    if (SW.tasks[ev.task_id]) SW.tasks[ev.task_id].status = ev.success ? 'done' : 'failed';
+    const a = SW.agents[swKey(ev)] || (sp && SW.agents[sp.key]);
+    if (a) {
+      a.status = 'idle'; a.task = null;
+      a.flash = ev.success ? 'done' : 'failed'; a.flashT = 1;
+    }
+    return;
+  }
+  if (et === 'llm.call') {
+    const a = swAgent(ev);
+    const tok = (ev.prompt_tokens || 0) + (ev.completion_tokens || 0);
+    a.calls += 1; a.tokens += tok; a.lastCall = ts;
+    if (ev.model) a.model = ev.model;
+    if (ev.task_id && !a.task && a.status !== 'gone') { a.lastTask = ev.task_id; }
+    a.pulse = 1;
+    SW.calls.push({ ts: ts, key: a.key, tok: ev.completion_tokens || 0 });
+    if (SW.calls.length > SW_MAX_CALLS) SW.calls.splice(0, SW.calls.length - SW_MAX_CALLS);
+    swParticles.push({ key: a.key, t: 0 });
+  }
+}
+
+// A (re)connecting page gets a snapshot of workers and tasks plus only
+// the most recent events; seed the swarm model from the snapshot so tasks
+// published before that window still appear.
+function swarmSeed(snapWorkers, snapTasks) {
+  for (const k of Object.keys(SW.agents)) delete SW.agents[k];
+  for (const k of Object.keys(SW.tasks)) delete SW.tasks[k];
+  for (const k of Object.keys(SW.spans)) delete SW.spans[k];
+  SW.order.length = 0; SW.calls.length = 0;
+  SW.t0 = null; SW.firstPick = null;
+  const st = { completed: 'done', failed: 'failed', running: 'running', pending: 'pending' };
+  for (const [tid, t] of Object.entries(snapTasks || {})) {
+    SW.tasks[tid] = {
+      name: t.agent_name, detail: t.detail || '', status: st[t.status] || 'pending',
+      group: null, ts: t.ts || null,
+    };
+    if (t.ts && (SW.t0 === null || t.ts < SW.t0)) SW.t0 = t.ts;
+  }
+  for (const [wid, w] of Object.entries(snapWorkers || {})) {
+    swAgent({ worker_id: wid, agent_name: w.agent_name });
+  }
+  for (const [tid, t] of Object.entries(snapTasks || {})) {
+    if (!t.worker_id || !SW.agents[t.worker_id]) continue;
+    const a = SW.agents[t.worker_id];
+    const start = t.ts || swNow();
+    const done = t.status === 'completed' || t.status === 'failed';
+    SW.spans[tid] = {
+      key: a.key, start: start,
+      end: done ? start + (t.duration_ms || 0) / 1000 : null,
+      status: done ? (t.status === 'failed' ? 'failed' : 'done') : 'running',
+    };
+    if (!done) {
+      a.status = swIsAuditor(a.name) ? 'auditing' : 'busy';
+      a.task = tid; a.lastTask = tid;
+    }
+    if (SW.firstPick === null || start < SW.firstPick) SW.firstPick = start;
+  }
+  SW.dirty = true;
+}
+
+// ── Derived metrics ──────────────────────────────────────────────
+function swMetrics() {
+  const now = swNow();
+  const keys = Object.keys(SW.agents);
+  const live = keys.filter(k => SW.agents[k].status !== 'gone');
+  const active = live.filter(k => ['busy', 'auditing'].includes(SW.agents[k].status));
+  const win = Math.max(1, Math.min(30, now - (SW.t0 || now)));
+  let tok = 0;
+  for (let i = SW.calls.length - 1; i >= 0 && SW.calls[i].ts >= now - win;
+    i--) tok += SW.calls[i].tok;
+  let busy = 0;
+  for (const sp of Object.values(SW.spans)) busy += Math.max(0, (sp.end || now) - sp.start);
+  const wall = SW.firstPick ? Math.max(1, now - SW.firstPick) : 0;
+  const counts = { pending: 0, running: 0, done: 0, failed: 0 };
+  for (const t of Object.values(SW.tasks)) counts[t.status] = (counts[t.status] || 0) + 1;
+  const rate = podRate();
+  const cost = rate > 0 && SW.t0 ? rate * (now - SW.t0) / 3600 : null;
+  return {
+    agents: live.length, active: active.length, tokps: tok / win,
+    par: wall ? busy / wall : null, counts: counts, cost: cost, rate: rate,
+    elapsed: SW.t0 ? now - SW.t0 : 0,
+  };
+}
+
+function podRate() {
+  const el = document.getElementById('pod-rate');
+  const v = el ? parseFloat(el.value) : NaN;
+  return isFinite(v) && v > 0 ? v : 0;
+}
+
+function fmtDur(s) {
+  s = Math.max(0, Math.round(s));
+  const m = Math.floor(s / 60), r = s % 60;
+  return m ? m + 'm ' + String(r).padStart(2, '0') + 's' : r + 's';
+}
+
+function renderSwarmMetrics() {
+  const el = document.getElementById('swarm-metrics');
+  if (!el) return;
+  const m = swMetrics();
+  const c = m.counts;
+  // Realized parallelism near 1 with several agents = serial collapse.
+  const parWarn = m.par !== null && m.agents >= 3 && m.par < 1.5;
+  const parts = [
+    `agents <b>${m.active}</b>/${m.agents} active`,
+    `<b>${Math.round(m.tokps)}</b> tok/s`,
+    `<span class="${parWarn ? 'warn' : ''}">parallelism <b>` +
+      `${m.par === null ? '—' : m.par.toFixed(1) + 'x'}</b></span>`,
+    `tasks <b>${c.done || 0}</b> done · <b>${c.running || 0}</b> running · ` +
+      `${c.pending || 0} pending` +
+      (c.failed ? ` · <span style="color:var(--red)"><b>${c.failed}</b> failed</span>` : ''),
+    `elapsed <b>${fmtDur(m.elapsed)}</b>`,
+  ];
+  if (m.cost !== null) parts.push(`pod <b>$${m.cost.toFixed(2)}</b> @ $${m.rate}/h`);
+  const s = SW.server;
+  if (s && s.enabled && s.ok) {
+    const f = (v, d) => (v === null || v === undefined) ? '—' : Number(v).toFixed(d);
+    const pct = v => (v === null || v === undefined) ? '—' : Math.round(v * 100) + '%';
+    parts.push(`<span class="srv">server: <b>${f(s.running, 0)}</b> running · ` +
+      `${f(s.queued, 0)} queued · KV <b>${pct(s.kv_usage)}</b> · ` +
+      `cache hit <b>${pct(s.cache_hit_rate)}</b> · gen <b>${f(s.gen_tps, 0)}</b> tok/s</span>`);
+  } else if (s && s.enabled && !s.ok) {
+    parts.push('<span class="warn">server metrics <b>unreachable</b></span>');
+  }
+  el.innerHTML = parts.join('<span style="color:var(--border)">│</span>');
+}
+
+// ── Canvas helpers ───────────────────────────────────────────────
+function fitCanvas(cv) {
+  const r = cv.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx: ctx, w: r.width, h: r.height };
+}
+
+// ── Swarm view: orchestrator hub, task anchors, agents, traffic ──
+const swParticles = [];
+let swHover = null;
+const swAnchors = {};   // task_id -> {x, y}
+
+function swLayout(w, h) {
+  const cx = w / 2, cy = h / 2;
+  // Ellipses that use the whole panel: tasks on the inner one, idle agents outside.
+  const R1x = w * 0.30, R1y = h * 0.30, R2x = w * 0.44, R2y = h * 0.42;
+  const open = Object.keys(SW.tasks)
+    .filter(t => ['pending', 'running'].includes(SW.tasks[t].status));
+  const shown = open.length ? open : Object.keys(SW.tasks).slice(-12);
+  for (const k in swAnchors) delete swAnchors[k];
+  shown.forEach((tid, i) => {
+    const ang = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(1, shown.length);
+    swAnchors[tid] = { x: cx + R1x * Math.cos(ang), y: cy + R1y * Math.sin(ang), ang: ang };
+  });
+  const live = SW.order.filter(k => SW.agents[k] && SW.agents[k].status !== 'gone');
+  const idle = live.filter(k => !SW.agents[k].task || !swAnchors[SW.agents[k].task]);
+  const perTask = {};
+  live.forEach(k => {
+    const a = SW.agents[k];
+    let tx, ty;
+    const an = a.task && swAnchors[a.task];
+    if (an) {
+      const n = perTask[a.task] = (perTask[a.task] || 0) + 1;
+      const out = swIsAuditor(a.name) ? 1.18 : 1.0;   // auditors sit just outside
+      const dx = an.x - cx, dy = an.y - cy, d = Math.hypot(dx, dy) || 1;
+      const spread = (n - 1) * 0.55;
+      const ang = Math.atan2(dy, dx) + spread * (n % 2 ? 1 : -1) * 0.18;
+      tx = cx + Math.cos(ang) * d * out + (dx / d) * 22;
+      ty = cy + Math.sin(ang) * d * out * 0.95 + (dy / d) * 22;
+    } else {
+      const i = idle.indexOf(k);
+      const ang = -Math.PI / 2 + (2 * Math.PI * i) / Math.max(1, idle.length);
+      tx = cx + R2x * Math.cos(ang); ty = cy + R2y * Math.sin(ang);
+    }
+    if (a.x === null) { a.x = cx + (Math.random() - 0.5) * 20;
+      a.y = cy + (Math.random() - 0.5) * 20; }
+    a.tx = tx; a.ty = ty;
+  });
+  return { cx: cx, cy: cy, live: live };
+}
+
+function drawSwarm(dt) {
+  const cv = document.getElementById('swarm-canvas');
+  if (!cv) return;
+  const { ctx, w, h } = fitCanvas(cv);
+  const L = swLayout(w, h);
+  // Ease toward targets; the floor keeps nodes moving when frames are
+  // sparse (throttled tabs, slow machines, headless captures).
+  const k = reduceMotion ? 1 : Math.max(0.12, Math.min(1, dt * 4));
+  // Move toward targets, then a light pairwise repulsion so nodes do not stack.
+  L.live.forEach(key => {
+    const a = SW.agents[key];
+    a.x += (a.tx - a.x) * k; a.y += (a.ty - a.y) * k;
+    a.alpha = Math.min(1, a.alpha + (reduceMotion ? 1 : dt * 2));
+    a.pulse = Math.max(0, a.pulse - dt * 1.6);
+    a.flashT = Math.max(0, a.flashT - dt * 0.7);
+  });
+  if (L.live.length <= 300) {
+    for (let i = 0; i < L.live.length; i++) for (let j = i + 1; j < L.live.length; j++) {
+      const a = SW.agents[L.live[i]], b = SW.agents[L.live[j]];
+      const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 0.01;
+      if (d < 18) { const p = (18 - d) / 2 / d; a.x -= dx * p; a.y -= dy * p; b.x += dx * p;
+        b.y += dy * p; }
+    }
+  }
+  ctx.clearRect(0, 0, w, h);
+  const g = ctx.createRadialGradient(L.cx, L.cy, 0, L.cx, L.cy, Math.max(w, h) * 0.6);
+  g.addColorStop(0, 'rgba(88,166,255,0.07)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+
+  // hub → task spokes, task anchors
+  ctx.lineWidth = 1;
+  for (const tid in swAnchors) {
+    const an = swAnchors[tid], t = SW.tasks[tid];
+    ctx.strokeStyle = 'rgba(139,148,158,0.18)';
+    ctx.beginPath(); ctx.moveTo(L.cx, L.cy); ctx.lineTo(an.x, an.y); ctx.stroke();
+    ctx.fillStyle = t.status === 'running' ? 'rgba(210,153,34,0.9)' : 'rgba(139,148,158,0.7)';
+    ctx.beginPath(); ctx.moveTo(an.x, an.y - 6); ctx.lineTo(an.x + 6, an.y);
+      ctx.lineTo(an.x, an.y + 6); ctx.lineTo(an.x - 6, an.y); ctx.closePath(); ctx.fill();
+    if (Object.keys(swAnchors).length <= 24) {
+      ctx.fillStyle = 'rgba(139,148,158,0.85)'; ctx.font = '10px SF Mono, monospace';
+        ctx.textAlign = 'center';
+      const lx = an.x + Math.cos(an.ang) * 46, ly = an.y + Math.sin(an.ang) * 30;
+      const c = Math.cos(an.ang);
+      ctx.textAlign = c > 0.3 ? 'left' : c < -0.3 ? 'right' : 'center';
+      ctx.fillText((t.detail || tid).split(':')[0].slice(0, 16), lx, ly + 3);
+    }
+  }
+  // agent → its task, and implementer ↔ auditor links (dashed)
+  const byTask = {};
+  L.live.forEach(key => {
+    const a = SW.agents[key];
+    if (a.task && swAnchors[a.task]) {
+      (byTask[a.task] = byTask[a.task] || []).push(a);
+      const an = swAnchors[a.task];
+      ctx.strokeStyle = 'rgba(210,153,34,0.25)';
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(an.x, an.y); ctx.stroke();
+    }
+  });
+  ctx.setLineDash([3, 3]); ctx.strokeStyle = 'rgba(188,140,255,0.7)';
+  for (const tid in byTask) {
+    const grp = byTask[tid];
+    const auds = grp.filter(a => swIsAuditor(a.name));
+    const impl = grp.filter(a => !swIsAuditor(a.name));
+    auds.forEach(au => impl.forEach(im => { ctx.beginPath(); ctx.moveTo(au.x, au.y);
+      ctx.lineTo(im.x, im.y); ctx.stroke(); }));
+  }
+  ctx.setLineDash([]);
+
+  // traffic: one particle per llm.call, flying agent → hub
+  if (!reduceMotion) {
+    for (let i = swParticles.length - 1; i >= 0; i--) {
+      const p = swParticles[i], a = SW.agents[p.key];
+      p.t += dt * 1.4;
+      if (!a || p.t >= 1) { swParticles.splice(i, 1); continue; }
+      const x = a.x + (L.cx - a.x) * p.t, y = a.y + (L.cy - a.y) * p.t;
+      ctx.fillStyle = 'rgba(88,166,255,' + (0.9 * (1 - p.t)).toFixed(2) + ')';
+      ctx.beginPath(); ctx.arc(x, y, 2, 0, Math.PI * 2); ctx.fill();
+    }
+  } else swParticles.length = 0;
+
+  // orchestrator hub
+  ctx.fillStyle = 'rgba(188,140,255,0.15)';
+  ctx.beginPath(); ctx.arc(L.cx, L.cy, 26, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#bc8cff';
+  ctx.beginPath(); ctx.arc(L.cx, L.cy, 14, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#e6edf3'; ctx.font = '600 11px SF Mono, monospace'; ctx.textAlign = 'center';
+  ctx.fillText('orchestrator', L.cx, L.cy + 40);
+  if (SW.request) { ctx.fillStyle = '#8b949e'; ctx.font = '10px SF Mono, monospace';
+    ctx.fillText(SW.request.slice(0, 48), L.cx, L.cy + 54); }
+
+  // agents
+  const labels = L.live.length <= 40;
+  L.live.forEach(key => {
+    const a = SW.agents[key];
+    const r = 5 + Math.min(6, Math.log10(a.tokens + 1));
+    const col = SW_STATUS_COLOR[a.status] || SW_STATUS_COLOR.idle;
+    ctx.globalAlpha = a.alpha;
+    if (a.pulse > 0 && !reduceMotion) {
+      ctx.strokeStyle = 'rgba(88,166,255,' + (a.pulse * 0.8).toFixed(2) + ')';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(a.x, a.y, r + (1 - a.pulse) * 14, 0, Math.PI * 2); ctx.stroke();
+      ctx.lineWidth = 1;
+    }
+    if (a.flashT > 0) {
+      const fa = (a.flashT * 0.5).toFixed(2);
+      ctx.fillStyle = a.flash === 'failed'
+        ? 'rgba(248,81,73,' + fa + ')' : 'rgba(63,185,80,' + fa + ')';
+      ctx.beginPath(); ctx.arc(a.x, a.y, r + 8, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(a.x, a.y, r, 0, Math.PI * 2); ctx.fill();
+    if (swIsAuditor(a.name)) { ctx.strokeStyle = '#bc8cff'; ctx.beginPath();
+      ctx.arc(a.x, a.y, r + 2.5, 0, Math.PI * 2); ctx.stroke(); }
+    if (labels || swHover === key) {
+      ctx.fillStyle = '#8b949e'; ctx.font = '10px SF Mono, monospace'; ctx.textAlign = 'center';
+      ctx.fillText(swShort(a.name), a.x, a.y + r + 12);
+    }
+    ctx.globalAlpha = 1;
+  });
+  if (!L.live.length) {
+    ctx.fillStyle = '#8b949e'; ctx.font = '12px SF Mono, monospace'; ctx.textAlign = 'center';
+    ctx.fillText('Waiting for a swarm…', L.cx, L.cy - 40);
+  }
+}
+
+// ── Timeline view: one row per agent, bars per task, ticks per call ─
+function drawTimeline() {
+  const cv = document.getElementById('timeline-canvas');
+  if (!cv) return;
+  const { ctx, w, h } = fitCanvas(cv);
+  ctx.clearRect(0, 0, w, h);
+  const now = swNow();
+  const t0 = SW.t0 || now, span = Math.max(60, now - t0);
+  const LW = 120, top = 22, rows = SW.order.length;
+  const rh = rows ? Math.max(6, Math.min(22, (h - top - 6) / rows)) : 22;
+  const X = t => LW + ((t - t0) / span) * (w - LW - 12);
+  // time axis
+  const steps = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+  const step = steps.find(s => span / s <= 10) || 3600;
+  ctx.font = '10px SF Mono, monospace'; ctx.textAlign = 'center';
+  for (let s = 0; s <= span; s += step) {
+    const x = X(t0 + s);
+    ctx.strokeStyle = 'rgba(48,54,61,0.8)'; ctx.beginPath(); ctx.moveTo(x, top - 4);
+      ctx.lineTo(x, h); ctx.stroke();
+    ctx.fillStyle = '#8b949e'; ctx.fillText(fmtDur(s), x, 12);
+  }
+  const rowOf = {};
+  SW.order.forEach((k, i) => { rowOf[k] = i; });
+  SW.order.forEach((k, i) => {
+    const a = SW.agents[k], y = top + i * rh;
+    if (i % 2) { ctx.fillStyle = 'rgba(255,255,255,0.02)'; ctx.fillRect(0, y, w, rh); }
+    if (rh >= 10) {
+      ctx.fillStyle = a.status === 'gone' ? '#30363d' : '#8b949e'; ctx.textAlign = 'left';
+      ctx.fillText(swShort(a.name).slice(0, 8) + ' ' + k.slice(-8), 6, y + rh / 2 + 3);
+    }
+  });
+  for (const tid in SW.spans) {
+    const sp = SW.spans[tid], i = rowOf[sp.key];
+    if (i === undefined) continue;
+    const y = top + i * rh, x1 = X(sp.start), x2 = X(sp.end || now);
+    ctx.fillStyle = sp.status === 'failed' ? 'rgba(248,81,73,0.55)'
+      : sp.status === 'done' ? 'rgba(63,185,80,0.45)' : 'rgba(210,153,34,0.55)';
+    ctx.fillRect(x1, y + 2, Math.max(2, x2 - x1), rh - 4);
+  }
+  ctx.fillStyle = 'rgba(88,166,255,0.9)';
+  SW.calls.forEach(c => {
+    const i = rowOf[c.key];
+    if (i === undefined) return;
+    ctx.fillRect(X(c.ts), top + i * rh + 1, 1.5, rh - 2);
+  });
+  ctx.strokeStyle = 'rgba(88,166,255,0.6)'; ctx.beginPath(); ctx.moveTo(X(now), top - 4);
+    ctx.lineTo(X(now), h); ctx.stroke();
+  if (!rows) { ctx.fillStyle = '#8b949e'; ctx.textAlign = 'center';
+    ctx.font = '12px SF Mono, monospace'; ctx.fillText('No agents yet', w / 2, h / 2); }
+}
+
+// ── View switching, hover, animation loop ───────────────────────
+let activeView = 'swarm';
+try { activeView = localStorage.getItem('memfun.view') || 'swarm';
+  } catch (_e) { /* storage blocked */ }
+// ?view=timeline (or swarm / tasks) opens a specific view.
+const viewParam = new URLSearchParams(location.search).get('view');
+if (['swarm', 'timeline', 'tasks'].includes(viewParam)) activeView = viewParam;
+function setView(v) {
+  activeView = v;
+  try { localStorage.setItem('memfun.view', v); } catch (_e) { /* storage blocked */ }
+  document.querySelectorAll('.view-btn')
+    .forEach(b => b.classList.toggle('active', b.dataset.view === v));
+  document.querySelectorAll('.view-pane')
+    .forEach(p => p.classList.toggle('active', p.dataset.view === v));
+  SW.dirty = true;
+}
+document.querySelectorAll('.view-btn')
+  .forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
+setView(activeView);
+
+(function initPodRate() {
+  const el = document.getElementById('pod-rate');
+  if (!el) return;
+  try { el.value = localStorage.getItem('memfun.podRate') || '';
+    } catch (_e) { /* storage blocked */ }
+  el.addEventListener('input', () => {
+    try { localStorage.setItem('memfun.podRate', el.value); } catch (_e) { /* storage blocked */ }
+    renderSwarmMetrics();
+  });
+})();
+
+(function initHover() {
+  const cv = document.getElementById('swarm-canvas'), tip = document.getElementById('swarm-tip');
+  if (!cv || !tip) return;
+  cv.addEventListener('mousemove', e => {
+    const r = cv.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+    let best = null, bd = 14;
+    for (const k in SW.agents) {
+      const a = SW.agents[k];
+      if (a.status === 'gone' || a.x === null) continue;
+      const d = Math.hypot(a.x - mx, a.y - my);
+      if (d < bd) { bd = d; best = a; }
+    }
+    swHover = best ? best.key : null;
+    if (!best) { tip.style.display = 'none'; return; }
+    const t = best.task && SW.tasks[best.task];
+    tip.innerHTML = `<b>${escHtml(best.name)}</b> ` +
+      `<span style="color:var(--muted)">${escHtml(best.key)}</span><br>` +
+      `status: ${best.status}${best.task ? ' · task ' + escHtml(best.task) : ''}<br>` +
+      (t && t.detail ? escHtml(t.detail.slice(0, 60)) + '<br>' : '') +
+      `model: ${escHtml(best.model || '—')}<br>` +
+      `${best.calls} calls · ${(best.tokens / 1000).toFixed(1)}k tok` +
+      (best.lastCall ? ' · last ' + fmtAgo(best.lastCall) : '');
+    tip.style.display = 'block';
+    tip.style.left = Math.min(mx + 14, r.width - 220) + 'px';
+    tip.style.top = (my + 14) + 'px';
+  });
+  cv.addEventListener('mouseleave', () => { tip.style.display = 'none'; swHover = null; });
+})();
+
+let swLastFrame = performance.now();
+function swFrame(t) {
+  const dt = Math.min(0.1, (t - swLastFrame) / 1000);
+  swLastFrame = t;
+  if (!document.hidden) {
+    // The swarm view animates continuously; under reduced motion it
+    // redraws only when something changed.
+    if (activeView === 'swarm' && (!reduceMotion || SW.dirty)) { drawSwarm(dt); SW.dirty = false; }
+    else if (activeView === 'timeline' && SW.dirty) { drawTimeline(); SW.dirty = false; }
+  }
+  requestAnimationFrame(swFrame);
+}
+requestAnimationFrame(swFrame);
+
+// Timeline and metrics also move with wall-clock time.
+setInterval(() => {
+  if (activeView === 'timeline') SW.dirty = true;
+  renderSwarmMetrics();
+}, 1000);
+
+// Inference-server metrics (SGLang/vLLM Prometheus), proxied by the
+// dashboard server; disabled unless MEMFUN_INFERENCE_METRICS_URL is set.
+async function pollServerMetrics() {
+  try {
+    const r = await fetch('/api/server-metrics');
+    SW.server = await r.json();
+  } catch (_e) {
+    SW.server = { enabled: true, ok: false };
+  }
+  if (SW.server && SW.server.enabled) setTimeout(pollServerMetrics, 3000);
+}
+pollServerMetrics();
 
 // Initial render
 renderAll();
