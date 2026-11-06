@@ -20,6 +20,3 @@ htmlcov/
 .coverage
 *.log
 .DS_Store
-
-# swarm smoke runner output (evals/swarm/run_smoke.py)
-evals/swarm/runs/

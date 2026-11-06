@@ -125,6 +125,12 @@ def swarm(args: argparse.Namespace, rest: list[str]) -> int:
         if mode == "crash":
             print("Traceback (most recent call last):\n  boom\nRuntimeError: fake crash")
             return 3
+        if mode == "hang_after_output":
+            for i, unit in enumerate(units):
+                wt = _worktree(repo, f"T{i + 1}")
+                for rel in unit["owns"]:
+                    _write(wt / rel, (bundle / "solution" / rel).read_bytes(), time.time())
+            mode = "hang"
         if mode == "hang":
             child = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(600)"],
@@ -165,7 +171,7 @@ def swarm(args: argparse.Namespace, rest: list[str]) -> int:
             bus.emit(2, "task.picked_up", task_id=full, agent_name="coder-agent",
                      workflow_id=WF, project=project)  # fmt: skip
             err = None
-            if mode == "server_error":
+            if mode == "server_error" or (mode == "server_error_recovered" and n == 0):
                 err = "litellm.APIConnectionError: Connection refused"
             bus.emit(
                 3 + n * 0.1,
@@ -192,14 +198,20 @@ def swarm(args: argparse.Namespace, rest: list[str]) -> int:
                     wrong = (mode == "fail_unit" and i == 0) or (mode == "duplicate" and n == 0)
                     start = bundle / "repo" / rel
                     bad = (start.read_bytes() if start.is_file() else b"") + b"\n# wrong\n"
+                    if mode == "exit_unit" and i == 0:  # unguarded CLI exit at import
+                        good = good + b"\nimport sys\nsys.exit(0)\n"
                     mtime += 10
+                    if mode == "symlink":  # point the owned path at the reference answer
+                        (target / rel).unlink(missing_ok=True)
+                        (target / rel).symlink_to(sol.resolve())
+                        continue
                     _write(target / rel, bad if wrong else good, mtime)
             if mode == "tamper":
                 _write(target / "tests" / "conftest.py", b"import pytest\n", mtime)
                 _write(target / "conftest.py", b"raise SystemExit(0)\n", mtime)
             bus.emit(5 + n, "task.completed", task_id=full, agent_name="coder-agent",
                      workflow_id=WF, project=project, success=True)  # fmt: skip
-        if mode == "server_error":
+        if mode in ("server_error", "server_error_recovered"):
             print("ERROR litellm.APIConnectionError: Connection refused")
         print("Swarm result\nsuccess True", flush=True)
         return 0
@@ -212,6 +224,8 @@ def dashboard(args: argparse.Namespace, rest: list[str]) -> int:
     port = int(rest[rest.index("--port") + 1])
     out = state / "dashboard_events.jsonl"
     (state / "dashboard_argv.json").write_text(json.dumps(rest))
+    (state / "dashboard.pid").write_text(str(os.getpid()))
+    time.sleep(args.dash_delay)  # a slow-starting dashboard
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -244,6 +258,7 @@ def main() -> int:
     ap.add_argument("--mode", default="pass")
     ap.add_argument("--bundle-mode", action="append", default=[])
     ap.add_argument("--hold", type=float, default=0.0)
+    ap.add_argument("--dash-delay", type=float, default=0.0)
     ap.add_argument("command")
     args, rest = ap.parse_known_args()
     Path(args.state).mkdir(parents=True, exist_ok=True)

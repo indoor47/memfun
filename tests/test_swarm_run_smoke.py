@@ -14,12 +14,14 @@ import http.server
 import json
 import os
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -45,6 +47,7 @@ ALL: list[str] = list(rs.DEFAULT_BUNDLES)
 
 class _Models:
     ids: list[str] = ["fake-qwen"]  # noqa: RUF012
+    redirect_to: str = ""
 
 
 @pytest.fixture
@@ -53,6 +56,11 @@ def models_server() -> Iterator[tuple[str, type[_Models]]]:
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
+            if _Models.redirect_to:
+                self.send_response(302)
+                self.send_header("Location", _Models.redirect_to)
+                self.end_headers()
+                return
             if self.path != "/v1/models":
                 self.send_response(404)
                 self.end_headers()
@@ -67,6 +75,7 @@ def models_server() -> Iterator[tuple[str, type[_Models]]]:
             pass
 
     _Models.ids = ["fake-qwen"]
+    _Models.redirect_to = ""
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
@@ -211,7 +220,7 @@ def test_untouched_trees_pass_no_unit_through_runner(
     for bid, ep in _episodes(results).items():
         assert ep["outcome"] in ("model_failure", "partial"), (bid, ep["reason"])
         assert all(u["status"] == "no_output" for u in ep["units"].values()), bid
-        assert not any(ep["grade"]["units"].values()), bid
+        assert not any(u["passed"] for u in ep["grade"]["units"].values()), bid
     assert results["overall"]["unit_pass_rate"] == 0.0
     assert all(u["passed"] == 0 for u in results["units"].values())
 
@@ -376,14 +385,23 @@ def test_unreachable_model_server_is_a_harness_error_and_nothing_runs(tmp_path: 
     assert not (state / "calls").exists()  # memfun swarm was never started
 
 
-def test_missing_bundle_is_a_harness_error(
+def test_broken_bundle_and_broken_reference_are_harness_errors(
     tmp_path: Path, models_server: tuple[str, type[_Models]]
 ) -> None:
     base_url, _ = models_server
-    _, results, state = _run(tmp_path, base_url, ["no-such-bundle"])
-    ep = results["episodes"][0]
-    assert ep["outcome"] == "harness_error"
-    assert "missing/invalid bundle files" in ep["reason"]
+    root = tmp_path / "bundles"
+    shutil.copytree(SMOKE / "formats-2", root / "formats-2")
+    (root / "formats-2" / "hidden" / "test_duration.py").unlink()  # missing bundle file
+    shutil.copytree(SMOKE / "textkit-3", root / "textkit-3")
+    (root / "textkit-3" / "solution" / "textkit" / "wrap.py").write_text("def wrap(:\n")
+    _, results, state = _run(
+        tmp_path, base_url, ["formats-2", "textkit-3"], "--bundles-root", str(root)
+    )
+    eps = _episodes(results)
+    assert eps["formats-2"]["outcome"] == "harness_error"
+    assert "missing/invalid bundle files" in eps["formats-2"]["reason"]
+    assert eps["textkit-3"]["outcome"] == "harness_error"  # the grader itself is suspect
+    assert "reference solution does not pass" in eps["textkit-3"]["reason"]
     assert not (state / "calls").exists()
 
 
@@ -674,14 +692,22 @@ def test_event_metrics_concurrency_tokens_and_derived_tasks() -> None:
 
 def test_classification_rules() -> None:
     assert rs.classify(fatal="git setup failed")[0] == "harness_error"
-    assert rs.classify(timed_out=True, timeout_s=5)[1].startswith("episode timeout after 5s")
-    assert rs.classify(returncode=1, produced_result=False)[0] == "harness_error"
+    no_out: dict[str, Any] = {"any_output": False}
+    assert rs.classify(timed_out=True, timeout_s=5, **no_out)[1].startswith(
+        "episode timeout after 5s"
+    )
+    # with owned output, a timeout / crash is graded on its merits (no pass-rate exclusion)
+    assert rs.classify(timed_out=True, all_pass=True)[0] == "pass"
+    assert rs.classify(timed_out=True, hidden_passed=0)[0] == "model_failure"
+    assert rs.classify(returncode=1, produced_result=False, **no_out)[0] == "harness_error"
+    assert rs.classify(returncode=1, produced_result=False, hidden_passed=2)[0] == "partial"
     # a swarm that ran but reported failure is the model's problem, not the harness's
     assert rs.classify(returncode=1, produced_result=True)[0] == "model_failure"
     assert rs.classify(grade_error="grader crashed (pytest rc=3)")[0] == "harness_error"
     assert rs.classify(all_pass=True, hidden_passed=9)[0] == "pass"
     assert rs.classify(all_pass=True, server_errors=2)[0] == "pass"
-    assert rs.classify(hidden_passed=0, server_errors=1)[0] == "harness_error"
+    assert rs.classify(hidden_passed=0, server_errors=1, **no_out)[0] == "harness_error"
+    assert rs.classify(hidden_passed=0, server_errors=1)[0] == "model_failure"  # symmetric
     assert rs.classify(hidden_passed=3)[0] == "partial"
     assert rs.classify(hidden_passed=0)[0] == "model_failure"
 
@@ -724,3 +750,395 @@ def test_prom_counters_sum_labelled_samples() -> None:
         "sglang:prompt_tokens_total": 150.0,
         "sglang:generation_tokens_total": 7.0,
     }
+
+
+# ── audit fixes: symlink-safe collection ───────────────────────────────────────
+
+TEXTKIT_SOL = SMOKE / "textkit-3" / "solution"
+
+
+def _repo_with_worktree(tmp_path: Path) -> tuple[rs.Bundle, Path, Path]:
+    bundle = rs.load_bundle(SMOKE / "textkit-3")
+    repo = tmp_path / "repo"
+    shutil.copytree(bundle.path / "repo", repo)
+    wt = repo / ".memfun" / "worktrees" / "wf1" / "T1"
+    shutil.copytree(bundle.path / "repo", wt)
+    for name in ("wrap.py", "roman.py"):  # two legit regular-file units
+        shutil.copy(TEXTKIT_SOL / "textkit" / name, wt / "textkit" / name)
+    return bundle, repo, wt
+
+
+def _collect_grade(bundle: rs.Bundle, repo: Path, tmp_path: Path) -> tuple[Any, Any]:
+    dest = tmp_path / "collected"
+    dest.mkdir()
+    collected = rs.collect_owned(bundle, repo, dest)
+    grade = rs.grade_candidate(bundle, dest, tmp_path / "g", 120)
+    return collected, grade
+
+
+def _plant(case: str, repo: Path, wt: Path) -> None:
+    sol_file = TEXTKIT_SOL / "textkit" / "slugify.py"
+    leaf = wt / "textkit" / "slugify.py"
+    if case == "absolute":
+        leaf.unlink()
+        leaf.symlink_to(sol_file.resolve())
+    elif case == "relative":
+        leaf.unlink()
+        leaf.symlink_to(os.path.relpath(sol_file.resolve(), leaf.parent.resolve()))
+    elif case == "parent_component":
+        shutil.rmtree(wt / "textkit")
+        (wt / "textkit").symlink_to((TEXTKIT_SOL / "textkit").resolve())
+    elif case == "root_parent_component":
+        shutil.rmtree(repo / ".memfun")
+        shutil.rmtree(repo / "textkit")
+        (repo / "textkit").symlink_to((TEXTKIT_SOL / "textkit").resolve())
+    elif case == "worktree_dir":
+        shutil.rmtree(repo / ".memfun")
+        (repo / ".memfun" / "worktrees" / "wf1").mkdir(parents=True)
+        (repo / ".memfun" / "worktrees" / "wf1" / "T9").symlink_to(TEXTKIT_SOL.resolve())
+    elif case == "worktrees_root":
+        shutil.rmtree(repo / ".memfun")
+        fake = repo.parent / "elsewhere" / "wf1"
+        shutil.copytree(TEXTKIT_SOL, fake / "T1")
+        (repo / ".memfun").mkdir()
+        (repo / ".memfun" / "worktrees").symlink_to(fake.parent.resolve())
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "absolute",
+        "relative",
+        "parent_component",
+        "root_parent_component",
+        "worktree_dir",
+        "worktrees_root",
+    ],
+)
+def test_symlinked_owned_files_never_count_as_output(tmp_path: Path, case: str) -> None:
+    bundle, repo, wt = _repo_with_worktree(tmp_path)
+    _plant(case, repo, wt)
+    collected, grade = _collect_grade(bundle, repo, tmp_path)
+    assert collected["tampering"], case
+    assert grade["units"]["slugify"]["passed"] is False, case
+    assert not (tmp_path / "collected" / "textkit" / "slugify.py").exists()
+    assert collected["units"]["slugify"]["output"] is False
+    if case in ("absolute", "relative", "parent_component", "root_parent_component"):
+        assert collected["units"]["slugify"]["symlink_tampering"] is True
+
+
+def test_legit_regular_files_still_pass(tmp_path: Path) -> None:
+    bundle, repo, wt = _repo_with_worktree(tmp_path)
+    shutil.copy(TEXTKIT_SOL / "textkit" / "slugify.py", wt / "textkit" / "slugify.py")
+    collected, grade = _collect_grade(bundle, repo, tmp_path)
+    assert collected["tampering"] == []
+    assert grade["all_pass"] is True
+
+
+def test_fifo_and_oversized_owned_files_are_refused(tmp_path: Path) -> None:
+    bundle, repo, wt = _repo_with_worktree(tmp_path)
+    (wt / "textkit" / "slugify.py").unlink()
+    os.mkfifo(wt / "textkit" / "slugify.py")  # opening it must not block
+    (wt / "textkit" / "wrap.py").write_bytes(b"#" * (rs.MAX_OWNED_BYTES + 1))
+    dest = tmp_path / "collected"
+    dest.mkdir()
+    collected = rs.collect_owned(bundle, repo, dest)
+    problems = " | ".join(collected["tampering"])
+    assert "not a regular file" in problems and "too large" in problems
+    assert collected["units"]["slugify"]["output"] is False
+    assert collected["units"]["wrap"]["output"] is False
+    assert collected["units"]["roman"]["output"] is True
+
+
+def test_runner_flags_symlinked_output_and_does_not_pass(
+    tmp_path: Path, models_server: tuple[str, type[_Models]]
+) -> None:
+    base_url, _ = models_server
+    _, results, _ = _run(tmp_path, base_url, ["textkit-3"], modes={"textkit-3": "symlink"})
+    ep = results["episodes"][0]
+    assert ep["outcome"] != "pass"
+    assert "symlink_tampering" in ep["flags"]
+    assert all(u["status"] == "fail" for u in ep["units"].values())
+
+
+def test_write_private_replaces_a_planted_symlink_without_following_it(tmp_path: Path) -> None:
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep")
+    (tmp_path / "episode.json").symlink_to(victim)
+    rs.write_private(tmp_path / "episode.json", "{}")
+    assert victim.read_text() == "keep"
+    assert not (tmp_path / "episode.json").is_symlink()
+
+
+def test_archive_refuses_a_planted_artifact_dir(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    (src / "a").mkdir(parents=True)
+    (src / "a" / "f.py").write_text("x")
+    ep = tmp_path / "ep"
+    ep.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (ep / "graded").symlink_to(elsewhere)
+    assert "not archived" in rs.archive_dir(src, ep, "graded")
+    assert list(elsewhere.iterdir()) == []
+
+
+# ── audit fixes: one unit's crash only fails that unit ─────────────────────────
+
+CRASHES = {
+    "sys_exit": "import sys\nsys.exit(0)\n",
+    "system_exit": "raise SystemExit(0)\n",
+    "keyboard_interrupt": "raise KeyboardInterrupt\n",
+    "os_exit": "import os\nos._exit(7)\n",
+    "syntax_error": "def broken(:\n",
+    "pytest_exit": "import pytest\npytest.exit('bye')\n",
+    "infinite_loop": "while True:\n    pass\n",
+}
+
+
+@pytest.mark.parametrize("mode", list(CRASHES))
+def test_a_crashing_unit_does_not_zero_the_others(tmp_path: Path, mode: str) -> None:
+    bundle = rs.load_bundle(SMOKE / "textkit-3")
+    cand = tmp_path / "cand"
+    shutil.copytree(TEXTKIT_SOL, cand)
+    slug = cand / "textkit" / "slugify.py"
+    slug.write_text(slug.read_text() + "\n" + CRASHES[mode])  # runs at import
+    grade = rs.grade_candidate(bundle, cand, tmp_path / "g", 8 if mode == "infinite_loop" else 120)
+    units = grade["units"]
+    assert units["slugify"]["passed"] is False
+    assert units["wrap"]["passed"] is True and units["roman"]["passed"] is True
+    assert units["wrap"]["tests"]["passed"] > 0
+    if mode == "infinite_loop":
+        assert units["slugify"]["timeout"] is True and "slugify" in grade["timeouts"]
+    outcome, _ = rs.classify(hidden_passed=grade["hidden_passed"], all_pass=grade["all_pass"])
+    assert outcome == "partial"
+
+
+def test_runner_unguarded_exit_in_one_unit_is_partial_not_harness_error(
+    tmp_path: Path, models_server: tuple[str, type[_Models]]
+) -> None:
+    base_url, _ = models_server
+    _, results, _ = _run(tmp_path, base_url, ["textkit-3"], modes={"textkit-3": "exit_unit"})
+    ep = results["episodes"][0]
+    assert ep["outcome"] == "partial", ep["reason"]
+    assert ep["units"]["slugify"]["status"] == "fail"
+    assert ep["units"]["wrap"]["status"] == "pass"
+    assert results["overall"]["outcomes"]["harness_error"] == 0
+
+
+def test_timeout_with_output_is_graded_and_recovered_server_errors_stay_pass(
+    tmp_path: Path, models_server: tuple[str, type[_Models]]
+) -> None:
+    base_url, _ = models_server
+    _, results, _ = _run(
+        tmp_path, base_url, ["formats-2", "textkit-3"], "--episode-timeout", "4",
+        "--parallel-tasks", "2",
+        modes={"formats-2": "hang_after_output", "textkit-3": "server_error_recovered"},
+    )  # fmt: skip
+    eps = _episodes(results)
+    assert eps["formats-2"]["outcome"] == "pass"
+    assert "episode_timeout" in eps["formats-2"]["flags"]
+    assert eps["textkit-3"]["outcome"] == "pass"
+    assert "server_errors" in eps["textkit-3"]["flags"] and eps["textkit-3"]["server_errors"] >= 1
+
+
+# ── audit fixes: signals, partial results, operator cleanup ────────────────────
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_signal_during_dashboard_startup_leaves_no_dashboard(
+    tmp_path: Path, models_server: tuple[str, type[_Models]], sig: signal.Signals
+) -> None:
+    base_url, _ = models_server
+    state = tmp_path / "state"
+    cmd = [*shlex.split(_fake_cmd(state)), "--dash-delay", "120"]
+    runner = subprocess.Popen(
+        [
+            sys.executable, str(SWARM_EVALS / "run_smoke.py"), "--base-url", base_url,
+            "--bundles", "formats-2", "--memfun-cmd", shlex.join(cmd),
+            "--out-dir", str(tmp_path / "runs"), "--run-id", "r1",
+            "--dashboard-port", str(_free_port()), "--kill-grace", "2",
+        ],
+        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )  # fmt: skip
+    try:
+        pidfile = state / "dashboard.pid"
+        for _ in range(1200):
+            if pidfile.is_file() and pidfile.read_text():
+                break
+            time.sleep(0.05)
+        dash_pid = int(pidfile.read_text())
+        runner.send_signal(sig)
+        assert runner.wait(timeout=120) == 130
+        assert _wait_dead(dash_pid)
+        assert not (state / "calls").exists()
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(runner.pid, signal.SIGKILL)
+        runner.wait()
+
+
+def test_partial_results_and_pgids_survive_a_sigkilled_runner(
+    tmp_path: Path, models_server: tuple[str, type[_Models]]
+) -> None:
+    base_url, _ = models_server
+    state = tmp_path / "state"
+    run_dir = tmp_path / "runs" / "r1"
+    runner = subprocess.Popen(
+        [
+            sys.executable, str(SWARM_EVALS / "run_smoke.py"), "--base-url", base_url,
+            "--bundles", "formats-2", "textkit-3", "--parallel-tasks", "2",
+            "--memfun-cmd", _fake_cmd(state, {"textkit-3": "hang"}),
+            "--out-dir", str(tmp_path / "runs"), "--run-id", "r1", "--no-dashboard",
+            "--episode-timeout", "600",
+        ],
+        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )  # fmt: skip
+    pgid = 0
+    try:
+        for _ in range(2400):
+            done = (run_dir / "results.json").is_file() and (state / "hang_child.pid").is_file()
+            if done:
+                break
+            time.sleep(0.05)
+        os.kill(runner.pid, signal.SIGKILL)
+        runner.wait()
+        partial = json.loads((run_dir / "results.json").read_text())
+        assert [e["episode"] for e in partial["episodes"]] == ["formats-2-t1"]
+        assert partial["episodes"][0]["outcome"] == "pass"
+        lines: dict[str, str] = {}
+        for line in (run_dir / "pgids.txt").read_text().splitlines():
+            group, episode = line.split()
+            lines[episode] = group
+        pgid = int(lines["textkit-3-t1"])
+        os.killpg(pgid, 0)  # the orphaned swarm group is still there ...
+        os.killpg(pgid, signal.SIGTERM)  # ... and the README's cleanup removes it
+        assert _wait_dead(int((state / "hang_child.pid").read_text()))
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(runner.pid, signal.SIGKILL)
+        if pgid:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+
+
+def test_kill_groups_uses_one_shared_grace_and_kills_term_ignorers(tmp_path: Path) -> None:
+    code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)"
+    procs = [
+        subprocess.Popen([sys.executable, "-c", code], start_new_session=True) for _ in range(3)
+    ]
+    try:
+        time.sleep(0.5)  # let them install the handler (not an assertion)
+        rs.kill_groups([p.pid for p in procs], grace=1.0)
+        for p in procs:
+            assert p.wait(timeout=30) == -signal.SIGKILL
+    finally:
+        for p in procs:
+            with contextlib.suppress(ProcessLookupError):
+                p.kill()
+
+
+def test_forwarder_finish_skips_the_final_drain_when_the_thread_is_stuck(tmp_path: Path) -> None:
+    release = threading.Event()
+
+    class Stuck(rs.EventForwarder):
+        pumps = 0
+
+        def run(self) -> None:
+            release.wait(30)
+
+        def pump(self) -> None:
+            Stuck.pumps += 1
+
+    fwd = Stuck(tmp_path / "x.db", 1)
+    fwd.start()
+    fwd.finish(join_timeout=0.2)
+    assert fwd.stuck is True and Stuck.pumps == 0
+    release.set()
+    fwd.join(10)
+
+
+def test_read_events_is_strictly_read_only(tmp_path: Path) -> None:
+    import sqlite3
+
+    db = tmp_path / "memfun.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE other (x)")
+    con.commit()
+    con.close()
+    before = db.read_bytes()
+    assert rs.read_events(db) == []  # no events table yet: empty, retried later
+    assert db.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["memfun.db"]
+
+
+def test_cross_host_redirect_is_refused(models_server: tuple[str, type[_Models]]) -> None:
+    base_url, models = models_server
+    port = urllib.parse.urlsplit(base_url).port
+    models.redirect_to = f"http://localhost:{port}/v1/models"
+    _, err = rs.preflight(base_url, None)
+    assert "cross-host redirect" in err
+
+
+# ── audit fixes: argument validation, out-dir ──────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--bundles", "../../../X"],
+        ["--bundles", ","],
+        ["--bundles", "no-such-bundle"],
+        ["--max-agents", "0"],
+        ["--max-agents", "101"],
+        ["--parallel-tasks", "0"],
+        ["--parallel-tasks", "65"],
+        ["--trials", "0"],
+        ["--run-id", "a..b"],
+        ["--run-id", "a/b"],
+        ["--metrics-url", "file:///etc/passwd"],
+        ["--out-dir", str(REPO_ROOT / "evals" / "swarm" / "runs")],
+    ],
+)
+def test_bad_arguments_are_refused(
+    tmp_path: Path, extra: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["--base-url", "http://127.0.0.1:18000/v1", "--out-dir", str(tmp_path / "runs")]
+    rc = rs.main([*argv, "--memfun-cmd", "false", *extra])
+    assert rc == 2, extra
+    assert "run_smoke:" in capsys.readouterr().err
+    assert not (tmp_path / "runs").exists()
+    assert not (REPO_ROOT / "evals" / "swarm" / "runs").exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
+def test_bundles_are_deduped_and_non_loopback_urls_warn(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = rs.main([
+        "--base-url", "http://10.1.2.3:18000/v1", "--bundles", "formats-2,formats-2",
+        "textkit-3", "--out-dir", str(tmp_path / "runs"), "--dry-plan",
+    ])  # fmt: skip
+    cap = capsys.readouterr()
+    assert rc == 0 and "episodes      : 2" in cap.out
+    assert "WARNING: --base-url" in cap.err and "NOT a loopback" in cap.err
+
+
+def test_default_out_dir_is_outside_the_checkout() -> None:
+    out = rs.DEFAULT_OUT_DIR.resolve()
+    assert out != REPO_ROOT and REPO_ROOT not in out.parents
+
+
+def test_episode_repo_is_its_own_pytest_rootdir(
+    tmp_path: Path, models_server: tuple[str, type[_Models]]
+) -> None:
+    base_url, _ = models_server
+    _, results, _ = _run(tmp_path, base_url, ["formats-2"])
+    repo = Path(results["episodes"][0]["repo"])
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-p", "no:cacheprovider", "tests"],
+        cwd=repo, capture_output=True, text=True, timeout=120,
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)},
+    )  # fmt: skip
+    assert f"rootdir: {repo.resolve()}" in proc.stdout or f"rootdir: {repo}" in proc.stdout
+    assert "configfile: pytest.ini" in proc.stdout
