@@ -128,6 +128,16 @@ Web tool configuration for URL fetching and web search.
 | `tavily_api_key_env` | string | `"TAVILY_API_KEY"` | Env var for Tavily API key |
 | `searxng_url` | string | `"http://localhost:8888"` | SearXNG instance URL |
 
+## Dashboard Environment Variables
+
+The live dashboard (`memfun dashboard`, or embedded in `memfun chat`) reads these at request time:
+
+| Variable | Description |
+|----------|-------------|
+| `MEMFUN_DASHBOARD_TOKEN` | Token non-local clients must present (falls back to `~/.config/memfun/dashboard_token`) |
+| `MEMFUN_INFERENCE_METRICS_URL` | Prometheus endpoint of the SGLang/vLLM server for the swarm view's server strip (e.g. `http://127.0.0.1:30000/metrics`) |
+| `MEMFUN_POD_RATE_USD` | Default pod cost in USD/hour (e.g. `8.99`) for the cost meter. Used only while the page's pod-rate box is empty; a value typed there always wins. Invalid or negative values are ignored. |
+
 ## Minimal Configuration
 
 A minimal `memfun.toml` that uses all defaults:

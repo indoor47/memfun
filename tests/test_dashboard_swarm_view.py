@@ -57,8 +57,9 @@ def test_malformed_lines_are_skipped() -> None:
 
 def test_server_metrics_disabled_without_configured_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEMFUN_INFERENCE_METRICS_URL", raising=False)
+    monkeypatch.delenv("MEMFUN_POD_RATE_USD", raising=False)
     client = TestClient(create_app(), client=("127.0.0.1", 50000))
-    assert client.get("/api/server-metrics").json() == {"enabled": False}
+    assert client.get("/api/server-metrics").json() == {"enabled": False, "pod_rate": None}
 
 
 def test_server_metrics_fetch_only_the_configured_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -81,9 +82,10 @@ def test_unreachable_server_degrades_instead_of_failing(monkeypatch: pytest.Monk
         raise OSError("connection refused")
 
     monkeypatch.setenv("MEMFUN_INFERENCE_METRICS_URL", "http://127.0.0.1:1/metrics")
+    monkeypatch.delenv("MEMFUN_POD_RATE_USD", raising=False)
     monkeypatch.setattr(server, "_fetch_text", boom)
     body = TestClient(create_app(), client=("127.0.0.1", 50000)).get("/api/server-metrics").json()
-    assert body == {"enabled": True, "ok": False, "error": "OSError"}
+    assert body == {"enabled": True, "ok": False, "error": "OSError", "pod_rate": None}
 
 
 def test_page_ships_the_three_views_without_arrow_chain() -> None:
