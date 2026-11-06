@@ -37,6 +37,7 @@ bound with :func:`role_context` (or ``agent_context(role=...)``).
 from __future__ import annotations
 
 import contextlib
+import logging
 import threading
 import time
 from contextvars import ContextVar
@@ -68,6 +69,35 @@ TRUNCATED_ERROR = (
 _TRUNCATIONS: dict[str, int] = {}
 _TRUNCATIONS_LOCK = threading.Lock()
 
+#: DSPy logs this (WARNING, logger ``dspy.clients.lm``) when a response hit max_tokens.
+_DSPY_LM_LOGGER = "dspy.clients.lm"
+_DSPY_TRUNCATION_MARKER = "truncated"
+
+
+class LLMTruncatedError(RuntimeError):
+    """An LLM response was cut off by ``max_tokens``; the run must not continue quietly."""
+
+
+class ContextFirstTruncatedError(LLMTruncatedError):
+    """The context-first solver's response was truncated by ``max_tokens``."""
+
+
+def truncation_advice(role: str | None = None) -> str:
+    """Operator advice appended to every truncation failure."""
+    where = f"[llm.roles.{role}].max_tokens" if role else "[llm.roles.<role>].max_tokens"
+    return f"response truncated (finish_reason=length): raise [llm] max_tokens (or {where})"
+
+
+def reset_truncations() -> None:
+    """Forget recorded truncations (a fresh swarm run starts from zero)."""
+    with _TRUNCATIONS_LOCK:
+        _TRUNCATIONS.clear()
+
+
+def total_truncations() -> int:
+    """Truncated LLM responses seen by this process, summed over roles."""
+    return sum(truncation_counts().values())
+
 
 def truncation_counts() -> dict[str, int]:
     """Truncated LLM responses seen by this process, by role."""
@@ -80,6 +110,45 @@ def _record_truncation(role: str) -> None:
         _TRUNCATIONS[role] = _TRUNCATIONS.get(role, 0) + 1
 
 
+# Dedupe: DSPy emits the truncation WARNING *before* ``on_lm_end`` fires, in the
+# same context.  The log hook is the counter of record; it sets this flag and the
+# callback, seeing it, only marks the llm.call event failed instead of counting a
+# second time.  The callback still counts on its own when the hook is absent.
+_hook_counted: ContextVar[bool] = ContextVar("memfun_truncation_hook_counted", default=False)
+
+
+class _TruncationLogHandler(logging.Handler):
+    """Counts a truncated response when DSPy logs its ``truncated`` warning."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if record.levelno < logging.WARNING:
+                return
+            if _DSPY_TRUNCATION_MARKER not in record.getMessage().lower():
+                return
+            role = current_role()
+            _record_truncation(role)
+            _hook_counted.set(True)
+            logger.error("LLM RESPONSE TRUNCATED (role=%s): %s", role, truncation_advice(role))
+        except Exception:
+            # Observability must never break the LM call.
+            logger.debug("truncation hook failed", exc_info=True)
+
+
+def install_truncation_hook() -> None:
+    """Attach the callback-independent truncation detector (idempotent)."""
+    target = logging.getLogger(_DSPY_LM_LOGGER)
+    if any(isinstance(h, _TruncationLogHandler) for h in target.handlers):
+        return
+    target.addHandler(_TruncationLogHandler(level=logging.WARNING))
+
+
+def _normalize_finish_reason(reason: str) -> str:
+    """Map provider spellings of "hit max_tokens" (``max_tokens``) to ``length``."""
+    lowered = reason.strip().lower()
+    return "length" if lowered in ("length", "max_tokens", "max_output_tokens") else reason
+
+
 def _finish_reason(instance: Any, outputs: Any) -> str | None:
     """``finish_reason`` of the call that just ended (DSPy history, else *outputs*)."""
     history = getattr(instance, "history", None)
@@ -87,6 +156,10 @@ def _finish_reason(instance: Any, outputs: Any) -> str | None:
         entry = history[-1]
         if isinstance(entry, dict):
             response = cast("object", entry.get("response"))
+            # lm15 ``Response`` (DSPy engine="auto"): no ``choices``, a flat ``finish_reason``.
+            flat = getattr(response, "finish_reason", None)
+            if isinstance(flat, str):
+                return _normalize_finish_reason(flat)
             choices = getattr(response, "choices", None)
             if choices is None and isinstance(response, dict):
                 choices = cast("dict[str, Any]", response).get("choices")
@@ -98,13 +171,13 @@ def _finish_reason(instance: Any, outputs: Any) -> str | None:
                     else getattr(first, "finish_reason", None)
                 )
                 if isinstance(reason, str):
-                    return reason
+                    return _normalize_finish_reason(reason)
     if isinstance(outputs, list):
         for item in cast("list[object]", outputs):
             if isinstance(item, dict):
                 reason = cast("dict[str, Any]", item).get("finish_reason")
                 if isinstance(reason, str):
-                    return reason
+                    return _normalize_finish_reason(reason)
     return None
 
 
@@ -373,6 +446,7 @@ class MemfunDSPyCallback:
                 "instance": instance,
             }
             _call_start_state.set(state)
+            _hook_counted.set(False)
         except Exception:
             # Never let observability blow up the LM call.
             logger.debug("on_lm_start failed", exc_info=True)
@@ -410,14 +484,18 @@ class MemfunDSPyCallback:
                 truncated_role = current_role()
                 success = False
                 error = TRUNCATED_ERROR
-                _record_truncation(truncated_role)
-                logger.error(
-                    "LLM RESPONSE TRUNCATED (role=%s, model=%s, %s completion tokens): %s",
-                    truncated_role,
-                    model or UNKNOWN_MODEL,
-                    completion_tokens,
-                    TRUNCATED_ERROR,
-                )
+                if _hook_counted.get():
+                    # The log hook already counted and logged this response.
+                    _hook_counted.set(False)
+                else:
+                    _record_truncation(truncated_role)
+                    logger.error(
+                        "LLM RESPONSE TRUNCATED (role=%s, model=%s, %s completion tokens): %s",
+                        truncated_role,
+                        model or UNKNOWN_MODEL,
+                        completion_tokens,
+                        TRUNCATED_ERROR,
+                    )
 
             ctx = _active_agent_context.get() or {}
             event_payload = {
@@ -623,6 +701,7 @@ def install_dspy_callback() -> None:
     by class name so the chat REPL / swarm / agent CLI commands can all
     invoke this at startup without piling up redundant handlers.
     """
+    install_truncation_hook()
     try:
         import dspy
 

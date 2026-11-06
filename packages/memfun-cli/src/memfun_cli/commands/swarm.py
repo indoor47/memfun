@@ -176,7 +176,15 @@ def _display_final_summary(
                 f"[red]failed: {cr.error}[/red]",
             )
 
-    border = "green" if result.success else "red"
+    truncated = _truncated_responses()
+    if truncated:
+        table.add_row(
+            "truncated",
+            f"[red]LLM RESPONSE TRUNCATED x{truncated}: raise [llm] max_tokens "
+            "(or [llm.roles.<role>].max_tokens)[/red]",
+        )
+
+    border = "green" if result.success and not truncated else "red"
     console.print()
     console.print(
         Panel(
@@ -224,6 +232,16 @@ def _normalize_op(op: Any) -> dict[str, str]:
     }
 
 
+def _truncated_responses() -> int:
+    """Truncated LLM responses in this process (all roles); 0 if telemetry is unavailable."""
+    try:
+        from memfun_agent.llm_telemetry import total_truncations
+
+        return total_truncations()
+    except Exception:
+        return 0
+
+
 def _swarm_result_payload(
     result: WorkflowResult | None,
     wall_seconds: float,
@@ -266,11 +284,23 @@ def _swarm_result_payload(
             # Per-task review verdicts live in engine state, not on WorkflowResult.
             "review": None,
         }
+    error_text = (result.error if result is not None else error) or None
+    success = bool(result.success) if result is not None else False
+    truncated = _truncated_responses()
+    if truncated:
+        success = False
+        if not error_text or "truncated" not in error_text.lower():
+            advice = (
+                f"{truncated} LLM response(s) truncated (finish_reason=length): "
+                "raise [llm] max_tokens (or [llm.roles.<role>].max_tokens)"
+            )
+            error_text = f"{error_text}; {advice}" if error_text else advice
     return {
         "schema_version": RESULT_JSON_SCHEMA_VERSION,
         "workflow_id": result.workflow_id if result is not None else None,
-        "success": bool(result.success) if result is not None else False,
-        "error": (result.error if result is not None else error) or None,
+        "success": success,
+        "error": error_text,
+        "truncated_responses": truncated,
         "unaccepted_tasks": list(result.unaccepted_tasks) if result is not None else [],
         "review_errors": result.review_errors if result is not None else 0,
         "review_rounds": result.review_rounds if result is not None else 0,
@@ -361,6 +391,22 @@ async def _run_swarm(
     _load_credentials()
     config = MemfunConfig.load()
     _configure_dspy(config)
+
+    # Truncation must be visible in swarm: install the callback AND the
+    # callback-independent log hook explicitly (``_configure_dspy`` returns
+    # early without an API key, and the callback alone missed real runs).
+    try:
+        from memfun_agent.llm_telemetry import (
+            install_dspy_callback,
+            install_truncation_hook,
+            reset_truncations,
+        )
+
+        reset_truncations()
+        install_truncation_hook()
+        install_dspy_callback()
+    except Exception:
+        logger.debug("Failed to install truncation detection", exc_info=True)
 
     project_root = Path.cwd()
 
@@ -559,7 +605,7 @@ async def _run_swarm(
     wall = time.perf_counter() - start
     _display_final_summary(result, wall)
     _write_swarm_result_json(_swarm_result_payload(result, wall, sub_tasks_seen))
-    return 0 if result.success else 1
+    return 0 if result.success and not _truncated_responses() else 1
 
 
 # ── Typer entrypoint ───────────────────────────────────────────────
