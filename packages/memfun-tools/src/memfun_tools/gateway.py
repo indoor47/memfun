@@ -15,30 +15,35 @@ from memfun_tools.web.search import search_server as web_search_server
 def create_gateway() -> FastMCP:
     """Create the main Memfun MCP gateway composing all tool servers.
 
-    Tool namespaces:
-    - fs.*       — File system operations (read, write, list, glob)
-    - search.*   — Code search (ripgrep, ast-grep)
-    - git.*      — Git operations (status, diff, log, show, blame)
-    - repo.*     — Repository map and file summary
-    - web.*      — Web fetch and search
-    - skills.*   — Skill discovery, search, and invocation
-    - agents.*   — Agent definition discovery and invocation
+    Each server is mounted under a namespace; fastmcp joins namespace and
+    tool name with ``_`` (e.g. ``fs`` + ``read_file`` -> ``fs_read_file``):
+    - fs_*         — File system operations (read, write, edit, list, glob)
+    - search_*     — Code search (ripgrep, ast-grep)
+    - git_*        — Git operations (status, diff, log, show, blame)
+    - repo_*       — Repository map and file summary
+    - web_fetch_*  — Web fetch
+    - web_search_* — Web search
+    - skills_*     — Skill discovery, search, and invocation
+    - agents_*     — Agent definition discovery and invocation
+
+    ``mount(..., namespace=...)`` is the fastmcp 3.x spelling of the
+    deprecated ``prefix=`` keyword and yields identical tool names.
     """
     gateway = FastMCP("memfun-gateway")
 
     # Mount code tools
-    gateway.mount(fs_server, prefix="fs")
-    gateway.mount(search_server, prefix="search")
-    gateway.mount(git_server, prefix="git")
-    gateway.mount(repo_map_server, prefix="repo")
+    gateway.mount(fs_server, namespace="fs")
+    gateway.mount(search_server, namespace="search")
+    gateway.mount(git_server, namespace="git")
+    gateway.mount(repo_map_server, namespace="repo")
 
     # Mount web tools
-    gateway.mount(fetch_server, prefix="web_fetch")
-    gateway.mount(web_search_server, prefix="web_search")
+    gateway.mount(fetch_server, namespace="web_fetch")
+    gateway.mount(web_search_server, namespace="web_search")
 
     # Mount skills and agents
-    gateway.mount(skills_server, prefix="skills")
-    gateway.mount(agents_server, prefix="agents")
+    gateway.mount(skills_server, namespace="skills")
+    gateway.mount(agents_server, namespace="agents")
 
     return gateway
 
