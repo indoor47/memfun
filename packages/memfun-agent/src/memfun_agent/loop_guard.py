@@ -114,12 +114,24 @@ def enabled() -> bool:
     return os.environ.get(ENV_DISABLE, "").lower() not in ("0", "false", "off", "no")
 
 
+#: (litellm model string, api_base) pairs of the LMs built with ``[llm] loop_guard = true``.
+#: The litellm wrapper is process-wide but only touches calls to these exact endpoints.
+_GUARDED: set[tuple[str, str]] = set()
+
+
+def register_guarded(model: str, api_base: str) -> None:
+    """Mark calls to ``model`` at ``api_base`` as guarded (idempotent)."""
+    with _LOCK:
+        _GUARDED.add((model, api_base))
+
+
 def _guardable(kwargs: dict[str, Any]) -> bool:
-    model = kwargs.get("model")
+    model, api_base = kwargs.get("model"), kwargs.get("api_base")
     return (
         isinstance(model, str)
         and model.startswith("openai/")
-        and bool(kwargs.get("api_base"))
+        and isinstance(api_base, str)
+        and (model, api_base) in _GUARDED
         and not kwargs.get("stream")
         and enabled()
     )

@@ -84,6 +84,7 @@ def test_mid_stream_errors_are_retried(fake: Any, monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(lg, "RETRY_BACKOFF_S", 0.0)
     lg.install_loop_guard()
+    lg.register_guarded("openai/m", fake.base)
     calls = {"n": 0}
     real = litellm.completion
 
@@ -323,11 +324,23 @@ def test_guard_can_be_disabled(fake: Any, monkeypatch: pytest.MonkeyPatch) -> No
     assert not fake.requests[-1].get("stream")  # plain request, no streaming
 
 
-def test_guard_is_off_for_other_providers() -> None:
-    assert lg._guardable({"model": "anthropic/x", "api_base": "http://h"}) is False  # pyright: ignore[reportPrivateUsage]
-    assert lg._guardable({"model": "openai/x"}) is False  # pyright: ignore[reportPrivateUsage]
-    assert lg._guardable({"model": "openai/x", "api_base": "http://h", "stream": True}) is False  # pyright: ignore[reportPrivateUsage]
-    assert lg._guardable({"model": "openai/x", "api_base": "http://h"}) is True  # pyright: ignore[reportPrivateUsage]
+def test_guard_only_touches_registered_endpoints() -> None:
+    lg.register_guarded("openai/x", "http://h")
+    guard = lg._guardable  # pyright: ignore[reportPrivateUsage]
+    assert guard({"model": "openai/x", "api_base": "http://h"}) is True
+    assert guard({"model": "openai/x", "api_base": "http://other"}) is False  # not registered
+    assert guard({"model": "openai/y", "api_base": "http://h"}) is False
+    assert guard({"model": "anthropic/x", "api_base": "http://h"}) is False
+    assert guard({"model": "openai/x"}) is False
+    assert guard({"model": "openai/x", "api_base": "http://h", "stream": True}) is False
+
+
+def test_an_unguarded_lm_on_another_endpoint_is_not_streamed(fake: Any) -> None:
+    """The litellm wrapper is process-wide; an LM built without loop_guard is untouched."""
+    role_models.build_lm(_cfg("http://127.0.0.1:1/v1"))  # installs the wrapper, registers it
+    lm = role_models.build_lm(_cfg(fake.base, loop_guard=False))
+    lm(f"unguarded {time.time_ns()}")
+    assert not fake.requests[-1].get("stream")
 
 
 def test_guard_is_opt_in_per_llm_config(fake: Any) -> None:

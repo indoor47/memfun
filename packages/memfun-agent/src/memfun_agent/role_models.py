@@ -179,12 +179,13 @@ def build_lm(llm: LLMConfig) -> Any:
     import dspy
 
     name, kwargs = lm_settings(llm)
-    from memfun_agent.loop_guard import enabled, install_loop_guard
+    from memfun_agent.loop_guard import enabled, install_loop_guard, register_guarded
 
     if llm.loop_guard and name.startswith("openai/") and kwargs.get("api_base") and enabled():
         # The loop guard wraps litellm.completion, which DSPy only calls on its LiteLLM
         # engine (the default "auto" picks the native lm15 engine for this request).
         install_loop_guard()
+        register_guarded(name, str(kwargs["api_base"]))
         # Only DSPy >= 3.x has an ``engine`` parameter (the default there picks the native
         # engine, which never reaches litellm); older DSPy always uses litellm and would
         # forward an unknown ``engine`` to the server as a request field.
