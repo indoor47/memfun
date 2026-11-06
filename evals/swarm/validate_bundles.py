@@ -181,7 +181,8 @@ def run_grader(tree: Path, tests_src: Path, scratch: Path, timeout: float) -> Ru
     return RunResult(rc, passed, failed, by_file, str(out)[-1500:])
 
 
-def _schema(bundle: Path, task: dict[str, object]) -> list[str]:
+def schema_problems(bundle: Path, task: dict[str, object]) -> list[str]:
+    """Schema problems of one bundle (empty list: the bundle is well formed)."""
     problems: list[str] = []
     if task.get("id") != bundle.name:
         problems.append(f"id {task.get('id')!r} != directory name {bundle.name!r}")
@@ -234,7 +235,8 @@ def _schema(bundle: Path, task: dict[str, object]) -> list[str]:
     return problems
 
 
-def _fails(res: RunResult, module: str) -> bool:
+def unit_fails(res: RunResult, module: str) -> bool:
+    """True unless ``module`` collected tests and all of them passed."""
     stats = res.by_file.get(module)
     # No testcases under that module name (collection error) counts as failing.
     return stats is None or stats["failed"] > 0 or stats["passed"] == 0
@@ -247,7 +249,7 @@ def validate_bundle(bundle: Path, timeout: float) -> BundleReport:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         report.problems.append(f"task.toml unreadable: {exc}")
         return report
-    report.problems.extend(_schema(bundle, task))
+    report.problems.extend(schema_problems(bundle, task))
     if report.problems:
         return report
     units: list[dict[str, object]] = task["units"]
@@ -265,7 +267,7 @@ def validate_bundle(bundle: Path, timeout: float) -> BundleReport:
         report.oracle = {"passed": res.passed, "failed": res.failed, "rc": res.returncode}
         if res.returncode != 0 or res.failed or not res.passed:
             report.problems.append(f"oracle does not pass all hidden tests:\n{res.output_tail}")
-        missing = [m for m in unit_modules.values() if _fails(res, m)]
+        missing = [m for m in unit_modules.values() if unit_fails(res, m)]
         if missing:
             report.problems.append(f"oracle: no passing tests collected from {missing}")
         if (bundle / "repo" / "tests").is_dir():
@@ -283,7 +285,7 @@ def validate_bundle(bundle: Path, timeout: float) -> BundleReport:
         if (hidden / f"{INTEGRATION}.py").is_file():
             must_fail["<integration>"] = INTEGRATION
         for uid, module in must_fail.items():
-            if not _fails(res, module):
+            if not unit_fails(res, module):
                 report.problems.append(f"null: unit {uid} ({module}) passes without any work")
 
         # --- independence: break one unit, only its tests may fail -----------------------
@@ -301,13 +303,13 @@ def validate_bundle(bundle: Path, timeout: float) -> BundleReport:
                 collateral = [
                     other
                     for other, module in unit_modules.items()
-                    if other != uid and _fails(res, module)
+                    if other != uid and unit_fails(res, module)
                 ]
-                own_fails = _fails(res, unit_modules[uid])
+                own_fails = unit_fails(res, unit_modules[uid])
                 if own_fails and not collateral:
                     report.independence[uid] = "ok"
                 else:
-                    detail = []
+                    detail: list[str] = []
                     if not own_fails:
                         detail.append("its own tests still pass")
                     if collateral:
