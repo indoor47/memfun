@@ -1057,7 +1057,9 @@ def _resolve_path(path: str, root: str | None) -> str:
         candidate = root_path / candidate
     resolved = candidate.resolve()
     if not resolved.is_relative_to(root_path):
-        raise PathOutsideRootError(f"path outside task root: {path!r} -> {resolved} (root={root})")
+        # Don't echo the resolved target: for a symlink it reveals where
+        # outside the root it points.
+        raise PathOutsideRootError(f"path outside task root: {path!r}")
     return str(resolved)
 
 
@@ -1073,10 +1075,10 @@ def _root_extra_tools(
     i.e. the process cwd).  Escapes return a ``[tool error ...]`` string
     in the same shape the bridge uses for failures.
 
-    Known residual gaps (not path arguments, so not rewritten here):
-    ``glob_files``'s ``pattern`` and ``git_diff``'s ``file`` are passed
-    through unchanged and interpreted by the tool relative to ``path``.
-    Tools outside the known set are passed through unwrapped.
+    Non-path arguments (``glob_files``'s ``pattern``, ``grep``'s ``glob``,
+    ``git_diff``'s ``file``) are checked by the bridge itself (absolute and
+    ``..`` patterns rejected) and the filesystem tools bound their matches
+    to the root.  Tools outside the known set are passed through unwrapped.
     """
     wrapped: dict[str, Callable[..., Any]] = {}
     for name, func in tools.items():
