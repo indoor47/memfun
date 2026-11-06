@@ -42,8 +42,8 @@ def test_detects_the_observed_loop() -> None:
 
 
 def test_detects_a_long_repeated_block() -> None:
-    block = "def helper(x):\n    return x + 1  # same line again and again\n" * 1
-    assert _feed_all(LoopDetector(), "prefix\n" + block * 80)
+    block = "def helper(x):\n    return x + 1  # same line again and again\n"
+    assert _feed_all(LoopDetector(), "prefix\n" + block * 150)
 
 
 def test_ordinary_code_and_data_are_not_loops() -> None:
@@ -51,6 +51,17 @@ def test_ordinary_code_and_data_are_not_loops() -> None:
     table = ",\n".join(f"(0x{i:04x}, 0x{i + 7:04x})" for i in range(0, 4000, 7))
     assert not _feed_all(LoopDetector(), code)
     assert not _feed_all(LoopDetector(), table)
+
+
+def test_legitimate_repetition_is_not_a_loop() -> None:
+    """Audit finding: each of these aborted at ~2060 chars with the first thresholds."""
+    long_line = "x" * 249 + "\n"
+    assert not _feed_all(LoopDetector(), long_line * 12)  # 12 identical 250-char lines
+    assert not _feed_all(LoopDetector(), "| 0 | 0 |\n" * 300)  # table rows
+    assert not _feed_all(LoopDetector(), "    pass\n" * 400)
+    assert not _feed_all(LoopDetector(), "0, " * 1000)  # padding
+    assert not _feed_all(LoopDetector(), "0, 0, 0,\n" * 600)  # no letter in the block
+    assert _feed_all(LoopDetector(), "ab " * 4000)  # ... but a real 12 000-char loop is cut
 
 
 def test_single_character_runs_and_short_repeats_are_not_loops() -> None:
@@ -66,6 +77,46 @@ def test_detection_is_incremental_and_bounded() -> None:
     assert not _feed_all(det, "".join(f"line {i} of normal output\n" for i in range(5000)), 211)
     assert time.perf_counter() - start < 5
     assert len(det._tail) <= lg.MIN_REPEAT_CHARS + lg.MAX_BLOCK * 2  # pyright: ignore[reportPrivateUsage]
+
+
+def test_mid_stream_errors_are_retried(fake: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+
+    monkeypatch.setattr(lg, "RETRY_BACKOFF_S", 0.0)
+    lg.install_loop_guard()
+    calls = {"n": 0}
+    real = litellm.completion
+
+    class Boom:
+        def __iter__(self) -> Any:
+            raise ConnectionError("dropped mid-stream")
+
+    orig_inner = getattr(real, "__wrapped__", real)
+
+    def flaky(**kw: Any) -> Any:
+        calls["n"] += 1
+        return Boom() if calls["n"] == 1 else orig_inner(**kw)
+
+    out = lg._guarded_completion(  # pyright: ignore[reportPrivateUsage]
+        litellm,
+        flaky,
+        model="openai/m",
+        api_base=fake.base,
+        api_key="x",
+        messages=[{"role": "user", "content": f"retry {time.time_ns()}"}],
+        num_retries=2,
+    )
+    assert calls["n"] == 2
+    assert out.choices[0].message.content == "hello world"
+    with pytest.raises(ConnectionError):
+        lg._guarded_completion(  # pyright: ignore[reportPrivateUsage]
+            litellm,
+            lambda **_k: Boom(),
+            model="openai/m",
+            api_base=fake.base,
+            messages=[{"role": "user", "content": "x"}],
+            num_retries=0,
+        )
 
 
 # ── fake OpenAI-compatible server ────────────────────────────────────────────
@@ -159,13 +210,19 @@ class _Fake:
                             }
                         )
                     else:
+                        parts = (" re,", " reall,", " re_first,")  # varied chunks
+                        same = " re, reall, re_first,"  # 'loop-identical': one chunk repeated
                         for i in range(200000):  # ~4 MB if never cut
                             ev(
                                 {
                                     "choices": [
                                         {
                                             "index": 0,
-                                            "delta": {"content": " re, reall, re_first,"},
+                                            "delta": {
+                                                "content": parts[i % 3]
+                                                if fake.mode == "loop"
+                                                else same
+                                            },
                                             "finish_reason": None,
                                         }
                                     ]
@@ -236,6 +293,17 @@ def test_identical_prompts_are_not_served_from_a_cache(fake: Any) -> None:
     lm("same prompt")
     lm("same prompt")
     assert len(fake.requests) == 2  # a cached loop response would otherwise be replayed
+
+
+def test_litellm_identical_chunk_guard_counts_as_a_loop_abort(fake: Any) -> None:
+    """Single-token repetition: litellm raises 'repeating the same chunk'; we must not retry."""
+    fake.mode = "loop-identical"
+    before = lg.loop_abort_counts().get("default", 0)
+    lm = role_models.build_lm(_cfg(fake.base))
+    out = lm(f"identical {time.time_ns()}")
+    assert _finish_reason(lm) == "length" and len(str(out)) > 0
+    assert lg.loop_abort_counts().get("default", 0) == before + 1
+    assert len(fake.requests) == 1  # not retried
 
 
 def test_normal_answers_pass_through_unchanged(fake: Any) -> None:

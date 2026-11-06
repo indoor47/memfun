@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
 import ipaddress
 import os
 import threading
@@ -184,7 +185,11 @@ def build_lm(llm: LLMConfig) -> Any:
         # The loop guard wraps litellm.completion, which DSPy only calls on its LiteLLM
         # engine (the default "auto" picks the native lm15 engine for this request).
         install_loop_guard()
-        kwargs["engine"] = "litellm"
+        # Only DSPy >= 3.x has an ``engine`` parameter (the default there picks the native
+        # engine, which never reaches litellm); older DSPy always uses litellm and would
+        # forward an unknown ``engine`` to the server as a request field.
+        if "engine" in inspect.signature(dspy.LM.__init__).parameters:
+            kwargs["engine"] = "litellm"
         # No response cache on these sampled, guarded calls: a cached loop-aborted (or
         # otherwise bad) response would be replayed identically on every retry.
         kwargs["cache"] = False

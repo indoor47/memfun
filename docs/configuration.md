@@ -293,8 +293,8 @@ loop_guard = true           # abort a call whose output repeats (see below)
 ```
 
 `loop_guard = true` (needs `base_url`, off by default) makes the call with streaming on
-DSPy's LiteLLM engine, with DSPy's response cache off for it, and cuts it as soon as the output
-ends in a block repeated 8+ times over 2000+ characters. The aborted response is returned as
+DSPy's LiteLLM engine (DSPy 3.x; older DSPy always uses litellm), with DSPy's response cache off for it, mid-stream connection errors retried, and cuts it as soon as the output
+ends in a block repeated 8+ times over 6000+ characters (about 1500 tokens: shorter repeats such as table rows or padding are legitimate). The aborted response is returned as
 cut off (`finish_reason=length`), so the truncation paths fail visibly, memfun logs
 `LLM LOOP ABORTED`, and `evals/swarm/run_smoke.py` counts `loop_aborts` per episode.
 `MEMFUN_LOOP_GUARD=0` switches the guard off for a process. `run_smoke.py` defaults to

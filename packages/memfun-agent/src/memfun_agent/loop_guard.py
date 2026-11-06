@@ -17,9 +17,11 @@ Everything else (Anthropic, streaming callers, no ``api_base``) passes through u
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import os
 import threading
+import time
 from typing import Any
 
 from memfun_core.logging import get_logger
@@ -28,8 +30,10 @@ logger = get_logger("agent.loop_guard")
 
 #: Check the tail every time this many new characters arrived.
 CHECK_EVERY_CHARS = 512
-#: The repeated region must be at least this long (~500 tokens) ...
-MIN_REPEAT_CHARS = 2000
+#: The repeated region must be at least this long (~1500 tokens): legitimate output can
+#: repeat a short line a few hundred times (``| 0 | 0 |`` table rows, ``pass`` lines,
+#: ``0,`` padding), a loop never stops, so waiting costs only seconds ...
+MIN_REPEAT_CHARS = 6000
 #: ... made of at least this many copies of one block, whose length is in this range.
 MIN_COPIES = 8
 MIN_BLOCK = 2
@@ -83,7 +87,7 @@ class LoopDetector:
                 copies >= self.min_copies
                 and copies * p >= self.min_repeat_chars
                 and len(set(unit)) >= 2
-                and unit.strip()
+                and any(ch.isalnum() for ch in unit)
             ):
                 self.block = unit
                 return True
@@ -164,52 +168,106 @@ def _stream_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+#: A connection error mid-stream is retried from scratch (litellm's own retries only cover
+#: the request phase), at most this many times, with a short backoff.
+MAX_STREAM_RETRIES = 3
+RETRY_BACKOFF_S = 1.0
+
+
+#: litellm's own streaming guard raises this after ~100 identical chunks in a row: that IS a
+#: loop (single-token repetition), so it is an abort, not a connection error to retry.
+LITELLM_REPEAT_MSG = "repeating the same chunk"
+
+
+def _is_litellm_repeat(exc: BaseException) -> bool:
+    return LITELLM_REPEAT_MSG in str(exc)
+
+
+def _repeat_block(chunks: list[Any]) -> str:
+    return (_chunk_text(chunks[-1]).strip() if chunks else "") or LITELLM_REPEAT_MSG
+
+
+def _retries(kwargs: dict[str, Any]) -> int:
+    n = kwargs.get("num_retries")
+    return max(0, min(int(n), MAX_STREAM_RETRIES)) if isinstance(n, int) else MAX_STREAM_RETRIES
+
+
 def _guarded_completion(litellm: Any, original: Any, *args: Any, **kwargs: Any) -> Any:
     if args or not _guardable(kwargs):
         return original(*args, **kwargs)
-    detector = LoopDetector()
-    chunks: list[Any] = []
-    aborted = ""
-    stream = original(**_stream_kwargs(kwargs))
-    try:
-        for chunk in stream:
-            chunks.append(chunk)
-            if detector.feed(_chunk_text(chunk)):
-                aborted = detector.block
-                break
-    finally:
-        close = getattr(stream, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:  # pragma: no cover - best effort
-                logger.debug("closing aborted stream failed", exc_info=True)
-    return _finish(litellm, chunks, kwargs, aborted)
+    attempt = 0
+    while True:
+        detector = LoopDetector()
+        chunks: list[Any] = []
+        aborted = ""
+        stream = None
+        try:
+            stream = original(**_stream_kwargs(kwargs))
+            for chunk in stream:
+                chunks.append(chunk)
+                if detector.feed(_chunk_text(chunk)):
+                    aborted = detector.block
+                    break
+        except Exception as exc:
+            if _is_litellm_repeat(exc) and chunks:
+                aborted = _repeat_block(chunks)
+            else:
+                if attempt >= _retries(kwargs):
+                    raise
+                attempt += 1
+                logger.warning(
+                    "LLM stream failed mid-call (%s); retry %d", type(exc).__name__, attempt
+                )
+                time.sleep(RETRY_BACKOFF_S * attempt)
+                continue
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # pragma: no cover - best effort
+                    logger.debug("closing stream failed", exc_info=True)
+        return _finish(litellm, chunks, kwargs, aborted)
 
 
 async def _guarded_acompletion(litellm: Any, original: Any, *args: Any, **kwargs: Any) -> Any:
     if args or not _guardable(kwargs):
         return await original(*args, **kwargs)
-    detector = LoopDetector()
-    chunks: list[Any] = []
-    aborted = ""
-    stream = await original(**_stream_kwargs(kwargs))
-    try:
-        async for chunk in stream:
-            chunks.append(chunk)
-            if detector.feed(_chunk_text(chunk)):
-                aborted = detector.block
-                break
-    finally:
-        aclose = getattr(stream, "aclose", None) or getattr(stream, "close", None)
-        if callable(aclose):
-            try:
-                res = aclose()
-                if hasattr(res, "__await__"):
-                    await res
-            except Exception:  # pragma: no cover - best effort
-                logger.debug("closing aborted stream failed", exc_info=True)
-    return _finish(litellm, chunks, kwargs, aborted)
+    attempt = 0
+    while True:
+        detector = LoopDetector()
+        chunks: list[Any] = []
+        aborted = ""
+        stream = None
+        try:
+            stream = await original(**_stream_kwargs(kwargs))
+            async for chunk in stream:
+                chunks.append(chunk)
+                if detector.feed(_chunk_text(chunk)):
+                    aborted = detector.block
+                    break
+        except Exception as exc:
+            if _is_litellm_repeat(exc) and chunks:
+                aborted = _repeat_block(chunks)
+            else:
+                if attempt >= _retries(kwargs):
+                    raise
+                attempt += 1
+                logger.warning(
+                    "LLM stream failed mid-call (%s); retry %d", type(exc).__name__, attempt
+                )
+                await asyncio.sleep(RETRY_BACKOFF_S * attempt)
+                continue
+        finally:
+            aclose = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+            if callable(aclose):
+                try:
+                    res = aclose()
+                    if hasattr(res, "__await__"):
+                        await res
+                except Exception:  # pragma: no cover - best effort
+                    logger.debug("closing stream failed", exc_info=True)
+        return _finish(litellm, chunks, kwargs, aborted)
 
 
 _INSTALLED = False
