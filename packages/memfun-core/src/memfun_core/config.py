@@ -124,10 +124,34 @@ class LLMConfig:
     base_url: str | None = None
     temperature: float = 0.0
     max_tokens: int = 128_000
+    # Sampling penalties against repetition loops, sent to OpenAI-compatible servers
+    # (SGLang: frequency_penalty / presence_penalty in [-2, 2]; repetition_penalty in
+    # (0, 2], 1.0 = off, sent as ``extra_body``).  0 / None send nothing.
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float | None = None
+    # Abort a call to an OpenAI-compatible server (``base_url`` set) as soon as its output
+    # degenerates into a repetition loop (``memfun_agent.loop_guard``).  Makes the call with
+    # streaming on DSPy's LiteLLM engine and disables DSPy's response cache for it.  Off by
+    # default; the B300 runner turns it on.
+    loop_guard: bool = False
     # Role -> overrides, from ``[llm.roles.<role>]``.  Empty = every role
     # uses this ``[llm]`` config (the pre-roles behaviour).  Excluded from
     # hashing so a resolved (role-free) LLMConfig stays hashable.
     roles: dict[str, LLMRoleConfig] = field(default_factory=lambda: _no_roles(), hash=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.loop_guard, bool):
+            raise ConfigError(f"[llm] loop_guard must be true or false, got {self.loop_guard!r}")
+        for name in ("frequency_penalty", "presence_penalty"):
+            val = getattr(self, name)
+            if isinstance(val, bool) or not isinstance(val, int | float) or not -2 <= val <= 2:
+                raise ConfigError(f"[llm] {name} must be a number in [-2, 2], got {val!r}")
+        rep = self.repetition_penalty
+        if rep is not None and (
+            isinstance(rep, bool) or not isinstance(rep, int | float) or not 0 < rep <= 2
+        ):
+            raise ConfigError(f"[llm] repetition_penalty must be a number in (0, 2], got {rep!r}")
 
     def for_role(self, role: str) -> LLMConfig:
         """Resolve *role* to a concrete :class:`LLMConfig`.

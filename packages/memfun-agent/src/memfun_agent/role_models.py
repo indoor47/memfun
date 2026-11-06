@@ -158,6 +158,13 @@ def lm_settings(llm: LLMConfig) -> tuple[str, dict[str, Any]]:
         "max_tokens": llm.max_tokens,
         "timeout": _LM_TIMEOUT_SECONDS,
     }
+    if llm.frequency_penalty:
+        kwargs["frequency_penalty"] = llm.frequency_penalty
+    if llm.presence_penalty:
+        kwargs["presence_penalty"] = llm.presence_penalty
+    if llm.repetition_penalty is not None and llm.repetition_penalty != 1.0:
+        # Not an OpenAI field: SGLang reads it from the request body (extra_body is merged).
+        kwargs["extra_body"] = {"repetition_penalty": llm.repetition_penalty}
     api_key = resolve_api_key(llm)
     if api_key:
         kwargs["api_key"] = api_key
@@ -171,6 +178,16 @@ def build_lm(llm: LLMConfig) -> Any:
     import dspy
 
     name, kwargs = lm_settings(llm)
+    from memfun_agent.loop_guard import enabled, install_loop_guard
+
+    if llm.loop_guard and name.startswith("openai/") and kwargs.get("api_base") and enabled():
+        # The loop guard wraps litellm.completion, which DSPy only calls on its LiteLLM
+        # engine (the default "auto" picks the native lm15 engine for this request).
+        install_loop_guard()
+        kwargs["engine"] = "litellm"
+        # No response cache on these sampled, guarded calls: a cached loop-aborted (or
+        # otherwise bad) response would be replayed identically on every retry.
+        kwargs["cache"] = False
     return dspy.LM(name, **kwargs)
 
 
@@ -189,6 +206,10 @@ def _cache_key(llm: LLMConfig) -> tuple[Any, ...]:
         llm.api_key_env,
         llm.temperature,
         llm.max_tokens,
+        llm.frequency_penalty,
+        llm.presence_penalty,
+        llm.repetition_penalty,
+        llm.loop_guard,
     )
 
 

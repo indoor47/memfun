@@ -278,6 +278,29 @@ instead of falling back to a single task. Raise `[llm] max_tokens` (or
 `[llm.roles.<role>].max_tokens`) if you see it; `evals/swarm/run_smoke.py` defaults to 32768
 for every role.
 
+### Sampling and repetition loops
+
+At `temperature = 0.0` a 27B model can fall into an endless repetition loop that only ends at
+`max_tokens`. Use a non-zero temperature plus a repetition penalty on OpenAI-compatible
+servers (SGLang: `frequency_penalty` / `presence_penalty` in [-2, 2], `repetition_penalty` in
+(0, 2], 1.0 = off):
+
+```toml
+[llm]
+temperature = 0.7
+repetition_penalty = 1.05   # sent as extra_body; 0/unset sends nothing
+loop_guard = true           # abort a call whose output repeats (see below)
+```
+
+`loop_guard = true` (needs `base_url`, off by default) makes the call with streaming on
+DSPy's LiteLLM engine, with DSPy's response cache off for it, and cuts it as soon as the output
+ends in a block repeated 8+ times over 2000+ characters. The aborted response is returned as
+cut off (`finish_reason=length`), so the truncation paths fail visibly, memfun logs
+`LLM LOOP ABORTED`, and `evals/swarm/run_smoke.py` counts `loop_aborts` per episode.
+`MEMFUN_LOOP_GUARD=0` switches the guard off for a process. `run_smoke.py` defaults to
+temperature 0.7, repetition penalty 1.05 and the guard on (`--temperature`,
+`--repetition-penalty`, `--frequency-penalty`, `--presence-penalty`, `--no-loop-guard`).
+
 ## Dashboard Environment Variables
 
 The live dashboard (`memfun dashboard`, or embedded in `memfun chat`) reads these at request time:
