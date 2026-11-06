@@ -20,6 +20,7 @@ api_key_env = "ANTHROPIC_API_KEY"      # Env var name containing the API key
 base_url = ""                          # Optional custom API base URL
 temperature = 0.0                      # Sampling temperature (0.0 = deterministic)
 max_tokens = 8192                      # Max tokens per LLM response
+# [llm.roles.<role>] tables override [llm] per role -- see "per-role models" below
 
 [backend]
 tier = "sqlite"                        # Backend tier: in-process, sqlite, redis, nats
@@ -78,6 +79,81 @@ variables at runtime -- the configuration file never contains raw secrets.
 | `base_url` | string | `""` | Custom API base URL (for proxies or self-hosted) |
 | `temperature` | float | `0.0` | Sampling temperature |
 | `max_tokens` | int | `8192` | Maximum tokens per response |
+
+### [llm.roles.<role>] -- per-role models
+
+A swarm can run different roles on different models. Each
+`[llm.roles.<role>]` table overrides `[llm]` for one role; every field is
+optional and falls back to `[llm]` **field by field**. Leave a role out and
+it uses `[llm]` unchanged. With no `[llm.roles]` section at all, behaviour
+is exactly as before: everything runs on `[llm]`.
+
+| Role | What runs under it |
+|------|--------------------|
+| `orchestrator` | The workflow engine itself (`memfun swarm`, chat workflow runs): any LLM call not bound to a narrower role |
+| `decomposer` | `TaskDecomposer` (task -> sub-task DAG), including hierarchical recursion |
+| `worker` | Specialist agents (`coder-agent`, `test-agent`, `file-agent`, ...) |
+| `auditor` | Per-task `review-agent` dispatches |
+| `reviewer` | The `pr-reviewer` agent at the PR layer |
+
+Allowed keys per role: `provider`, `model`, `base_url`, `api_key_env`,
+`temperature`, `max_tokens`. Unknown role names and unknown keys are
+ignored with a warning. Wrong value types raise a configuration error, and
+so does an `api_key_env` that is not a valid environment variable *name*:
+this field names the variable that holds the key and never holds the key
+itself. `base_url = ""` clears an inherited `[llm].base_url`.
+
+Example: orchestrator and decomposer on Claude Opus 5.5 through the
+Anthropic API; workers and auditors on a self-hosted OpenAI-compatible
+server (for example SGLang or vLLM) reached through an SSH tunnel on
+`localhost:18000`; the PR reviewer falls back to `[llm]`.
+
+```toml
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-6"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[llm.roles.orchestrator]
+provider = "anthropic"
+model = "claude-opus-5-5"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[llm.roles.decomposer]
+provider = "anthropic"
+model = "claude-opus-5-5"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[llm.roles.worker]
+provider = "openai"                     # OpenAI-compatible endpoint
+model = "qwen3.8-27b"                   # the alias the server serves
+base_url = "http://127.0.0.1:18000/v1"  # local end of the SSH tunnel
+api_key_env = "MEMFUN_WORKER_API_KEY"   # dummy; unset -> placeholder key
+
+[llm.roles.auditor]
+provider = "openai"
+model = "qwen3.8-27b"
+base_url = "http://127.0.0.1:18000/v1"
+api_key_env = "MEMFUN_WORKER_API_KEY"
+
+# [llm.roles.reviewer] omitted -> pr-reviewer uses [llm]
+```
+
+Open the tunnel before starting the swarm, e.g.
+`ssh -N -L 18000:127.0.0.1:<server-port> <user>@<host>`.
+
+Notes:
+
+- `provider = "openai"` with a `base_url` and an unset key variable sends
+  the placeholder key `sk-local`, since self-hosted servers usually run
+  without auth.
+- Field-by-field fallback means a role that switches `provider` still
+  inherits `[llm].base_url` and `[llm].api_key_env` unless it sets them.
+  Set both explicitly when a role uses a different provider than `[llm]`.
+- Each role's model is bound per call with a task-local `dspy.context`, so
+  concurrent agents running different roles do not interfere.
+- Every `llm.call` telemetry event carries `model` (the model id used) and
+  `role` (`default` when no role is bound).
 
 ### [backend]
 

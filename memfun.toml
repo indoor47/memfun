@@ -5,6 +5,35 @@ name = "memfun"
 provider = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 
+# Per-role models (optional; see docs/configuration.md). Without any
+# [llm.roles.*] table every role uses [llm]. Uncomment to run the
+# orchestrator + decomposer on Claude Opus 5.5 and the workers + per-task
+# auditors on an OpenAI-compatible server behind an SSH tunnel.
+#
+# [llm.roles.orchestrator]
+# provider = "anthropic"
+# model = "claude-opus-5-5"
+# api_key_env = "ANTHROPIC_API_KEY"
+#
+# [llm.roles.decomposer]
+# provider = "anthropic"
+# model = "claude-opus-5-5"
+# api_key_env = "ANTHROPIC_API_KEY"
+#
+# [llm.roles.worker]
+# provider = "openai"
+# model = "qwen3.8-27b"
+# base_url = "http://127.0.0.1:18000/v1"
+# api_key_env = "MEMFUN_WORKER_API_KEY"
+#
+# [llm.roles.auditor]
+# provider = "openai"
+# model = "qwen3.8-27b"
+# base_url = "http://127.0.0.1:18000/v1"
+# api_key_env = "MEMFUN_WORKER_API_KEY"
+#
+# [llm.roles.reviewer] is left out: pr-reviewer falls back to [llm].
+
 [backend]
 tier = "sqlite"
 sqlite_path = ".memfun/memfun.db"
