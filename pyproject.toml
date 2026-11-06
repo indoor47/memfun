@@ -21,6 +21,14 @@ Issues = "https://github.com/indoor47/memfun/issues"
 [tool.uv.workspace]
 members = ["packages/*"]
 
+[tool.uv]
+# Resolver-only pins that hold transitive/dev deps back from releases that break us.
+constraint-dependencies = [
+    "fastmcp<4",  # 4.x: `TypeError: FastMCP.mount() got an unexpected keyword argument 'prefix'` (memfun_tools/gateway.py); migrate to 4.x mount(namespace=...) API
+    "ruff<0.16",  # 0.16 also formats ```python blocks in Markdown: `ruff format --check` fails on skills/{generate-tests,refactor}/SKILL.md; migrate by reformatting (or excluding) those docs in a separate PR
+    "filelock>=4.2.1",  # security floor: filelock<4.2.1 has 13 advisories (CVE-2026-112907..112940); forces litellm below 1.108 (which caps filelock<4.0); drop once litellm allows filelock 4
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
