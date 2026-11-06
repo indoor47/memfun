@@ -212,6 +212,7 @@ async def _event_listener(bus: Any) -> None:
                 "workflow_id": event.workflow_id,
                 # ── LLM-call telemetry (only set for event_type=llm.call) ──
                 "model": event.model,
+                "role": getattr(event, "role", None),
                 "prompt_preview": event.prompt_preview,
                 "completion_preview": event.completion_preview,
                 "prompt_tokens": event.prompt_tokens,
@@ -2570,6 +2571,7 @@ function swarmIngest(ev) {
     const tok = (ev.prompt_tokens || 0) + (ev.completion_tokens || 0);
     a.calls += 1; a.tokens += tok; a.lastCall = ts;
     if (ev.model) a.model = ev.model;
+    if (ev.role) a.role = ev.role;
     if (ev.task_id && !a.task && a.status !== 'gone') { a.lastTask = ev.task_id; }
     a.pulse = 1;
     SW.calls.push({ ts: ts, key: a.key, tok: ev.completion_tokens || 0 });
@@ -3005,7 +3007,8 @@ setView(activeView);
       `<span style="color:var(--muted)">${escHtml(best.key)}</span><br>` +
       `status: ${best.status}${best.task ? ' · task ' + escHtml(best.task) : ''}<br>` +
       (t && t.detail ? escHtml(t.detail.slice(0, 60)) + '<br>' : '') +
-      `model: ${escHtml(best.model || '—')}<br>` +
+      `model: ${escHtml(best.model || '—')}` +
+      `${best.role ? ' · role ' + escHtml(best.role) : ''}<br>` +
       `${best.calls} calls · ${(best.tokens / 1000).toFixed(1)}k tok` +
       (best.lastCall ? ' · last ' + fmtAgo(best.lastCall) : '');
     tip.style.display = 'block';
