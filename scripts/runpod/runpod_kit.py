@@ -649,6 +649,7 @@ def build_boot_env(
         "MEMFUN_SGLANG_ARGS": args.sglang_args,
         "MEMFUN_ALLOW_PULL": "1" if args.pull_in_pod else "0",
         "MEMFUN_CRASH_GRACE_MIN": str(args.crash_grace_minutes),
+        "MEMFUN_FAIL_GRACE_MIN": str(getattr(args, "fail_grace_minutes", 2)),
     }
     return [{"key": k, "value": v} for k, v in env.items()]
 
@@ -1104,6 +1105,16 @@ def _positive_minutes(text: str) -> int:
     return value
 
 
+def _grace_minutes(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"grace must be an integer, got {text!r}") from None
+    if not 0 <= value <= 60:
+        raise argparse.ArgumentTypeError("grace must be 0..60 minutes")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="runpod_kit", description=(__doc__ or "").split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1136,6 +1147,12 @@ def build_parser() -> argparse.ArgumentParser:
     la.add_argument("--sglang-args", default="", help="extra launch_server args")
     la.add_argument("--pull-in-pod", action="store_true", help="download weights if missing")
     la.add_argument("--crash-grace-minutes", type=int, default=10)
+    la.add_argument(
+        "--fail-grace-minutes",
+        type=_grace_minutes,
+        default=2,
+        help="keep a pod whose boot failed this long so its logs can be read (not the deadline)",
+    )
     la.add_argument("--ssh-public-key", default="~/.ssh/id_ed25519.pub")
     la.add_argument(
         "--server-terminate-after",

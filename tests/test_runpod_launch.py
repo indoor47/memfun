@@ -725,13 +725,14 @@ def test_boot_script_self_terminates_with_pod_scoped_runpodctl(tmp_path: Path) -
         "RUNPOD_POD_ID": "podXYZ",
         "RUNPOD_API_KEY": "pod-scoped-injected",
         "PUBLIC_KEY": "",
+        "MEMFUN_FAIL_GRACE_MIN": "0",
     }
     proc = subprocess.run(
         ["bash", str(kit.BOOT_SCRIPT)], env=env, capture_output=True, text=True, timeout=120
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     lines = record.read_text().splitlines()
-    assert lines and all(line == "pod delete podXYZ key=pod-scoped-injected" for line in lines)
+    assert lines and all(line == "remove pod podXYZ key=pod-scoped-injected" for line in lines)
     assert "hard stop armed: 0s" in proc.stdout
 
 
@@ -1436,15 +1437,54 @@ def test_watch_plain_ctrl_c_keeps_waiting_for_memfun() -> None:
     assert rc == 0 and calls["n"] == 2
 
 
-def _run_boot(tmp_path: Path, extra_env: dict[str, str]) -> tuple[str, list[str], list[str]]:
-    """Run pod_boot.sh with fake runpodctl/python3; return (log, runpodctl, python3 argv)."""
+FAKE_PY = r"""#!/bin/sh
+# Fake python3: records SGLang argv; simulates huggingface_hub / pip per FAKE_* env.
+D="@DIR@"
+if [ "$1" = "-m" ] && [ "$2" = "sglang.launch_server" ]; then
+  for a in "$@"; do printf "%s\n" "$a"; done >> "$D/python3.log"
+  [ -n "${FAKE_SGLANG_OUT:-}" ] && echo "$FAKE_SGLANG_OUT"
+  exit 0
+fi
+case "$1" in
+  --version) echo "Python 3.12.99-fake"; exit 0 ;;
+  -m)
+    if [ "$2" = pip ]; then
+      echo "$*" >> "$D/pip.log"
+      echo "ERROR: fake pip: no network"
+      [ "${FAKE_PIP_OK:-0}" = 1 ] && { touch "$D/hub_installed"; exit 0; }
+      exit 1
+    fi ;;
+  -c)
+    case "$2" in
+      "import huggingface_hub")
+        [ "${FAKE_HF_HUB:-0}" = 1 ] || [ -f "$D/hub_installed" ]; exit $? ;;
+      "import "*) exit 1 ;;
+      *snapshot_download*)
+        shift 2; echo "$*" >> "$D/snapshot.log"
+        [ -n "${FAKE_SNAP_SLEEP:-}" ] && sleep "$FAKE_SNAP_SLEEP"
+        echo "fake snapshot output line"
+        exit "${FAKE_SNAP_RC:-0}" ;;
+      *) echo "  py fake-module 0.0"; exit 0 ;;
+    esac ;;
+esac
+exit 1
+"""
+
+
+def _run_boot(
+    tmp_path: Path, extra_env: dict[str, str], *, runpodctl: str | None = None
+) -> tuple[str, list[str], list[str]]:
+    """Run pod_boot.sh with fake runpodctl/python3/curl/pip; return (log, runpodctl, python3)."""
     fakebin = tmp_path / "bin"
     fakebin.mkdir(exist_ok=True)
     rp_log, py_log = tmp_path / "runpodctl.log", tmp_path / "python3.log"
-    (fakebin / "runpodctl").write_text(f'#!/bin/sh\necho "$@" >> "{rp_log}"\nexit 0\n')
-    (fakebin / "python3").write_text(
-        f'#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a"; done >> "{py_log}"\nexit 0\n'
+    (fakebin / "runpodctl").write_text(
+        runpodctl or f'#!/bin/sh\necho "$@" >> "{rp_log}"\necho "pod removed"\nexit 0\n'
     )
+    (fakebin / "python3").write_text(FAKE_PY.replace("@DIR@", str(tmp_path)))
+    # Hermetic: never touch the network from the preflight reachability check.
+    (fakebin / "curl").write_text("#!/bin/sh\necho 'HTTP/2 200 (fake curl)'\n")
+    (fakebin / "pip").write_text(f'#!/bin/sh\necho "$@" >> "{tmp_path}/pip.log"\nexit 1\n')
     for f in fakebin.iterdir():
         f.chmod(0o755)
     models = tmp_path / "models"
@@ -1457,6 +1497,8 @@ def _run_boot(tmp_path: Path, extra_env: dict[str, str]) -> tuple[str, list[str]
         "MEMFUN_MODEL_REPO": "Qwen/M",
         "MEMFUN_SERVED_NAME": "m",
         "MEMFUN_CRASH_GRACE_MIN": "0",
+        "MEMFUN_FAIL_GRACE_MIN": "0",
+        "MEMFUN_PULL_RETRY_SLEEP": "0",
         "MEMFUN_RUN_DIR": str(tmp_path / "run"),
         "RUNPOD_POD_ID": "podB",
         "PUBLIC_KEY": "",
@@ -1497,7 +1539,7 @@ def test_boot_extra_args_never_glob_and_metrics_enabled(tmp_path: Path) -> None:
     _log, rp, py = _run_boot(tmp_path, {"MEMFUN_SGLANG_ARGS": "--tp 1 *"})
     assert "--enable-metrics" in py and "*" in py and "SHOULD_NOT_APPEAR.txt" not in py
     assert py[py.index("--tp") + 1] == "1"
-    assert rp and rp[0] == "pod delete podB"  # SGLang exited -> grace 0 -> self-terminate
+    assert rp and rp[0] == "remove pod podB"  # SGLang exited -> grace 0 -> self-terminate
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
@@ -1505,7 +1547,7 @@ def test_boot_refuses_marker_for_other_pinned_revision(tmp_path: Path) -> None:
     _write_marker(tmp_path, "a" * 40)
     log, rp, py = _run_boot(tmp_path, {"MEMFUN_MODEL_REVISION": "b" * 40})
     assert py == []  # SGLang never started
-    assert "marker sha != pinned" in log and rp[0] == "pod delete podB"
+    assert "marker sha != pinned" in log and rp[0] == "remove pod podB"
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
@@ -1564,3 +1606,191 @@ def test_memfun_snippet_is_single_qwen_llm_block(
     spy = FakeRunPod(allow_mutations=False)
     assert run(["launch", "--ssh-public-key", pubkey], spy) == 0
     _assert_qwen_everywhere(capsys.readouterr().out, kit.DEFAULT_LOCAL_PORT)
+
+
+# ---------------------------------------------------------------------------
+# Boot script: downloader without hf/huggingface-cli, diagnostics, grace, mirror.
+# ---------------------------------------------------------------------------
+
+needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+
+
+def _lines(path: Path) -> list[str]:
+    return path.read_text().splitlines() if path.exists() else []
+
+
+@needs_bash
+def test_boot_pull_uses_python_api_when_no_hf_cli(tmp_path: Path) -> None:
+    sha = "d" * 40
+    log, rp, py = _run_boot(
+        tmp_path, {"MEMFUN_ALLOW_PULL": "1", "MEMFUN_MODEL_REVISION": sha, "FAKE_HF_HUB": "1"}
+    )
+    snap = _lines(tmp_path / "snapshot.log")
+    assert snap == [f"Qwen/M {sha} {tmp_path / 'models' / 'Qwen' / 'M'}"], log
+    assert "via python-api" in log and "not available: hf huggingface-cli" in log
+    assert "download finished via python-api" in log
+    marker = json.loads((tmp_path / "models" / "Qwen" / "M" / ".memfun_verified").read_text())
+    assert marker["sha"] == sha and marker["repo"] == "Qwen/M"
+    assert "--enable-metrics" in py  # SGLang started after the download
+    assert not (tmp_path / "pip.log").exists()  # pip only as the last resort
+    assert rp == ["remove pod podB"]
+
+
+@needs_bash
+def test_boot_pull_pip_installs_hub_as_last_resort(tmp_path: Path) -> None:
+    log, _rp, py = _run_boot(tmp_path, {"MEMFUN_ALLOW_PULL": "1", "FAKE_PIP_OK": "1"})
+    assert "pip install -q huggingface_hub" in (tmp_path / "pip.log").read_text()
+    assert "via python-api-pip" in log and _lines(tmp_path / "snapshot.log")
+    assert "--enable-metrics" in py
+
+
+@needs_bash
+def test_boot_pull_nothing_available_fails_clearly_then_removes_pod(tmp_path: Path) -> None:
+    log, rp, py = _run_boot(tmp_path, {"MEMFUN_ALLOW_PULL": "1"})
+    assert "pip install -q huggingface_hub" in (tmp_path / "pip.log").read_text()
+    assert (
+        "no way to download weights: missing: hf huggingface-cli python3:huggingface_hub "
+        "pip-install-failed" in log
+    )
+    # The reason and the tail of pull.log are on stdout BEFORE the pod goes away.
+    assert "last 30 lines of" in log and "ERROR: fake pip: no network" in log
+    assert log.index("ERROR: fake pip") < log.index("FAILED: weight download failed")
+    assert log.index("FAILED: weight download failed") < log.index("self-terminate:")
+    assert "last 40 lines of" in log and "pull.log" in log
+    assert py == [] and rp == ["remove pod podB"]
+
+
+@needs_bash
+def test_boot_pull_retries_are_bounded_and_resumable(tmp_path: Path) -> None:
+    log, rp, py = _run_boot(
+        tmp_path, {"MEMFUN_ALLOW_PULL": "1", "FAKE_HF_HUB": "1", "FAKE_SNAP_RC": "1"}
+    )
+    assert len(_lines(tmp_path / "snapshot.log")) == 3
+    assert "download attempt 3/3 failed" in log and "attempt 4" not in log
+    assert "all 3 download attempts via python-api failed" in log
+    assert "fake snapshot output line" in log  # tail of pull.log shown
+    assert py == [] and rp == ["remove pod podB"]
+    assert not (tmp_path / "models" / "Qwen" / "M" / ".memfun_verified").exists()
+
+
+@needs_bash
+def test_boot_pull_prints_progress_lines(tmp_path: Path) -> None:
+    log, _rp, _py = _run_boot(
+        tmp_path,
+        {
+            "MEMFUN_ALLOW_PULL": "1",
+            "FAKE_HF_HUB": "1",
+            "FAKE_SNAP_SLEEP": "1.6",
+            "MEMFUN_PROGRESS_SEC": "1",
+        },
+    )
+    assert "download progress:" in log and "elapsed (python-api)" in log
+
+
+@needs_bash
+def test_boot_preflight_prints_names_never_values(tmp_path: Path) -> None:
+    _write_marker(tmp_path, "a" * 40)
+    secret = "rpa_PODSCOPED_value_7f3e9c1d"
+    log, _rp, _py = _run_boot(
+        tmp_path,
+        {
+            "RUNPOD_API_KEY": secret,
+            "RUNPOD_SOMETHING_TOKEN": "tok_value_should_not_print",
+            "PUBLIC_KEY": "ssh-ed25519 AAAAPUBLICVALUE test",
+        },
+    )
+    pre = log[log.index("---- preflight ----") : log.index("---- end preflight ----")]
+    assert log.index("hard stop armed") < log.index("---- preflight ----")
+    assert "RUNPOD_API_KEY" in pre and "RUNPOD_SOMETHING_TOKEN" in pre and "MEMFUN_" in pre
+    for value in (secret, "tok_value_should_not_print", "AAAAPUBLICVALUE"):
+        assert value not in log
+    needles = ["uname:", "python3: Python 3.12.99-fake", "tool hf: MISSING", "disk:"]
+    needles += ["tool runpodctl:", "huggingface.co: HTTP/2 200", "ulimit -n:"]
+    for needle in needles:
+        assert needle in pre, needle
+
+
+@needs_bash
+def test_boot_remove_pod_first_then_pod_delete_fallback(tmp_path: Path) -> None:
+    rp_log = tmp_path / "runpodctl.log"
+    old_cli_fails = (
+        f'#!/bin/sh\necho "$@" >> "{rp_log}"\n'
+        'if [ "$1" = remove ]; then echo \'Error: unknown command "remove"\' >&2; exit 1; fi\n'
+        "exit 0\n"
+    )
+    log, rp, _py = _run_boot(tmp_path, {}, runpodctl=old_cli_fails)  # no weights -> fail
+    assert rp == ["remove pod podB", "pod delete podB"]
+    assert "terminated via 'runpodctl pod delete'" in log
+    assert "unknown command" not in log
+
+
+@needs_bash
+def test_boot_mirrors_sglang_log_to_stdout(tmp_path: Path) -> None:
+    _write_marker(tmp_path, "a" * 40)
+    log, _rp, _py = _run_boot(tmp_path, {"FAKE_SGLANG_OUT": "sglang-mirror-probe-line"})
+    assert "sglang-mirror-probe-line" in log
+    # Shown live by the mirror, before the exit message and the post-mortem dump.
+    assert log.index("sglang-mirror-probe-line") < log.index("SGLang exited rc=")
+
+
+@needs_bash
+def test_boot_fail_grace_waits_but_deadline_still_fires(tmp_path: Path) -> None:
+    import os as _os
+    import time as _time
+
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    rp_log = tmp_path / "runpodctl.log"
+    (fakebin / "runpodctl").write_text(f'#!/bin/sh\necho "$@" >> "{rp_log}"\nexit 0\n')
+    (fakebin / "curl").write_text("#!/bin/sh\necho fake\n")
+    (fakebin / "python3").write_text("#!/bin/sh\nexit 1\n")
+    for f in fakebin.iterdir():
+        f.chmod(0o755)
+    env = {
+        "PATH": f"{fakebin}:/usr/bin:/bin",
+        "MEMFUN_MAX_MINUTES": "60",
+        "MEMFUN_DEADLINE_EPOCH": str(int(_time.time()) + 3),
+        "MEMFUN_MODELS_ROOT": str(tmp_path / "models"),
+        "MEMFUN_MODEL_DIR": str(tmp_path / "models" / "Qwen" / "M"),
+        "MEMFUN_MODEL_REPO": "Qwen/M",
+        "MEMFUN_FAIL_GRACE_MIN": "1",
+        "MEMFUN_RUN_DIR": str(tmp_path / "run"),
+        "RUNPOD_POD_ID": "podG",
+        "PUBLIC_KEY": "",
+    }
+    out_file = tmp_path / "boot.out"
+    with out_file.open("w") as out:
+        proc = subprocess.Popen(
+            ["bash", str(kit.BOOT_SCRIPT)], env=env, stdout=out, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )  # fmt: skip
+        try:
+            for _ in range(300):  # wait for the deadline subshell's removal, not a fixed time
+                if rp_log.exists():
+                    break
+                _time.sleep(0.05)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                _os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+    log = out_file.read_text()
+    assert "FAILED: weights missing/unverified" in log
+    assert "terminating in 1m (MEMFUN_FAIL_GRACE_MIN)" in log
+    assert "self-terminate: deadline reached" in log  # the grace never outlives the deadline
+    assert "self-terminate: weights missing" not in log  # still inside the grace
+    assert _lines(rp_log) == ["remove pod podG"]
+
+
+def test_fail_grace_flag_reaches_pod_env(capsys: pytest.CaptureFixture[str], pubkey: str) -> None:
+    spy = FakeRunPod(allow_mutations=False)
+    assert run(["launch", "--ssh-public-key", pubkey, "--fail-grace-minutes", "5"], spy) == 0
+    assert '"key": "MEMFUN_FAIL_GRACE_MIN"' in capsys.readouterr().out
+    args = kit.build_parser().parse_args(["launch", "--fail-grace-minutes", "4"])
+    env = {e["key"]: e["value"] for e in kit.build_boot_env(args, 0, "")}
+    assert env["MEMFUN_FAIL_GRACE_MIN"] == "4"
+    assert kit.build_boot_env(kit.build_parser().parse_args(["launch"]), 0, "")[-1] == {
+        "key": "MEMFUN_FAIL_GRACE_MIN",
+        "value": "2",
+    }
+    with pytest.raises(SystemExit):
+        kit.build_parser().parse_args(["launch", "--fail-grace-minutes", "-1"])
