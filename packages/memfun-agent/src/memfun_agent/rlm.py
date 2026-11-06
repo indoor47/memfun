@@ -1005,6 +1005,33 @@ _PATH_SCOPED_BRIDGE_TOOLS: frozenset[str] = frozenset(
 )
 
 
+# Non-``path`` arguments that the tool resolves relative to ``path``.
+# An absolute value or a ``..`` component would step outside the root.
+_ROOT_RELATIVE_PATTERN_ARGS: dict[str, tuple[str, ...]] = {
+    "glob_files": ("pattern",),
+    "grep": ("glob",),
+    "git_diff": ("file",),
+}
+
+
+def _escapes_relative(value: str) -> bool:
+    """True if *value* is absolute or has a ``..`` path component.
+
+    Both ``/`` and ``\\`` count as separators so a Windows-style value
+    cannot sneak a ``..`` past the check.  A leading ``!`` (ripgrep's
+    negated glob) is ignored for the absolute-path test.
+    """
+    import os as _os
+
+    if not value:
+        return False
+    bare = value[1:] if value.startswith("!") else value
+    if _os.path.isabs(bare) or bare.startswith(("/", "\\")):
+        return True
+    parts = bare.replace("\\", "/").split("/")
+    return ".." in parts
+
+
 class PathOutsideRootError(PermissionError):
     """Raised when a REPL helper path resolves outside the task root."""
 
@@ -1043,7 +1070,9 @@ def _resolve_path(path: str, root: str | None) -> str:
         candidate = root_path / candidate
     resolved = candidate.resolve()
     if not resolved.is_relative_to(root_path):
-        raise PathOutsideRootError(f"path outside task root: {path!r} -> {resolved} (root={root})")
+        # The resolved target is deliberately not reported: for an in-root
+        # symlink it would disclose where outside the root it points.
+        raise PathOutsideRootError(f"path outside task root: {path!r} (root={root})")
     return str(resolved)
 
 
@@ -1059,10 +1088,17 @@ def _root_extra_tools(
     i.e. the process cwd).  Escapes return a ``[tool error ...]`` string
     in the same shape the bridge uses for failures.
 
-    Known residual gaps (not path arguments, so not rewritten here):
-    ``glob_files``'s ``pattern`` and ``git_diff``'s ``file`` are passed
-    through unchanged and interpreted by the tool relative to ``path``.
-    Tools outside the known set are passed through unwrapped.
+    Pattern-style arguments that the tool interprets relative to
+    ``path`` (see :data:`_ROOT_RELATIVE_PATTERN_ARGS`: ``glob_files``'s
+    ``pattern``, ``grep``'s ``glob``, ``git_diff``'s ``file``) are rejected
+    when absolute or containing a ``..`` component.  ``fs_glob_files``
+    additionally drops every match resolving outside the search base, so
+    in-root symlinks pointing out are covered there.
+
+    The task root is a guard against ACCIDENTAL escapes, not a sandbox:
+    the REPL has full builtins and ``run_cmd``, so deliberate code can
+    still reach anything the process can.  Tools outside the known set
+    are passed through unwrapped.
     """
     wrapped: dict[str, Callable[..., Any]] = {}
     for name, func in tools.items():
@@ -1078,12 +1114,23 @@ def _wrap_rooted_tool(
     func: Callable[..., Any],
     root: str,
 ) -> Callable[..., Any]:
+    pattern_args = _ROOT_RELATIVE_PATTERN_ARGS.get(name, ())
+
     def rooted_tool(**kwargs: Any) -> Any:
         raw = kwargs.get("path", ".")
         try:
             kwargs["path"] = _resolve_path(str(raw), root)
         except PathOutsideRootError as exc:
             return f"[tool error: {name}]: {exc}"
+        for arg in pattern_args:
+            value = kwargs.get(arg)
+            if value is not None and _escapes_relative(str(value)):
+                # The value is not echoed back: it is attacker/LLM chosen
+                # and the message alone says what to change.
+                return (
+                    f"[tool error: {name}]: {arg!r} must be relative to the task "
+                    "root and must not contain '..' components"
+                )
         return func(**kwargs)
 
     rooted_tool.__name__ = getattr(func, "__name__", name)
