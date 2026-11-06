@@ -195,6 +195,7 @@ def test_workflow_single_task_result_is_failed_with_truncated_error() -> None:
     engine = WorkflowEngine.__new__(WorkflowEngine)
     engine._manager = MagicMock()  # type: ignore[attr-defined]
     engine._manager.is_running.return_value = True
+    engine._project_root = None  # type: ignore[attr-defined]  # read by the no-edits check
     engine._emit_status = lambda *_a, **_k: None  # type: ignore[method-assign]
 
     async def dispatch(*_a: Any, **_k: Any) -> TaskResult:
