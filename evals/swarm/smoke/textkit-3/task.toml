@@ -1,0 +1,36 @@
+id = "textkit-3"
+kind = "fanout"
+spec = """
+Implement three independent text utilities in the `textkit` package. Each lives in its own
+module; the stubs and docstrings in repo/ are the contract. Do not change signatures.
+
+1. textkit/slugify.py  slugify(text, sep="-") -> str
+   Lowercase; NFKD-normalise and drop non-ASCII; every run of characters that are not
+   [a-z0-9] becomes one `sep`; no leading/trailing `sep`. Empty result -> "".
+2. textkit/wrap.py  wrap(text, width) -> list[str]
+   Greedy word wrap on whitespace-separated words joined by single spaces. A word longer
+   than `width` is split into chunks of exactly `width` (last chunk shorter). width < 1
+   -> ValueError. Text with no words -> [].
+3. textkit/roman.py  to_roman(n) -> str, from_roman(s) -> int
+   1..3999 only, canonical subtractive form (IV, IX, XL, XC, CD, CM). to_roman outside the
+   range -> ValueError. from_roman is case-insensitive and rejects non-canonical input
+   ("IIII", "IC", "", "MMMM") with ValueError.
+"""
+
+[[units]]
+id = "slugify"
+owns = ["textkit/slugify.py"]
+hidden_test = "hidden/test_slugify.py"
+
+[[units]]
+id = "wrap"
+owns = ["textkit/wrap.py"]
+hidden_test = "hidden/test_wrap.py"
+
+[[units]]
+id = "roman"
+owns = ["textkit/roman.py"]
+hidden_test = "hidden/test_roman.py"
+
+[budget]
+max_minutes = 10

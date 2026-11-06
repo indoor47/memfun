@@ -1,0 +1,34 @@
+id = "formats-2"
+kind = "fanout"
+spec = """
+Two independent parsers/formatters in the `formats` package.
+
+1. formats/duration.py
+   parse_duration(s) -> int seconds. Grammar: one or more of <int>d <int>h <int>m <int>s,
+   in that order, each at most once, no spaces, e.g. "1h30m", "2d", "45s", "1d2h3m4s".
+   Anything else (empty, "1m1h", "1h 30m", "1.5h", "-1s", "h") -> ValueError.
+   format_duration(seconds) -> canonical string using d/h/m/s, largest units first,
+   zero components omitted; 0 -> "0s"; negative -> ValueError.
+   parse_duration(format_duration(n)) == n for every n >= 0.
+2. formats/inilite.py
+   parse_ini(text) -> dict[str, dict[str, str]]. `[section]` headers; `key = value` lines
+   (key and value stripped; value may contain "="); blank lines and lines starting with
+   `#` or `;` ignored; duplicate keys: last wins; a repeated section header continues
+   that section. A key before any section, or a non-blank line that is neither header nor
+   key=value -> ValueError whose message contains "line <n>" (1-based).
+   dump_ini(data) -> str: sections in insertion order, `[name]` then `key = value` lines,
+   one blank line between sections, trailing newline. parse_ini(dump_ini(d)) == d.
+"""
+
+[[units]]
+id = "duration"
+owns = ["formats/duration.py"]
+hidden_test = "hidden/test_duration.py"
+
+[[units]]
+id = "inilite"
+owns = ["formats/inilite.py"]
+hidden_test = "hidden/test_inilite.py"
+
+[budget]
+max_minutes = 8

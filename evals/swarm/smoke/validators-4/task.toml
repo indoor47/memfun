@@ -1,0 +1,47 @@
+id = "validators-4"
+kind = "fanout"
+spec = """
+Four independent validators in the `checks` package; checks/__init__.py (given, do not
+edit) dispatches `validate(kind, value)` to them. All functions take `str`; spaces and
+hyphens are ignored wherever noted. None of them may raise on bad input: they return False.
+
+1. checks/luhn.py    luhn_valid(s) -> bool (digits and spaces only, >= 2 digits);
+                     luhn_check_digit(partial) -> str, the digit that makes partial+digit valid.
+2. checks/isbn.py    isbn10_valid(s), isbn13_valid(s) -> bool (hyphens/spaces ignored; ISBN-10
+                     check char may be X/x); isbn10_to_13(s) -> str (13 digits, "978" prefix,
+                     no hyphens; ValueError if s is not a valid ISBN-10).
+3. checks/iban.py    iban_valid(s) -> bool: spaces ignored, case-insensitive; 2 letters + 2
+                     digits + alphanumerics; total length 15..34; if the country is one of
+                     DE 22, GB 22, FR 27, NL 18, ES 24 the length must match; mod-97 == 1.
+4. checks/semver.py  parse_semver(s) -> (major, minor, patch, prerelease | None) per
+                     semver.org 2.0 core (no leading zeros in numeric parts, optional
+                     -prerelease of dot-separated [0-9A-Za-z-] identifiers, optional +build
+                     which is ignored); invalid -> ValueError.  semver_valid(s) -> bool.
+                     compare_semver(a, b) -> -1 | 0 | 1 with semver precedence (a version
+                     with prerelease is lower; numeric identifiers compare numerically and
+                     are lower than alphanumeric ones; a shorter identifier list is lower
+                     when all preceding are equal).
+"""
+
+[[units]]
+id = "luhn"
+owns = ["checks/luhn.py"]
+hidden_test = "hidden/test_luhn.py"
+
+[[units]]
+id = "isbn"
+owns = ["checks/isbn.py"]
+hidden_test = "hidden/test_isbn.py"
+
+[[units]]
+id = "iban"
+owns = ["checks/iban.py"]
+hidden_test = "hidden/test_iban.py"
+
+[[units]]
+id = "semver"
+owns = ["checks/semver.py"]
+hidden_test = "hidden/test_semver.py"
+
+[budget]
+max_minutes = 12

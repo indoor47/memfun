@@ -1,0 +1,37 @@
+id = "minicli-3"
+kind = "fanout"
+spec = """
+`minicli` is an argparse CLI whose subcommands live in minicli/commands/<name>.py. The
+dispatcher minicli/main.py is given; do not edit it. Each command module exposes
+`register(subparsers)` (adds its parser and calls `set_defaults(func=run)`) and
+`run(args, out) -> int` (writes to the text stream `out`, returns the exit code).
+
+1. stats  NUM [NUM ...] [--json]
+   Prints five lines `count N`, `mean X`, `median X`, `min X`, `max X` where numbers are
+   formatted with format(x, "g"). With --json prints one JSON object with those keys
+   (numbers as JSON numbers). Exit 0.
+2. convert VALUE FROM TO     length units m, km, cm, mm, mi, ft, in (1 mi = 1609.344 m,
+   1 ft = 0.3048 m, 1 in = 0.0254 m). Prints `format(result, ".6g") + " " + TO`. Unknown
+   unit -> prints `error: unknown unit <u>` and returns 2.
+3. hashsum [--algo sha256|sha1|md5] FILE [FILE ...]   default sha256. One line per file
+   `<hexdigest>  <path>` (two spaces, like sha256sum). A missing file prints
+   `error: <path>: not found`, processing continues, exit code 1; otherwise 0.
+"""
+
+[[units]]
+id = "stats"
+owns = ["minicli/commands/stats.py"]
+hidden_test = "hidden/test_stats.py"
+
+[[units]]
+id = "convert"
+owns = ["minicli/commands/convert.py"]
+hidden_test = "hidden/test_convert.py"
+
+[[units]]
+id = "hashsum"
+owns = ["minicli/commands/hashsum.py"]
+hidden_test = "hidden/test_hashsum.py"
+
+[budget]
+max_minutes = 10
