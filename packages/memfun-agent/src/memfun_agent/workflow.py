@@ -1349,6 +1349,7 @@ class WorkflowEngine:
                 elapsed_ms,
             )
 
+        result = await self._constrained_verdict_fallback(tid, result, review_id=review_id)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         review = self._parse_per_task_review(tid, result, elapsed_ms, review_id=review_id)
 
@@ -1368,6 +1369,36 @@ class WorkflowEngine:
         )
 
         return review
+
+    @staticmethod
+    async def _constrained_verdict_fallback(
+        tid: str, result: TaskResult, *, review_id: str
+    ) -> TaskResult:
+        """Recover an unparseable review via ONE grammar-constrained call.
+
+        Only when ``[llm] constrained_json`` is effective for the auditor
+        role, the reviewer task succeeded, and its answer has no valid
+        findings block for *review_id*.  The extraction yields findings JSON
+        that replaces the answer and then goes through the SAME fail-closed
+        parser (nonce check, code-computed verdict) as any reviewer answer;
+        if extraction fails the original result is returned unchanged and
+        the review errors exactly as before.
+        """
+        from memfun_agent.constrained_json import extract_review_block, role_constrained
+
+        if not result.success or not role_constrained("auditor"):
+            return result
+        answer = str((result.result or {}).get("answer", "") or "").strip()
+        try:
+            if parse_review_output(answer, review_id=review_id) is not None:
+                return result
+        except Exception:
+            pass  # unparseable: fall through to extraction (parser re-checks)
+        block = await extract_review_block(answer, review_id)
+        if block is None:
+            return result
+        logger.info("Per-task review %s: recovered verdict via constrained extraction", tid)
+        return dataclasses.replace(result, result={**(result.result or {}), "answer": block})
 
     @staticmethod
     def _build_per_task_review_query(
