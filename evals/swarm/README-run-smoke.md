@@ -373,6 +373,9 @@ python evals/swarm/run_smoke.py --suite commit0 --commit0-dir ~/.cache/memfun-co
   against the reference solution twice in the grader. Tests that fail, skip or flake against
   the reference are listed in `hidden/.deselect`; a test file that cannot be collected is
   dropped (`files_dropped` in `task.toml`). `[source] tests_kept` is the denominator.
+  pytest's `--deselect` is a prefix match, so deselecting `a.py::test_x` also drops
+  `a.py::test_x_other` and `a.py::test_x[param]`: a slightly smaller denominator, never a
+  scoring change an agent can influence (the list comes from the reference run).
 - Code the agent leaves unimportable (pytest exit 2/4/5) is a model failure, not a harness
   crash.
 - The tests stay visible in `repo/` (as in Commit0); the grader uses its own copy from

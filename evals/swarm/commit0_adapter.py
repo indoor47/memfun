@@ -84,6 +84,7 @@ LITE = [
     "minitorch",
 ]
 LIB_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SPEC_NAME = "SPEC.txt"
 MAX_SPEC_CHARS = 2_000_000
 REFERENCE_RUNS = 2
@@ -189,15 +190,32 @@ def clone(name: str, cache: Path, git_base: str) -> Path:
     return dest
 
 
+def check_rel_dir(value: str, what: str) -> str:
+    """A dataset-supplied repo-relative directory: no option-like, absolute or ``..`` path."""
+    parts = PurePosixPath(value).parts
+    if (
+        not value
+        or value.startswith("-")
+        or PurePosixPath(value).is_absolute()
+        or ".." in parts
+        or "\\" in value
+        or "\0" in value
+    ):
+        raise AdapterError(f"unsafe {what} {value!r}")
+    return value
+
+
 def export_tree(clone_dir: Path, commit: str, dest: Path, subdir: str = "") -> None:
     """``git archive`` of ``commit`` (optionally one subdirectory) into ``dest``.
 
     Symlinks, hard links, devices and escaping paths are refused: a bundle is data the
     grader copies around, so it must be plain files.
     """
+    if not COMMIT_RE.match(commit):
+        raise AdapterError(f"commit {commit!r} is not a 40-hex object id")
     args = ["archive", "--format=tar", commit]
     if subdir and subdir != ".":
-        args.append(subdir.rstrip("/") + "/")
+        args += ["--", check_rel_dir(subdir, "subdirectory").rstrip("/") + "/"]
     data = _git(args, cwd=clone_dir)
     dest.mkdir(parents=True, exist_ok=True)
     strip = len(PurePosixPath(subdir).parts) if subdir and subdir != "." else 0
@@ -355,7 +373,14 @@ def build_bundle(
     """Create ``<cache>/bundles/c0-<name>`` and return a summary dict."""
     if not LIB_RE.match(row.name):
         raise AdapterError(f"bad library name {row.name!r}")
+    for commit in (row.base_commit, row.reference_commit):
+        if not COMMIT_RE.match(commit):
+            raise AdapterError(f"{row.name}: commit {commit!r} is not a 40-hex object id")
     src, tests = row.src_dir.rstrip("/"), row.test_dir.rstrip("/")
+    if src:
+        check_rel_dir(src, "src_dir")
+    if tests and tests != ".":
+        check_rel_dir(tests, "test_dir")
     if not src or not tests or tests == ".":
         raise AdapterError(f"{row.name}: unsupported layout (src {src!r}, tests {tests!r})")
     if tests == src or tests.startswith(src + "/"):

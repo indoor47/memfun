@@ -205,3 +205,26 @@ def test_reviewer_rejections_are_counted() -> None:
     )
     assert rs.log_signals(line * 3 + "other\n")["reviewer_json_rejections"] == 3
     assert rs.log_signals("nothing\n")["reviewer_json_rejections"] == 0
+
+
+def test_dataset_fields_cannot_inject_git_options_or_paths(
+    tmp_path: Path, fake_origin: tuple[Path, c0.Row]
+) -> None:
+    git_base, row = fake_origin
+    clone = git_base / "minilib.git"
+    pwned = tmp_path / "pwned"
+    with pytest.raises(c0.AdapterError):  # an option, not a commit
+        c0.export_tree(clone, f"--output={pwned}", tmp_path / "o")
+    assert not pwned.exists()
+    for bad in ("--output=x", "/abs", "../up", "a/../../b", "a\\b"):
+        with pytest.raises(c0.AdapterError):
+            c0.export_tree(clone, row.reference_commit, tmp_path / "o2", subdir=bad)
+    for kwargs in (
+        {"src_dir": "../x/"},
+        {"test_dir": "/etc"},
+        {"base_commit": "--output=y"},
+        {"reference_commit": "HEAD"},
+    ):
+        bad_row = c0.Row(**{**row.__dict__, **kwargs})
+        with pytest.raises(c0.AdapterError):
+            c0.build_bundle(bad_row, tmp_path / "c", git_base=f"{git_base}/", log=lambda _m: None)
