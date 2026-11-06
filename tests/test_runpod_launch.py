@@ -234,6 +234,20 @@ class FakeRunPod:
         raise SpyError(f"unexpected rest {method} {path}")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermetic guard: authenticated requests may only reach local test servers."""
+    real_open = kit._AUTH_OPENER.open  # pyright: ignore[reportPrivateUsage]
+
+    def guarded(req: Any, *a: Any, **k: Any) -> Any:
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if not url.startswith("http://127.0.0.1:"):
+            raise SpyError(f"test tried a real network request to {url}")
+        return real_open(req, *a, **k)
+
+    monkeypatch.setattr(kit._AUTH_OPENER, "open", guarded)  # pyright: ignore[reportPrivateUsage]
+
+
 class FakeClock:
     def __init__(self, start: float = 1_000_000.0) -> None:
         self.t = start
@@ -524,14 +538,14 @@ def test_key_loaded_from_file_and_redacted_in_http_errors(
         body = io.BytesIO(f'{{"error": "bad key {FAKE_KEY}"}}'.encode())
         raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", Message(), body)
 
-    monkeypatch.setattr(kit.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(kit, "_auth_open", boom)
     transport = kit.HttpTransport(secret)
     with pytest.raises(kit.KitError) as exc:
         transport.graphql("query { gpuTypes { id } }")
     assert FAKE_KEY not in str(exc.value) and "***" in str(exc.value)
     assert exc.value.__cause__ is None and exc.value.__suppress_context__
 
-    rc = kit.main(["gpus"], env={}, key_path=key_file)  # real HttpTransport, patched urlopen
+    rc = kit.main(["gpus"], env={}, key_path=key_file)  # real HttpTransport, patched opener
     assert rc == 1
     captured = capsys.readouterr()
     assert FAKE_KEY not in captured.out + captured.err
@@ -1062,7 +1076,7 @@ def test_http_transport_wraps_every_exception(
     def boom(req: Any, timeout: float = 0) -> Any:
         raise make_exc()
 
-    monkeypatch.setattr(kit.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(kit, "_auth_open", boom)
     for argv in (["gpus"], ["spend", "--pod-id", "x"], ["status", "--pod-id", "x"]):
         assert kit.main(argv, env=dict(ENV)) == 1
     captured = capsys.readouterr()
@@ -1080,7 +1094,7 @@ def test_http_error_body_redacted_before_truncation(
             body = io.BytesIO(("x" * pad + FAKE_KEY + " tail").encode())
             raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", Message(), body)
 
-        monkeypatch.setattr(kit.urllib.request, "urlopen", boom)
+        monkeypatch.setattr(kit, "_auth_open", boom)
         with pytest.raises(kit.KitError) as exc:
             kit.HttpTransport(secret).graphql("query { gpuTypes { id } }")
         _assert_clean(str(exc.value), FAKE_KEY)
@@ -2413,3 +2427,83 @@ def test_boot_pip_hang_is_bounded(tmp_path: Path) -> None:
     )
     assert "timed out after 1s: python3" in log and "timed out after 1s: pip" in log
     assert "no way to download weights" in log and rp == ["remove pod podB"]
+
+
+# ---------------------------------------------------------------------------
+# The Bearer key never follows a redirect.
+# ---------------------------------------------------------------------------
+
+
+def _start_server(handler: Any) -> tuple[Any, int]:
+    import http.server
+    import threading
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, int(srv.server_address[1])
+
+
+def test_api_key_never_sent_to_redirect_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    import http.server
+
+    received: list[dict[str, str]] = []
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_a: Any) -> None:
+            pass
+
+        def _any(self) -> None:
+            received.append({k.lower(): v for k, v in self.headers.items()})
+            body = b'{"data": {}}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            self._any()
+
+        def do_POST(self) -> None:
+            self._any()
+
+    target, tport = _start_server(Target)
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_a: Any) -> None:
+            pass
+
+        def _any(self) -> None:
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{tport}/stolen?k={FAKE_KEY}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            self._any()
+
+        def do_POST(self) -> None:
+            self._any()
+
+    redirector, rport = _start_server(Redirector)
+    try:
+        base = f"http://127.0.0.1:{rport}"
+        kit.REDACT.add(kit.Secret(FAKE_KEY))
+        monkeypatch.setattr(kit, "GRAPHQL_URL", base + "/graphql")
+        monkeypatch.setattr(kit, "REST_URL", base + "/v1")
+        t = kit.HttpTransport(kit.Secret(FAKE_KEY), logs_url=base + "/v2/pods/{pod_id}/logs")
+        errors: list[str] = []
+        for call in (
+            lambda: t.graphql("query { myself { id } }"),
+            lambda: t.rest("GET", "/pods"),
+            lambda: list(t.stream_logs("pod1", {"tail": "1"}, None, 5.0)),
+        ):
+            with pytest.raises(kit.KitError) as info:
+                call()
+            errors.append(str(info.value))
+    finally:
+        redirector.shutdown()
+        target.shutdown()
+    assert received == []  # the redirect target never got a request, let alone the key
+    for msg in errors:
+        assert "refusing HTTP 302 redirect" in msg
+        _assert_clean(msg, FAKE_KEY)

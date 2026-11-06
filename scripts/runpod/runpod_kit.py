@@ -367,8 +367,34 @@ def _retry_after(value: str | None) -> float | None:
     return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the Bearer key must not travel to another URL."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        detail = f"refusing HTTP {code} redirect from {req.full_url} to {newurl}"
+        raise KitError(REDACT(detail + ": the API key is never sent to a redirect target")[:400])
+
+
+#: The only opener the kit uses for authenticated requests (no redirects followed).
+_AUTH_OPENER = urllib.request.build_opener(_RefuseRedirects)
+
+
+def _auth_open(req: urllib.request.Request, timeout: float) -> Any:
+    """Open an authenticated request (redirects refused).  Tests patch this."""
+    return _AUTH_OPENER.open(req, timeout=timeout)
+
+
 class HttpTransport:
-    """Real RunPod transport.  The key only ever goes into the Authorization header."""
+    """Real RunPod transport.  The key only ever goes into the Authorization header, as an
+    unredirected header, through an opener that refuses redirects."""
 
     def __init__(self, key: Secret, *, timeout: float = 30.0, logs_url: str = LOGS_URL) -> None:
         self._key = key
@@ -378,13 +404,13 @@ class HttpTransport:
     def _request(self, method: str, url: str, body: dict[str, Any] | None) -> Any:
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("Authorization", f"Bearer {self._key.reveal()}")
+        req.add_unredirected_header("Authorization", f"Bearer {self._key.reveal()}")
         req.add_header("Content-Type", "application/json")
         req.add_header("User-Agent", "memfun-runpod-kit/1")
         # Every failure becomes a KitError whose text was redacted BEFORE truncation;
         # no original exception (which may quote the header) is chained or re-raised.
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with _auth_open(req, timeout=self._timeout) as resp:
                 text = resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             try:
@@ -432,13 +458,13 @@ class HttpTransport:
         if params:
             url += "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, method="GET")
-        req.add_header("Authorization", f"Bearer {self._key.reveal()}")
+        req.add_unredirected_header("Authorization", f"Bearer {self._key.reveal()}")
         req.add_header("Accept", "text/event-stream")
         req.add_header("User-Agent", "memfun-runpod-kit/1")
         if last_event_id and re.fullmatch(r"[\x20-\x7e]{1,256}", last_event_id):
             req.add_header("Last-Event-ID", last_event_id)
         try:
-            resp = urllib.request.urlopen(req, timeout=timeout)
+            resp = _auth_open(req, timeout=timeout)
         except urllib.error.HTTPError as exc:
             try:
                 detail = exc.read(2000).decode("utf-8", "replace")
