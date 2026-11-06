@@ -134,6 +134,10 @@ class _SpecialistBase(BaseAgent):
         # a WorktreeManager is configured.  Falls back to the process
         # cwd when not set, preserving existing single-tree semantics.
         task_cwd = payload.get("cwd") or os.getcwd()
+        # Only an explicit payload cwd roots the RLM's REPL helpers.
+        # Without one, the helpers keep resolving against the process
+        # cwd at call time (legacy behaviour).
+        rlm_root: str | None = str(payload["cwd"]) if payload.get("cwd") else None
 
         # Augment context with sub-task specific input files if
         # they weren't already gathered by the shared context pass.
@@ -222,6 +226,7 @@ class _SpecialistBase(BaseAgent):
                 max_iterations=max_iter,
                 verbose=True,
                 enable_planning=False,
+                root=rlm_root,
             ),
             extra_tools=self._extra_tools,
             on_step=_on_step,
@@ -298,7 +303,13 @@ class _SpecialistBase(BaseAgent):
             read_affected_files,
         )
 
-        project_root = Path(cwd or os.getcwd())
+        project_root = Path(cwd or os.getcwd()).resolve()
+        # With an explicit task cwd (per-task worktree), confine the
+        # fix/polish edits to it: the LLM emits paths relative to the
+        # ``=== FILE: rel ===`` headers, which OperationExecutor would
+        # otherwise resolve against the *process* cwd (main checkout).
+        # Without one, keep the legacy unconfined behaviour.
+        exec_base_dir: Path | None = project_root if cwd else None
         extra_ops: list[tuple[str, str, Any]] = []
         extra_files: list[str] = []
 
@@ -341,6 +352,7 @@ class _SpecialistBase(BaseAgent):
                                 executor = OperationExecutor(
                                     project_root,
                                     edit_only=True,
+                                    base_dir=exec_base_dir,
                                 )
                                 await executor.execute(fix_ops)
                                 extra_ops.extend(executor.ops)
@@ -386,6 +398,7 @@ class _SpecialistBase(BaseAgent):
                             executor = OperationExecutor(
                                 project_root,
                                 edit_only=True,
+                                base_dir=exec_base_dir,
                             )
                             await executor.execute(polish_ops)
                             extra_ops.extend(executor.ops)

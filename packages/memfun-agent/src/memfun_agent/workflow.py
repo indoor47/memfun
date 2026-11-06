@@ -1567,7 +1567,7 @@ class WorkflowEngine:
             build_file_manifest,
         )
 
-        project_root = os.getcwd()
+        project_root = str(self._project_root) if self._project_root else os.getcwd()
         config = ContextFirstConfig()
         manifest = build_file_manifest(project_root)
 

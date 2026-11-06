@@ -52,6 +52,7 @@ def build_context_metadata(
     *,
     has_history: bool = False,
     history_len: int = 0,
+    root: str | None = None,
 ) -> str:
     """Build a compact metadata string for the LLM about the context.
 
@@ -77,6 +78,17 @@ def build_context_metadata(
     ]
 
     lines.append("")
+    if root is not None:
+        lines.append(f"WORKING DIRECTORY: {root}")
+        lines.append(
+            "  write_file/read_file/edit_file/list_files resolve relative "
+            "paths against this directory and reject paths outside it. "
+            "run_cmd starts commands in this directory but does NOT "
+            "confine them (cd / absolute paths still reach elsewhere), so "
+            "keep commands inside it. Do NOT use os.chdir(), raw open() "
+            "or subprocess -- they are not rooted."
+        )
+        lines.append("")
     lines.append("Available helper functions in the REPL:")
     lines.append("  write_file(path: str, content: str) -> str  # Write a file, returns abs path")
     lines.append("  read_file(path: str) -> str  # Read file contents as string")
@@ -227,6 +239,16 @@ class RLMConfig:
     max_history_chars: int = _MAX_HISTORY_CHARS
     verbose: bool = False
     enable_planning: bool = True
+    # Per-task working directory for the REPL file/command helpers.
+    # When set, ``write_file``/``read_file``/``edit_file``/``list_files``
+    # resolve relative paths against it (and reject paths that resolve
+    # outside it, symlinks included), ``run_cmd`` runs with ``cwd=root``,
+    # and the path-scoped MCP bridge tools get their ``path`` argument
+    # rooted the same way.  ``None`` keeps the legacy behaviour: paths
+    # resolve against the *process* cwd at call time.  This is
+    # deliberately not ``os.chdir`` / ``MEMFUN_PROJECT_ROOT`` -- both are
+    # process-global and concurrent tasks need different roots.
+    root: str | None = None
 
 
 @dataclass(slots=True)
@@ -354,6 +376,7 @@ class RLMModule(dspy.Module):
             self.config.preview_length,
             has_history=bool(conversation_history),
             history_len=len(conversation_history or []),
+            root=_canonical_root(self.config.root),
         )
 
         # Set up REPL environment
@@ -828,8 +851,16 @@ class RLMModule(dspy.Module):
         repl.namespace["llm_query"] = self._make_llm_query()
         repl.namespace["llm_query_batched"] = self._make_llm_query_batched()
 
-        # Inject extra tools (e.g., MCP tool wrappers)
-        for name, func in self._extra_tools.items():
+        root = _canonical_root(self.config.root)
+
+        # Inject extra tools (e.g., MCP tool wrappers).  When a task
+        # root is set, the bridge's path-scoped tools are wrapped so
+        # their ``path`` argument resolves inside the root instead of
+        # the process cwd (see ``_root_extra_tools``).
+        extra_tools = (
+            _root_extra_tools(self._extra_tools, root) if root is not None else self._extra_tools
+        )
+        for name, func in extra_tools.items():
             repl.namespace[name] = func
 
         # Standard library imports available in the REPL
@@ -840,11 +871,13 @@ class RLMModule(dspy.Module):
         repl.namespace["state"]["_files"] = []
 
         # Inject robust helper functions
-        repl.namespace["write_file"] = _make_write_file(repl.namespace)
-        repl.namespace["read_file"] = _make_read_file(repl.namespace)
-        repl.namespace["run_cmd"] = _make_run_cmd(repl.namespace)
-        repl.namespace["edit_file"] = _make_edit_file(repl.namespace)
-        repl.namespace["list_files"] = _make_list_files()
+        repl.namespace["write_file"] = _make_write_file(repl.namespace, root=root)
+        repl.namespace["read_file"] = _make_read_file(repl.namespace, root=root)
+        repl.namespace["run_cmd"] = _make_run_cmd(repl.namespace, root=root)
+        repl.namespace["edit_file"] = _make_edit_file(repl.namespace, root=root)
+        repl.namespace["list_files"] = _make_list_files(root=root)
+        if root is not None:
+            repl.namespace["PROJECT_ROOT"] = root
         repl.namespace["web_search"] = _make_web_search(repl.namespace)
         repl.namespace["web_fetch"] = _make_web_fetch(repl.namespace)
 
@@ -950,11 +983,121 @@ class RLMModule(dspy.Module):
         )
 
 
+# ── Task-root path resolution ──────────────────────────────────
+
+# MCP bridge tools (see ``MCPToolBridge.get_repl_tools``) whose ``path``
+# keyword names a file or directory.  Without wrapping they resolve
+# against the process cwd (or ``MEMFUN_PROJECT_ROOT``), bypassing the
+# per-task root.  ``read_file``/``write_file`` are listed for
+# completeness even though the RLM's own rooted helpers shadow them.
+_PATH_SCOPED_BRIDGE_TOOLS: frozenset[str] = frozenset(
+    {
+        "read_file",
+        "write_file",
+        "list_directory",
+        "glob_files",
+        "grep",
+        "git_status",
+        "git_diff",
+        "git_log",
+        "repo_map",
+    }
+)
+
+
+class PathOutsideRootError(PermissionError):
+    """Raised when a REPL helper path resolves outside the task root."""
+
+
+def _canonical_root(root: str | None) -> str | None:
+    """Return the symlink-resolved absolute form of *root* (or None)."""
+    if root is None:
+        return None
+    from pathlib import Path
+
+    return str(Path(root).resolve())
+
+
+def _resolve_path(path: str, root: str | None) -> str:
+    """Resolve *path* for a REPL helper.
+
+    With ``root=None`` this is exactly the legacy behaviour:
+    ``os.path.abspath(path)`` against the process cwd.
+
+    With a root, relative paths are joined onto the root, the result is
+    resolved with symlinks followed (``Path.resolve``), and anything
+    landing outside the root -- ``../`` escapes, absolute paths
+    elsewhere, symlinks inside the root pointing out -- raises
+    :class:`PathOutsideRootError`.  *root* must already be canonical
+    (see :func:`_canonical_root`).
+    """
+    import os as _os
+    from pathlib import Path
+
+    if root is None:
+        return _os.path.abspath(path)
+
+    root_path = Path(root)
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = root_path / candidate
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root_path):
+        raise PathOutsideRootError(f"path outside task root: {path!r} -> {resolved} (root={root})")
+    return str(resolved)
+
+
+def _root_extra_tools(
+    tools: dict[str, Callable[..., Any]],
+    root: str,
+) -> dict[str, Callable[..., Any]]:
+    """Wrap path-scoped MCP bridge tools so ``path`` resolves in *root*.
+
+    Only names in :data:`_PATH_SCOPED_BRIDGE_TOOLS` are wrapped; the
+    bridge wrappers accept keyword arguments only.  A missing ``path``
+    defaults to the root itself (the bridge tools default to ``"."``,
+    i.e. the process cwd).  Escapes return a ``[tool error ...]`` string
+    in the same shape the bridge uses for failures.
+
+    Known residual gaps (not path arguments, so not rewritten here):
+    ``glob_files``'s ``pattern`` and ``git_diff``'s ``file`` are passed
+    through unchanged and interpreted by the tool relative to ``path``.
+    Tools outside the known set are passed through unwrapped.
+    """
+    wrapped: dict[str, Callable[..., Any]] = {}
+    for name, func in tools.items():
+        if name not in _PATH_SCOPED_BRIDGE_TOOLS:
+            wrapped[name] = func
+            continue
+        wrapped[name] = _wrap_rooted_tool(name, func, root)
+    return wrapped
+
+
+def _wrap_rooted_tool(
+    name: str,
+    func: Callable[..., Any],
+    root: str,
+) -> Callable[..., Any]:
+    def rooted_tool(**kwargs: Any) -> Any:
+        raw = kwargs.get("path", ".")
+        try:
+            kwargs["path"] = _resolve_path(str(raw), root)
+        except PathOutsideRootError as exc:
+            return f"[tool error: {name}]: {exc}"
+        return func(**kwargs)
+
+    rooted_tool.__name__ = getattr(func, "__name__", name)
+    rooted_tool.__doc__ = getattr(func, "__doc__", None)
+    return rooted_tool
+
+
 # ── REPL helper function factories ─────────────────────────────
 
 
 def _make_write_file(
     ns: dict[str, Any],
+    *,
+    root: str | None = None,
 ) -> Callable[[str, str], str]:
     """Create a ``write_file`` helper bound to *ns*."""
     import os as _os
@@ -968,7 +1111,7 @@ def _make_write_file(
         content would lose >30% of lines, the write is blocked and
         a warning is printed suggesting ``edit_file()`` instead.
         """
-        path = _os.path.abspath(path)
+        path = _resolve_path(path, root)
 
         # Guard: detect destructive overwrites of existing files.
         if _os.path.isfile(path):
@@ -1006,6 +1149,8 @@ def _make_write_file(
 
 def _make_read_file(
     ns: dict[str, Any],
+    *,
+    root: str | None = None,
 ) -> Callable[[str], str]:
     """Create a ``read_file`` helper bound to *ns*.
 
@@ -1015,7 +1160,6 @@ def _make_read_file(
     re-reading unchanged files every iteration.
     """
     import hashlib
-    import os as _os
 
     # Track {abs_path: content_md5} for cache invalidation.
     _read_cache: dict[str, str] = {}
@@ -1028,7 +1172,7 @@ def _make_read_file(
         content is still accessible as a Python variable from a
         prior iteration.
         """
-        path = _os.path.abspath(path)
+        path = _resolve_path(path, root)
         with open(path) as fh:
             content = fh.read()
 
@@ -1064,8 +1208,15 @@ def _make_read_file(
 
 def _make_run_cmd(
     ns: dict[str, Any],
+    *,
+    root: str | None = None,
 ) -> Callable[[str], str]:
-    """Create a ``run_cmd`` helper bound to *ns*."""
+    """Create a ``run_cmd`` helper bound to *ns*.
+
+    With *root* set, commands run with ``cwd=root``.  This sets the
+    starting directory only; it is not a sandbox (a command can still
+    ``cd`` elsewhere or use absolute paths).
+    """
     import os as _os
     import subprocess as _sp
 
@@ -1080,7 +1231,7 @@ def _make_run_cmd(
             capture_output=True,
             text=True,
             timeout=120,
-            cwd=_os.getcwd(),
+            cwd=root if root is not None else _os.getcwd(),
         )
         ns["state"]["_ops"].append(("cmd", cmd, result.returncode))
         if result.stdout:
@@ -1094,10 +1245,10 @@ def _make_run_cmd(
 
 def _make_edit_file(
     ns: dict[str, Any],
+    *,
+    root: str | None = None,
 ) -> Callable[[str, str, str], bool]:
     """Create an ``edit_file`` helper bound to *ns*."""
-    import os as _os
-
     from memfun_agent.context_first import _fuzzy_find_and_replace
 
     def edit_file(path: str, old_text: str, new_text: str) -> bool:
@@ -1108,7 +1259,7 @@ def _make_edit_file(
 
         Returns ``True`` if the replacement was made.
         """
-        path = _os.path.abspath(path)
+        path = _resolve_path(path, root)
         with open(path) as fh:
             content = fh.read()
 
@@ -1135,8 +1286,17 @@ def _make_edit_file(
     return edit_file
 
 
-def _make_list_files() -> Callable[[str], list[str]]:
-    """Create a ``list_files`` helper."""
+def _make_list_files(
+    *,
+    root: str | None = None,
+) -> Callable[[str], list[str]]:
+    """Create a ``list_files`` helper.
+
+    With *root* set, *path* is resolved inside the root (escapes raise
+    :class:`PathOutsideRootError`) but the returned entries keep the
+    legacy shape ``os.path.join(path, <relative>)`` so ``list_files('.')``
+    still yields ``./...`` entries, now relative to the root.
+    """
     import os as _os
 
     def list_files(path: str = ".", with_times: bool = False) -> list[str]:
@@ -1152,13 +1312,19 @@ def _make_list_files() -> Callable[[str], list[str]]:
         import datetime
 
         files: list[str] = []
-        for root, dirs, filenames in _os.walk(path):
+        walk_dir = path if root is None else _resolve_path(path, root)
+        for dirpath, dirs, filenames in _os.walk(walk_dir):
             dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
             for fname in filenames:
-                fpath = _os.path.join(root, fname)
+                real_path = _os.path.join(dirpath, fname)
+                if root is None:
+                    fpath = real_path
+                else:
+                    rel = _os.path.relpath(real_path, walk_dir)
+                    fpath = _os.path.join(path, rel)
                 if with_times:
                     try:
-                        mtime = _os.path.getmtime(fpath)
+                        mtime = _os.path.getmtime(real_path)
                         dt = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
                         fpath = f"{fpath} (modified: {dt})"
                     except OSError:
