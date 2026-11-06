@@ -263,6 +263,8 @@ The smoke task set for the first run is `evals/swarm/smoke/` (validate it with
 `uv run python evals/swarm/validate_bundles.py`). Grade agent output only the way its
 README's "Grading rules" section describes: owned files over a clean `repo/`, hidden tests
 run from a separate grader dir with a pinned rootdir/ini and no conftest from the agent tree.
+`evals/swarm/run_smoke.py` does all of it (episode repos, `memfun swarm`, grading, one shared
+dashboard, `results.json`); commands in `evals/swarm/README-run-smoke.md`.
 
 ## Ports
 
