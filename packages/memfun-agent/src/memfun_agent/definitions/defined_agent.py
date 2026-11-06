@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 import uuid
 from typing import TYPE_CHECKING
@@ -58,7 +59,18 @@ class DefinedAgent(BaseAgent):
         Builds a prompt from the definition instructions and task payload,
         then returns the result.  Delegation to sub-agents is performed
         via the orchestrator when ``delegates-to`` is configured.
+
+        The whole body runs under the agent's LLM role (e.g.
+        ``pr-reviewer`` -> ``reviewer``) so any LLM call made on its
+        behalf uses that role's model.
         """
+        from memfun_agent.role_models import role_for_agent, role_scope
+
+        role = role_for_agent(self._definition.name, default=None)
+        with role_scope(role) if role else contextlib.nullcontext():
+            return await self._handle_impl(task)
+
+    async def _handle_impl(self, task: TaskMessage) -> TaskResult:
         from memfun_core.types import TaskResult as TaskRes
 
         start = time.monotonic()

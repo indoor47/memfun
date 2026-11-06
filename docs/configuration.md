@@ -20,6 +20,7 @@ api_key_env = "ANTHROPIC_API_KEY"      # Env var name containing the API key
 base_url = ""                          # Optional custom API base URL
 temperature = 0.0                      # Sampling temperature (0.0 = deterministic)
 max_tokens = 8192                      # Max tokens per LLM response
+# [llm.roles.<role>] tables override [llm] per role -- see "per-role models" below
 
 [backend]
 tier = "sqlite"                        # Backend tier: in-process, sqlite, redis, nats
@@ -78,6 +79,127 @@ variables at runtime -- the configuration file never contains raw secrets.
 | `base_url` | string | `""` | Custom API base URL (for proxies or self-hosted) |
 | `temperature` | float | `0.0` | Sampling temperature |
 | `max_tokens` | int | `8192` | Maximum tokens per response |
+
+### [llm.roles.<role>] -- per-role models
+
+A swarm can run different roles on different models. Each
+`[llm.roles.<role>]` table overrides `[llm]` for one role; every field is
+optional and falls back to `[llm]` **field by field**. Leave a role out and
+it uses `[llm]` unchanged. With no `[llm.roles]` section at all, behaviour
+is exactly as before: everything runs on `[llm]`.
+
+| Role | What runs under it |
+|------|--------------------|
+| `orchestrator` | The workflow engine itself (`memfun swarm`, chat workflow runs): any LLM call not bound to a narrower role |
+| `decomposer` | `TaskDecomposer` (task -> sub-task DAG), including hierarchical recursion |
+| `worker` | Specialist agents (`coder-agent`, `test-agent`, `file-agent`, ...) and the single-task `rlm-coder` dispatch of a workflow |
+| `auditor` | Per-task `review-agent` dispatches |
+| `reviewer` | The `pr-reviewer` agent at the PR layer |
+
+Allowed keys per role: `provider`, `model`, `base_url`, `api_key_env`,
+`temperature`, `max_tokens`. Unknown role names and unknown keys are
+ignored with a warning. Wrong value types raise a configuration error, and
+so does an `api_key_env` that is not a valid environment variable *name*:
+this field names the variable that holds the key and never holds the key
+itself; `api_key_env = ""` means "no key". `base_url = ""` clears an
+inherited `[llm].base_url`.
+
+Two fields are exceptions to plain field-by-field fallback, so a role
+never sends credentials to the wrong place:
+
+- `base_url`: a role that switches `provider` does **not** inherit
+  `[llm].base_url` (it uses the new provider's default endpoint unless it
+  sets its own `base_url`). `base_url = ""` clears an inherited value
+  explicitly.
+- `api_key_env`: a role inherits `[llm].api_key_env` only when its
+  `provider` **and** `base_url` both resolve to the same values as
+  `[llm]`'s. A role that changes either gets no key unless it sets its own
+  `api_key_env`, so the `[llm]` key is never sent to a different endpoint.
+  For `custom` (and any other provider memfun does not map itself) the
+  route is part of `model` (e.g. `openrouter/...`), so a role that changes
+  the model's route prefix also gets no inherited key.
+
+Provider names are matched case-insensitively; an unrecognized provider
+logs a warning.
+
+Global and project configs are merged before roles are resolved, so an
+`api_key_env` from `~/.memfun/config.toml` combined with a project-level
+`provider` or `base_url` change is sent to the project's endpoint -- the
+same trust model as `[llm].base_url`. Review merged configs from untrusted
+projects.
+
+#### Default example: Qwen for every role
+
+The shipped example runs **all five roles** on one self-hosted
+OpenAI-compatible server (SGLang serving Qwen3.8-27B under the alias
+`qwen3.8-27b`) reached through an SSH tunnel on `localhost:18000`. No
+Anthropic key is needed. Set the endpoint once in `[llm]`; every role
+inherits it, and a role table is only needed to tune that role:
+
+```toml
+[llm]
+provider = "openai"                     # OpenAI-compatible endpoint
+model = "qwen3.8-27b"                   # the alias the server serves
+base_url = "http://127.0.0.1:18000/v1"  # local end of the SSH tunnel
+api_key_env = "MEMFUN_WORKER_API_KEY"   # dummy; unset -> placeholder key
+
+# Optional per-role tuning; omitted fields (endpoint, key) are inherited.
+[llm.roles.worker]
+max_tokens = 16384
+```
+
+| Role | Resolves to |
+|------|-------------|
+| `orchestrator` | `[llm]`: `openai/qwen3.8-27b` at `http://127.0.0.1:18000/v1` |
+| `decomposer` | `[llm]`: same endpoint |
+| `worker` | `[llm]` plus its own `max_tokens` |
+| `auditor` | `[llm]`: same endpoint |
+| `reviewer` | `[llm]`: same endpoint |
+
+Open the tunnel before starting the swarm, e.g.
+`ssh -N -L 18000:127.0.0.1:<server-port> <user>@<host>`.
+
+#### Optional comparison arm: Claude Opus 5.5 as orchestrator/decomposer
+
+Not the default. To compare against a frontier planner, add these tables
+on top of the Qwen `[llm]` above; workers, auditors and the reviewer stay
+on Qwen. Each anthropic role sets its own `api_key_env` (it would not
+inherit `MEMFUN_WORKER_API_KEY` anyway, because the provider differs) and
+does not inherit the tunnel `base_url`:
+
+```toml
+[llm.roles.orchestrator]
+provider = "anthropic"
+model = "claude-opus-5-5"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[llm.roles.decomposer]
+provider = "anthropic"
+model = "claude-opus-5-5"
+api_key_env = "ANTHROPIC_API_KEY"
+```
+
+Notes:
+
+- `provider = "openai"` with an unset key variable sends the placeholder
+  key `sk-local` only when `base_url` is a loopback / private / link-local
+  host (`localhost`, `*.local`, 127.0.0.0/8, ::1, 10/8, 172.16/12,
+  192.168/16), since self-hosted servers usually run without auth. A hosted
+  `base_url` with no key gets no placeholder: memfun warns instead.
+- At startup memfun logs one warning per configured role whose key is
+  missing or whose model cannot be set up.
+- Once any `[llm.roles.*]` table exists, every role binds its own resolved
+  model explicitly; a role without a table runs on `[llm]`, never on the
+  model of an enclosing role (for example a worker dispatched by the
+  orchestrator).
+- Chat requests answered outside a multi-agent workflow (direct answers,
+  the single-agent and context-first paths) run as role `default` on
+  `[llm]`.
+- Each role's model is bound per call with a task-local `dspy.context`, so
+  concurrent agents running different roles do not interfere.
+- Every `llm.call` telemetry event carries `model` (the configured model id
+  of the LM that made the call, e.g. `openai/qwen3.8-27b`, not the name the
+  server echoes back) and `role` (`default` when no role is bound).
 
 ### [backend]
 

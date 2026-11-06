@@ -112,7 +112,7 @@ class DistributedEvent:
     * Per-LLM-call telemetry: ``llm.call`` (published by
       :class:`memfun_agent.llm_telemetry.MemfunDSPyCallback`).  The
       extra ``model`` / ``prompt_preview`` / ``completion_preview`` /
-      ``prompt_tokens`` / ``completion_tokens`` / ``error`` fields are
+      ``prompt_tokens`` / ``completion_tokens`` / ``error`` / ``role`` fields are
       LLM-call specific and ``None`` for lifecycle events.
     """
 
@@ -133,6 +133,8 @@ class DistributedEvent:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     error: str | None = None
+    # Per-role model binding the call ran under (``llm.call`` only).
+    role: str | None = None
 
     def to_bytes(self) -> bytes:
         self.ts = self.ts or time.time()
@@ -154,6 +156,7 @@ class DistributedEvent:
                 "prompt_tokens": self.prompt_tokens,
                 "completion_tokens": self.completion_tokens,
                 "error": self.error,
+                "role": self.role,
             }
         ).encode()
 
@@ -177,6 +180,7 @@ class DistributedEvent:
             prompt_tokens=d.get("prompt_tokens"),
             completion_tokens=d.get("completion_tokens"),
             error=d.get("error"),
+            role=d.get("role"),
         )
 
 

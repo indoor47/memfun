@@ -686,10 +686,15 @@ class WorkflowEngine:
             correlation_id=state.workflow_id,
         )
 
-        result = await self._orchestrator.dispatch(
-            task_msg,
-            "rlm-coder",
-        )
+        from memfun_agent.role_models import role_scope
+
+        # Single-task coding is worker work: bind the worker role model
+        # (not the enclosing orchestrator's) for the rlm-coder dispatch.
+        with role_scope("worker"):
+            result = await self._orchestrator.dispatch(
+                task_msg,
+                "rlm-coder",
+            )
 
         state.status = WorkflowStatus.COMPLETED
         state.completed_at = time.time()

@@ -780,12 +780,15 @@ class ChatSession:
             # skip the context-first attempt that would truncate.
             try:
                 engine = await self._init_workflow_engine()
-                wf_result = await engine.execute_workflow(
-                    task_description=user_input,
-                    project_context=context,
-                    conversation_history=self._history,
-                    project=Path.cwd().name,
-                )
+                from memfun_agent.role_models import role_scope
+
+                with role_scope("orchestrator"):
+                    wf_result = await engine.execute_workflow(
+                        task_description=user_input,
+                        project_context=context,
+                        conversation_history=self._history,
+                        project=Path.cwd().name,
+                    )
                 # Auto-switch back to "auto" after workflow completes.
                 if self._mode == "workflow":
                     self._mode = "auto"
@@ -817,12 +820,15 @@ class ChatSession:
             # PHASE 2: Escalate to multi-agent workflow
             try:
                 engine = await self._init_workflow_engine()
-                wf_result = await engine.execute_workflow(
-                    task_description=user_input,
-                    project_context=context,
-                    conversation_history=self._history,
-                    project=Path.cwd().name,
-                )
+                from memfun_agent.role_models import role_scope
+
+                with role_scope("orchestrator"):
+                    wf_result = await engine.execute_workflow(
+                        task_description=user_input,
+                        project_context=context,
+                        conversation_history=self._history,
+                        project=Path.cwd().name,
+                    )
                 # Auto-switch back to "auto" after workflow completes.
                 if self._mode == "workflow":
                     self._mode = "auto"
@@ -1765,22 +1771,20 @@ def _load_creds_file(creds_path: Path) -> None:
 
 def _configure_dspy(config: MemfunConfig) -> None:
     """Configure DSPy with the LLM from memfun config."""
-    import os
 
     import dspy
+    from memfun_agent.role_models import lm_settings, resolve_api_key, set_role_config
+
+    # Register [llm.roles.*] so each agent's role_scope picks its model
+    # per call (task-local dspy.context); [llm] stays the global default.
+    set_role_config(config)
 
     provider = config.llm.provider
-    model = config.llm.model
-    api_key = os.environ.get(config.llm.api_key_env, "")
+    # Env lookup + keyless-local placeholders (openai-compat, ollama,
+    # openai with a base_url) live in the shared role_models helper.
+    api_key = resolve_api_key(config.llm)
 
-    # openai-compat endpoints (local llama.cpp / vLLM / OpenRouter)
-    # often run without auth. LiteLLM still requires a non-empty
-    # api_key, so inject "sk-local" as a placeholder when none is
-    # configured.
-    if provider == "openai-compat" and not api_key:
-        api_key = "sk-local"
-
-    if not api_key and provider != "ollama":
+    if not api_key:
         logger.warning(
             "No API key found for %s (set %s). LLM calls will fail.",
             provider,
@@ -1794,34 +1798,9 @@ def _configure_dspy(config: MemfunConfig) -> None:
         )
         return
 
-    # DSPy uses LiteLLM model names: provider/model
-    if provider == "anthropic":
-        lm_model = f"anthropic/{model}"
-    elif provider == "openai":
-        lm_model = f"openai/{model}"
-    elif provider == "openai-compat":
-        # LiteLLM treats this as openai with a custom api_base.
-        lm_model = f"openai/{model}"
-    elif provider == "ollama":
-        lm_model = f"ollama_chat/{model}"
-        api_key = "ollama"  # LiteLLM requires a non-empty key
-    else:
-        lm_model = model
-
-    kwargs: dict[str, Any] = {
-        "temperature": config.llm.temperature,
-        "max_tokens": config.llm.max_tokens,
-        # Local CPU-served models (and queued multi-slot servers) can take
-        # 10-30+ minutes per call on large outputs.  LiteLLM defaults to 600s
-        # which kills calls long before the server completes them — wasting
-        # all the compute already spent.  Bump to 1h so the agent stays
-        # patient and self-heals through slow but progressing endpoints.
-        "timeout": 3600,
-    }
-    if api_key:
-        kwargs["api_key"] = api_key
-    if config.llm.base_url:
-        kwargs["api_base"] = config.llm.base_url
+    # DSPy uses LiteLLM model names (provider/model) + a 1h timeout so
+    # slow self-hosted endpoints aren't killed mid-call.
+    lm_model, kwargs = lm_settings(config.llm)
 
     try:
         lm = dspy.LM(lm_model, **kwargs)

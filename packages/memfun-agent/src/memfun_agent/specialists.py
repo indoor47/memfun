@@ -106,17 +106,30 @@ class _SpecialistBase(BaseAgent):
             self._MAX_ITERATIONS,
         )
 
+    @property
+    def llm_role(self) -> str:
+        """Per-role model binding: ``auditor`` for review-agent, else ``worker``."""
+        from memfun_agent.role_models import role_for_agent
+
+        return role_for_agent(self.agent_id) or "worker"
+
     async def handle(self, task: TaskMessage) -> TaskResult:
         from memfun_agent.llm_telemetry import agent_context
+        from memfun_agent.role_models import role_scope
 
         # Attribute every nested LLM call (plan/code/verify/fix/polish)
-        # to this specialist + sub-task.  The contextvar is restored on
-        # exit so sibling tasks don't inherit attribution.
+        # to this specialist + sub-task, and run them on this agent's
+        # role model (``[llm.roles.worker]`` / ``[llm.roles.auditor]``).
+        # Both bindings are contextvar-local and restored on exit, so
+        # sibling tasks running concurrently don't inherit them.
         workflow_id = task.payload.get("workflow_id", "")
-        with agent_context(
-            agent_name=self.agent_id,
-            task_id=task.task_id,
-            workflow_id=workflow_id or None,
+        with (
+            agent_context(
+                agent_name=self.agent_id,
+                task_id=task.task_id,
+                workflow_id=workflow_id or None,
+            ),
+            role_scope(self.llm_role),
         ):
             return await self._handle_impl(task)
 
