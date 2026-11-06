@@ -12,6 +12,7 @@
 # fails, the fallback stops SGLang and exits PID 1: that frees the GPU from work but may
 # NOT stop billing, which is why the local watchdog and terminateAfter also exist.
 set -u
+set -f  # no globbing: $MEMFUN_SGLANG_ARGS is word-split on purpose but must never glob
 
 log() { echo "[memfun-boot] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 
@@ -19,6 +20,7 @@ MAX_MIN="${MEMFUN_MAX_MINUTES:?MEMFUN_MAX_MINUTES unset}"
 DEADLINE_EPOCH="${MEMFUN_DEADLINE_EPOCH:?MEMFUN_DEADLINE_EPOCH unset}"
 MODEL_DIR="${MEMFUN_MODEL_DIR:?MEMFUN_MODEL_DIR unset}"
 MODEL_REPO="${MEMFUN_MODEL_REPO:-}"
+REVISION="${MEMFUN_MODEL_REVISION:-main}"
 SERVED_NAME="${MEMFUN_SERVED_NAME:-model}"
 PORT="${MEMFUN_SGLANG_PORT:-30000}"
 EXTRA_ARGS="${MEMFUN_SGLANG_ARGS:-}"
@@ -82,17 +84,52 @@ else
 fi
 
 # ---- 3. weights ----
-if [ ! -f "$MODEL_DIR/.memfun_verified" ]; then
+# Names are validated by the kit too; re-check here so the pod never builds a path from
+# an unvalidated string (no "..", no absolute paths).
+valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$ ]] && [[ "$1" != *..* ]]
+}
+valid_name "$MODEL_REPO" || self_terminate "invalid MEMFUN_MODEL_REPO"
+valid_name "$SERVED_NAME" || self_terminate "invalid MEMFUN_SERVED_NAME"
+[[ "$REVISION" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$REVISION" != *..* ]] \
+  || self_terminate "invalid MEMFUN_MODEL_REVISION"
+MODELS_ROOT="${MEMFUN_MODELS_ROOT:-/workspace/models}"
+case "$MODEL_DIR" in
+  "$MODELS_ROOT"/*) ;;
+  *) self_terminate "MEMFUN_MODEL_DIR outside $MODELS_ROOT" ;;
+esac
+[[ "$MODEL_DIR" != *..* ]] || self_terminate "MEMFUN_MODEL_DIR contains .."
+
+MARKER="$MODEL_DIR/.memfun_verified"
+marker_field() {  # one-line JSON written by verify_weights.py / this script
+  sed -n "s/.*\"$1\": *\"\([^\"]*\)\".*/\1/p" "$MARKER" 2>/dev/null | head -n 1
+}
+weights_ok() {
+  [ -f "$MARKER" ] || { log "no $MARKER"; return 1; }
+  [ "$(marker_field repo)" = "$MODEL_REPO" ] || { log "marker repo != $MODEL_REPO"; return 1; }
+  if [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]]; then  # pinned commit: must be exactly that one
+    [ "$(marker_field sha)" = "$REVISION" ] || { log "marker sha != pinned $REVISION"; return 1; }
+  fi
+  return 0
+}
+
+if ! weights_ok; then
   if [ "$ALLOW_PULL" = "1" ] && [ -n "$MODEL_REPO" ]; then
-    log "weights not verified at $MODEL_DIR: downloading $MODEL_REPO (GPU time is burning)"
+    log "weights not verified at $MODEL_DIR: downloading $MODEL_REPO@$REVISION (GPU time is burning)"
+    rm -f "$MARKER"
+    mkdir -p "$MODEL_DIR"
     if command -v hf >/dev/null 2>&1; then
-      hf download "$MODEL_REPO" --local-dir "$MODEL_DIR" >"$RUN_DIR/pull.log" 2>&1
+      hf download "$MODEL_REPO" --revision "$REVISION" --local-dir "$MODEL_DIR" >"$RUN_DIR/pull.log" 2>&1
     else
-      huggingface-cli download "$MODEL_REPO" --local-dir "$MODEL_DIR" >"$RUN_DIR/pull.log" 2>&1
+      huggingface-cli download "$MODEL_REPO" --revision "$REVISION" --local-dir "$MODEL_DIR" \
+        >"$RUN_DIR/pull.log" 2>&1
     fi || self_terminate "weight download failed"
     # hf download checks transfer integrity; full Hub-checksum verification is
     # prepull_weights.sh's job (verify_weights.py is not shipped into the pod).
-    echo '{"source": "in-pod pull, hf download integrity only"}' >"$MODEL_DIR/.memfun_verified"
+    sha=""
+    [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] && sha="$REVISION"
+    printf '{"repo": "%s", "sha": "%s", "revision": "%s", "source": "in-pod pull"}\n' \
+      "$MODEL_REPO" "$sha" "$REVISION" >"$MARKER"
   else
     self_terminate "weights missing/unverified at $MODEL_DIR (run prepull_weights.sh first)"
   fi

@@ -6,22 +6,28 @@ a regression that lets dry-run mutate fails loudly instead of renting a GPU.
 
 from __future__ import annotations
 
+import argparse
 import base64
+import contextlib
 import datetime as dt
 import hashlib
 import io
 import json
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import urllib.error
 from email.message import Message
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -88,6 +94,13 @@ class FakeRunPod:
         ]
         self.terminate_calls = 0
         self.dc_stock = {"EU-RO-1": "AVAILABLE", "US-KS-2": "AVAILABLE", "EU-NL-1": "UNAVAILABLE"}
+        # Failure-injection hooks.
+        self.deploy_mode = "ok"  # | "timeout_after_create" | "fail_no_pod"
+        self.cost_in_deploy = True
+        self.on_pod_query: Callable[[], None] | None = None
+        self.raise_any: Callable[[], BaseException] | None = None
+        self.lookup_fails = False
+        self.price_override: float | None = None
 
     def _mutate(self, what: str) -> None:
         if not self.allow_mutations:
@@ -96,6 +109,8 @@ class FakeRunPod:
 
     def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
         self.calls.append(("graphql", query))
+        if self.raise_any is not None:
+            raise self.raise_any()
         if "mutation" in query.lower():
             if "podFindAndDeployOnDemand" in query:
                 self._mutate("deploy")
@@ -120,7 +135,15 @@ class FakeRunPod:
                         ],
                     },
                 }
-                return {"podFindAndDeployOnDemand": self.pods[pod_id]}
+                if self.deploy_mode == "timeout_after_create":
+                    raise kit.KitError("RunPod request failed: TimeoutError: timed out")
+                if self.deploy_mode == "fail_no_pod":
+                    self.pods.pop(pod_id)
+                    raise kit.KitError("RunPod HTTP 500: internal error")
+                ret = dict(self.pods[pod_id])
+                if not self.cost_in_deploy:
+                    ret["costPerHr"] = None
+                return {"podFindAndDeployOnDemand": ret}
             if "podTerminate" in query:
                 self._mutate("terminate")
                 self.terminate_calls += 1
@@ -155,6 +178,8 @@ class FakeRunPod:
             assert gid
             rows = [g for g in GPU_TYPES if g["id"] == gid.group(1)]
             price = rows[0]["securePrice"] if rows else None
+            if self.price_override is not None:
+                price = self.price_override
             return {
                 "gpuTypes": [
                     {
@@ -169,9 +194,18 @@ class FakeRunPod:
             }
         if "gpuTypes" in query:
             return {"gpuTypes": GPU_TYPES}
+        if "myself { pods" in query:
+            if self.lookup_fails:
+                raise kit.KitError("RunPod HTTP 503: unavailable")
+            return {
+                "myself": {"pods": [{"id": k, "name": v["name"]} for k, v in self.pods.items()]}
+            }
         if "myself" in query:
             return {"myself": {"clientBalance": 50.0, "networkVolumes": self.volumes}}
         if "pod(input" in query:
+            if self.on_pod_query is not None:
+                hook, self.on_pod_query = self.on_pod_query, None
+                hook()
             if self.pod_errors > 0:
                 self.pod_errors -= 1
                 msg = "RunPod HTTP 503: unavailable"
@@ -185,6 +219,8 @@ class FakeRunPod:
 
     def rest(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.calls.append(("rest", f"{method} {path}"))
+        if self.raise_any is not None:
+            raise self.raise_any()
         if method.upper() != "GET":
             self._mutate(f"rest {method} {path}")
             if path == "/networkvolumes" and body:
@@ -640,7 +676,7 @@ def test_tunnel_prints_command_and_snippet_without_starting(
     out = capsys.readouterr().out
     assert f"-L 127.0.0.1:{free}:127.0.0.1:30000" in out
     assert "-p 40022" in out and "root@203.0.113.7" in out
-    assert "[llm.roles.worker]" in out
+    assert "\n[llm]\n" in out
     assert f'base_url = "http://127.0.0.1:{free}/v1"' in out
     assert f'model = "{kit.DEFAULT_SERVED_NAME}"' in out
 
@@ -682,7 +718,9 @@ def test_boot_script_self_terminates_with_pod_scoped_runpodctl(tmp_path: Path) -
         "PATH": f"{fakebin}:/usr/bin:/bin",
         "MEMFUN_MAX_MINUTES": "1",
         "MEMFUN_DEADLINE_EPOCH": "0",  # already past: arm fires immediately
-        "MEMFUN_MODEL_DIR": str(tmp_path / "no-weights"),
+        "MEMFUN_MODEL_DIR": str(tmp_path / "models" / "no-weights"),
+        "MEMFUN_MODELS_ROOT": str(tmp_path / "models"),
+        "MEMFUN_MODEL_REPO": "Qwen/Qwen3.8-27B-FP8",
         "MEMFUN_RUN_DIR": str(tmp_path / "run"),
         "RUNPOD_POD_ID": "podXYZ",
         "RUNPOD_API_KEY": "pod-scoped-injected",
@@ -884,7 +922,8 @@ def test_watch_tunnel_ready_memfun_caffeinate(capsys: pytest.CaptureFixture[str]
     tunnel, memfun, caff = system.procs
     assert tunnel.argv[:2] == ["ssh", "-N"]
     assert f"127.0.0.1:{port}:127.0.0.1:30000" in tunnel.argv
-    assert system.kwargs[0] == {"start_new_session": True}
+    assert system.kwargs[0]["start_new_session"] is True
+    assert "RUNPOD_API_KEY" not in system.kwargs[0]["env"]
     assert memfun.argv == ["memfun", "chat"]
     env = system.kwargs[1]["env"]
     assert env["MEMFUN_INFERENCE_METRICS_URL"] == f"http://127.0.0.1:{port}/metrics"
@@ -943,3 +982,585 @@ def test_watch_env_drops_key_and_never_hardcodes_rate() -> None:
     )
     assert "RUNPOD_API_KEY" not in env and "MEMFUN_POD_RATE_USD" not in env
     assert env["MEMFUN_INFERENCE_METRICS_URL"] == "http://127.0.0.1:18001/metrics"
+
+
+# ===========================================================================
+# Audit round 1: key handling (critical), watchdog coverage and cost guards (high),
+# advisories.
+# ===========================================================================
+
+BAD_KEYS = [
+    "rpa_GOODPART123\n# my runpod key",
+    "rpa_GOODPART123\r\nsecondline",
+    "rpa_GOOD PART123",
+    "rpa_GOODPART123\x00tail_after_nul",
+    "rpa_GOODPART123;rm",
+]
+
+
+def _fragments(value: str) -> list[str]:
+    pieces = [p for p in re.split(r"[\s\x00;]+", value) if len(p) >= 6]
+    return [*pieces, value.strip()[:10]]
+
+
+def _assert_clean(text: str, secret: str) -> None:
+    assert "Traceback" not in text
+    for frag in _fragments(secret):
+        assert frag not in text, frag
+
+
+@pytest.mark.parametrize("bad", BAD_KEYS)
+def test_malformed_key_in_env_rejected_without_echo(
+    bad: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def factory(_k: kit.Secret) -> kit.Transport:
+        raise AssertionError("no transport may be built for a malformed key")
+
+    rc = kit.main(["gpus"], factory=factory, env={"RUNPOD_API_KEY": bad})
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "malformed" in captured.err and "not shown" in captured.err
+    _assert_clean(captured.out + captured.err, bad)
+
+
+@pytest.mark.parametrize("bad", BAD_KEYS)
+def test_malformed_key_in_file_rejected_without_echo(
+    bad: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    key_file = tmp_path / "key"
+    key_file.write_text(bad + "\n")
+    key_file.chmod(0o600)
+    with pytest.raises(kit.KitError) as exc:
+        kit.load_api_key(env={}, path=key_file)
+    _assert_clean(str(exc.value), bad)
+    assert kit.main(["spend", "--pod-id", "p"], env={}, key_path=key_file) == 1
+    captured = capsys.readouterr()
+    _assert_clean(captured.out + captured.err, bad)
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [
+        lambda: ValueError(f"Invalid header value b'Bearer {FAKE_KEY}\\n'"),
+        lambda: urllib.error.URLError(f"bad auth {FAKE_KEY}"),
+        lambda: OSError(f"socket for Bearer {FAKE_KEY}"),
+        lambda: UnicodeError(f"cannot encode {FAKE_KEY}"),
+        lambda: RuntimeError(f"Authorization: Bearer {FAKE_KEY}"),
+    ],
+)
+def test_http_transport_wraps_every_exception(
+    make_exc: Callable[[], BaseException],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def boom(req: Any, timeout: float = 0) -> Any:
+        raise make_exc()
+
+    monkeypatch.setattr(kit.urllib.request, "urlopen", boom)
+    for argv in (["gpus"], ["spend", "--pod-id", "x"], ["status", "--pod-id", "x"]):
+        assert kit.main(argv, env=dict(ENV)) == 1
+    captured = capsys.readouterr()
+    _assert_clean(captured.out + captured.err, FAKE_KEY)
+    assert "error:" in captured.err
+
+
+def test_http_error_body_redacted_before_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = kit.load_api_key(env=dict(ENV))
+    for pad in (380, 395, 401, 490):
+
+        def boom(req: Any, timeout: float = 0, pad: int = pad) -> Any:
+            body = io.BytesIO(("x" * pad + FAKE_KEY + " tail").encode())
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", Message(), body)
+
+        monkeypatch.setattr(kit.urllib.request, "urlopen", boom)
+        with pytest.raises(kit.KitError) as exc:
+            kit.HttpTransport(secret).graphql("query { gpuTypes { id } }")
+        _assert_clean(str(exc.value), FAKE_KEY)
+        assert "rpa_FA" not in str(exc.value)
+
+
+def test_redactor_hides_prefixes_and_inner_runs() -> None:
+    kit.load_api_key(env=dict(ENV))
+    for leaked in (FAKE_KEY[:6], FAKE_KEY[:11], FAKE_KEY[4:20], FAKE_KEY[-9:]):
+        out = kit.REDACT(f"before {leaked} after")
+        assert leaked not in out and "***" in out
+    assert kit.REDACT("rpa_ short") == "rpa_ short"  # 4 chars: below the prefix threshold
+
+
+def _all_subcommands(pubkey: str, port: int) -> list[list[str]]:
+    return [
+        ["gpus"],
+        ["gpus", "--where", B300],
+        ["launch", "--ssh-public-key", pubkey],
+        ["launch", "--no-dry-run", "--yes-spend-money", "--ssh-public-key", pubkey],
+        ["status", "--pod-id", "pod1"],
+        ["spend", "--pod-id", "pod1"],
+        ["watchdog", "--pod-id", "pod1", "--max-minutes", "1"],
+        ["tunnel", "--pod-id", "pod1", "--local-port", str(port)],
+        ["watch", "--pod-id", "pod1", "--local-port", str(port)],
+    ]
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [
+        lambda: kit.KitError(f"RunPod HTTP 401: echo Authorization: Bearer {FAKE_KEY}"),
+        lambda: RuntimeError(f"boom Authorization: Bearer {FAKE_KEY}"),
+        lambda: ValueError(f"Invalid header value b'Bearer {FAKE_KEY}'"),
+        lambda: KeyError(FAKE_KEY),
+    ],
+)
+def test_no_subcommand_leaks_key_on_any_exception(
+    make_exc: Callable[[], BaseException], capsys: pytest.CaptureFixture[str], pubkey: str
+) -> None:
+    port = _free_port()
+    for argv in _all_subcommands(pubkey, port):
+        fake = FakeRunPod()
+        fake.raise_any = make_exc
+        system = FakeSystem(caffeinate=None)
+        clock = FakeClock()
+        rc = kit.main(
+            argv,
+            factory=lambda _k, f=fake: f,
+            env=dict(ENV),
+            clock=clock,
+            sleep=clock.sleep,
+            now=NOW,
+            watch_deps=system.deps(),
+        )
+        assert rc != 0, argv
+    captured = capsys.readouterr()
+    _assert_clean(captured.out + captured.err, FAKE_KEY)
+
+
+def test_watch_with_api_errors_echoing_auth_header(capsys: pytest.CaptureFixture[str]) -> None:
+    fake = _fake_with_pod()
+    fake.pod_errors = 1
+    fake.echo_key_in_errors = True
+    system = FakeSystem(caffeinate=None)
+    assert (
+        _watch(["watch", "--pod-id", "pod1", "--local-port", str(_free_port())], fake, system) == 1
+    )
+    captured = capsys.readouterr()
+    _assert_clean(captured.out + captured.err, FAKE_KEY)
+    assert "RunPod HTTP 503" in captured.err
+
+
+# ---------------------------------------------------------------- HIGH: watchdog coverage
+
+
+def _real_launch(fake: FakeRunPod, pubkey: str, *extra: str) -> int:
+    argv = ["launch", "--no-dry-run", "--yes-spend-money", "--ssh-public-key", pubkey, *extra]
+    return run(argv, fake)
+
+
+def test_get_pod_error_right_after_deploy_still_terminates(pubkey: str) -> None:
+    fake = FakeRunPod()
+    fake.cost_in_deploy = False
+
+    def fail() -> None:
+        raise kit.KitError("RunPod HTTP 502: bad gateway")
+
+    fake.on_pod_query = fail
+    assert _real_launch(fake, pubkey) == 1
+    assert fake.mutations == ["deploy", "terminate"]
+    assert fake.pods == {}
+
+
+def test_ctrl_c_right_after_deploy_terminates(pubkey: str) -> None:
+    fake = FakeRunPod()
+    fake.cost_in_deploy = False
+
+    def interrupt() -> None:
+        raise KeyboardInterrupt
+
+    fake.on_pod_query = interrupt
+    assert _real_launch(fake, pubkey) == 130
+    assert fake.mutations == ["deploy", "terminate"] and fake.pods == {}
+
+
+def test_sigterm_right_after_deploy_terminates(pubkey: str) -> None:
+    fake = FakeRunPod()
+    fake.cost_in_deploy = False
+    old_term = signal.getsignal(signal.SIGTERM)
+    old_hup = signal.getsignal(signal.SIGHUP)
+    kit.install_exit_signals()
+    try:
+        fake.on_pod_query = lambda: signal.raise_signal(signal.SIGTERM)
+        assert _real_launch(fake, pubkey) == 130
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGHUP, old_hup)
+    assert fake.mutations == ["deploy", "terminate"] and fake.pods == {}
+
+
+def test_deploy_timeout_after_create_finds_pod_by_name_and_terminates(
+    capsys: pytest.CaptureFixture[str], pubkey: str
+) -> None:
+    fake = FakeRunPod()
+    fake.deploy_mode = "timeout_after_create"
+    assert _real_launch(fake, pubkey) == 4
+    assert fake.mutations == ["deploy", "terminate"] and fake.pods == {}
+    name = fake.deployed[0]["name"]
+    assert re.fullmatch(r"memfun-swarm-[0-9a-f]{10}", name)
+    assert "RunPod did create pod pod1" in capsys.readouterr().err
+
+
+def test_deploy_failure_with_unknown_state_warns_loudly_incl_volume(
+    capsys: pytest.CaptureFixture[str], pubkey: str
+) -> None:
+    fake = FakeRunPod()
+    fake.deploy_mode = "fail_no_pod"
+    fake.lookup_fails = True
+    rc = _real_launch(fake, pubkey, "--volume-name", "fresh", "--data-center", "US-KS-2")
+    assert rc == 4
+    assert fake.mutations == ["rest POST /networkvolumes", "deploy"]  # nothing to terminate
+    err = capsys.readouterr().err
+    name = fake.deployed[0]["name"]
+    assert "COULD NOT CONFIRM WHETHER POD" in err and name in err
+    assert "runpodctl pod delete" in err
+    assert "network volume volNEW" in err and "keeps billing storage" in err
+
+
+def test_deploy_failure_without_pod_does_not_terminate(pubkey: str) -> None:
+    fake = FakeRunPod()
+    fake.deploy_mode = "fail_no_pod"
+    assert _real_launch(fake, pubkey) == 4
+    assert fake.mutations == ["deploy"]
+
+
+# ---------------------------------------------------------------- HIGH: cost guards
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--max-cost-usd", "nan"],
+        ["--max-cost-usd", "inf"],
+        ["--max-cost-usd", "-1"],
+        ["--max-cost-usd", "0"],
+        ["--max-cost-usd", "abc"],
+        ["--gpu-count", "0"],
+        ["--gpu-count", "-3"],
+        ["--gpu-count", "1.5"],
+        ["--gpu-count", "abc"],
+        ["--gpu-count", "999"],
+        ["--max-minutes", "0"],
+        ["--max-minutes", "-5"],
+        ["--max-minutes", "nan"],
+        ["--max-minutes", "inf"],
+        ["--max-minutes", "abc"],
+        ["--max-minutes", "100000"],
+    ],
+)
+def test_bad_numeric_inputs_refused_before_any_transport(extra: list[str], pubkey: str) -> None:
+    def factory(_k: kit.Secret) -> kit.Transport:
+        raise AssertionError("transport built despite invalid input")
+
+    argv = ["launch", "--no-dry-run", "--yes-spend-money", "--ssh-public-key", pubkey, *extra]
+    with pytest.raises(SystemExit) as exc:
+        kit.main(argv, factory=factory, env=dict(ENV), now=NOW)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("price", [0.0, -1.0, float("nan"), float("inf")])
+def test_invalid_api_price_refuses(
+    price: float, capsys: pytest.CaptureFixture[str], pubkey: str
+) -> None:
+    fake = FakeRunPod()
+    fake.price_override = price
+    assert _real_launch(fake, pubkey) == 1
+    assert fake.mutations == []
+    assert "invalid secure price" in capsys.readouterr().err
+
+
+def test_validate_launch_args_rejects_programmatic_bad_values(pubkey: str) -> None:
+    good = kit.build_parser().parse_args(["launch", "--ssh-public-key", pubkey])
+    kit.validate_launch_args(good)
+    for field_name, value in (
+        ("gpu_count", 0),
+        ("gpu_count", True and 99),
+        ("max_minutes", 0),
+        ("max_cost_usd", float("nan")),
+        ("max_cost_usd", 0.0),
+    ):
+        bad = argparse.Namespace(**vars(good))
+        setattr(bad, field_name, value)
+        with pytest.raises(kit.KitError):
+            kit.validate_launch_args(bad)
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--model-repo", "../../etc"),
+        ("--model-repo", "/etc/passwd"),
+        ("--model-repo", "a/b/c"),
+        ("--model-repo", "Qwen/.."),
+        ("--model-repo", "Qwen/x y"),
+        ("--served-name", "../x"),
+        ("--served-name", "name;rm"),
+        ("--model-revision", "../main"),
+    ],
+)
+def test_bad_model_names_refused(
+    flag: str, value: str, capsys: pytest.CaptureFixture[str], pubkey: str
+) -> None:
+    spy = FakeRunPod(allow_mutations=False)
+    assert run(["launch", flag, value, "--ssh-public-key", pubkey], spy) == 1
+    assert spy.calls == []
+    assert "must" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- advisories
+
+
+def test_ssh_child_env_has_no_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _fake_with_pod()
+    system = FakeSystem(caffeinate=None)
+    deps = system.deps()
+    deps.environ = {
+        "PATH": "/usr/bin",
+        "SSH_AUTH_SOCK": "/tmp/agent.sock",
+        "RUNPOD_API_KEY": FAKE_KEY,
+        "ANTHROPIC_API_KEY": "sk-ant-xyz",
+        "GITHUB_TOKEN": "ghp_x",
+        "RUNPOD_OTHER": "x",
+    }
+    port = _free_port()
+    rc = kit.main(
+        ["watch", "--pod-id", "pod1", "--local-port", str(port)],
+        factory=lambda _k: fake,
+        env=dict(ENV),
+        watch_deps=deps,
+    )
+    assert rc == 0
+    ssh_env = system.kwargs[0]["env"]
+    assert ssh_env == {"PATH": "/usr/bin", "SSH_AUTH_SOCK": "/tmp/agent.sock"}
+    memfun_env = system.kwargs[1]["env"]
+    assert "RUNPOD_API_KEY" not in memfun_env and memfun_env["ANTHROPIC_API_KEY"] == "sk-ant-xyz"
+
+    seen: dict[str, Any] = {}
+
+    def fake_call(cmd: list[str], env: dict[str, str] | None = None) -> int:
+        seen["cmd"], seen["env"] = cmd, env
+        return 0
+
+    monkeypatch.setattr(kit.subprocess, "call", fake_call)
+    monkeypatch.setenv("RUNPOD_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("SOME_SECRET", "s")
+    assert run(["tunnel", "--pod-id", "pod1", "--local-port", str(port), "--run"], fake) == 0
+    assert "RUNPOD_API_KEY" not in seen["env"] and "SOME_SECRET" not in seen["env"]
+
+
+def test_ssh_uses_per_pod_known_hosts_not_home(capsys: pytest.CaptureFixture[str]) -> None:
+    cmd = kit.build_ssh_command("h", 22, 18000, 30000, None, known_hosts=Path("/tmp/kh"))
+    assert "UserKnownHostsFile=/tmp/kh" in cmd and "GlobalKnownHostsFile=/dev/null" in cmd
+    assert not any(".ssh/known_hosts" in c for c in cmd)
+    fake = _fake_with_pod()
+    system = FakeSystem(caffeinate=None)
+    assert (
+        _watch(["watch", "--pod-id", "pod1", "--local-port", str(_free_port())], fake, system) == 0
+    )
+    kh = next(a for a in system.procs[0].argv if a.startswith("UserKnownHostsFile="))
+    run_dir = Path(kh.split("=", 1)[1]).parent
+    assert run_dir.name.startswith("memfun-runpod-")
+    assert not run_dir.exists()  # removed when watch exits
+
+
+def test_watch_strips_only_first_separator() -> None:
+    fake = _fake_with_pod()
+    system = FakeSystem(caffeinate=None)
+    argv = ["watch", "--pod-id", "pod1", "--local-port", str(_free_port())]
+    assert _watch([*argv, "--", "memfun", "swarm", "--", "x"], fake, system) == 0
+    assert system.procs[1].argv == ["memfun", "swarm", "--", "x"]
+
+
+def test_watch_sigterm_stops_children_and_exits(capsys: pytest.CaptureFixture[str]) -> None:
+    fake = _fake_with_pod()
+    system = FakeSystem(caffeinate="/usr/bin/caffeinate")
+
+    def popen(argv: list[str], **kwargs: Any) -> FakeProc:
+        proc = FakeSystem.popen(system, argv, **kwargs)
+        if argv[0] == "memfun":
+
+            def wait() -> int:
+                raise kit.TerminateRequestedError("signal 15")
+
+            proc.wait = wait  # type: ignore[method-assign]
+        return proc
+
+    deps = system.deps()
+    deps.popen = popen
+    rc = kit.main(
+        ["watch", "--pod-id", "pod1", "--local-port", str(_free_port())],
+        factory=lambda _k: fake,
+        env=dict(ENV),
+        watch_deps=deps,
+    )
+    assert rc == 143
+    tunnel, memfun, caff = system.procs
+    assert memfun.terminated and tunnel.terminated and caff.terminated
+    assert "POD KEEPS RUNNING" in capsys.readouterr().err
+    assert fake.mutations == []
+
+
+def test_watch_plain_ctrl_c_keeps_waiting_for_memfun() -> None:
+    fake = _fake_with_pod()
+    system = FakeSystem(caffeinate=None)
+    calls = {"n": 0}
+
+    def popen(argv: list[str], **kwargs: Any) -> FakeProc:
+        proc = FakeSystem.popen(system, argv, **kwargs)
+        if argv[0] == "memfun":
+
+            def wait() -> int:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise KeyboardInterrupt
+                return 0
+
+            proc.wait = wait  # type: ignore[method-assign]
+        return proc
+
+    deps = system.deps()
+    deps.popen = popen
+    rc = kit.main(
+        ["watch", "--pod-id", "pod1", "--local-port", str(_free_port())],
+        factory=lambda _k: fake,
+        env=dict(ENV),
+        watch_deps=deps,
+    )
+    assert rc == 0 and calls["n"] == 2
+
+
+def _run_boot(tmp_path: Path, extra_env: dict[str, str]) -> tuple[str, list[str], list[str]]:
+    """Run pod_boot.sh with fake runpodctl/python3; return (log, runpodctl, python3 argv)."""
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir(exist_ok=True)
+    rp_log, py_log = tmp_path / "runpodctl.log", tmp_path / "python3.log"
+    (fakebin / "runpodctl").write_text(f'#!/bin/sh\necho "$@" >> "{rp_log}"\nexit 0\n')
+    (fakebin / "python3").write_text(
+        f'#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a"; done >> "{py_log}"\nexit 0\n'
+    )
+    for f in fakebin.iterdir():
+        f.chmod(0o755)
+    models = tmp_path / "models"
+    env = {
+        "PATH": f"{fakebin}:/usr/bin:/bin",
+        "MEMFUN_MAX_MINUTES": "60",
+        "MEMFUN_DEADLINE_EPOCH": "9999999999",
+        "MEMFUN_MODELS_ROOT": str(models),
+        "MEMFUN_MODEL_DIR": str(models / "Qwen" / "M"),
+        "MEMFUN_MODEL_REPO": "Qwen/M",
+        "MEMFUN_SERVED_NAME": "m",
+        "MEMFUN_CRASH_GRACE_MIN": "0",
+        "MEMFUN_RUN_DIR": str(tmp_path / "run"),
+        "RUNPOD_POD_ID": "podB",
+        "PUBLIC_KEY": "",
+        **extra_env,
+    }
+    out_file = tmp_path / "boot.out"
+    with out_file.open("w") as out:
+        proc = subprocess.Popen(
+            ["bash", str(kit.BOOT_SCRIPT)],
+            env=env,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=tmp_path,
+        )
+        try:
+            proc.wait(timeout=120)
+        finally:  # the armed deadline subshell is still sleeping: kill the whole group
+            import os as _os
+
+            with contextlib.suppress(ProcessLookupError):
+                _os.killpg(proc.pid, signal.SIGKILL)
+    rp = rp_log.read_text().splitlines() if rp_log.exists() else []
+    py = py_log.read_text().splitlines() if py_log.exists() else []
+    return out_file.read_text(), rp, py
+
+
+def _write_marker(tmp_path: Path, sha: str, repo: str = "Qwen/M") -> None:
+    d = tmp_path / "models" / "Qwen" / "M"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / ".memfun_verified").write_text(json.dumps({"repo": repo, "sha": sha}))
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_boot_extra_args_never_glob_and_metrics_enabled(tmp_path: Path) -> None:
+    _write_marker(tmp_path, "a" * 40)
+    (tmp_path / "SHOULD_NOT_APPEAR.txt").write_text("x")  # a glob of * in cwd would find this
+    _log, rp, py = _run_boot(tmp_path, {"MEMFUN_SGLANG_ARGS": "--tp 1 *"})
+    assert "--enable-metrics" in py and "*" in py and "SHOULD_NOT_APPEAR.txt" not in py
+    assert py[py.index("--tp") + 1] == "1"
+    assert rp and rp[0] == "pod delete podB"  # SGLang exited -> grace 0 -> self-terminate
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_boot_refuses_marker_for_other_pinned_revision(tmp_path: Path) -> None:
+    _write_marker(tmp_path, "a" * 40)
+    log, rp, py = _run_boot(tmp_path, {"MEMFUN_MODEL_REVISION": "b" * 40})
+    assert py == []  # SGLang never started
+    assert "marker sha != pinned" in log and rp[0] == "pod delete podB"
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_boot_refuses_marker_for_other_repo_and_bad_names(tmp_path: Path) -> None:
+    _write_marker(tmp_path, "a" * 40, repo="Other/M")
+    log, _rp, py = _run_boot(tmp_path, {})
+    assert py == [] and "marker repo != Qwen/M" in log
+    log, _rp, py = _run_boot(
+        tmp_path,
+        {"MEMFUN_MODEL_REPO": "../../etc", "MEMFUN_MODEL_DIR": "/workspace/models/../../etc"},
+    )
+    assert py == [] and "invalid MEMFUN_MODEL_REPO" in log
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_boot_in_pod_pull_honours_pinned_revision(tmp_path: Path) -> None:
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    hf_log = tmp_path / "hf.log"
+    (fakebin / "hf").write_text(f'#!/bin/sh\necho "$@" >> "{hf_log}"\nexit 0\n')
+    (fakebin / "hf").chmod(0o755)
+    sha = "c" * 40
+    _log, _rp, py = _run_boot(tmp_path, {"MEMFUN_ALLOW_PULL": "1", "MEMFUN_MODEL_REVISION": sha})
+    assert f"download Qwen/M --revision {sha} --local-dir" in hf_log.read_text()
+    marker = json.loads((tmp_path / "models" / "Qwen" / "M" / ".memfun_verified").read_text())
+    assert marker["sha"] == sha and marker["repo"] == "Qwen/M"
+    assert "--enable-metrics" in py
+
+
+def _assert_qwen_everywhere(out: str, port: int) -> None:
+    assert "\n[llm]\n" in out
+    assert f'base_url = "http://127.0.0.1:{port}/v1"' in out
+    assert f'model = "{kit.DEFAULT_SERVED_NAME}"' in out
+    assert 'provider = "openai"' in out
+    assert 'api_key_env = "MEMFUN_SGLANG_DUMMY_KEY"' in out
+    assert "[llm.roles.worker]" not in out
+    assert "anthropic" not in out.lower()
+
+
+def test_memfun_snippet_is_single_qwen_llm_block(
+    capsys: pytest.CaptureFixture[str], pubkey: str
+) -> None:
+    snippet = kit.memfun_snippet(18123, "served-x")
+    assert snippet.splitlines().count("[llm]") == 1 and "anthropic" not in snippet.lower()
+    assert 'base_url = "http://127.0.0.1:18123/v1"' in snippet and 'model = "served-x"' in snippet
+
+    port = _free_port()
+    fake = _fake_with_pod()
+    assert run(["tunnel", "--pod-id", "pod1", "--local-port", str(port)], fake) == 0
+    _assert_qwen_everywhere(capsys.readouterr().out, port)
+
+    system = FakeSystem(caffeinate=None)
+    assert _watch(["watch", "--pod-id", "pod1", "--local-port", str(port)], fake, system) == 0
+    _assert_qwen_everywhere(capsys.readouterr().out, port)
+
+    spy = FakeRunPod(allow_mutations=False)
+    assert run(["launch", "--ssh-public-key", pubkey], spy) == 0
+    _assert_qwen_everywhere(capsys.readouterr().out, kit.DEFAULT_LOCAL_PORT)

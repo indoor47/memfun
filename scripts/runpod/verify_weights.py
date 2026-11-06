@@ -101,7 +101,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"NOT VERIFIED: {len(problems)} problem(s)")
         return 1
     marker.write_text(
-        json.dumps({"repo": args.repo, "sha": meta.get("sha"), "verified_at": time.time()}),
+        json.dumps(
+            {
+                "repo": args.repo,
+                "sha": meta.get("sha"),
+                "revision": args.revision,
+                "verified_at": time.time(),
+            }
+        ),
         encoding="utf-8",
     )
     print(f"VERIFIED: wrote {marker}")

@@ -28,6 +28,7 @@ import base64
 import dataclasses
 import datetime as dt
 import json
+import math
 import os
 import re
 import shlex
@@ -37,9 +38,11 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,6 +56,8 @@ GRAPHQL_URL = "https://api.runpod.io/graphql"
 REST_URL = "https://rest.runpod.io/v1"
 KEY_PATH = Path("~/.config/runpod/key")
 KEY_ENV = "RUNPOD_API_KEY"
+#: Name of the dummy env var memfun's [llm] api_key_env points at (SGLang ignores it).
+LLM_KEY_ENV = "MEMFUN_SGLANG_DUMMY_KEY"
 
 #: RunPod ``gpuTypeId`` for one B300.  Verified with the read-only ``gpuTypes`` query
 #: (``runpod_kit.py gpus --filter B300``) on 2026-11-06.  For H200 pass
@@ -83,6 +88,14 @@ DEFAULT_MAX_COST_USD = 40.0
 
 BOOT_SCRIPT = Path(__file__).with_name("pod_boot.sh")
 SECRET_ENV_HINT = re.compile(r"(api[_-]?key|token|secret|password|passwd)", re.IGNORECASE)
+#: RunPod keys are [A-Za-z0-9_-]; anything else (newline, space, NUL...) is refused so it
+#: can never reach an HTTP header where http.client would echo it in an exception.
+KEY_CHARSET = re.compile(r"[A-Za-z0-9_\-]{8,512}")
+#: Hugging Face style ``org/name`` (or ``name``); no ``..``/absolute paths (see _check_name).
+REPO_NAME_RE = re.compile(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?")
+REVISION_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+MAX_GPU_COUNT = 16
+MAX_COST_CAP_USD = 10_000.0
 
 
 class KitError(Exception):
@@ -137,7 +150,7 @@ class Redactor:
 
     def add(self, secret: Secret) -> None:
         raw = secret.reveal()
-        if len(raw) < 4:
+        if len(raw) < _FRAG_PREFIX:
             return
         for needle in (raw, base64.b64encode(raw.encode()).decode(), json.dumps(raw)[1:-1]):
             if needle and needle not in self._needles:
@@ -145,9 +158,46 @@ class Redactor:
         self._needles.sort(key=len, reverse=True)
 
     def __call__(self, text: str) -> str:
+        text = str(text)
         for needle in self._needles:
             text = text.replace(needle, "***")
+        for needle in self._needles:
+            text = _redact_fragments(text, needle)
         return text
+
+
+#: A key prefix this long (or any inner run of _FRAG_INNER chars) is treated as the key.
+_FRAG_PREFIX = 6
+_FRAG_INNER = 8
+
+
+def _redact_fragments(text: str, secret: str) -> str:
+    """Hide truncated pieces of ``secret``: any prefix >= 6 chars, any inner run >= 8."""
+    if len(secret) < _FRAG_PREFIX:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        best = 0
+        # Longest run starting at text[i] that equals some slice of the secret.
+        for start in range(len(secret)):
+            if secret[start] != text[i]:
+                continue
+            n = 0
+            while (
+                i + n < len(text) and start + n < len(secret) and text[i + n] == secret[start + n]
+            ):
+                n += 1
+            need = _FRAG_PREFIX if start == 0 else _FRAG_INNER
+            if n >= need and n > best:
+                best = n
+        if best:
+            out.append("***")
+            i += best
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
 
 
 REDACT = Redactor()
@@ -162,18 +212,36 @@ def emit(message: str = "", *, err: bool = False) -> None:
 def load_api_key(env: dict[str, str] | None = None, path: Path | None = None) -> Secret:
     """Read the key from ``$RUNPOD_API_KEY`` or ``~/.config/runpod/key``.  Never echoes it."""
     env = dict(os.environ) if env is None else env
-    raw = env.get(KEY_ENV, "").strip()
-    if not raw:
+    raw = env.get(KEY_ENV, "")
+    source = f"${KEY_ENV}"
+    if not raw.strip():
         key_file = (path or KEY_PATH).expanduser()
         if not key_file.is_file():
             raise KitError(f"no RunPod API key: set ${KEY_ENV} or create {key_file} (chmod 600)")
         mode = stat.S_IMODE(key_file.stat().st_mode)
         if mode & 0o077:
             emit(f"warning: {key_file} is mode {oct(mode)}; run chmod 600 on it", err=True)
-        raw = key_file.read_text(encoding="utf-8").strip()
-    if not raw:
+        try:
+            raw = key_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            raise KitError(f"cannot read {key_file} as UTF-8 text") from None
+        source = str(key_file)
+    # Register the raw value and every piece of it before validating, so even a rejected
+    # key can never be printed.
+    REDACT.add(Secret(raw.strip()))
+    for piece in re.split(r"[\s\x00]+", raw):
+        if len(piece) >= _FRAG_INNER:
+            REDACT.add(Secret(piece))
+    value = raw.strip()
+    if not value:
         raise KitError("RunPod API key is empty")
-    secret = Secret(raw)
+    if not KEY_CHARSET.fullmatch(value):
+        raise KitError(
+            f"RunPod API key from {source} is malformed: it must be one line of 8-512 "
+            "characters from [A-Za-z0-9_-] (no spaces, comments or control characters). "
+            "The value is not shown."
+        )
+    secret = Secret(value)
     REDACT.add(secret)
     return secret
 
@@ -253,20 +321,28 @@ class HttpTransport:
         req.add_header("Authorization", f"Bearer {self._key.reveal()}")
         req.add_header("Content-Type", "application/json")
         req.add_header("User-Agent", "memfun-runpod-kit/1")
+        # Every failure becomes a KitError whose text was redacted BEFORE truncation;
+        # no original exception (which may quote the header) is chained or re-raised.
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 text = resp.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:400]
-            raise KitError(REDACT(f"RunPod HTTP {exc.code} for {url}: {detail}")) from None
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise KitError(REDACT(f"RunPod request to {url} failed: {exc}")) from None
+            try:
+                detail = exc.read().decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            msg = REDACT(f"RunPod HTTP {exc.code} for {url}: {detail}")
+            raise KitError(msg[:500]) from None
+        except Exception as exc:
+            msg = REDACT(f"RunPod request to {url} failed: {type(exc).__name__}: {exc}")
+            raise KitError(msg[:500]) from None
         if not text:
             return None
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            raise KitError(REDACT(f"RunPod returned non-JSON from {url}: {text[:200]}")) from None
+            msg = REDACT(f"RunPod returned non-JSON from {url}: {text}")
+            raise KitError(msg[:300]) from None
 
     def graphql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {"query": query}
@@ -547,10 +623,13 @@ def estimate_cost(price_per_gpu_hr: float, gpu_count: int, minutes: float) -> fl
 
 def conservative_price(gpu: GpuType, offer: Offer, cloud: str) -> float:
     """The higher of the list price and the live lowest price: an upper bound."""
-    prices = [p for p in (gpu.list_price(cloud), offer.lowest_price) if p is not None and p > 0]
-    if not prices:
+    reported = [p for p in (gpu.list_price(cloud), offer.lowest_price) if p is not None]
+    bad = [p for p in reported if not (math.isfinite(p) and p > 0)]
+    if bad:
+        raise KitError(f"RunPod reported an invalid {cloud} price {bad} for {gpu.id}; refusing")
+    if not reported:
         raise KitError(f"RunPod reported no {cloud} price for {gpu.id}; refusing to estimate")
-    return max(prices)
+    return max(reported)
 
 
 def build_boot_env(
@@ -564,6 +643,7 @@ def build_boot_env(
         "MEMFUN_DEADLINE_EPOCH": str(deadline_epoch),
         "MEMFUN_MODEL_DIR": f"{VOLUME_MOUNT}/models/{args.model_repo}",
         "MEMFUN_MODEL_REPO": args.model_repo,
+        "MEMFUN_MODEL_REVISION": args.model_revision,
         "MEMFUN_SERVED_NAME": args.served_name,
         "MEMFUN_SGLANG_PORT": str(args.sglang_port),
         "MEMFUN_SGLANG_ARGS": args.sglang_args,
@@ -768,8 +848,8 @@ def _pod_gone(t: Transport, pod_id: str) -> bool | None:
     """True gone, False still there, None unknown."""
     try:
         pod = get_pod(t, pod_id)
-    except KitError as exc:
-        return True if _GONE_ERR.search(str(exc)) else None
+    except Exception as exc:
+        return True if isinstance(exc, KitError) and _GONE_ERR.search(str(exc)) else None
     return pod is None or pod.desired_status.upper() == "TERMINATED"
 
 
@@ -790,8 +870,12 @@ def terminate_and_verify(
                 terminate_pod(t, pod_id)
                 called = True
                 emit(f"[watchdog] terminate request {attempt}/{retries} accepted for {pod_id}")
-            except KitError as exc:
-                emit(f"[watchdog] terminate attempt {attempt}/{retries} failed: {exc}", err=True)
+            except Exception as exc:
+                emit(
+                    f"[watchdog] terminate attempt {attempt}/{retries} failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    err=True,
+                )
             for _ in range(verify_polls):
                 gone = _pod_gone(t, pod_id)
                 if gone:
@@ -889,11 +973,24 @@ def check_local_port(port: int) -> None:
             raise KitError(f"local port {port} is already in use; pick another") from None
 
 
+def default_known_hosts(pod_id: str) -> Path:
+    """Per-pod known_hosts outside ~/.ssh (RunPod reuses IP:port across pods)."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", pod_id)
+    return Path(tempfile.gettempdir()) / f"memfun-runpod-{safe}.known_hosts"
+
+
 def build_ssh_command(
-    host: str, ssh_port: int, local_port: int, remote_port: int, identity: str | None
+    host: str,
+    ssh_port: int,
+    local_port: int,
+    remote_port: int,
+    identity: str | None,
+    known_hosts: Path | None = None,
 ) -> list[str]:
+    """ssh -N -L ...; trust-on-first-use against a per-pod known_hosts, never ~/.ssh."""
     if local_port in FORBIDDEN_LOCAL_PORTS:
         raise KitError(f"refusing local port {local_port}")
+    hosts = known_hosts if known_hosts is not None else default_known_hosts(f"{host}-{ssh_port}")
     cmd = [
         "ssh", "-N",
         "-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
@@ -901,6 +998,8 @@ def build_ssh_command(
         "-o", "ExitOnForwardFailure=yes",
         "-o", "ServerAliveInterval=30",
         "-o", "StrictHostKeyChecking=accept-new",
+        "-o", f"UserKnownHostsFile={hosts}",
+        "-o", "GlobalKnownHostsFile=/dev/null",
     ]  # fmt: skip
     if identity:
         cmd += ["-i", str(Path(identity).expanduser())]
@@ -908,14 +1007,27 @@ def build_ssh_command(
     return cmd
 
 
+def ssh_env(base: dict[str, str]) -> dict[str, str]:
+    """Environment for ssh: drop the RunPod key and anything that looks like a credential."""
+    return {
+        k: v
+        for k, v in base.items()
+        if k != KEY_ENV and not k.startswith("RUNPOD_") and not SECRET_ENV_HINT.search(k)
+    }
+
+
 def memfun_snippet(local_port: int, served_name: str) -> str:
+    """Qwen everywhere: one [llm] block that every memfun role inherits.  No cloud key."""
     return (
-        "[llm.roles.worker]\n"
+        "# memfun.toml: every role (orchestrator, decomposer, workers, auditors, reviewer)\n"
+        "# inherits [llm], so all of them use the model served by SGLang on the pod.\n"
+        "[llm]\n"
         'provider = "openai"\n'
-        f'model = "{served_name}"\n'
         f'base_url = "http://127.0.0.1:{local_port}/v1"\n'
-        "# Any non-empty value works: SGLang binds 127.0.0.1 in the pod; the tunnel is the auth.\n"
-        'api_key_env = "MEMFUN_SGLANG_DUMMY_KEY"\n'
+        f'model = "{served_name}"\n'
+        f'api_key_env = "{LLM_KEY_ENV}"  # NAME of a dummy env var; SGLang needs no key\n'
+        "# Once per-role models land ([llm.roles.<role>]), single roles can be overridden,\n"
+        "# e.g. Claude Opus 5.5 for orchestrator/decomposer as a comparison arm.\n"
     )
 
 
@@ -931,8 +1043,62 @@ def _default_factory(key: Secret) -> Transport:
     return HttpTransport(key)
 
 
+def _gpu_count(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--gpu-count must be an integer, got {text!r}") from None
+    if not 1 <= value <= MAX_GPU_COUNT:
+        raise argparse.ArgumentTypeError(f"--gpu-count must be 1..{MAX_GPU_COUNT}")
+    return value
+
+
+def _cost_cap(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--max-cost-usd must be a number, got {text!r}"
+        ) from None
+    if not (math.isfinite(value) and 0 < value <= MAX_COST_CAP_USD):
+        raise argparse.ArgumentTypeError(
+            f"--max-cost-usd must be finite and in (0, {MAX_COST_CAP_USD:g}]"
+        )
+    return value
+
+
+def _check_name(value: str, what: str) -> str:
+    if (
+        not REPO_NAME_RE.fullmatch(value)
+        or any(part in (".", "..") for part in value.split("/"))
+        or ".." in value
+    ):
+        raise KitError(f"{what} {value!r} must look like org/name using [A-Za-z0-9._-]")
+    return value
+
+
+def validate_launch_args(args: argparse.Namespace) -> None:
+    """Belt and braces on top of the argparse types; runs before any transport exists."""
+    if not (isinstance(args.gpu_count, int) and 1 <= args.gpu_count <= MAX_GPU_COUNT):
+        raise KitError(f"--gpu-count must be an integer 1..{MAX_GPU_COUNT}")
+    if not (isinstance(args.max_minutes, int) and 1 <= args.max_minutes <= MAX_MINUTES_CAP):
+        raise KitError(f"--max-minutes must be an integer 1..{MAX_MINUTES_CAP}")
+    cap = args.max_cost_usd
+    if not (isinstance(cap, float | int) and math.isfinite(cap) and 0 < cap <= MAX_COST_CAP_USD):
+        raise KitError("--max-cost-usd must be finite and > 0")
+    _check_name(args.model_repo, "--model-repo")
+    _check_name(args.served_name, "--served-name")
+    if not REVISION_RE.fullmatch(args.model_revision) or ".." in args.model_revision:
+        raise KitError("--model-revision must be a branch, tag or commit sha")
+
+
 def _positive_minutes(text: str) -> int:
-    value = int(text)
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--max-minutes must be an integer, got {text!r}"
+        ) from None
     if not 1 <= value <= MAX_MINUTES_CAP:
         raise argparse.ArgumentTypeError(f"--max-minutes must be 1..{MAX_MINUTES_CAP}")
     return value
@@ -951,7 +1117,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     la = sub.add_parser("launch", help="plan (default) or rent a pod")
     la.add_argument("--gpu-type", default=DEFAULT_GPU_TYPE, help="RunPod gpuTypeId")
-    la.add_argument("--gpu-count", type=int, default=1)
+    la.add_argument("--gpu-count", type=_gpu_count, default=1)
     la.add_argument("--cloud", choices=("secure", "community"), default="secure")
     la.add_argument("--image", default=DEFAULT_IMAGE, help="verify the tag before launch")
     la.add_argument("--name", default="memfun-swarm")
@@ -962,8 +1128,9 @@ def build_parser() -> argparse.ArgumentParser:
     la.add_argument("--data-center", default=None, help="e.g. EU-RO-1 (needed to create)")
     la.add_argument("--container-disk-gb", type=int, default=50)
     la.add_argument("--max-minutes", type=_positive_minutes, default=DEFAULT_MAX_MINUTES)
-    la.add_argument("--max-cost-usd", type=float, default=DEFAULT_MAX_COST_USD)
+    la.add_argument("--max-cost-usd", type=_cost_cap, default=DEFAULT_MAX_COST_USD)
     la.add_argument("--model-repo", default=DEFAULT_MODEL_REPO)
+    la.add_argument("--model-revision", default="main", help="branch/tag/sha to serve")
     la.add_argument("--served-name", default=DEFAULT_SERVED_NAME)
     la.add_argument("--sglang-port", type=int, default=SGLANG_DEFAULT_PORT)
     la.add_argument("--sglang-args", default="", help="extra launch_server args")
@@ -1049,7 +1216,6 @@ def cmd_gpus(ro: ReadOnlyTransport, args: argparse.Namespace) -> int:
 KIT_CMD = "uv run python scripts/runpod/launch_pod.py"
 METRICS_ENV = "MEMFUN_INFERENCE_METRICS_URL"
 RATE_ENV = "MEMFUN_POD_RATE_USD"
-WORKER_KEY_ENV = "MEMFUN_SGLANG_DUMMY_KEY"
 
 
 def metrics_url(local_port: int) -> str:
@@ -1168,7 +1334,7 @@ def build_watch_env(base: dict[str, str], local_port: int, rate: float | None) -
         env[RATE_ENV] = format_rate(rate)
     else:
         env.pop(RATE_ENV, None)
-    env.setdefault(WORKER_KEY_ENV, "unused")
+    env.setdefault(LLM_KEY_ENV, "unused")
     return env
 
 
@@ -1184,9 +1350,19 @@ def cmd_watch(ro: ReadOnlyTransport, args: argparse.Namespace, deps: WatchDeps) 
     endpoint = pod.ssh_endpoint()
     if endpoint is None:
         raise KitError("pod has no public TCP 22 mapping yet (still starting?)")
-    command = [c for c in args.command if c != "--"] or ["memfun", "chat"]
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]  # only the first separator belongs to us
+    command = command or ["memfun", "chat"]
+    base_env = dict(os.environ) if deps.environ is None else deps.environ
+    run_dir = Path(tempfile.mkdtemp(prefix="memfun-runpod-"))
     ssh = build_ssh_command(
-        endpoint[0], endpoint[1], args.local_port, args.remote_port, args.identity
+        endpoint[0],
+        endpoint[1],
+        args.local_port,
+        args.remote_port,
+        args.identity,
+        known_hosts=run_dir / "known_hosts",
     )
     emit(f"export {METRICS_ENV}={metrics_url(args.local_port)}")
     if pod.cost_per_hr is not None:
@@ -1194,9 +1370,11 @@ def cmd_watch(ro: ReadOnlyTransport, args: argparse.Namespace, deps: WatchDeps) 
     else:
         emit(f"warning: RunPod reports no costPerHr; {RATE_ENV} not set", err=True)
     emit("tunnel: " + shlex.join(ssh))
+    emit(memfun_snippet(args.local_port, args.served_name))
     # New sessions: Ctrl-C inside memfun must not kill the tunnel or caffeinate.
-    tunnel = deps.popen(ssh, start_new_session=True)
+    tunnel = deps.popen(ssh, start_new_session=True, env=ssh_env(base_env))
     caff: Any = None
+    child: Any = None
     try:
         wait_ready(
             args.local_port,
@@ -1206,11 +1384,7 @@ def cmd_watch(ro: ReadOnlyTransport, args: argparse.Namespace, deps: WatchDeps) 
             args.ready_interval,
             tunnel,
         )
-        env = build_watch_env(
-            dict(os.environ) if deps.environ is None else deps.environ,
-            args.local_port,
-            pod.cost_per_hr,
-        )
+        env = build_watch_env(base_env, args.local_port, pod.cost_per_hr)
         emit("starting: " + shlex.join(command))
         child = deps.popen(command, env=env)
         caff_path = None if args.no_caffeinate else deps.which("caffeinate")
@@ -1223,12 +1397,20 @@ def cmd_watch(ro: ReadOnlyTransport, args: argparse.Namespace, deps: WatchDeps) 
         while True:
             try:
                 return int(child.wait())
+            except TerminateRequestedError:
+                emit(
+                    "watch: terminating memfun and the tunnel. The POD KEEPS RUNNING until the "
+                    "launch watchdog / in-pod hard stop ends it (or Ctrl-C the launch terminal).",
+                    err=True,
+                )
+                return 143
             except KeyboardInterrupt:
-                continue  # memfun owns Ctrl-C; the wrapper leaves when memfun exits
+                continue  # Ctrl-C belongs to memfun; the wrapper leaves when memfun exits
     finally:
-        for proc in (caff, tunnel):
+        for proc in (child, caff, tunnel):
             if proc is not None and proc.poll() is None:
                 proc.terminate()
+        shutil.rmtree(run_dir, ignore_errors=True)
 
 
 def cmd_launch(
@@ -1240,6 +1422,7 @@ def cmd_launch(
     sleep: Sleeper,
     now: dt.datetime,
 ) -> int:
+    validate_launch_args(args)
     if args.no_volume:
         args.volume_name = None
         args.volume_id = None
@@ -1259,12 +1442,17 @@ def cmd_launch(
         )
         for line in card:
             emit(line)
+        emit("\n" + memfun_snippet(DEFAULT_LOCAL_PORT, args.served_name))
         emit("\nDRY RUN: nothing was created. To rent, add --no-dry-run --yes-spend-money.")
         return 0
     if not args.yes_spend_money:
         emit("refusing: --no-dry-run also needs --yes-spend-money", err=True)
         return 2
-    if plan.est_max_cost > args.max_cost_usd:
+    est = plan.est_max_cost
+    if not (math.isfinite(est) and est > 0):
+        emit(f"refusing: the cost estimate {est!r} is not a positive number", err=True)
+        return 2
+    if est > args.max_cost_usd:
         emit(
             f"refusing: estimated max cost ${plan.est_max_cost:.2f} exceeds "
             f"--max-cost-usd {args.max_cost_usd:.2f}",
@@ -1283,48 +1471,117 @@ def cmd_launch(
 
     # Only past this point does a mutating transport exist.
     rw = factory(key)
-    emit(f"\nLAUNCHING: up to ${plan.est_max_cost:.2f} will be spent.")
+    ro_rw = ReadOnlyTransport(rw)
+    emit(f"\nLAUNCHING: up to ${est:.2f} will be spent.")
+    created_volume: Volume | None = None
     if plan.volume_to_create:
-        n, s, d = plan.volume_to_create
-        vol = create_network_volume(rw, n, s, d)
-        emit(f"created network volume {vol.id} ({s} GB, {d})")
-        plan.payload["networkVolumeId"] = vol.id
+        n, sz, dc = plan.volume_to_create
+        created_volume = create_network_volume(rw, n, sz, dc)
+        emit(f"created network volume {created_volume.id} ({sz} GB, {dc})")
+        plan.payload["networkVolumeId"] = created_volume.id
+    # A unique name lets us find the pod if the create call dies after RunPod made it.
+    pod_name = f"{args.name}-{uuid.uuid4().hex[:10]}"
+    plan.payload["name"] = pod_name
     assert_no_secret(plan.payload, key, "the pod payload")
     started = clock()
     deadline = started + plan.max_minutes * 60
-    pod = deploy_pod(rw, plan.payload)
-    emit(f"pod {pod.id} created ({pod.desired_status})")
-    if pod.cost_per_hr is None:
-        fresh = get_pod(rw, pod.id)
-        pod = dataclasses.replace(pod, cost_per_hr=fresh.cost_per_hr if fresh else None)
-    reported = pod.cost_per_hr is not None
-    card = run_card(
-        pod_id=pod.id,
-        gpu_id=plan.gpu.id,
-        gpu_count=plan.gpu_count,
-        rate_per_hr=pod.cost_per_hr
-        if pod.cost_per_hr is not None
-        else plan.price_per_gpu_hr * plan.gpu_count,
-        rate_source="reported by RunPod for this pod" if reported else "plan estimate",
-        deadline_utc=now + dt.timedelta(minutes=plan.max_minutes),
-        minutes=plan.max_minutes,
+    pod_id: str | None = None
+    handed_to_watchdog = False
+    try:
+        try:
+            pod = deploy_pod(rw, plan.payload)
+            pod_id = pod.id
+        except BaseException as exc:
+            emit(f"pod create failed or was interrupted: {type(exc).__name__}: {exc}", err=True)
+            pod_id = find_pod_id_by_name(ro_rw, pod_name, sleep=sleep)
+            if pod_id is None:
+                _warn_orphans(pod_name, created_volume)
+                if isinstance(exc, KeyboardInterrupt):
+                    raise
+                return 4
+            emit(f"RunPod did create pod {pod_id} ({pod_name}); terminating it", err=True)
+            return 4
+        emit(f"pod {pod.id} created ({pod.desired_status}) as {pod_name}")
+        if pod.cost_per_hr is None:
+            fresh = get_pod(rw, pod.id)
+            pod = dataclasses.replace(pod, cost_per_hr=fresh.cost_per_hr if fresh else None)
+        reported = pod.cost_per_hr is not None
+        card = run_card(
+            pod_id=pod.id,
+            gpu_id=plan.gpu.id,
+            gpu_count=plan.gpu_count,
+            rate_per_hr=pod.cost_per_hr
+            if pod.cost_per_hr is not None
+            else plan.price_per_gpu_hr * plan.gpu_count,
+            rate_source="reported by RunPod for this pod" if reported else "plan estimate",
+            deadline_utc=now + dt.timedelta(minutes=plan.max_minutes),
+            minutes=plan.max_minutes,
+        )
+        for line in card:
+            emit(line)
+        emit("\n" + memfun_snippet(DEFAULT_LOCAL_PORT, args.served_name))
+        handed_to_watchdog = True  # run_watchdog terminates on every exit path itself
+        result = run_watchdog(
+            rw, pod.id, deadline, clock=clock, sleep=sleep, started_at=started,
+            poll_seconds=args.poll_seconds,
+        )  # fmt: skip
+        emit(f"done: {result.reason}; ~${result.spent_usd:.2f} spent; gone={result.verified_gone}")
+        return 0 if result.verified_gone else 3
+    finally:
+        if pod_id is not None and not handed_to_watchdog:
+            emit(f"[launch] pod {pod_id} exists but is not watched yet: terminating it", err=True)
+            terminate_and_verify(rw, pod_id, sleep=sleep)
+
+
+def find_pod_id_by_name(
+    t: Transport, name: str, *, sleep: Sleeper, attempts: int = 3, backoff: float = 10.0
+) -> str | None:
+    """Read-only ``myself { pods }`` lookup of the kit-generated unique pod name."""
+    for attempt in range(1, attempts + 1):
+        try:
+            data = t.graphql("query { myself { pods { id name desiredStatus } } }")
+            for pod in map(_d, _l(_d(data.get("myself")).get("pods"))):
+                if pod.get("name") == name and pod.get("id"):
+                    return str(pod["id"])
+            return None
+        except KitError as exc:
+            emit(f"[launch] pod lookup {attempt}/{attempts} failed: {exc}", err=True)
+            sleep(backoff)
+    return None
+
+
+def _warn_orphans(pod_name: str, volume: Volume | None) -> None:
+    emit(
+        f"!!! COULD NOT CONFIRM WHETHER POD '{pod_name}' EXISTS. Check "
+        "https://console.runpod.io/pods now. If it exists, terminate it with:\n"
+        f"    runpodctl pod delete <POD_ID>   # the pod named {pod_name}\n"
+        "or the console's Terminate button. !!!",
+        err=True,
     )
-    for line in card:
-        emit(line)
-    result = run_watchdog(
-        rw, pod.id, deadline, clock=clock, sleep=sleep, started_at=started,
-        poll_seconds=args.poll_seconds,
-    )  # fmt: skip
-    emit(f"done: {result.reason}; ~${result.spent_usd:.2f} spent; gone={result.verified_gone}")
-    return 0 if result.verified_gone else 3
+    if volume is not None:
+        emit(
+            f"!!! network volume {volume.id} ('{volume.name}', {volume.size_gb} GB) was created "
+            "for this launch and keeps billing storage. The kit never deletes volumes; delete "
+            "it in the console if unwanted. !!!",
+            err=True,
+        )
+
+
+class TerminateRequestedError(KeyboardInterrupt):
+    """SIGTERM/SIGHUP.  A KeyboardInterrupt, so every launch/watchdog path that terminates
+    on Ctrl-C also terminates on these; ``watch`` tells it apart from a plain Ctrl-C."""
+
+
+def _exit_signal_handler(signum: int, _frame: object) -> None:
+    raise TerminateRequestedError(f"signal {signum}")
 
 
 def install_exit_signals() -> None:
-    """Turn SIGTERM/SIGHUP (closed terminal, kill) into KeyboardInterrupt so the watchdog's
-    termination path runs.  Only called from the CLI entry points, never from tests."""
+    """Turn SIGTERM/SIGHUP (closed terminal, kill) into TerminateRequestedError so the
+    watchdog's termination path runs.  Only called from the CLI entry points."""
 
-    def handler(signum: int, _frame: object) -> None:
-        raise KeyboardInterrupt(f"signal {signum}")
+    def handler(signum: int, frame: object) -> None:
+        _exit_signal_handler(signum, frame)
 
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, handler)
@@ -1373,20 +1630,37 @@ def main(
             endpoint = pod.ssh_endpoint()
             if endpoint is None:
                 raise KitError("pod has no public TCP 22 mapping yet (still starting?)")
+            hosts_file = default_known_hosts(args.pod_id)
             cmd = build_ssh_command(
-                endpoint[0], endpoint[1], args.local_port, args.remote_port, args.identity
+                endpoint[0],
+                endpoint[1],
+                args.local_port,
+                args.remote_port,
+                args.identity,
+                known_hosts=hosts_file,
             )
             emit("ssh command: " + shlex.join(cmd))
-            emit("\nmemfun config (project memfun.toml):\n" + memfun_snippet(
+            emit(f"(host keys: trust-on-first-use in {hosts_file}, not ~/.ssh/known_hosts)")
+            emit("\n" + memfun_snippet(
                 args.local_port, args.served_name))  # fmt: skip
             emit("export MEMFUN_SGLANG_DUMMY_KEY=unused")
             emit(f"check: curl -s http://127.0.0.1:{args.local_port}/v1/models")
             if not args.run:
                 emit("(not started; add --run to open the tunnel)")
                 return 0
-            return subprocess.call(cmd)
+            try:
+                return subprocess.call(cmd, env=ssh_env(dict(os.environ)))
+            finally:
+                hosts_file.unlink(missing_ok=True)
     except KitError as exc:
         emit(f"error: {REDACT(str(exc))}", err=True)
+        return 1
+    except KeyboardInterrupt:
+        emit("interrupted", err=True)
+        return 130
+    except Exception as exc:
+        # Never let a raw traceback (which could quote a header) reach the terminal.
+        emit(f"error: {type(exc).__name__}: {REDACT(str(exc))}", err=True)
         return 1
     return 2
 

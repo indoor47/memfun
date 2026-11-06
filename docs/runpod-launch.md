@@ -30,11 +30,21 @@ is too old.
 - **Spend guards on the real path:** prints the plan and estimated max cost first; refuses
   if the estimate exceeds `--max-cost-usd` (default $40), if RunPod reports no stock, if the
   GPU is not `AVAILABLE` in the volume's data center, or if there is no SSH public key.
-  `--max-minutes` is capped at 720.
+  Inputs are validated before any transport exists: `--max-cost-usd` finite and in
+  (0, 10000], `--gpu-count` an integer 1..16, `--max-minutes` an integer 1..720 (so `nan`,
+  `inf`, `0` and negatives are refused), and a price from the API that is 0, negative, NaN
+  or infinite refuses the launch. `--model-repo`/`--served-name` must look like `org/name`
+  over `[A-Za-z0-9._-]` (no `..`, no absolute paths); the boot script re-checks them.
 - **API key:** read from `$RUNPOD_API_KEY` or `~/.config/runpod/key` (warns if the file is
-  not chmod 600). It only goes into the `Authorization` header. Every line the kit prints and
-  every error it raises passes through a redactor; HTTP errors are re-raised without the
-  original exception chain. The launch payload is checked so it cannot carry the key, and
+  not chmod 600). It must be one line of `[A-Za-z0-9_-]`; anything else (a comment line,
+  spaces, CR, NUL) is refused with a message that does not show the value, so a malformed
+  key can never reach an HTTP header (where `http.client` would quote it in an exception).
+  It only goes into the `Authorization` header. Every line the kit prints and every error
+  it raises passes through a redactor that also hides key prefixes of 6+ characters and
+  inner runs of 8+; text is redacted before it is truncated. Every exception (not only
+  HTTP errors) is converted to a redacted one-line error without the original exception
+  chain, and the CLI never prints a raw traceback. ssh gets an environment without the
+  RunPod key or any `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*` variable. The launch payload is checked so it cannot carry the key, and
   `watch` strips `RUNPOD_API_KEY` from the environment it gives memfun. **The account key is
   never sent into the pod.**
 
@@ -61,6 +71,13 @@ is too old.
    and then **verified**: the pod query must return nothing or `TERMINATED`. If it cannot be
    verified, it prints a loud warning to terminate the pod in the console and exits 3. For a
    pod launched some other way: `launch_pod.py watchdog --pod-id <id> --max-minutes N`.
+   **No unwatched window:** from the create call until the watchdog takes over, any error,
+   Ctrl-C or SIGTERM terminates the pod. Each pod gets a unique name
+   (`<--name>-<10 hex>`); if the create call itself fails or times out after RunPod made
+   the pod, the kit finds it by that name (read-only `myself { pods }`) and terminates it.
+   If that lookup also fails, it prints a loud warning with the pod name and the manual
+   `runpodctl pod delete` / console steps (exit 4). A network volume the kit created for a
+   failed launch is never deleted; the kit prints a warning that it keeps billing storage.
 
 Network volumes survive termination (weights and runs stay); container disk does not.
 
@@ -120,7 +137,9 @@ It downloads with `hf download` (or `huggingface-cli download`) into
 `/workspace/models/Qwen/Qwen3.8-27B-FP8`, retries, then checks every file against the Hub's
 sha256 (LFS) or git blob sha1 and writes `.memfun_verified`. **The volume is ready when the
 script prints `VERIFIED` and `du -sh` shows ~29 GiB.** Terminate the CPU pod. The GPU pod
-refuses to serve without `.memfun_verified` and terminates itself straight away. (Pulling on
+refuses to serve without `.memfun_verified` and terminates itself straight away. The
+marker must name the same repo, and when `--model-revision` is a 40-hex commit sha the
+marker's sha must equal it; an in-pod pull uses `--revision` of that pin. (Pulling on
 the GPU pod is possible with `--pull-in-pod`, but costs GPU minutes and only gets
 `hf download`'s own integrity checks.)
 
@@ -184,22 +203,42 @@ uv run python scripts/runpod/launch_pod.py watch --pod-id <id> --identity ~/.ssh
    with `MEMFUN_INFERENCE_METRICS_URL=http://127.0.0.1:<local>/metrics` and
    `MEMFUN_POD_RATE_USD=<the pod's costPerHr from the API>` set. The rate is never
    hardcoded; if the API reports none, the variable is left unset. It also sets
-   `MEMFUN_SGLANG_DUMMY_KEY=unused` for the worker role below.
+   `MEMFUN_SGLANG_DUMMY_KEY=unused` for the `[llm]` block below.
 5. On macOS it runs `caffeinate -dimsu -w <memfun pid>`, so the Mac stays awake until memfun
    exits. Elsewhere it prints a notice; `--no-caffeinate` turns it off.
 6. When memfun exits, it closes the tunnel. It does **not** stop the pod; the watchdog does.
+   Ctrl-C belongs to memfun (the wrapper keeps waiting); SIGTERM/SIGHUP to the wrapper stops
+   memfun, the tunnel and caffeinate and exits 143, and the pod keeps running under the
+   watchdog and in-pod stop.
+
+**Host keys.** RunPod reuses public IP:port pairs across pods, so the kit never touches
+`~/.ssh/known_hosts`. ssh runs with `StrictHostKeyChecking=accept-new` against a per-pod
+`UserKnownHostsFile` (a temp dir for `watch` and `tunnel --run`, deleted on exit). That is
+trust on first use: the first connection to a fresh pod accepts its host key unverified,
+which is the usual trade-off for ephemeral cloud pods (the host key is generated at boot and
+not published anywhere the kit could check). The tunnel only carries localhost traffic to
+SGLang and authenticates you by key, so the exposure is a man-in-the-middle on the first
+connection reading or changing model traffic.
 
 Starting memfun yourself instead: `tunnel --pod-id <id> --run` and paste the printed
-`export ...` lines. Point the swarm workers at the pod in the project `memfun.toml`
-(`tunnel` prints this too):
+`export ...` lines.
+
+**memfun config: Qwen everywhere.** For the first run every memfun role (orchestrator,
+decomposer, workers, auditors, reviewer) uses the same model served by SGLang on the pod,
+and no cloud API key is needed. One `[llm]` block in the project `memfun.toml` does it,
+since every role inherits it (`tunnel`, `watch` and `launch` print this block):
 
 ```toml
-[llm.roles.worker]
+[llm]
 provider = "openai"
-model = "qwen3.8-27b-fp8"
 base_url = "http://127.0.0.1:18000/v1"
-api_key_env = "MEMFUN_SGLANG_DUMMY_KEY"   # any value; SGLang binds 127.0.0.1 in the pod
+model = "qwen3.8-27b-fp8"                 # the --served-name alias
+api_key_env = "MEMFUN_SGLANG_DUMMY_KEY"   # NAME of a dummy env var; SGLang needs no key
 ```
+
+Once per-role models land (`[llm.roles.<role>]`, PR 4, not merged yet), single roles can
+be overridden; for example Claude Opus 5.5 for orchestrator/decomposer as a later
+comparison arm.
 
 **Dashboard.** With `MEMFUN_INFERENCE_METRICS_URL` set, the dashboard server proxies the
 SGLang Prometheus endpoint (`/api/server-metrics`), and the inference-server strip shows
@@ -217,6 +256,13 @@ URL). See the "Remote access: token auth" section of
 The watchdog terminates the pod at the deadline, or press Ctrl-C in the launch terminal. It
 prints `verified: pod <id> is gone`; if it prints `COULD NOT VERIFY`, terminate the pod in
 the console. Network volume storage is billed until you delete the volume.
+
+## Smoke tasks and grading
+
+The smoke task set for the first run is `evals/swarm/smoke/` (validate it with
+`uv run python evals/swarm/validate_bundles.py`). Grade agent output only the way its
+README's "Grading rules" section describes: owned files over a clean `repo/`, hidden tests
+run from a separate grader dir with a pinned rootdir/ini and no conftest from the agent tree.
 
 ## Ports
 
