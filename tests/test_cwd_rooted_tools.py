@@ -394,3 +394,67 @@ async def test_gather_shared_context_uses_engine_project_root(
     ctx_legacy = await legacy._gather_shared_context("raw", MagicMock())  # pyright: ignore[reportPrivateUsage]
     assert "IN_PROCESS_CWD" in ctx_legacy
     assert "IN_PROJECT_ROOT" not in ctx_legacy
+
+
+# ── _post_process fix/polish edits land in the task cwd ───────
+
+
+async def test_post_process_fix_and_polish_edit_task_cwd(
+    dirs: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real ``_post_process`` (real Verifier, OperationExecutor, file
+    reads); only the LLM calls (FixSolver.afix, ConsistencyReviewer.areview)
+    are stubbed.  The LLM emits paths *relative* to the ``=== FILE: rel ===``
+    headers, exactly as read_affected_files presents them.
+    """
+    import shutil
+
+    from memfun_agent import context_first
+    from memfun_agent.rlm import RLMResult
+
+    if shutil.which("ruff") is None:
+        pytest.skip("ruff not on PATH; needed for real verification")
+
+    a, b, _ = dirs
+    # Same relative file exists in the main tree (A) and the worktree (B),
+    # mirroring a git worktree of the same repo.
+    for root in (a, b):
+        (root / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+        (root / "feature.py").write_text("import os\nVALUE = 1\n")
+    a_before = {p.name: p.read_text() for p in a.iterdir()}
+
+    afix_calls: list[str] = []
+
+    async def fake_afix(self: Any, query: str, full_context: str, verification_errors: str) -> Any:
+        afix_calls.append(verification_errors)
+        assert "=== FILE: feature.py ===" in full_context
+        if len(afix_calls) == 1:  # lint fix (Phase 1)
+            return [
+                {"op": "edit_file", "path": "feature.py", "old": "import os\n", "new": ""},
+                {"op": "write_file", "path": "fix_added.py", "content": "ADDED = 1\n"},
+            ]
+        # polish (Phase 2)
+        return [{"op": "edit_file", "path": "feature.py", "old": "VALUE = 1", "new": "VALUE = 2"}]
+
+    async def fake_areview(self: Any, **kwargs: Any) -> Any:
+        return context_first.ConsistencyResult(
+            has_issues=True, issues=["VALUE should be 2"], reasoning="r"
+        )
+
+    monkeypatch.setattr(context_first.FixSolver, "afix", fake_afix)
+    monkeypatch.setattr(context_first.ConsistencyReviewer, "areview", fake_areview)
+
+    agent = CoderAgent(MagicMock())
+    rlm_result = RLMResult(answer="done", files_created=[str(b / "feature.py")])
+    out = await agent._post_process(  # pyright: ignore[reportPrivateUsage]
+        query="q", rlm_result=rlm_result, sub_task_id="s1", cwd=str(b)
+    )
+
+    assert len(afix_calls) == 2  # verification really failed -> fix ran; polish ran
+    assert "F401" in afix_calls[0]
+    assert (b / "feature.py").read_text() == "VALUE = 2\n"
+    assert (b / "fix_added.py").read_text() == "ADDED = 1\n"
+    # Main tree untouched, no new file there.
+    assert {p.name: p.read_text() for p in a.iterdir()} == a_before
+    assert str(b / "fix_added.py") in out.files_created

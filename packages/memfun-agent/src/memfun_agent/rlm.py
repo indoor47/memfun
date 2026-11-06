@@ -81,10 +81,12 @@ def build_context_metadata(
     if root is not None:
         lines.append(f"WORKING DIRECTORY: {root}")
         lines.append(
-            "  Relative paths given to write_file/read_file/edit_file/"
-            "list_files and commands run via run_cmd resolve against this "
-            "directory. Paths outside it are rejected. Do NOT use "
-            "os.chdir(), raw open() or subprocess -- they are not rooted."
+            "  write_file/read_file/edit_file/list_files resolve relative "
+            "paths against this directory and reject paths outside it. "
+            "run_cmd starts commands in this directory but does NOT "
+            "confine them (cd / absolute paths still reach elsewhere), so "
+            "keep commands inside it. Do NOT use os.chdir(), raw open() "
+            "or subprocess -- they are not rooted."
         )
         lines.append("")
     lines.append("Available helper functions in the REPL:")

@@ -303,7 +303,13 @@ class _SpecialistBase(BaseAgent):
             read_affected_files,
         )
 
-        project_root = Path(cwd or os.getcwd())
+        project_root = Path(cwd or os.getcwd()).resolve()
+        # With an explicit task cwd (per-task worktree), confine the
+        # fix/polish edits to it: the LLM emits paths relative to the
+        # ``=== FILE: rel ===`` headers, which OperationExecutor would
+        # otherwise resolve against the *process* cwd (main checkout).
+        # Without one, keep the legacy unconfined behaviour.
+        exec_base_dir: Path | None = project_root if cwd else None
         extra_ops: list[tuple[str, str, Any]] = []
         extra_files: list[str] = []
 
@@ -346,6 +352,7 @@ class _SpecialistBase(BaseAgent):
                                 executor = OperationExecutor(
                                     project_root,
                                     edit_only=True,
+                                    base_dir=exec_base_dir,
                                 )
                                 await executor.execute(fix_ops)
                                 extra_ops.extend(executor.ops)
@@ -391,6 +398,7 @@ class _SpecialistBase(BaseAgent):
                             executor = OperationExecutor(
                                 project_root,
                                 edit_only=True,
+                                base_dir=exec_base_dir,
                             )
                             await executor.execute(polish_ops)
                             extra_ops.extend(executor.ops)
