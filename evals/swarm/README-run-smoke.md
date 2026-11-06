@@ -243,6 +243,13 @@ it explains the outcome. In order:
    - **`partial`**: some hidden tests pass;
    - **`model_failure`**: no hidden test passes (this includes a swarm that finished and
      reported failure, agent code that crashes or hangs its unit's grader process).
+   - **no edits** (`no_edits: true` in `swarm-result.json`, also flag `no_edits` and the
+     aggregate `no_edit_episodes`): a code-writing sub-task (coder/test agents or the
+     single-task `rlm-coder`) produced no file change, so the swarm fails closed
+     (exit 1, `no file changes produced (...)`) and the episode is a `model_failure`
+     even if hidden tests would pass. A change is a `files_created` entry or a recorded
+     `write`/`edit` op; a `cmd`-only run is judged by `git status --porcelain`; read-only
+     specialists are exempt.
 
 The record keeps the reason string and the last 40 log lines. `harness_error_rate` is over
 ALL episodes; `episode_pass_rate` = pass / (episodes - harness errors) and `unit_pass_rate`

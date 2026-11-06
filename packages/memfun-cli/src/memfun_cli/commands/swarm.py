@@ -139,6 +139,11 @@ def _display_final_summary(
         "workflow_duration",
         _format_duration(result.total_duration_ms / 1000.0),
     )
+    if result.no_edits:
+        table.add_row(
+            "no_edits",
+            f"[red]{result.no_edit_subtasks} code sub-task(s) produced no file changes[/red]",
+        )
     if result.error:
         table.add_row("error", f"[red]{result.error}[/red]")
 
@@ -304,6 +309,8 @@ def _swarm_result_payload(
         "unaccepted_tasks": list(result.unaccepted_tasks) if result is not None else [],
         "review_errors": result.review_errors if result is not None else 0,
         "review_rounds": result.review_rounds if result is not None else 0,
+        "no_edits": bool(result.no_edits) if result is not None else False,
+        "no_edit_subtasks": result.no_edit_subtasks if result is not None else 0,
         "files_created": list(result.files_created) if result is not None else [],
         "decomposition": None
         if decomposition is None

@@ -1309,6 +1309,7 @@ def classify(
     any_output: bool = True,
     server_errors: int = 0,
     truncated_failure: bool = False,
+    no_edits: bool = False,
 ) -> tuple[str, str]:
     """One of OUTCOMES plus a reason.  Same rules for passing and failing episodes.
 
@@ -1329,6 +1330,8 @@ def classify(
             return "harness_error", f"memfun swarm exited {returncode} without a result"
         if server_errors:
             return "harness_error", f"model server errors ({server_errors}) and no output"
+    if no_edits:  # fail closed: the swarm changed no file, whatever else it reported
+        return "model_failure", "no file changes produced"
     if all_pass:
         return "pass", "all hidden tests pass"
     if hidden_passed:
@@ -1634,6 +1637,9 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
             rec["n_sub_tasks"] = metrics["primary_sub_tasks"]
             rec["agents_used"] = metrics["agents_used"]
             rec["unaccepted_tasks"] = None
+        rec["no_edits"] = bool(swarm_doc and swarm_doc.get("no_edits"))
+        if rec["no_edits"]:
+            rec["flags"].append("no_edits")
 
         collected_dir = private / "collected"
         collected_dir.mkdir()
@@ -1707,6 +1713,7 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
                 rec["truncated_responses"]
                 and (swarm_doc.get("success") is False if swarm_doc else proc.returncode != 0)
             ),
+            no_edits=rec["no_edits"],
         )
         rec.update(outcome=outcome, reason=reason, metrics=metrics)
         return rec
@@ -1798,6 +1805,7 @@ def aggregate(episodes: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str,
             "truncated_responses": sum(e.get("truncated_responses", 0) for e in eps),
             "loop_aborts": sum(e.get("loop_aborts", 0) for e in eps),
             "stalled_stops": sum(e.get("stalled_stops", 0) for e in eps),
+            "no_edit_episodes": sum(1 for e in eps if e.get("no_edits")),
             "flags": sorted({f for e in eps for f in e.get("flags", [])}),
             "tool_usage": _tool_block(eps),
         }
@@ -1870,8 +1878,9 @@ def summary_table(results: dict[str, Any]) -> str:
     rows.append(
         f"raw counts: episodes={results['overall']['episodes']} pass={o['pass']} "
         f"partial={o['partial']} model_failure={o['model_failure']} "
-        f"harness_error={o['harness_error']}  (ep% and unit% exclude harness errors; "
-        "harness rate is over ALL episodes)"
+        f"harness_error={o['harness_error']} "
+        f"no_edit_episodes={results['overall']['no_edit_episodes']}  "
+        "(ep% and unit% exclude harness errors; harness rate is over ALL episodes)"
     )
     rows.append("")
     rows.append("tool usage (mean per episode; search = grep/find_files):")

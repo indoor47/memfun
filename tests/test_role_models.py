@@ -774,7 +774,10 @@ class _RecordingCoder:
         answer = await asyncio.to_thread(_call)
         self.seen.append((answer, current_role()))
         return TaskResult(
-            task_id=task.task_id, agent_id="rlm-coder", success=True, result={"answer": answer}
+            task_id=task.task_id,
+            agent_id="rlm-coder",
+            success=True,
+            result={"answer": answer, "ops": [{"type": "edit", "target": "a.py"}]},
         )
 
 
