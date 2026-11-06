@@ -335,6 +335,11 @@ def _run_reference(bundle: Path, owned: list[str], work: Path, timeout: float) -
             f"reference run produced no record (rc={res.returncode}):\n{res.output_tail}"
         )
     data = cast("dict[str, Any]", json.loads(record.read_text("utf-8")))
+    # Node ids are rootdir-relative or not depending on how pytest was started (plain
+    # vs under another pytest/CI); store them without the grader's directory prefix.
+    prefix = "graded_tests/"
+    data["tests"] = {k.removeprefix(prefix): v for k, v in data["tests"].items()}
+    data["collect_errors"] = [e.removeprefix(prefix) for e in data["collect_errors"]]
     data["rc"] = res.returncode
     return data
 
