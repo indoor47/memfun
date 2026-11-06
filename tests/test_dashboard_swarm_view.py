@@ -57,7 +57,7 @@ def test_malformed_lines_are_skipped() -> None:
 
 def test_server_metrics_disabled_without_configured_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEMFUN_INFERENCE_METRICS_URL", raising=False)
-    client = TestClient(create_app())
+    client = TestClient(create_app(), client=("127.0.0.1", 50000))
     assert client.get("/api/server-metrics").json() == {"enabled": False}
 
 
@@ -70,7 +70,7 @@ def test_server_metrics_fetch_only_the_configured_url(monkeypatch: pytest.Monkey
 
     monkeypatch.setenv("MEMFUN_INFERENCE_METRICS_URL", "http://127.0.0.1:30000/metrics")
     monkeypatch.setattr(server, "_fetch_text", fake_fetch)
-    client = TestClient(create_app())
+    client = TestClient(create_app(), client=("127.0.0.1", 50000))
     body = client.get("/api/server-metrics", params={"url": "http://evil.example/"}).json()
     assert seen == ["http://127.0.0.1:30000/metrics"], "a query param must never pick the URL"
     assert body["enabled"] is True and body["ok"] is True and body["running"] == 16.0
@@ -82,12 +82,12 @@ def test_unreachable_server_degrades_instead_of_failing(monkeypatch: pytest.Monk
 
     monkeypatch.setenv("MEMFUN_INFERENCE_METRICS_URL", "http://127.0.0.1:1/metrics")
     monkeypatch.setattr(server, "_fetch_text", boom)
-    body = TestClient(create_app()).get("/api/server-metrics").json()
+    body = TestClient(create_app(), client=("127.0.0.1", 50000)).get("/api/server-metrics").json()
     assert body == {"enabled": True, "ok": False, "error": "OSError"}
 
 
 def test_page_ships_the_three_views_without_arrow_chain() -> None:
-    html = TestClient(create_app()).get("/").text
+    html = TestClient(create_app(), client=("127.0.0.1", 50000)).get("/").text
     for view in ("swarm", "timeline", "tasks"):
         assert f'data-view="{view}"' in html
     assert 'id="swarm-canvas"' in html and 'id="timeline-canvas"' in html
@@ -103,7 +103,7 @@ def test_trailing_prometheus_timestamp_is_not_the_value() -> None:
 def test_escaping_covers_quotes_for_attribute_contexts() -> None:
     # Task details and request descriptions land in title="..." attributes;
     # an unescaped quote there is an attribute-breakout XSS.
-    html = TestClient(create_app()).get("/").text
+    html = TestClient(create_app(), client=("127.0.0.1", 50000)).get("/").text
     js = html.split("<script>", 1)[1]
     body = js[js.index("function escHtml") : js.index("function escHtml") + 400]
     assert "&quot;" in body and "&#39;" in body

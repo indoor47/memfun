@@ -426,18 +426,25 @@ def ensure_dashboard_token() -> str:
     import secrets
 
     token = secrets.token_urlsafe(24)
-    _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _TOKEN_FILE.touch(mode=0o600, exist_ok=True)
-    _TOKEN_FILE.write_text(token + "\n", encoding="utf-8")
-    _TOKEN_FILE.chmod(0o600)
+    _TOKEN_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Private from the first byte: create a fresh 0600 temp file, then
+    # atomically replace (never write the secret into a looser file).
+    tmp = _TOKEN_FILE.with_name(f".{_TOKEN_FILE.name}.{secrets.token_hex(4)}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(token + "\n")
+    os.replace(tmp, _TOKEN_FILE)
     return token
 
 
 def _is_remote_client(scope: dict[str, Any]) -> bool:
-    """True for a real non-loopback IP client.
+    """True unless the peer is a loopback IP (or there is no peer at all).
 
-    Clients without an IP (unix sockets, in-process test clients) are
-    local by construction; uvicorn always reports the peer IP for TCP.
+    A peer that is not a parseable IP counts as REMOTE: behind a local
+    proxy, uvicorn can surface a forwarded value such as ``unknown``, and
+    treating that as local would skip the token.  Note that any local
+    reverse proxy or tunnel (cloudflared, ngrok, ``tailscale serve``) makes
+    remote users look like 127.0.0.1 -- don't put one in front of this.
     """
     import ipaddress
 
@@ -447,7 +454,7 @@ def _is_remote_client(scope: dict[str, Any]) -> bool:
     try:
         return not ipaddress.ip_address(str(client[0])).is_loopback
     except ValueError:
-        return False
+        return True
 
 
 def _presented_token(scope: dict[str, Any]) -> tuple[str, bool]:
@@ -473,6 +480,26 @@ def _presented_token(scope: dict[str, Any]) -> tuple[str, bool]:
     return (morsel.value if morsel else ""), False
 
 
+def _same_origin(scope: dict[str, Any]) -> bool:
+    """False when a browser Origin header names a different host:port.
+
+    Applies to WebSocket handshakes and state-changing HTTP methods; plain
+    GETs of the page itself are left alone.
+    """
+    from urllib.parse import urlsplit
+
+    if scope.get("type") == "http" and scope.get("method", "GET") in ("GET", "HEAD", "OPTIONS"):
+        return True
+    headers = {
+        k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])
+    }
+    origin = headers.get("origin")
+    if not origin:
+        return True  # memfun processes, curl, the iOS app's native probes
+    host = headers.get("host", "")
+    return urlsplit(origin).netloc.lower() == host.lower()
+
+
 class _RemoteAuthMiddleware:
     """ASGI middleware covering both HTTP and the ``/ws`` WebSocket."""
 
@@ -481,7 +508,20 @@ class _RemoteAuthMiddleware:
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         kind = scope.get("type")
-        if kind not in ("http", "websocket") or not _is_remote_client(scope):
+        if kind not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        if not _same_origin(scope):
+            # Cross-site WebSocket hijacking / CSRF: another web page (even
+            # one opened in a browser on this Mac) must not read the state
+            # or post events.  Non-browser clients send no Origin.
+            if kind == "websocket":
+                await receive()
+                await send({"type": "websocket.close", "code": 1008})
+            else:
+                await self._send_json(send, 403, b'{"error":"cross-origin request refused"}')
+            return
+        if not _is_remote_client(scope):
             await self.app(scope, receive, send)
             return
         if kind == "http" and scope.get("path") == "/api/health":
@@ -492,7 +532,11 @@ class _RemoteAuthMiddleware:
         presented, from_query = _presented_token(scope)
         import hmac
 
-        ok = bool(expected) and bool(presented) and hmac.compare_digest(presented, expected)
+        ok = (
+            bool(expected)
+            and bool(presented)
+            and hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
+        )
         if not ok:
             if kind == "websocket":
                 await receive()  # websocket.connect
@@ -2859,6 +2903,13 @@ function drawTimeline() {
 
 // ── Phone layout / app embed ─────────────────────────────────────
 const pageParams = new URLSearchParams(location.search);
+// The token arrived in the query; the server has set the cookie, so drop it
+// from the address bar and history.
+if (pageParams.has('token')) {
+  const clean = new URL(location.href);
+  clean.searchParams.delete('token');
+  history.replaceState(null, '', clean.pathname + clean.search + clean.hash);
+}
 if (pageParams.get('embed') === '1') document.body.classList.add('embed');
 function applyMobileLayout() {
   const on = pageParams.get('mobile') === '1' || window.innerWidth <= 820;

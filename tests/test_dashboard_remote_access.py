@@ -94,3 +94,44 @@ def test_token_file_is_created_private(tmp_path: Path) -> None:
     assert token and path.read_text().strip() == token
     assert oct(path.stat().st_mode & 0o777) == "0o600"
     assert server.ensure_dashboard_token() == token  # stable once created
+
+
+def test_non_ip_peer_counts_as_remote(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Behind a local proxy uvicorn may report e.g. ("unknown", 0); that must
+    # not be mistaken for loopback.
+    monkeypatch.setenv("MEMFUN_DASHBOARD_TOKEN", TOKEN)
+    assert _client(("unknown", 0)).get("/api/state").status_code == 401
+    assert _client(("testclient", 50000)).get("/api/state").status_code == 401
+
+
+def test_non_ascii_token_is_rejected_not_a_server_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MEMFUN_DASHBOARD_TOKEN", TOKEN)
+    assert _client(REMOTE).get("/api/state", params={"token": "é"}).status_code == 401
+
+
+def test_cross_origin_websocket_refused_even_from_loopback() -> None:
+    # Any web page in a browser on this Mac could otherwise read the swarm state.
+    c = _client(LOCAL)
+    with (
+        pytest.raises(WebSocketDisconnect) as exc,
+        c.websocket_connect("/ws", headers={"origin": "https://evil.example"}) as ws,
+    ):
+        ws.receive_json()
+    assert exc.value.code == 1008
+
+
+def test_cross_origin_post_refused_same_origin_allowed() -> None:
+    c = _client(LOCAL)
+    evil = c.post(
+        "/api/event", json={"event_type": "x"}, headers={"origin": "https://evil.example"}
+    )
+    assert evil.status_code == 403
+    same = c.post("/api/event", json={"event_type": "x"}, headers={"origin": "http://testserver"})
+    assert same.status_code == 200
+    # Non-browser clients (memfun processes posting events) send no Origin.
+    assert c.post("/api/event", json={"event_type": "x"}).status_code == 200
+
+
+def test_page_strips_token_from_the_address_bar() -> None:
+    html = _client(LOCAL).get("/").text
+    assert "searchParams.delete('token')" in html and "history.replaceState" in html
