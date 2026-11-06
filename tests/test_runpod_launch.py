@@ -1455,6 +1455,7 @@ case "$1" in
   -m)
     if [ "$2" = pip ]; then
       echo "$*" >> "$D/pip.log"
+      [ -n "${FAKE_PIP_SLEEP:-}" ] && sleep "$FAKE_PIP_SLEEP"
       echo "ERROR: fake pip: no network"
       [ "${FAKE_PIP_OK:-0}" = 1 ] && { touch "$D/hub_installed"; exit 0; }
       exit 1
@@ -1477,7 +1478,11 @@ exit 1
 
 
 def _run_boot(
-    tmp_path: Path, extra_env: dict[str, str], *, runpodctl: str | None = None
+    tmp_path: Path,
+    extra_env: dict[str, str],
+    *,
+    runpodctl: str | None = None,
+    wait_bound: float = 120,
 ) -> tuple[str, list[str], list[str]]:
     """Run pod_boot.sh with fake runpodctl/python3/curl/pip; return (log, runpodctl, python3)."""
     fakebin = tmp_path / "bin"
@@ -1489,7 +1494,10 @@ def _run_boot(
     (fakebin / "python3").write_text(FAKE_PY.replace("@DIR@", str(tmp_path)))
     # Hermetic: never touch the network from the preflight reachability check.
     (fakebin / "curl").write_text("#!/bin/sh\necho 'HTTP/2 200 (fake curl)'\n")
-    (fakebin / "pip").write_text(f'#!/bin/sh\necho "$@" >> "{tmp_path}/pip.log"\nexit 1\n')
+    (fakebin / "pip").write_text(
+        f'#!/bin/sh\necho "$@" >> "{tmp_path}/pip.log"\n'
+        '[ -n "${FAKE_PIP_SLEEP:-}" ] && sleep "$FAKE_PIP_SLEEP"\nexit 1\n'
+    )
     for f in fakebin.iterdir():
         f.chmod(0o755)
     models = tmp_path / "models"
@@ -1520,7 +1528,7 @@ def _run_boot(
             cwd=tmp_path,
         )
         try:
-            proc.wait(timeout=120)
+            proc.wait(timeout=wait_bound)  # liveness bound: TimeoutExpired = PID 1 hung
         finally:  # the armed deadline subshell is still sleeping: kill the whole group
             import os as _os
 
@@ -2323,3 +2331,85 @@ def test_killpg_wrapper_plus_kit_double_sigterm_still_terminates(tmp_path: Path)
             _os.killpg(proc.pid, signal.SIGKILL)
     assert (tmp_path / "events.rc").read_text().split()[1] == "gone"
     assert "terminate" in marker.read_text()
+
+
+# Boot script: hangs can never keep PID 1 alive past the deadline.
+# ---------------------------------------------------------------------------
+
+
+def _rp_script(tmp_path: Path, body: str) -> str:
+    return f'#!/bin/sh\necho "$@" >> "{tmp_path / "runpodctl.log"}"\n{body}\n'
+
+
+def _soon(seconds: int) -> str:
+    import time as _time
+
+    return str(int(_time.time()) + seconds)
+
+
+@needs_bash
+def test_boot_hung_download_and_failed_removal_still_ends_pid1(tmp_path: Path) -> None:
+    log, rp, py = _run_boot(
+        tmp_path,
+        {
+            "MEMFUN_DEADLINE_EPOCH": _soon(3),
+            "MEMFUN_ALLOW_PULL": "1",
+            "FAKE_HF_HUB": "1",
+            "FAKE_SNAP_SLEEP": "600",  # the download hangs
+            "MEMFUN_TERM_ATTEMPTS": "1",
+            "MEMFUN_TERM_RETRY_SLEEP": "0",
+            "MEMFUN_KILL_GRACE": "0",
+        },
+        runpodctl=_rp_script(tmp_path, "exit 1"),  # removal fails
+        wait_bound=60,
+    )
+    assert "self-terminate: deadline reached" in log
+    assert rp == ["remove pod podB", "pod delete podB"]
+    # The main shell's TERM trap ran promptly (not deferred behind the download).
+    assert "container shutdown: stopping all processes and exiting PID 1" in log
+    assert py == []
+
+
+@needs_bash
+def test_boot_hung_runpodctl_is_bounded(tmp_path: Path) -> None:
+    log, rp, _py = _run_boot(
+        tmp_path,
+        {"MEMFUN_RUNPODCTL_TIMEOUT": "1", "MEMFUN_TERM_ATTEMPTS": "1", "MEMFUN_KILL_GRACE": "0"},
+        runpodctl=_rp_script(tmp_path, "sleep 600"),
+        wait_bound=60,
+    )  # no weights -> fail -> self_terminate in the main shell
+    assert rp == ["remove pod podB", "pod delete podB"]
+    assert "'runpodctl remove pod' timed out after 1s" in log
+    assert "'runpodctl remove pod' failed (rc=124)" in log
+    assert "pod-scoped termination failed" in log
+
+
+@needs_bash
+def test_boot_download_stall_detection_retries(tmp_path: Path) -> None:
+    log, rp, py = _run_boot(
+        tmp_path,
+        {
+            "MEMFUN_ALLOW_PULL": "1",
+            "FAKE_HF_HUB": "1",
+            "FAKE_SNAP_SLEEP": "600",
+            "MEMFUN_PROGRESS_SEC": "1",
+            "MEMFUN_STALL_SEC": "2",
+            "MEMFUN_PULL_RETRIES": "2",
+        },
+        wait_bound=60,
+    )
+    assert log.count("download stalled: no growth") == 2
+    assert len(_lines(tmp_path / "snapshot.log")) == 2
+    assert "all 2 download attempts via python-api failed" in log
+    assert py == [] and rp == ["remove pod podB"]
+
+
+@needs_bash
+def test_boot_pip_hang_is_bounded(tmp_path: Path) -> None:
+    log, rp, _py = _run_boot(
+        tmp_path,
+        {"MEMFUN_ALLOW_PULL": "1", "FAKE_PIP_SLEEP": "600", "MEMFUN_PIP_TIMEOUT": "1"},
+        wait_bound=60,
+    )
+    assert "timed out after 1s: python3" in log and "timed out after 1s: pip" in log
+    assert "no way to download weights" in log and rp == ["remove pod podB"]

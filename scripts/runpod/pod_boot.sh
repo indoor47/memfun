@@ -35,11 +35,48 @@ PULL_RETRY_SLEEP="${MEMFUN_PULL_RETRY_SLEEP:-15}"
 [[ "$PULL_RETRY_SLEEP" =~ ^[0-9]{1,4}$ ]] || PULL_RETRY_SLEEP=15
 PROGRESS_SEC="${MEMFUN_PROGRESS_SEC:-20}"
 [[ "$PROGRESS_SEC" =~ ^[1-9][0-9]{0,3}$ ]] || PROGRESS_SEC=20
+num_or() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && echo "$1" || echo "$2"; }
+PULL_ATTEMPT_SEC=$(num_or "${MEMFUN_PULL_ATTEMPT_SEC:-1500}" 1500)  # per-attempt cap
+STALL_SEC=$(num_or "${MEMFUN_STALL_SEC:-300}" 300)         # no growth this long => retry
+PIP_TIMEOUT=$(num_or "${MEMFUN_PIP_TIMEOUT:-300}" 300)
+RPC_TIMEOUT=$(num_or "${MEMFUN_RUNPODCTL_TIMEOUT:-60}" 60)  # per runpodctl call
+TERM_ATTEMPTS=$(num_or "${MEMFUN_TERM_ATTEMPTS:-5}" 5)
+TERM_RETRY_SLEEP=$(num_or "${MEMFUN_TERM_RETRY_SLEEP:-10}" 10)
+KILL_GRACE=$(num_or "${MEMFUN_KILL_GRACE:-15}" 15)
 RUN_DIR="${MEMFUN_RUN_DIR:-/workspace/runs/${RUNPOD_POD_ID:-local}}"
 mkdir -p "$RUN_DIR" 2>/dev/null || RUN_DIR=/tmp
+DYING="$RUN_DIR/.memfun_dying"
+rm -f "$DYING"
 SGLANG_PID=""
+IN_DEADLINE=0
 MIRROR_PID=""
 LOGS_DUMPED=0
+
+# Kill a process and all its descendants (children first).
+kill_tree() {
+  local p=$1 sig=${2:-TERM} c
+  for c in $(pgrep -P "$p" 2>/dev/null); do kill_tree "$c" "$sig"; done
+  kill -"$sig" "$p" 2>/dev/null
+}
+
+# bounded SECS CMD...: run CMD in the background and `wait` for it, so (a) a hang is cut
+# off after SECS (TERM, then KILL 5 s later; returns 124 like coreutils timeout) and (b)
+# this shell stays in `wait`, where TERM traps run immediately (bash defers traps while a
+# FOREGROUND child runs).  The watcher writes nothing, so $(bounded ...) never blocks on it.
+bounded() {
+  local secs=$1 pid wd rc flag
+  shift
+  flag="$RUN_DIR/.timeout.$$.$RANDOM"
+  "$@" &
+  pid=$!
+  ( sleep "$secs"; kill -0 "$pid" 2>/dev/null || exit 0; : >"$flag"
+    kill_tree "$pid" TERM; sleep 5; kill_tree "$pid" KILL ) >/dev/null 2>&1 &
+  wd=$!
+  wait "$pid"; rc=$?
+  kill_tree "$wd" KILL 2>/dev/null
+  if [ -f "$flag" ]; then rm -f "$flag"; log "timed out after ${secs}s: $1" >&2; return 124; fi
+  return "$rc"
+}
 
 # Print the tail of every run log that exists, so the RunPod log stream (stdout) shows
 # WHY the pod is going away even after the pod (and its disk) is gone.
@@ -69,44 +106,66 @@ stop_mirror() {
 # and keep the newer `pod delete` as a fallback.  Their stderr noise is not printed.
 runpodctl_remove() {
   local out rc
-  out=$(runpodctl remove pod "$RUNPOD_POD_ID" 2>&1); rc=$?
+  out=$(bounded "$RPC_TIMEOUT" runpodctl remove pod "$RUNPOD_POD_ID" 2>&1); rc=$?
   if [ "$rc" = 0 ]; then
     log "terminated via 'runpodctl remove pod': $(printf '%s' "$out" | head -n 1)"
     return 0
   fi
+  [ "$rc" = 124 ] && log "'runpodctl remove pod' timed out after ${RPC_TIMEOUT}s"
   log "'runpodctl remove pod' failed (rc=$rc); trying 'runpodctl pod delete'"
-  out=$(runpodctl pod delete "$RUNPOD_POD_ID" 2>&1); rc=$?
+  out=$(bounded "$RPC_TIMEOUT" runpodctl pod delete "$RUNPOD_POD_ID" 2>&1); rc=$?
   if [ "$rc" = 0 ]; then
     log "terminated via 'runpodctl pod delete': $(printf '%s' "$out" | head -n 1)"
     return 0
   fi
+  [ "$rc" = 124 ] && log "'runpodctl pod delete' timed out after ${RPC_TIMEOUT}s"
   log "'runpodctl pod delete' failed (rc=$rc)"
   return 1
 }
 
+# Main shell, after the deadline subshell gave up on runpodctl: stop everything, exit PID 1.
+die_now() {
+  local c
+  log "container shutdown: stopping all processes and exiting PID 1"
+  for c in $(pgrep -P "$$" 2>/dev/null); do kill_tree "$c" TERM; done
+  [ -n "$SGLANG_PID" ] && kill_tree "$SGLANG_PID" TERM
+  sleep 2
+  for c in $(pgrep -P "$$" 2>/dev/null); do kill_tree "$c" KILL; done
+  exit 1
+}
+
 self_terminate() {
   trap '' TERM INT
+  if [ "$IN_DEADLINE" = 0 ] && [ -f "$DYING" ]; then die_now; fi
   log "self-terminate: $1"
   dump_logs
   stop_mirror
   local i
-  for i in 1 2 3 4 5; do
+  for i in $(seq 1 "$TERM_ATTEMPTS"); do
     if command -v runpodctl >/dev/null 2>&1 && [ -n "${RUNPOD_POD_ID:-}" ]; then
       runpodctl_remove && exit 0
     else
       log "runpodctl or RUNPOD_POD_ID unavailable"
       break
     fi
-    sleep 10
+    [ "$i" -lt "$TERM_ATTEMPTS" ] && sleep "$TERM_RETRY_SLEEP"
   done
   log "pod-scoped termination failed: stopping SGLang and exiting PID 1 (billing may continue;"
   log "the local watchdog / terminateAfter must terminate the pod)"
   [ -n "$SGLANG_PID" ] && kill -TERM "$SGLANG_PID" 2>/dev/null
   pkill -TERM -f sglang.launch_server 2>/dev/null
-  sleep 15
+  sleep "$KILL_GRACE"
   pkill -KILL -f sglang.launch_server 2>/dev/null
-  # From the deadline subshell, also take down the main script (PID 1) so the container exits.
-  [ "${BASHPID:-$$}" != "$$" ] && kill -TERM "$$" 2>/dev/null
+  # From the deadline subshell, also take down the main script (PID 1) so the container
+  # exits.  Every long step in the main shell runs under `bounded`/`wait`, so its TERM
+  # trap runs at once; the marker makes it skip runpodctl and just stop (die_now).  KILL
+  # follows for a non-PID-1 main shell (PID 1 ignores KILL from inside its namespace).
+  if [ "$IN_DEADLINE" = 1 ]; then
+    : >"$DYING"
+    kill -TERM "$$" 2>/dev/null
+    sleep 10
+    kill -KILL "$$" 2>/dev/null
+  fi
   exit 1
 }
 
@@ -130,12 +189,14 @@ by_minutes=$(( MAX_MIN * 60 ))
 remaining=$(( by_epoch < by_minutes ? by_epoch : by_minutes ))
 [ "$remaining" -lt 0 ] && remaining=0
 log "hard stop armed: ${remaining}s from now"
-( sleep "$remaining"; self_terminate "deadline reached" ) &
+DEADLINE_AT=$(( now + remaining ))
+# IN_DEADLINE marks the timer subshell explicitly ($BASHPID does not exist in bash 3.2).
+( IN_DEADLINE=1; sleep "$remaining"; self_terminate "deadline reached" ) &
 trap 'self_terminate "received SIGTERM"' TERM
 trap 'self_terminate "received SIGINT"' INT
 
 # ---- 1b. preflight diagnostics (stdout => RunPod log stream).  Names, never values. ----
-with_timeout() { if command -v timeout >/dev/null 2>&1; then timeout 10 "$@"; else "$@"; fi; }
+with_timeout() { bounded 10 "$@"; }
 preflight() {
   log "---- preflight ----"
   echo "date: $(date -u)"
@@ -146,7 +207,7 @@ preflight() {
   else
     echo "gpu: nvidia-smi not found"
   fi
-  echo "disk:"; df -h / "${MEMFUN_MODELS_ROOT:-/workspace}" 2>&1 | sed 's/^/  /'
+  echo "disk:"; with_timeout df -h / "${MEMFUN_MODELS_ROOT:-/workspace}" 2>&1 | sed 's/^/  /'
   if command -v free >/dev/null 2>&1; then
     echo "memory: $(free -h 2>&1 | sed -n 2p)"
   elif [ -r /proc/meminfo ]; then
@@ -190,8 +251,10 @@ preflight
 if [ -n "${PUBLIC_KEY:-}" ]; then
   if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
     log "installing openssh-server"
-    (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server) \
-      >"$RUN_DIR/apt.log" 2>&1 || log "openssh-server install failed (see apt.log)"
+    apt_sshd() {
+      apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server
+    }
+    bounded 900 apt_sshd >"$RUN_DIR/apt.log" 2>&1 || log "openssh-server install failed (see apt.log)"
   fi
   mkdir -p /root/.ssh /run/sshd && chmod 700 /root/.ssh
   printf '%s\n' "$PUBLIC_KEY" >/root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys
@@ -256,7 +319,8 @@ pick_download_method() {
   DL_MISSING="$DL_MISSING python3:huggingface_hub"
   if command -v python3 >/dev/null 2>&1; then
     log "huggingface_hub not importable: trying pip install -q huggingface_hub"
-    { python3 -m pip install -q huggingface_hub || pip install -q huggingface_hub; } \
+    { bounded "$PIP_TIMEOUT" python3 -m pip install -q huggingface_hub \
+        || bounded "$PIP_TIMEOUT" pip install -q huggingface_hub; } \
       >>"$RUN_DIR/pull.log" 2>&1
     if py_has huggingface_hub; then DL_METHOD=python-api-pip; return 0; fi
     DL_MISSING="$DL_MISSING pip-install-failed"
@@ -275,7 +339,7 @@ run_download() {
   esac
 }
 download_weights() {
-  local pull_log="$RUN_DIR/pull.log" attempt rc=1 start prog
+  local pull_log="$RUN_DIR/pull.log" attempt rc=1 start prog dl cap
   : >"$pull_log"
   if ! pick_download_method; then
     log "no way to download weights: missing:$DL_MISSING"
@@ -287,14 +351,34 @@ download_weights() {
   start=$(date +%s)
   for attempt in $(seq 1 "$PULL_RETRIES"); do
     log "download attempt $attempt/$PULL_RETRIES via $DL_METHOD: $MODEL_REPO@$REVISION"
-    ( while sleep "$PROGRESS_SEC"; do
+    # Per-attempt cap: never past the deadline (it fires anyway), at most PULL_ATTEMPT_SEC.
+    cap=$(( DEADLINE_AT - $(date +%s) ))
+    [ "$cap" -gt "$PULL_ATTEMPT_SEC" ] && cap=$PULL_ATTEMPT_SEC
+    [ "$cap" -lt 1 ] && cap=1
+    # Background + wait (not foreground) so the TERM trap / deadline can always act.
+    run_download >>"$pull_log" 2>&1 &
+    dl=$!
+    ( t0=$(date +%s); last=-1; still=0
+      while sleep "$PROGRESS_SEC"; do
+        kill -0 "$dl" 2>/dev/null || exit 0
+        kb=$(du -sk "$MODEL_DIR" 2>/dev/null | cut -f1)
         log "download progress: $(du -sh "$MODEL_DIR" 2>/dev/null | cut -f1) in $MODEL_DIR," \
           "$(( $(date +%s) - start ))s elapsed ($DL_METHOD)"
+        if [ "${kb:-0}" = "$last" ]; then still=$(( still + PROGRESS_SEC )); else still=0; fi
+        last=${kb:-0}
+        if [ "$STALL_SEC" -gt 0 ] && [ "$still" -ge "$STALL_SEC" ]; then
+          log "download stalled: no growth for ${still}s; killing this attempt"
+          kill_tree "$dl"; exit 0
+        fi
+        if [ $(( $(date +%s) - t0 )) -ge "$cap" ]; then
+          log "download attempt hit its ${cap}s cap; killing it"
+          kill_tree "$dl"; exit 0
+        fi
       done ) &
     prog=$!
-    run_download >>"$pull_log" 2>&1
+    wait "$dl"
     rc=$?
-    kill "$prog" 2>/dev/null; wait "$prog" 2>/dev/null
+    kill_tree "$prog" KILL; wait "$prog" 2>/dev/null
     if [ "$rc" = 0 ]; then
       log "download finished via $DL_METHOD in $(( $(date +%s) - start ))s:" \
         "$(du -sh "$MODEL_DIR" 2>/dev/null | cut -f1)"
