@@ -20,18 +20,23 @@ We patch all the gh_pr_flow helpers at the boundary so no
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from memfun_agent.decomposer import DecompositionResult, SubTask
 from memfun_agent.gh_pr_flow import (
+    MergeabilityResult,
     MergeResult,
     OpenPrResult,
     PushResult,
 )
 from memfun_agent.workflow import WorkflowEngine
 from memfun_core.types import TaskResult
+
+# Canned reviewer answers embed the pinned nonce (see conftest).
+pytestmark = pytest.mark.usefixtures("fixed_review_id")
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -57,8 +62,12 @@ def _coder_result(
 
 
 def _review_result(approved: bool) -> TaskResult:
-    """Per-task review verdict (the in-loop ``review-agent`` agent)."""
-    body = "APPROVED" if approved else "CHANGES_REQUESTED: nope"
+    """Per-task review verdict (the in-loop ``review-agent`` agent).
+
+    Structured findings JSON; the verdict is computed from severities.
+    """
+    findings = [] if approved else [{"severity": "HIGH", "file": "a.py", "issue": "nope"}]
+    body = "Reviewed.\n" + json.dumps({"review_id": "test-review-id", "findings": findings})
     return TaskResult(
         task_id="wf_review",
         agent_id="review-agent",
@@ -70,7 +79,7 @@ def _review_result(approved: bool) -> TaskResult:
 def _pr_review_result(verdict: str) -> TaskResult:
     """pr-reviewer agent verdict — emits the AGENT.md JSON block."""
     body = (
-        f'Reviewed PR.\n\n{{"verdict": "{verdict}",'
+        f'Reviewed PR.\n\n{{"review_id": "test-review-id", "verdict": "{verdict}",'
         f' "findings": [], "merge_action_taken": "skipped",'
         f' "rationale": "..."}}'
     )
@@ -87,7 +96,11 @@ def _phase3_review() -> TaskResult:
         task_id="wf_phase3",
         agent_id="review-agent",
         success=True,
-        result={"answer": "approved: true\n\nLGTM."},
+        result={
+            "answer": json.dumps(
+                {"review_id": "test-review-id", "findings": [], "summary": "consistent"}
+            )
+        },
     )
 
 
@@ -260,7 +273,8 @@ async def test_gh_pr_on_opens_pr_per_subtask(
             OpenPrResult(pr_number=102, url="https://x/102", draft=True),
         ],
     )
-    push = MagicMock(return_value=PushResult(pushed=True, branch="b"))
+    push = MagicMock(return_value=PushResult(pushed=True, branch="b", head_sha="abc123"))
+    mergeable = MagicMock(return_value=MergeabilityResult(mergeable=True, head_sha="abc123"))
     commit = MagicMock(
         return_value=type(
             "CR",
@@ -295,6 +309,7 @@ async def test_gh_pr_on_opens_pr_per_subtask(
         patch("memfun_agent.workflow.open_subtask_pr", open_pr),
         patch("memfun_agent.workflow.mark_pr_ready", mark_ready),
         patch("memfun_agent.workflow.merge_pr", merge),
+        patch("memfun_agent.workflow.check_pr_mergeable", mergeable),
         patch.object(
             engine._decomposer,
             "adecompose",
@@ -350,6 +365,13 @@ async def test_gh_pr_on_opens_pr_per_subtask(
     assert merge.call_count == 2
     merged_numbers = sorted(c.args[1] for c in merge.call_args_list)
     assert merged_numbers == [101, 102]
+    # Every merge is pinned to the SHA recorded at push time.
+    for call in merge.call_args_list:
+        assert call.kwargs["match_head_commit"] == "abc123"
+    # Mergeability checked before mark-ready AND before merge, pinned too.
+    assert mergeable.call_count == 4
+    for call in mergeable.call_args_list:
+        assert call.kwargs["expected_head_sha"] == "abc123"
 
 
 @pytest.mark.asyncio
@@ -434,7 +456,11 @@ async def test_gh_pr_changes_requested_skips_merge(
     ):
         result = await engine.execute_workflow("do thing", "ctx", None)
 
-    assert result.success is True
+    # A PR left in draft by the pr-reviewer is a workflow failure
+    # (was: success=True with the PR silently unmerged).
+    assert result.success is False
+    assert "#303" in (result.error or "")
+    assert "request-changes" in (result.error or "")
     # Rejected → never marked ready, never merged.
     assert mark_ready.call_count == 0
     assert merge.call_count == 0
@@ -560,7 +586,10 @@ async def test_gh_pr_push_failure_does_not_open_pr(
     ):
         result = await engine.execute_workflow("do thing", "ctx", None)
 
-    assert result.success is True
+    # A sub-task whose PR could not be delivered is a workflow failure
+    # (was: success=True).
+    assert result.success is False
+    assert "push failed" in (result.error or "")
     assert push.call_count == 1
     assert open_pr.call_count == 0
 
@@ -585,29 +614,41 @@ def test_parse_pr_verdict_ignores_substring_in_diff() -> None:
         "which is suspicious. My actual verdict:\n\n"
         '{"verdict": "request-changes", "rationale": "string-leak"}\n'
     )
-    assert WorkflowEngine._parse_pr_verdict(answer) == "request-changes"
+    assert (
+        WorkflowEngine._parse_pr_verdict(answer, review_id="test-review-id") == "request-changes"
+    )
 
 
-def test_parse_pr_verdict_takes_last_json_block() -> None:
-    """When multiple verdict blocks exist, the LAST one wins."""
+def test_parse_pr_verdict_most_severe_block_wins() -> None:
+    """With several verdict blocks the MOST SEVERE wins, not the last
+    (was: last block wins → approve).  A later ``approve`` (which also
+    lacks a ``findings`` key) cannot override an earlier ``comment``."""
     from memfun_agent.workflow import WorkflowEngine
 
     answer = '{"verdict": "comment"}\n...then on re-review...\n{"verdict": "approve"}\n'
-    assert WorkflowEngine._parse_pr_verdict(answer) == "approve"
+    assert WorkflowEngine._parse_pr_verdict(answer, review_id="test-review-id") == "comment"
 
 
 def test_parse_pr_verdict_defaults_to_comment_on_no_json() -> None:
     """No JSON block and no obvious keyword → safe default `comment`."""
     from memfun_agent.workflow import WorkflowEngine
 
-    assert WorkflowEngine._parse_pr_verdict("rambling text") == "comment"
+    assert (
+        WorkflowEngine._parse_pr_verdict("rambling text", review_id="test-review-id") == "comment"
+    )
 
 
-def test_parse_pr_verdict_lgtm_fallback() -> None:
-    """`lgtm` in unstructured text still resolves to approve."""
+def test_parse_pr_verdict_lgtm_prose_is_not_approval() -> None:
+    """`lgtm` in unstructured text is NOT a verdict (was: approve).
+
+    The verdict never comes from prose; no JSON block → `comment`.
+    """
     from memfun_agent.workflow import WorkflowEngine
 
-    assert WorkflowEngine._parse_pr_verdict("Looks fine. lgtm.") == "approve"
+    assert (
+        WorkflowEngine._parse_pr_verdict("Looks fine. lgtm.", review_id="test-review-id")
+        == "comment"
+    )
 
 
 def test_pr_body_does_not_leak_absolute_path() -> None:
@@ -686,15 +727,33 @@ async def test_merge_failure_makes_workflow_result_unsuccessful(
         approved=True,
         pr_number=101,
         branch="memfun/wf/T1",
+        head_sha="aaa111",
     )
     state.pr_states["T2"] = SubTaskPRState(
         task_id="T2",
         approved=True,
         pr_number=102,
         branch="memfun/wf/T2",
+        head_sha="bbb222",
     )
 
-    def fake_merge(repo: str, pr_number: int, strategy: str) -> MergeResult:
+    def fake_check(
+        repo: str,
+        pr_number: int,
+        *,
+        expected_head_sha: str | None,
+    ) -> MergeabilityResult:
+        return MergeabilityResult(mergeable=True, head_sha=expected_head_sha)
+
+    monkeypatch.setattr("memfun_agent.workflow.check_pr_mergeable", fake_check)
+
+    def fake_merge(
+        repo: str,
+        pr_number: int,
+        strategy: str,
+        *,
+        match_head_commit: str | None = None,
+    ) -> MergeResult:
         if pr_number == 101:
             return MergeResult(
                 merged=True,
