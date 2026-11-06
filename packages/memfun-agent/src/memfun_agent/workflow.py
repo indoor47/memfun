@@ -309,6 +309,7 @@ class WorkflowEngine:
         auto_commit: bool = False,
         auto_push: bool = False,
         project_root: Path | None = None,
+        decompose: bool = True,
         gh_pr: bool = False,
         gh_pr_base: str = "main",
         gh_pr_merge_strategy: str = "squash",
@@ -317,6 +318,8 @@ class WorkflowEngine:
         self._orchestrator = orchestrator
         self._manager = manager
         self._decomposer = TaskDecomposer()
+        # False: skip the LLM planner and run the whole task as one sub-task.
+        self._decompose = decompose
         self._spec_store = SharedSpecStore(context.state_store)
         self._on_workflow_status = on_workflow_status
         self._on_sub_task_status = on_sub_task_status
@@ -422,10 +425,13 @@ class WorkflowEngine:
         state.status = WorkflowStatus.DECOMPOSING
         self._emit_status(state)
 
-        decomposition = await self._decomposer.adecompose(
-            task_description,
-            project_context,
-        )
+        if getattr(self, "_decompose", True):
+            decomposition = await self._decomposer.adecompose(
+                task_description,
+                project_context,
+            )
+        else:
+            decomposition = self._decomposer.single_task(task_description)
         state.decomposition = decomposition
 
         logger.info(

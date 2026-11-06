@@ -232,3 +232,186 @@ def test_dataset_fields_cannot_inject_git_options_or_paths(
         bad_row = c0.Row(**{**row.__dict__, **kwargs})
         with pytest.raises(c0.AdapterError):
             c0.build_bundle(bad_row, tmp_path / "c", git_base=f"{git_base}/", log=lambda _m: None)
+
+
+# ── function-level tasks (split) ─────────────────────────────────────────────
+
+_CLASS_SRC = '''\
+import functools
+
+
+class Box:
+    """A box."""
+
+    @staticmethod
+    @functools.lru_cache(maxsize=None)
+    def twice(x):
+        """Double."""
+        pass
+
+    def keep(self):
+        return 1
+
+
+def helper(a):
+    return a
+'''
+
+
+def test_function_spans_and_single_function_stubbing() -> None:
+    ref = _CLASS_SRC.replace("        pass\n", "        return x * 2\n")
+    spans = c0.function_spans(ref)
+    assert set(spans) == {"Box.twice", "Box.keep", "helper"}
+    assert spans["Box.twice"].start < spans["Box.twice"].end  # decorators are included
+    assert c0.function_spans(_CLASS_SRC)["Box.twice"].is_stub
+    assert not c0.function_spans(_CLASS_SRC)["Box.keep"].is_stub
+    out = c0.stub_one(ref, _CLASS_SRC, "Box.twice")
+    assert out == _CLASS_SRC  # only the target went back to its stub
+    two = ref.replace("        return 1\n", "        return 2\n")
+    assert "return 2" in c0.stub_one(two, _CLASS_SRC, "Box.twice")  # the others stay as in ref
+
+
+def test_split_builds_one_independent_bundle_per_stubbed_function(
+    tmp_path: Path, fake_origin: tuple[Path, c0.Row]
+) -> None:
+    pytest.importorskip("coverage")
+    _build(tmp_path, fake_origin)
+    cache = tmp_path / "cache"
+    rows = c0.split_lib("minilib", cache, timeout=180, log=lambda _m: None)
+    assert sorted(r["function"] for r in rows) == ["add", "sub"]
+    for r in rows:
+        bundle_dir = cache / "bundles" / r["id"]
+        assert r["id"].startswith("c0s-minilib-")
+        src = (bundle_dir / "repo" / "minilib" / "__init__.py").read_text()
+        other = "return a - b" if r["function"] == "add" else "return a + b"
+        mine = "return a + b" if r["function"] == "add" else "return a - b"
+        assert other in src and mine not in src  # only this function is stubbed
+        # graded by the tests that execute it, and only those
+        deselected = (bundle_dir / "hidden" / vb.DESELECT_FILE).read_text()
+        own_test = f"test_{r['function']}"
+        assert f"test_mini.py::{own_test}\n" not in deselected + "\n"
+        bundle = rs.load_bundle(bundle_dir)
+        assert bundle.problems == ()
+        assert bundle.units[0].owns == ("minilib/__init__.py",)
+        solved = rs.grade_candidate(
+            bundle, bundle_dir / "solution", tmp_path / f"g-{r['id']}", 120
+        )
+        assert solved["all_pass"] and solved["hidden_passed"] == r["tests"] == 1
+        null = rs.grade_candidate(bundle, None, tmp_path / f"n-{r['id']}", 120)
+        assert not null["all_pass"] and null["hidden_passed"] == 0
+        assert rs.tests_kept(bundle_dir) == 1
+
+
+def test_split_requires_a_built_bundle(tmp_path: Path) -> None:
+    with pytest.raises(c0.AdapterError, match="build"):
+        c0.split_lib("minilib", tmp_path, log=lambda _m: None)
+
+
+# ── no planner (--no-decompose) and the incremental progress file ────────────
+
+
+def test_swarm_cmd_and_suite_defaults_for_decomposition(tmp_path: Path) -> None:
+    assert "--no-decompose" not in rs.swarm_cmd(["memfun"], "spec", 1, 60)
+    assert "--no-decompose" in rs.swarm_cmd(["memfun"], "spec", 1, 60, decompose=False)
+    base = ["--base-url", "http://127.0.0.1:8441/v1", "--out-dir", str(tmp_path / "out")]
+    c0dir = tmp_path / "c0" / "bundles" / "c0-x"
+    c0dir.mkdir(parents=True)
+    (c0dir / "task.toml").write_text("id = 'c0-x'\n")
+    smoke = rs.parse_args(base)
+    rs._validate_args(smoke)  # pyright: ignore[reportPrivateUsage]
+    assert smoke.decompose is True
+    commit0 = rs.parse_args([*base, "--suite", "commit0", "--commit0-dir", str(tmp_path / "c0")])
+    rs._validate_args(commit0)  # pyright: ignore[reportPrivateUsage]
+    assert commit0.decompose is False
+    forced = rs.parse_args(
+        [*base, "--suite", "commit0", "--commit0-dir", str(tmp_path / "c0"), "--decompose"]
+    )
+    rs._validate_args(forced)  # pyright: ignore[reportPrivateUsage]
+    assert forced.decompose is True
+
+
+def test_workflow_without_decompose_never_calls_the_planner() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from memfun_agent.decomposer import TaskDecomposer
+    from memfun_agent.workflow import WorkflowEngine, WorkflowState
+
+    engine = WorkflowEngine.__new__(WorkflowEngine)
+    engine._decompose = False  # pyright: ignore[reportPrivateUsage]
+    engine._decomposer = MagicMock(  # pyright: ignore[reportPrivateUsage]
+        adecompose=AsyncMock(side_effect=AssertionError("planner called")),
+        single_task=TaskDecomposer.single_task,
+    )
+    engine._emit_dashboard = AsyncMock()  # type: ignore[method-assign]
+    engine._emit_status = MagicMock()  # type: ignore[method-assign]
+    sentinel = object()
+    engine._execute_single_task = AsyncMock(return_value=sentinel)  # type: ignore[method-assign]
+    state = WorkflowState(workflow_id="w", project="p")
+    out = asyncio.run(engine._run(state, "implement f", "ctx", None))  # pyright: ignore[reportPrivateUsage]
+    assert out is sentinel
+    assert state.decomposition is not None and state.decomposition.is_single_task
+    engine._decomposer.adecompose.assert_not_called()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_swarm_cli_decompose_flag() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    import typer
+    from memfun_cli.commands.swarm import swarm_command
+    from typer.testing import CliRunner
+
+    app = typer.Typer()
+    app.command("swarm")(swarm_command)
+    for extra, expected in (([], True), (["--no-decompose"], False)):
+        with patch("memfun_cli.commands.swarm._run_swarm", new=AsyncMock(return_value=0)) as run:
+            result = CliRunner().invoke(app, ["do it", *extra])
+        assert result.exit_code == 0, result.output
+        assert run.call_args.kwargs["decompose"] is expected
+
+
+def test_progress_file_gets_one_line_per_episode(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "bundles" / "c0-x"
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "task.toml").write_text('id = "c0-x"\n[source]\ntests_kept = 40\n')
+    assert rs.tests_kept(bundle_dir) == 40 and rs.tests_kept(tmp_path) is None
+    plan = rs.EpisodePlan(rs.load_bundle(bundle_dir), 1, tmp_path / "run")
+    ep = {
+        "episode": "c0-x-t1",
+        "outcome": "partial",
+        "reason": "some hidden tests pass",
+        "wall_s": 150.0,
+        "grade": {"hidden_passed": 31, "hidden_failed": 9},
+        "metrics": {"tokens": {"prompt": 1000, "completion": 200}},
+        "stalled_stops": 1,
+        "truncated_responses": 0,
+        "loop_aborts": 2,
+        "no_edits": False,
+        "reviewer_json_rejections": 3,
+    }
+    out = tmp_path / "logs" / "progress.md"
+    rs.append_progress(out, ep, plan)
+    rs.append_progress(out, {**ep, "episode": "c0-x-t2", "outcome": "model_failure"}, plan)
+    lines = out.read_text().splitlines()
+    assert len(lines) == 2
+    assert "c0-x-t1: tests 31/40" in lines[0] and "wall 2.5 min" in lines[0]
+    assert "1000 in / 200 out" in lines[0] and "loop-aborts 2" in lines[0]
+    assert "stalled 1" in lines[0] and "partial" in lines[0]
+    assert lines[1].endswith("model_failure (some hidden tests pass)")
+
+
+def test_bundles_accept_fnmatch_patterns(tmp_path: Path) -> None:
+    base = tmp_path / "c0" / "bundles"
+    for b in ("c0-lib", "c0s-lib-a", "c0s-lib-b", "c0s-other-a"):
+        (base / b).mkdir(parents=True)
+        (base / b / "task.toml").write_text(f"id = '{b}'\n")
+    common = [
+        "--base-url", "http://127.0.0.1:8441/v1", "--out-dir", str(tmp_path / "out"),
+        "--suite", "commit0", "--commit0-dir", str(tmp_path / "c0"),
+    ]  # fmt: skip
+    args = rs.parse_args([*common, "--bundles", "c0s-lib-*", "c0-lib"])
+    rs._validate_args(args)  # pyright: ignore[reportPrivateUsage]
+    assert args.bundles == ["c0s-lib-a", "c0s-lib-b", "c0-lib"]
+    bad = rs.parse_args([*common, "--bundles", "nothing-*"])
+    with pytest.raises(rs.UsageError, match="matches no bundle"):
+        rs._validate_args(bad)  # pyright: ignore[reportPrivateUsage]

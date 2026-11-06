@@ -954,6 +954,15 @@ class TaskDecomposer(dspy.Module):
         return new_tasks, cleaned_groups
 
     @staticmethod
+    def single_task(description: str) -> DecompositionResult:
+        """The whole task as ONE coder sub-task, with no LLM planning call.
+
+        For callers that already know the task is small and self-contained (e.g. one
+        stubbed function), where a planner would only add read-only "analysis" sub-tasks.
+        """
+        return TaskDecomposer._single_fallback(description)
+
+    @staticmethod
     def _single_fallback(description: str) -> DecompositionResult:
         sub_tasks = [
             SubTask(
