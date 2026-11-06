@@ -9,6 +9,7 @@ the task is too simple to decompose.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 from collections import deque
@@ -690,11 +691,24 @@ class TaskDecomposer(dspy.Module):
             # current context, so the task-local dspy.context override
             # reaches the worker thread.  Recursive calls re-enter here.
             with role_scope("decomposer"):
-                result = await asyncio.to_thread(
-                    self.decomposer,
-                    task_description=task_description,
-                    project_context=project_context[:4000],
+                from memfun_agent.constrained_json import (
+                    decomposition_adapter,
+                    role_constrained,
                 )
+
+                # [llm] constrained_json: grammar-bound the plan (bounded
+                # lengths/counts); the parse below stays as the backstop.
+                adapter_ctx = (
+                    dspy.context(adapter=decomposition_adapter())
+                    if role_constrained("decomposer")
+                    else contextlib.nullcontext()
+                )
+                with adapter_ctx:
+                    result = await asyncio.to_thread(
+                        self.decomposer,
+                        task_description=task_description,
+                        project_context=project_context[:4000],
+                    )
 
             raw_tasks = getattr(result, "sub_tasks", [])
             sub_tasks = _parse_sub_tasks(raw_tasks)

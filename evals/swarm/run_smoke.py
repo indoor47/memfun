@@ -841,7 +841,11 @@ DEFAULT_REPETITION_PENALTY = 1.05
 
 
 def memfun_toml(
-    base_url: str, model: str, max_tokens: int, sampling: Sampling | None = None
+    base_url: str,
+    model: str,
+    max_tokens: int,
+    sampling: Sampling | None = None,
+    constrained_json: bool = True,
 ) -> str:
     sampling = sampling or Sampling()
     extra = ""
@@ -863,6 +867,7 @@ def memfun_toml(
         f"max_tokens = {int(max_tokens)}\n"
         f"temperature = {sampling.temperature!r}\n"
         f"{extra}"
+        f"constrained_json = {'true' if constrained_json else 'false'}\n"
         "\n"
         "[backend]\n"
         'tier = "sqlite"\n'
@@ -889,6 +894,7 @@ def create_episode_repo(
     model: str,
     max_tokens: int,
     sampling: Sampling | None = None,
+    constrained_json: bool = True,
 ) -> None:
     home.mkdir(parents=True, exist_ok=False)
     (home / ".gitconfig").write_text(
@@ -897,7 +903,9 @@ def create_episode_repo(
         encoding="utf-8",
     )
     shutil.copytree(bundle.path / "repo", repo)
-    (repo / "memfun.toml").write_text(memfun_toml(base_url, model, max_tokens, sampling), "utf-8")
+    (repo / "memfun.toml").write_text(
+        memfun_toml(base_url, model, max_tokens, sampling, constrained_json), "utf-8"
+    )
     (repo / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
     if not any((repo / name).exists() for name in PYTEST_CONFIG_FILES):
         (repo / "pytest.ini").write_text(EPISODE_PYTEST_INI, encoding="utf-8")
@@ -1449,6 +1457,7 @@ class RunContext:
     grader_timeout: float
     max_tokens: int
     sampling: Sampling = dataclasses.field(default_factory=Sampling)
+    constrained_json: bool = True
     dashboard: SharedDashboard | None = None
     fatal: str = ""
     kill_grace: float = 5.0
@@ -1556,6 +1565,7 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
                     ctx.model,
                     ctx.max_tokens,
                     ctx.sampling,
+                    ctx.constrained_json,
                 )
             except subprocess.CalledProcessError as exc:
                 err = (exc.stderr or b"").decode("utf-8", "replace")[-500:]
@@ -1990,6 +2000,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     ap.add_argument("--frequency-penalty", type=float, default=0.0, help="in [-2, 2], 0 = off")
     ap.add_argument("--presence-penalty", type=float, default=0.0, help="in [-2, 2], 0 = off")
+    ap.add_argument(
+        "--constrained-json",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="[llm] constrained_json: grammar-constrained decoding (response_format json_schema) "
+        "for the decomposer plan and the auditor findings (default on; needs an SGLang/vLLM-style "
+        "server)",
+    )
     ap.add_argument("--memfun-cmd", default="memfun", help="memfun executable (shell-split)")
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--run-id", default="")
@@ -2246,6 +2264,7 @@ def run(args: argparse.Namespace) -> int:
                 else args.repetition_penalty,
                 loop_guard=not args.no_loop_guard,
             ),
+            constrained_json=args.constrained_json,
             dashboard=dashboard,
             fatal=fatal,
             kill_grace=args.kill_grace,

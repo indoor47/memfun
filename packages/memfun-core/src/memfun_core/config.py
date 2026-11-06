@@ -106,6 +106,7 @@ class LLMRoleConfig:
     api_key_env: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
+    constrained_json: bool | None = None
 
 
 def _no_roles() -> dict[str, LLMRoleConfig]:
@@ -135,6 +136,11 @@ class LLMConfig:
     # streaming on DSPy's LiteLLM engine and disables DSPy's response cache for it.  Off by
     # default; the B300 runner turns it on.
     loop_guard: bool = False
+    # Grammar-constrained decoding (structured outputs) for the decomposer's
+    # plan and the auditor's findings.  Only effective for provider
+    # openai/openai-compat with a base_url (SGLang / vLLM style servers);
+    # off by default, so other providers see no change.  Inherited by roles.
+    constrained_json: bool = False
     # Role -> overrides, from ``[llm.roles.<role>]``.  Empty = every role
     # uses this ``[llm]`` config (the pre-roles behaviour).  Excluded from
     # hashing so a resolved (role-free) LLMConfig stays hashable.
@@ -152,6 +158,24 @@ class LLMConfig:
             isinstance(rep, bool) or not isinstance(rep, int | float) or not 0 < rep <= 2
         ):
             raise ConfigError(f"[llm] repetition_penalty must be a number in (0, 2], got {rep!r}")
+        if not isinstance(self.constrained_json, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise ConfigError(
+                f"[llm] constrained_json must be true or false, got {self.constrained_json!r}"
+            )
+
+    @property
+    def constrained_json_effective(self) -> bool:
+        """``constrained_json`` AND an endpoint that can honour it.
+
+        Grammar-constrained decoding is an OpenAI-compatible-server feature
+        (``response_format``); it is never sent to Anthropic/Ollama/custom
+        routes, nor to openai without a ``base_url`` (the hosted API).
+        """
+        return (
+            self.constrained_json
+            and self.provider in ("openai", "openai-compat")
+            and bool(self.base_url)
+        )
 
     def for_role(self, role: str) -> LLMConfig:
         """Resolve *role* to a concrete :class:`LLMConfig`.
@@ -469,6 +493,11 @@ def _validate_role_value(role: str, key: str, val: Any) -> Any:
     if key == "max_tokens":
         if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
             msg = f"{where} must be a positive integer"
+            raise ConfigError(msg)
+        return val
+    if key == "constrained_json":
+        if not isinstance(val, bool):
+            msg = f"{where} must be true or false"
             raise ConfigError(msg)
         return val
     return val  # pragma: no cover - guarded by the allowed-keys check
