@@ -17,9 +17,13 @@ Language:
   last statement (an assignment's value is the assigned value). `env` supplies
   initial variables and is NOT mutated.
 - Python numeric semantics (`/` true division, `%` Python modulo, ints stay ints).
-- Errors (raise CalcError, never another exception type): unknown variable or function,
-  wrong arity, syntax errors (pos of the offending token), division/modulo by zero,
-  empty program.
+- Empty statements are allowed: `a = 2;;` and a trailing `;` are fine.
+- Errors (raise CalcError, never another exception type) and their `pos`:
+  syntax error -> start of the offending token (end of input: len(src));
+  unexpected character -> its offset; unknown variable -> start of the name;
+  unknown function or wrong arity (abs takes 1, min/max take 1+) -> start of the
+  function name; division or modulo by zero -> offset of the `/` or `%` operator;
+  empty program (no statements) -> len(src).
 """
 
 [[units]]

@@ -5,7 +5,8 @@ Four independent validators in the `checks` package; checks/__init__.py (given, 
 edit) dispatches `validate(kind, value)` to them. All functions take `str`; spaces and
 hyphens are ignored wherever noted. None of them may raise on bad input: they return False.
 
-1. checks/luhn.py    luhn_valid(s) -> bool (digits and spaces only, >= 2 digits);
+1. checks/luhn.py    luhn_valid(s) -> bool (ASCII digits 0-9 and spaces only, >= 2 digits;
+                     hyphens or any other character -> False);
                      luhn_check_digit(partial) -> str, the digit that makes partial+digit valid.
 2. checks/isbn.py    isbn10_valid(s), isbn13_valid(s) -> bool (hyphens/spaces ignored; ISBN-10
                      check char may be X/x); isbn10_to_13(s) -> str (13 digits, "978" prefix,

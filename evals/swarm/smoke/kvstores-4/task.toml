@@ -11,13 +11,19 @@ not edit it). Contract for every store:
 
 Stores:
 1. kv/memory.py      MemoryStore()                      in-process dict
-2. kv/jsonfile.py    JsonFileStore(path)                persists to one JSON file; a new
-                     instance on the same path sees earlier writes; writes are atomic
-                     (write a temp file in the same directory, then os.replace)
+2. kv/jsonfile.py    JsonFileStore(path)                persists to one JSON file whose
+                     content is a single JSON object {key: value}; missing parent
+                     directories are created; a new instance on the same path sees
+                     earlier writes; writes are atomic (temp file in the same directory,
+                     then os.replace) and leave no other files behind
 3. kv/sqlite_store.py SqliteStore(path)                 sqlite3, one table, persists
-                     across instances; close() closes the connection
+                     across instances; close() closes the connection, after which any
+                     operation raises sqlite3.ProgrammingError; keys are bound
+                     parameters (any string is a valid key)
 4. kv/ttl.py         TTLStore(inner, ttl_seconds, clock=time.monotonic)
-                     wraps any KVStore; a key expires `ttl_seconds` after its last set;
+                     wraps any KVStore; a key expires `ttl_seconds` after its last set,
+                     i.e. it is expired once clock() >= set_time + ttl_seconds (exactly
+                     at the boundary counts as expired);
                      expired keys behave as absent for get/keys/delete (delete of an
                      expired key returns False and removes it from `inner`).
 """

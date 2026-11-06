@@ -68,3 +68,79 @@ def test_validator_flags_broken_oracle_and_trivial_null(tmp_path: Path) -> None:
     assert any("oracle" in p for p in by_id["formats-2"]["problems"])
     assert not by_id["textkit-3"]["ok"]
     assert any("unit roman" in p for p in by_id["textkit-3"]["problems"])
+
+
+def _load_validator() -> Any:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("validate_bundles", VALIDATOR)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["validate_bundles"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+EAGER_MAIN = """
+import argparse, importlib, sys
+
+COMMANDS = ("stats", "convert", "hashsum")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="minicli")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in COMMANDS:
+        importlib.import_module(f"minicli.commands.{name}").register(sub)
+    return parser
+
+
+def main(argv=None, out=None):
+    args = build_parser().parse_args(argv)
+    return int(args.func(args, out or sys.stdout))
+"""
+
+
+def test_validator_flags_units_that_are_not_independent(tmp_path: Path) -> None:
+    eager = tmp_path / "minicli-3"
+    shutil.copytree(SMOKE / "minicli-3", eager)
+    (eager / "repo" / "minicli" / "main.py").write_text(EAGER_MAIN)  # imports every command
+    rc, reports = _validate(eager)
+    assert rc == 1
+    problems = reports[0]["problems"]
+    assert any(p.startswith("independence: breaking stats") for p in problems), problems
+    assert reports[0]["independence"]["stats"] != "ok"
+
+
+def test_grader_ignores_planted_conftest_and_ini(tmp_path: Path) -> None:
+    vb = _load_validator()
+    bundle = SMOKE / "textkit-3"
+    tree = vb.graded_tree(bundle, [], None, tmp_path / "tree")  # null: untouched repo
+    # A cheating agent plants files that would make every test pass if they were loaded.
+    (tree / "conftest.py").write_text(
+        "import pytest\n"
+        "@pytest.hookimpl(hookwrapper=True)\n"
+        "def pytest_runtest_makereport(item, call):\n"
+        "    outcome = yield\n"
+        "    outcome.get_result().outcome = 'passed'\n"
+    )
+    (tree / "pytest.ini").write_text("[pytest]\naddopts = -p no:terminal --co\n")
+    (tree / "sitecustomize.py").write_text("raise SystemExit(0)\n")
+    res = vb.run_grader(tree, bundle / "hidden", tmp_path / "scratch", 300)
+    assert res.returncode != 0
+    assert res.failed > 0 and res.passed == 0
+
+
+def test_graded_tree_takes_only_owned_files(tmp_path: Path) -> None:
+    vb = _load_validator()
+    bundle = SMOKE / "textkit-3"
+    cand = tmp_path / "cand"
+    shutil.copytree(bundle / "solution", cand)
+    (cand / "conftest.py").write_text("raise RuntimeError('planted')\n")
+    (cand / "textkit" / "extra.py").write_text("x = 1\n")
+    tree = vb.graded_tree(bundle, ["textkit/roman.py"], cand, tmp_path / "tree")
+    assert not (tree / "conftest.py").exists() and not (tree / "textkit" / "extra.py").exists()
+    assert (tree / "textkit" / "roman.py").read_text() == (
+        cand / "textkit" / "roman.py"
+    ).read_text()
+    assert "NotImplementedError" in (tree / "textkit" / "wrap.py").read_text()  # not owned here

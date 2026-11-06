@@ -37,8 +37,30 @@ uv run python evals/swarm/validate_bundles.py <bundle>   # one bundle; --json fo
 For each bundle, in fresh temp copies and in subprocesses with a timeout and sockets
 disabled, the validator checks the schema, that **repo/ + solution/ passes every hidden
 test** (and the visible tests), and that **untouched repo/ fails every unit's hidden test
-file** and the integration test. `tests/test_swarm_smoke_bundles.py` runs it in CI and
-also checks that it catches a broken oracle and a unit that "passes" with no work.
+file** and the integration test, plus the independence check below. Every file in
+`solution/` must be owned by a unit. `tests/test_swarm_smoke_bundles.py` runs it in CI and
+also checks that it catches a broken oracle, a unit that "passes" with no work, a
+non-independent unit and a planted conftest.
+
+## Grading rules (anti reward hacking)
+
+An agent controls its working tree, so grading must not trust it:
+
+1. Build the graded tree from a clean copy of `repo/` plus ONLY the files listed in the
+   units' `owns`, taken from the agent's tree. Everything else the agent wrote (a planted
+   `conftest.py`, `pytest.ini`, `sitecustomize.py`, edited visible tests) is ignored.
+2. Run the hidden tests from a separate grader directory, never from the graded tree:
+   `-c <grader ini> --rootdir <grader> --confcutdir <grader> -p no:cacheprovider`, Python
+   with `-P`, and the graded tree appended to `sys.path` after site-packages by the grader's
+   own `conftest.py`, so the tree cannot shadow pytest or the stdlib.
+3. Disable networking and use a timeout; `--continue-on-collection-errors` so one broken
+   unit does not hide the others.
+
+`validate_bundles.py` grades the oracle, null and independence runs exactly this way.
+It also checks **independence**: for each fan-out unit, it replaces that unit's owned
+files with a syntax error and requires that only that unit's hidden tests fail (the
+integration test is exempt). minicli's dispatcher imports only the subcommand being run,
+so this holds there too.
 
 `ruff.toml` here relaxes a few import-style rules for bundle sources; they are task
 material, not memfun code (pyright already excludes `evals/`).

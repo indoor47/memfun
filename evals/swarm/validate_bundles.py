@@ -3,15 +3,26 @@
 
 For every ``<root>/<id>/task.toml`` this checks:
 
-* schema: id matches the directory, kind is fanout|control, units have unique ids, every
-  ``hidden_test`` exists, fan-out units own disjoint paths, and every owned path exists in
-  ``repo/`` or ``solution/``;
-* **oracle**: ``repo/`` + ``solution/`` overlay passes ALL hidden tests and the visible tests;
-* **null**: the untouched ``repo/`` FAILS, and fails every unit's hidden test file (and
-  ``test_integration.py`` when present), so no unit is graded as solved by doing nothing.
+* **schema**: id matches the directory, kind is fanout|control, units have unique ids,
+  every ``hidden_test`` exists, fan-out units own disjoint paths, every owned path exists
+  in ``repo/`` or ``solution/``, and every file in ``solution/`` is owned by some unit;
+* **oracle**: grading the reference solution passes ALL hidden tests and the visible tests;
+* **null**: grading the untouched ``repo/`` FAILS every unit's hidden test file (and
+  ``test_integration.py`` when present), so no unit is solved by doing nothing;
+* **independence** (fan-out only): for each unit, grading the reference solution with
+  THAT unit's owned files replaced by a syntax error fails only that unit's hidden tests;
+  every other unit's hidden tests still pass (the integration test is exempt).
 
-Each run happens in a fresh temp copy, in a subprocess with a timeout, with networking
-disabled by a ``sitecustomize`` guard that makes ``socket.connect`` raise.
+Grading models how agent output must be graded (see evals/swarm/smoke/README.md):
+
+1. the graded tree is a clean copy of ``repo/`` plus ONLY the files the units own, taken
+   from the candidate tree (here: ``solution/``); nothing else from the candidate is used;
+2. hidden tests run from a separate grader directory, never from inside the graded tree:
+   ``--rootdir`` and ``-c`` point at the grader's own ini, ``--confcutdir`` stops conftest
+   discovery there, ``-p no:cacheprovider``, ``python -P``; the graded tree is appended to
+   ``sys.path`` (after site-packages) by the grader's own conftest, so a planted
+   ``pytest.py``/``conftest.py``/``sitecustomize.py`` in the tree cannot take over;
+3. a ``sitecustomize`` guard disables outbound sockets, and each run has a timeout.
 
 Usage: python evals/swarm/validate_bundles.py [ROOT ...] [--json] [--timeout 120]
 """
@@ -32,6 +43,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_ROOT = HERE / "smoke"
+INTEGRATION = "test_integration"
+BROKEN_SOURCE = "def broken(:  # deliberately not Python (independence check)\n"
 
 NETGUARD = """
 import socket as _s
@@ -52,6 +65,17 @@ _s.create_connection = _blocked
 _s.getaddrinfo = _blocked
 """
 
+GRADER_CONFTEST = """
+import os
+import sys
+
+# The graded tree goes AFTER site-packages/stdlib: it can provide the task's packages but
+# cannot shadow pytest, the stdlib or this grader.
+sys.path.append(os.environ["BUNDLE_GRADED_TREE"])
+"""
+
+GRADER_INI = "[pytest]\naddopts =\n"
+
 
 @dataclass
 class RunResult:
@@ -69,6 +93,7 @@ class BundleReport:
     problems: list[str] = field(default_factory=lambda: list[str]())
     oracle: dict[str, int] | None = None
     null: dict[str, int] | None = None
+    independence: dict[str, str] | None = None
 
 
 def _copytree(src: Path, dst: Path) -> None:
@@ -82,9 +107,10 @@ def _parse_junit(path: Path) -> tuple[int, int, dict[str, dict[str, int]]]:
     if not path.is_file():
         return 0, 0, {}
     for case in ET.parse(path).getroot().iter("testcase"):
-        classname = case.get("classname", "")
-        # classname looks like "hidden_tests.test_x" or "hidden_tests.test_x.TestCls".
-        module = next((p for p in classname.split(".") if p.startswith("test")), classname)
+        # classname looks like "hidden_tests.test_x[.TestCls]"; a collection error has an
+        # empty classname and the module path in name.
+        label = case.get("classname") or case.get("name", "")
+        module = next((p for p in label.split(".") if p.startswith("test")), label)
         bad = any(child.tag in ("failure", "error") for child in case)
         skipped = any(child.tag == "skipped" for child in case)
         slot = by_file.setdefault(module, {"passed": 0, "failed": 0})
@@ -97,28 +123,56 @@ def _parse_junit(path: Path) -> tuple[int, int, dict[str, dict[str, int]]]:
     return passed, failed, by_file
 
 
-def run_pytest(workdir: Path, test_dir: str, timeout: float) -> RunResult:
-    guard = workdir.parent / "_netguard"
+def graded_tree(bundle: Path, owned: list[str], candidate: Path | None, dest: Path) -> Path:
+    """Clean repo/ plus ONLY the owned paths taken from ``candidate``."""
+    _copytree(bundle / "repo", dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    if candidate is not None:
+        for rel in owned:
+            src = candidate / rel
+            target = dest / rel
+            if src.is_dir():
+                shutil.copytree(src, target, dirs_exist_ok=True)
+            elif src.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, target)
+    return dest
+
+
+def run_grader(tree: Path, tests_src: Path, scratch: Path, timeout: float) -> RunResult:
+    """Run the tests in ``tests_src`` against ``tree`` from an isolated grader dir."""
+    grader = scratch / "grader"
+    shutil.rmtree(grader, ignore_errors=True)
+    grader.mkdir(parents=True)
+    _copytree(tests_src, grader / "graded_tests")
+    (grader / "conftest.py").write_text(GRADER_CONFTEST, encoding="utf-8")
+    ini = grader / "pytest.ini"
+    ini.write_text(GRADER_INI, encoding="utf-8")
+    guard = scratch / "_netguard"
     guard.mkdir(exist_ok=True)
     (guard / "sitecustomize.py").write_text(NETGUARD, encoding="utf-8")
-    report = workdir.parent / f"junit-{test_dir.replace('/', '_')}.xml"
+    report = scratch / "junit.xml"
+    report.unlink(missing_ok=True)
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "PYTHONPATH": os.pathsep.join([str(guard), str(workdir)]),
+        "PYTHONPATH": str(guard),
+        "BUNDLE_GRADED_TREE": str(tree),
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONHASHSEED": "0",
-        "HOME": str(workdir.parent),
+        "HOME": str(scratch),
         "NO_PROXY": "*",
         "http_proxy": "http://127.0.0.1:9",
         "https_proxy": "http://127.0.0.1:9",
     }
     cmd = [
-        sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-        "--rootdir", str(workdir), f"--junitxml={report}", test_dir,
+        sys.executable, "-P", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+        "-c", str(ini), "--rootdir", str(grader), "--confcutdir", str(grader),
+        "--continue-on-collection-errors",
+        f"--junitxml={report}", "graded_tests",
     ]  # fmt: skip
     try:
         proc = subprocess.run(
-            cmd, cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout
+            cmd, cwd=grader, env=env, capture_output=True, text=True, timeout=timeout
         )
         rc, out = proc.returncode, proc.stdout + proc.stderr
     except subprocess.TimeoutExpired as exc:
@@ -168,7 +222,22 @@ def _schema(bundle: Path, task: dict[str, object]) -> list[str]:
     for d in ("repo", "hidden", "solution"):
         if not (bundle / d).is_dir():
             problems.append(f"{d}/ missing")
+    sol = bundle / "solution"
+    if sol.is_dir():
+        for f in sorted(sol.rglob("*")):
+            if f.is_file() and "__pycache__" not in f.parts:
+                rel = f.relative_to(sol).as_posix()
+                if not any(rel == o or rel.startswith(o.rstrip("/") + "/") for o in owners):
+                    problems.append(
+                        f"solution/{rel} is not owned by any unit (grading ignores it)"
+                    )
     return problems
+
+
+def _fails(res: RunResult, module: str) -> bool:
+    stats = res.by_file.get(module)
+    # No testcases under that module name (collection error) counts as failing.
+    return stats is None or stats["failed"] > 0 or stats["passed"] == 0
 
 
 def validate_bundle(bundle: Path, timeout: float) -> BundleReport:
@@ -183,44 +252,68 @@ def validate_bundle(bundle: Path, timeout: float) -> BundleReport:
         return report
     units: list[dict[str, object]] = task["units"]
     unit_modules = {str(u["id"]): Path(str(u["hidden_test"])).stem for u in units}
+    unit_owns = {str(u["id"]): [str(p) for p in u["owns"]] for u in units}  # type: ignore[union-attr]
+    all_owned = [p for owns in unit_owns.values() for p in owns]
+    hidden = bundle / "hidden"
 
-    with tempfile.TemporaryDirectory(prefix=f"bundle-{bundle.name}-") as tmp:
-        # --- oracle: start tree + reference solution + hidden tests ------------------
-        oracle = Path(tmp) / "oracle" / "work"
-        _copytree(bundle / "repo", oracle)
-        _copytree(bundle / "solution", oracle)
-        _copytree(bundle / "hidden", oracle / "hidden_tests")
-        res = run_pytest(oracle, "hidden_tests", timeout)
+    with tempfile.TemporaryDirectory(prefix=f"bundle-{bundle.name}-") as tmp_s:
+        tmp = Path(tmp_s)
+
+        # --- oracle ----------------------------------------------------------------------
+        tree = graded_tree(bundle, all_owned, bundle / "solution", tmp / "oracle" / "tree")
+        res = run_grader(tree, hidden, tmp / "oracle", timeout)
         report.oracle = {"passed": res.passed, "failed": res.failed, "rc": res.returncode}
         if res.returncode != 0 or res.failed or not res.passed:
             report.problems.append(f"oracle does not pass all hidden tests:\n{res.output_tail}")
-        missing = [
-            m for m in unit_modules.values() if res.by_file.get(m, {}).get("passed", 0) == 0
-        ]
+        missing = [m for m in unit_modules.values() if _fails(res, m)]
         if missing:
             report.problems.append(f"oracle: no passing tests collected from {missing}")
-        if (oracle / "tests").is_dir():
-            vis = run_pytest(oracle, "tests", timeout)
+        if (bundle / "repo" / "tests").is_dir():
+            vis = run_grader(tree, bundle / "repo" / "tests", tmp / "oracle-visible", timeout)
             if vis.returncode != 0:
                 report.problems.append(f"oracle fails visible tests:\n{vis.output_tail}")
 
-        # --- null: untouched start tree + hidden tests -------------------------------
-        null = Path(tmp) / "null" / "work"
-        _copytree(bundle / "repo", null)
-        _copytree(bundle / "hidden", null / "hidden_tests")
-        res = run_pytest(null, "hidden_tests", timeout)
+        # --- null ------------------------------------------------------------------------
+        tree = graded_tree(bundle, all_owned, None, tmp / "null" / "tree")
+        res = run_grader(tree, hidden, tmp / "null", timeout)
         report.null = {"passed": res.passed, "failed": res.failed, "rc": res.returncode}
         if res.returncode == 0:
             report.problems.append("null (untouched repo/) PASSES the hidden tests")
         must_fail = dict(unit_modules)
-        if (bundle / "hidden" / "test_integration.py").is_file():
-            must_fail["<integration>"] = "test_integration"
+        if (hidden / f"{INTEGRATION}.py").is_file():
+            must_fail["<integration>"] = INTEGRATION
         for uid, module in must_fail.items():
-            stats = res.by_file.get(module)
-            # A module that errors at collection has no testcases with its name but
-            # still counts as failing (pytest reports a collection error, rc != 0).
-            if stats is not None and stats["failed"] == 0:
+            if not _fails(res, module):
                 report.problems.append(f"null: unit {uid} ({module}) passes without any work")
+
+        # --- independence: break one unit, only its tests may fail -----------------------
+        if task.get("kind") == "fanout":
+            report.independence = {}
+            for uid, owns in unit_owns.items():
+                cand = tmp / f"mut-{uid}" / "candidate"
+                _copytree(bundle / "solution", cand)
+                for rel in owns:
+                    target = cand / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(BROKEN_SOURCE, encoding="utf-8")
+                tree = graded_tree(bundle, all_owned, cand, tmp / f"mut-{uid}" / "tree")
+                res = run_grader(tree, hidden, tmp / f"mut-{uid}", timeout)
+                collateral = [
+                    other
+                    for other, module in unit_modules.items()
+                    if other != uid and _fails(res, module)
+                ]
+                own_fails = _fails(res, unit_modules[uid])
+                if own_fails and not collateral:
+                    report.independence[uid] = "ok"
+                else:
+                    detail = []
+                    if not own_fails:
+                        detail.append("its own tests still pass")
+                    if collateral:
+                        detail.append(f"also fails units {collateral}")
+                    report.independence[uid] = "; ".join(detail)
+                    report.problems.append(f"independence: breaking {uid}: {'; '.join(detail)}")
     report.ok = not report.problems
     return report
 
@@ -252,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
         for r in reports:
             status = "OK  " if r.ok else "FAIL"
             print(f"{status} {r.id:<16} oracle={r.oracle} null={r.null}")
+            if r.independence is not None:
+                print(f"     independence: {r.independence}")
             for p in r.problems:
                 print("     - " + p.replace("\n", "\n       "))
     return 0 if all(r.ok for r in reports) else 1

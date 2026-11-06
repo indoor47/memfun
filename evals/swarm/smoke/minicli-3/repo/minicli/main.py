@@ -10,16 +10,23 @@ from typing import TextIO
 COMMANDS = ("stats", "convert", "hashsum")
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(only: str | None = None) -> argparse.ArgumentParser:
+    """All subcommands, or with ``only`` just that one imported (the others are listed but
+    their modules are not imported, so one broken command cannot break the rest)."""
     parser = argparse.ArgumentParser(prog="minicli")
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in COMMANDS:
-        importlib.import_module(f"minicli.commands.{name}").register(sub)
+        if only is None or name == only:
+            importlib.import_module(f"minicli.commands.{name}").register(sub)
+        else:
+            sub.add_parser(name)
     return parser
 
 
 def main(argv: list[str] | None = None, out: TextIO | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else list(argv)
+    only = argv[0] if argv and argv[0] in COMMANDS else None
+    args = build_parser(only).parse_args(argv)
     return int(args.func(args, out or sys.stdout))
 
 
