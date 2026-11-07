@@ -534,7 +534,7 @@ def test_parallel_tasks_bound_and_clean_child_env(
 
     allowed = {*rs.ENV_ALLOW, "HOME", rs.DUMMY_KEY_ENV, "PYTHONUNBUFFERED", "COLUMNS",
                "GIT_CONFIG_NOSYSTEM", "__CF_USER_TEXT_ENCODING", "LC_CTYPE",
-               rs.SWARM_RESULT_ENV, rs.NO_DASHBOARD_ENV}  # fmt: skip
+               rs.SWARM_RESULT_ENV, rs.NO_DASHBOARD_ENV, rs.TRUST_PROJECT_VERIFY_ENV}  # fmt: skip
     for trial in range(1, 5):
         call = json.loads((state / "calls" / f"formats-2-t{trial}.json").read_text())
         env = call["env"]

@@ -32,6 +32,11 @@ from evals.swarm import run_smoke as rs  # noqa: E402
 # ── project verify file ──────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _trust_project_verify(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(cf.TRUST_PROJECT_VERIFY_ENV, "1")
+
+
 def _write_verify(root: Path, doc: Any) -> None:
     (root / ".memfun").mkdir(exist_ok=True)
     (root / ".memfun" / "verify.json").write_text(
@@ -49,6 +54,33 @@ def test_read_project_verify(tmp_path: Path) -> None:
     assert cf.read_project_verify(tmp_path) == ([], None)
     _write_verify(tmp_path, [1, 2])
     assert cf.read_project_verify(tmp_path) == ([], None)
+
+
+def test_the_project_verify_file_is_ignored_unless_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repository must not be able to make memfun run its shell commands by itself."""
+    _write_verify(tmp_path, {"commands": ["touch pwned"], "max_fix_attempts": 4})
+    monkeypatch.delenv(cf.TRUST_PROJECT_VERIFY_ENV)
+    assert cf.read_project_verify(tmp_path) == ([], None)
+    monkeypatch.setenv(cf.TRUST_PROJECT_VERIFY_ENV, "0")
+    assert cf.read_project_verify(tmp_path) == ([], None)
+    solver = cf.ContextFirstSolver.__new__(cf.ContextFirstSolver)
+    solver.project_root = tmp_path
+    solver.config = cf.ContextFirstConfig()
+    monkeypatch.delenv(cf.TRUST_PROJECT_VERIFY_ENV)
+    assert solver._get_verify_commands() == []  # pyright: ignore[reportPrivateUsage]
+    assert not (tmp_path / "pwned").exists()
+
+
+def test_the_runner_trusts_its_own_episode_verify_file(tmp_path: Path) -> None:
+    env = rs.child_env(tmp_path, {"PATH": "/usr/bin"})
+    assert (
+        env[rs.TRUST_PROJECT_VERIFY_ENV]
+        == cf.TRUST_PROJECT_VERIFY_ENV
+        == "MEMFUN_TRUST_PROJECT_VERIFY"
+    )
+    assert env[rs.TRUST_PROJECT_VERIFY_ENV] == "1"
 
 
 def test_solver_uses_the_project_verify_file_before_auto_detection(tmp_path: Path) -> None:

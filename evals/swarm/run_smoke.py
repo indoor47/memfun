@@ -79,6 +79,9 @@ DUMMY_KEY_VALUE = "dummy-not-a-secret"
 #: take the port the shared dashboard needs).  Episodes only reuse the one named by their
 #: ``.memfun/dashboard.lock``; the runner owns the single real dashboard.
 NO_DASHBOARD_ENV = "MEMFUN_NO_DASHBOARD_AUTOSTART"
+#: memfun_agent.context_first.TRUST_PROJECT_VERIFY_ENV: episodes may run the verify commands
+#: the runner wrote into their own ``.memfun/verify.json``.
+TRUST_PROJECT_VERIFY_ENV = "MEMFUN_TRUST_PROJECT_VERIFY"
 #: memfun_runtime.distributed.EVENT_TOPIC (kept literal so the runner is stdlib-only).
 EVENT_TOPIC = "memfun.distributed.events"
 VOID_THRESHOLD = 0.05
@@ -501,6 +504,7 @@ def child_env(
     env["COLUMNS"] = "160"
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env[NO_DASHBOARD_ENV] = "1"  # the token is never passed to episodes (not in ENV_ALLOW)
+    env[TRUST_PROJECT_VERIFY_ENV] = "1"  # the episode's own .memfun/verify.json (runner-written)
     if result_json is not None:
         env[SWARM_RESULT_ENV] = str(result_json)
     return env

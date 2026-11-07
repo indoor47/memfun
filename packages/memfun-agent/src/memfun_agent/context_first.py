@@ -1113,10 +1113,19 @@ def _detect_verify_commands(
 #: A project may carry its own verification (e.g. the visible tests of the function to
 #: implement): ``.memfun/verify.json`` = ``{"commands": ["..."], "max_fix_attempts": 4}``.
 PROJECT_VERIFY_FILE = ".memfun/verify.json"
+#: The file's commands run through a shell, so a repository must not be able to make memfun
+#: execute them on its own: they are read only when this variable is truthy (the benchmark
+#: runner sets it for its episodes; a user opts in explicitly).
+TRUST_PROJECT_VERIFY_ENV = "MEMFUN_TRUST_PROJECT_VERIFY"
 
 
 def read_project_verify(project_root: Path) -> tuple[list[str], int | None]:
-    """``(commands, max_fix_attempts)`` from ``.memfun/verify.json``; empty when absent/invalid."""
+    """``(commands, max_fix_attempts)`` from ``.memfun/verify.json``.
+
+    Empty unless ``MEMFUN_TRUST_PROJECT_VERIFY`` is set, and when the file is absent/invalid.
+    """
+    if os.environ.get(TRUST_PROJECT_VERIFY_ENV, "").lower() not in ("1", "true", "yes"):
+        return [], None
     try:
         data = json.loads((project_root / PROJECT_VERIFY_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
