@@ -13,13 +13,14 @@ import asyncio
 import contextlib
 import dataclasses
 import os
+import subprocess
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from memfun_core.logging import get_logger
 from memfun_core.types import TaskMessage, TaskResult
@@ -272,6 +273,85 @@ class WorkflowResult:
     # Number of reviews (per-task + cross-task) that ended in
     # ``error`` (reviewer unavailable / failed / unparseable).
     review_errors: int = 0
+    # Code-writing sub-tasks that produced no file change (see
+    # :func:`no_edit_reason`); ``no_edits`` is True when there is any.
+    no_edit_subtasks: int = 0
+    no_edits: bool = False
+
+
+# ── No-edit detection (fail-closed) ───────────────────────────
+
+#: Agents that are meant to write files (``AGENT_TYPE_MAP`` types ``coder`` and
+#: ``test``, plus the single-task ``rlm-coder`` path).  A run of one of these
+#: that produced no file change is a failure.  Read-only specialists
+#: (file/review/web/planner/debug/security) are exempt.
+CODE_WRITING_AGENTS: frozenset[str] = frozenset(
+    {agent_name_for_type("coder"), agent_name_for_type("test"), "rlm-coder"}
+)
+
+NO_EDITS_PREFIX = "no file changes produced"
+
+
+def _op_kind(op: Any) -> str:
+    if isinstance(op, dict):
+        return str(cast("dict[str, Any]", op).get("type", ""))
+    if isinstance(op, (list, tuple)) and op:
+        return str(cast("Sequence[Any]", op)[0])
+    return ""
+
+
+def _git_has_changes(root: Path | None) -> bool | None:
+    """``git status --porcelain`` non-empty?  ``None`` when it cannot be judged."""
+    if root is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ("git", "status", "--porcelain"),
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return bool(proc.stdout.strip())
+
+
+def no_edit_reason(
+    agent_name: str,
+    data: dict[str, Any] | None,
+    project_root: Path | None = None,
+) -> str | None:
+    """Why a code-writing agent's result counts as "no file changes", else ``None``.
+
+    Rule: an agent in :data:`CODE_WRITING_AGENTS` must show a file change.
+    Changes are ``files_created`` entries or recorded ``write``/``edit`` ops
+    (an edit-only run on existing files counts).  A run whose only mutating
+    ops are ``cmd`` (e.g. a formatter) is judged by ``git status --porcelain``
+    of ``project_root``; when git cannot judge it, it is given the benefit of
+    the doubt.  Everything else (including ``iterations == 0`` with no ops)
+    has made no change.  Read-only agents are never flagged.
+    """
+    if agent_name not in CODE_WRITING_AGENTS:
+        return None
+    data = data or {}
+    if data.get("files_created"):
+        return None
+    ops = list(data.get("ops") or [])
+    kinds = {_op_kind(o) for o in ops}
+    if kinds & {"write", "edit"}:
+        return None
+    if "cmd" in kinds and _git_has_changes(project_root) is not False:
+        return None
+    detail = f"agent={agent_name}, iterations={data.get('iterations', 0)}, ops={len(ops)}"
+    if data.get("method"):
+        detail += f", method={data['method']}"
+    if data.get("stop_reason"):
+        detail += f", stop_reason={data['stop_reason']}"
+    return f"{NO_EDITS_PREFIX} ({detail})"
 
 
 # ── Callback type aliases ─────────────────────────────────────
@@ -566,6 +646,8 @@ class WorkflowEngine:
             review,
             elapsed,
             require_per_task_review=self._pair_with_reviewer,
+            project_root=self._project_root,
+            worktrees=self._worktrees.get(state.workflow_id, {}),
         )
 
         # ── Phase 6: AUTO-COMMIT (issue #37) ─────────────────
@@ -702,6 +784,15 @@ class WorkflowEngine:
 
         elapsed = (time.perf_counter() - start) * 1000.0
         data = result.result or {}
+        # Fail closed: the rlm-coder must have changed a file, and an
+        # escalation signal / zero-iteration run is never a success.
+        no_edit = no_edit_reason("rlm-coder", data, self._project_root)
+        if result.success and (no_edit or data.get("_escalate")):
+            result = dataclasses.replace(
+                result,
+                success=False,
+                error=no_edit or f"{NO_EDITS_PREFIX} (context-first escalated, RLM did not run)",
+            )
         wf_result = WorkflowResult(
             workflow_id=state.workflow_id,
             success=result.success,
@@ -712,6 +803,8 @@ class WorkflowEngine:
             ops=data.get("ops", []),
             error=result.error,
             decomposition=state.decomposition,
+            no_edit_subtasks=1 if no_edit else 0,
+            no_edits=bool(no_edit),
         )
         # Auto-commit single-task results too (issue #37), but only
         # when the task actually succeeded — never commit a failed
@@ -2131,6 +2224,8 @@ class WorkflowEngine:
                 state,
                 tid,
                 require_per_task_review=self._pair_with_reviewer,
+                project_root=self._project_root,
+                worktrees=wt_map,
             )
             if reason is not None:
                 # Never lift unaccepted output to a PR — it could
@@ -2806,8 +2901,13 @@ class WorkflowEngine:
         tid: str,
         *,
         require_per_task_review: bool,
+        project_root: Path | None = None,
+        worktrees: Mapping[str, Path] | None = None,
     ) -> str | None:
         """Why sub-task *tid* is not accepted, or ``None`` if it is.
+
+        ``worktrees`` maps sub-task ids to their git worktrees: a ``cmd``-only run is
+        judged by ``git status`` THERE (its edits are in its worktree, not the repo root).
 
         A sub-task is accepted only when its coder result exists and
         succeeded AND — when per-task review is required (pairing on)
@@ -2819,6 +2919,10 @@ class WorkflowEngine:
             return "no result (agent never ran or result was lost)"
         if not sub_status.result.success:
             return f"coder failed: {sub_status.result.error or 'unknown error'}"
+        where = (worktrees or {}).get(tid) or project_root
+        no_edit = no_edit_reason(sub_status.agent_name, sub_status.result.result, where)
+        if no_edit:
+            return no_edit
         review = state.per_task_reviews.get(tid)
         if review is None:
             return "no per-task review recorded" if require_per_task_review else None
@@ -2835,6 +2939,8 @@ class WorkflowEngine:
         elapsed_ms: float,
         *,
         require_per_task_review: bool = False,
+        project_root: Path | None = None,
+        worktrees: Mapping[str, Path] | None = None,
     ) -> WorkflowResult:
         """Aggregate all sub-task results into WorkflowResult.
 
@@ -2882,6 +2988,16 @@ class WorkflowEngine:
                     f"*Failed: {sub_status.result.error or 'unknown error'}*"
                 )
 
+        no_edit_subtasks = sum(
+            1
+            for tid_, ss in state.sub_task_statuses.items()
+            if ss.result is not None
+            and no_edit_reason(
+                ss.agent_name, ss.result.result, (worktrees or {}).get(tid_) or project_root
+            )
+            is not None
+        )
+
         if none_count:
             logger.error(
                 "%d/%d sub-tasks produced no result",
@@ -2900,6 +3016,8 @@ class WorkflowEngine:
                 state,
                 tid,
                 require_per_task_review=require_per_task_review,
+                project_root=project_root,
+                worktrees=worktrees,
             )
             if reason is not None:
                 unaccepted.append(tid)
@@ -2926,6 +3044,8 @@ class WorkflowEngine:
             error="; ".join(error_parts) if error_parts else None,
             unaccepted_tasks=unaccepted,
             review_errors=review_errors,
+            no_edit_subtasks=no_edit_subtasks,
+            no_edits=no_edit_subtasks > 0,
             answer=merged_answer,
             sub_task_results=sub_results,
             review_summary=review.summary,

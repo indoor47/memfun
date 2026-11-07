@@ -56,7 +56,7 @@ def _coder_result(
         result={
             "answer": "done",
             "files_created": files or [],
-            "ops": [],
+            "ops": [{"type": "edit", "target": "stub.py"}],
         },
     )
 

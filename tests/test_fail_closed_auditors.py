@@ -68,7 +68,12 @@ def _coder(tid: str = "T1", *, success: bool = True, files: list[str] | None = N
         task_id=f"wf_{tid}",
         agent_id="coder-agent",
         success=success,
-        result={"answer": f"coded {tid}", "files_created": files or [], "ops": []},
+        result={
+            "answer": f"coded {tid}",
+            "files_created": files or [],
+            # An edit op: a coder run that changed nothing is a failure.
+            "ops": [{"type": "edit", "target": "stub.py"}],
+        },
         error=None if success else "coder blew up",
     )
 

@@ -34,7 +34,7 @@ def _coder_result(tid: str, success: bool = True, answer: str = "ok") -> TaskRes
         result={
             "answer": answer,
             "files_created": [],
-            "ops": [],
+            "ops": [{"type": "edit", "target": "stub.py"}],
         },
     )
 

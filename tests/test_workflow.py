@@ -782,7 +782,7 @@ async def test_execute_group_uses_fan_out_to_pool_for_repeated_names():
             result={
                 "answer": f"Done {i}",
                 "files_created": [],
-                "ops": [],
+                "ops": [{"type": "edit", "target": "stub.py"}],
             },
         )
         for i in range(1, 6)
@@ -858,7 +858,7 @@ async def test_execute_group_singleton_still_uses_fan_out():
         task_id="wf_T2",
         agent_id="coder-agent",
         success=True,
-        result={"answer": "ok2", "files_created": [], "ops": []},
+        result={"answer": "ok2", "files_created": [], "ops": [{"type": "edit", "target": "a.py"}]},
     )
 
     mock_orchestrator.fan_out.return_value = [t1, t2]
