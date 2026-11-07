@@ -6,6 +6,49 @@ test counts of `evals/swarm/run_smoke.py --suite commit0`; the visible tests of 
 same files (checked byte for byte), so "visible" and "hidden" agree except for a few episodes
 where the agent edited other files.
 
+## Pod (2026-11-07, 09:06 to 09:46 CET): thinking-on probe on `wcswidth`
+
+**Setup.** SGLang with `--reasoning-parser qwen3` and no `enable_thinking=false` default, so
+Qwen thinks and the reasoning arrives as `reasoning_content`, apart from `content`. Probe A:
+3 trials of the `wcswidth` function task (the one function Qwen could not do without thinking),
+`--max-agents 1`, visible-test verifier on, temperature 0.6, `max_tokens` 32768, 30 minute cap,
+constrained JSON off. Main a3de91a plus reasoning-token counting (branch `feat/thinking-support`).
+
+**Checked before the run (fake server, both DSPy engines, streamed and not).** The parsed
+answer stays clean and `reasoning_content` is kept as a separate field; the server's
+`completion_tokens_details.reasoning_tokens` survives on both engines and is now counted per
+episode; the loop guard does not abort 100,000 characters of varied reasoning and does abort a
+reasoning loop; reasoning that uses the whole `max_tokens` budget is a visible truncation.
+
+**Result: no score.** At 09:34 (28 minutes in) no episode had finished and no file had been
+edited (all three trials: 23 of 23 visible tests failing). What the calls looked like
+(prompt tokens, completion tokens):
+
+| trial | solve call 1 | solve call 2 (JSON-mode retry) | after the no-edit retry |
+|---|---|---|---|
+| 1 | 12,903 / 32,768 truncated | 12,892 / 32,768 truncated | planner calls again |
+| 2 | 15,962 / 32,768 truncated | 15,951 / 32,768 truncated | planner calls again |
+| 3 | 30,752 / 28,745 answered | 30,741 / 17,210 answered | 17,291 / 32,768 truncated |
+
+**Findings.**
+1. **Thinking is expensive on this function:** 17,000 to 33,000 tokens of reasoning for one
+   solve call, against about 1,500 tokens for the same call without thinking. At about 52
+   tokens/s per stream that is 6 to 11 minutes per call, and a call that fails is asked again
+   (DSPy's JSON-mode retry, then the single-task retry), so one episode needs 30+ minutes.
+2. **32,768 `max_tokens` is too small with thinking on:** 5 of the 8 solve calls used the whole
+   budget on reasoning and produced no answer. Every one of them was caught (`LLM RESPONSE
+   TRUNCATED`) and failed visibly; none was a quiet empty success.
+3. **Trial 3 did get two complete answers** (28,745 and 17,210 tokens) yet nothing was edited;
+   whether those answers were wrong or unparseable was not examined before the pod stopped.
+4. Probe B (all 18 tasks with thinking) was not run: 18 episodes of 10-minute calls cannot finish
+   in the pod's time.
+
+**To try this properly:** `max_tokens` of about 65,000 to 98,000 (the context is 262,144 and the
+prompt is 13,000 to 31,000 tokens), a pod of at least 90 minutes, `wcswidth` only with 3 trials,
+thinking off for the small planning calls, and a smaller solve prompt (only the relevant files).
+Cost of this pod was a few dollars for no result; the experiment answers "does the model fit the
+budget", not "does thinking solve `wcswidth`".
+
 ## Pod `hsz253jmn1dgrr` (2026-11-07, serving from about 05:42 until 06:16 CET): wcwidth as 6 function tasks
 
 **Setup.** `wcwidth` split into 6 function-level tasks (`commit0_adapter.py split`): the rest of
