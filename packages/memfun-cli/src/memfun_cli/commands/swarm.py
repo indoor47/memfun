@@ -247,6 +247,16 @@ def _truncated_responses() -> int:
         return 0
 
 
+def _reasoning_tokens() -> int:
+    """Reasoning tokens the model server reported in this process; 0 if unavailable."""
+    try:
+        from memfun_agent.llm_telemetry import total_reasoning_tokens
+
+        return total_reasoning_tokens()
+    except Exception:
+        return 0
+
+
 def _swarm_result_payload(
     result: WorkflowResult | None,
     wall_seconds: float,
@@ -306,6 +316,7 @@ def _swarm_result_payload(
         "success": success,
         "error": error_text,
         "truncated_responses": truncated,
+        "reasoning_tokens": _reasoning_tokens(),
         "unaccepted_tasks": list(result.unaccepted_tasks) if result is not None else [],
         "review_errors": result.review_errors if result is not None else 0,
         "review_rounds": result.review_rounds if result is not None else 0,
