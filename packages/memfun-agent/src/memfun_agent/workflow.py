@@ -363,6 +363,9 @@ OnSubTaskStatus = Callable[[str, SubTaskStatus], None]
 # ── Workflow engine ───────────────────────────────────────────
 
 
+#: Re-dispatches of the single-task coder when its result changed no file.
+SINGLE_TASK_NO_EDIT_RETRIES = 1
+
 #: Longest reviewer answer given to the constrained extractor (it is never truncated).
 MAX_EXTRACT_ANSWER_CHARS = 20_000
 
@@ -787,6 +790,23 @@ class WorkflowEngine:
                 task_msg,
                 "rlm-coder",
             )
+            # A successful dispatch that changed nothing (or escalated with nowhere to go)
+            # is retried once with a fresh sample before it becomes a failure.
+            for retry in range(1, SINGLE_TASK_NO_EDIT_RETRIES + 1):
+                data_ = result.result or {}
+                if not (
+                    result.success
+                    and (
+                        no_edit_reason("rlm-coder", data_, self._project_root)
+                        or data_.get("_escalate")
+                    )
+                ):
+                    break
+                logger.warning("single task made no file change; retry %d", retry)
+                result = await self._orchestrator.dispatch(
+                    dataclasses.replace(task_msg, task_id=f"{task_msg.task_id}_r{retry}"),
+                    "rlm-coder",
+                )
 
         state.status = WorkflowStatus.COMPLETED
         state.completed_at = time.time()

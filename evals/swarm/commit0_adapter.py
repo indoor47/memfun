@@ -38,6 +38,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -672,6 +673,38 @@ def function_task_id(name: str, rel: str, qualname: str, used: set[str]) -> str:
     return tid
 
 
+MAX_VERIFY_IDS = 40
+VERIFY_FIX_ATTEMPTS = 4
+
+
+def visible_test_command(repo: Path, relevant: list[str]) -> str | None:
+    """A pytest command running the task's relevant tests as they sit in the VISIBLE tree.
+
+    The ids in *relevant* are relative to the hidden-test copy (``test_core.py::test_x``);
+    in the episode repo the same files live under the library's own test directory.  The
+    agent may run these while it works (they are the tests it can already read); the
+    hidden grader copy is never involved.  ``None`` when a test file cannot be located.
+    """
+    ids: list[str] = []
+    files: list[str] = []
+    for tid in relevant:
+        fname, sep, rest = tid.partition("::")
+        hits = sorted(
+            (p for p in repo.rglob(PurePosixPath(fname).name) if p.is_file()),
+            key=lambda p: len(p.parts),
+        )
+        hits = [h for h in hits if h.relative_to(repo).as_posix().endswith(fname)]
+        if not hits:
+            return None
+        rel = hits[0].relative_to(repo).as_posix()
+        if rel not in files:
+            files.append(rel)
+        ids.append(f"{rel}{sep}{rest}")
+    targets = ids if len(ids) <= MAX_VERIFY_IDS else files
+    quoted = " ".join(shlex.quote(t) for t in targets)
+    return f"python -m pytest -q --tb=short -p no:cacheprovider {quoted}"
+
+
 def func_task_spec(row_name: str, rel: str, qualname: str, tests: list[str]) -> str:
     listed = ", ".join(f"`{t}`" for t in tests[:MAX_LISTED_TESTS])
     more = f" (and {len(tests) - MAX_LISTED_TESTS} more)" if len(tests) > MAX_LISTED_TESTS else ""
@@ -755,6 +788,13 @@ def split_lib(
                 "\n".join(deselect) + ("\n" if deselect else ""), "utf-8"
             )
             spec = func_task_spec(name, rel, span.qualname, relevant)
+            verify_cmd = visible_test_command(dest / "repo", relevant)
+            verify_toml = (
+                f"\n[verify]\ncommands = [{json.dumps(verify_cmd)}]\n"
+                f"max_fix_attempts = {VERIFY_FIX_ATTEMPTS}\n"
+                if verify_cmd
+                else ""
+            )
             (dest / "task.toml").write_text(
                 f'id = "{tid}"\nkind = "control"\nspec = {json.dumps(spec)}\n\n'
                 f'[[units]]\nid = "fn"\nowns = [{json.dumps(rel)}]\n'
@@ -762,7 +802,7 @@ def split_lib(
                 f"[source]\nlibrary = {json.dumps(name)}\nfunction = {json.dumps(span.qualname)}\n"
                 f"file = {json.dumps(rel)}\ntests_kept = {len(relevant)}\n"
                 f"parent = {json.dumps(f'c0-{name}')}\n"
-                f"weak = {'true' if len(relevant) < WEAK_TESTS else 'false'}\n",
+                f"weak = {'true' if len(relevant) < WEAK_TESTS else 'false'}\n" + verify_toml,
                 "utf-8",
             )
             report = vb.validate_bundle(dest, timeout)

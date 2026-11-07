@@ -915,6 +915,30 @@ def create_episode_repo(
     _git(["add", "-A"], repo, env)
     _git(["commit", "-q", "-m", f"smoke start tree: {bundle.id}"], repo, env)
     (repo / ".memfun").mkdir(exist_ok=True)
+    write_project_verify(bundle, repo)
+
+
+def write_project_verify(bundle: Bundle, repo: Path) -> None:
+    """Give the episode its own verification: ``[verify]`` of the bundle's task.toml.
+
+    Commit0 function tasks list their relevant VISIBLE tests there; the solver runs them
+    after its edit and feeds failures back (see ``context_first.read_project_verify``).
+    """
+    try:
+        task = tomllib.loads((bundle.path / "task.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return
+    verify = task.get("verify")
+    if not isinstance(verify, dict):
+        return
+    cmds = [c for c in verify.get("commands", []) if isinstance(c, str)]
+    if not cmds:
+        return
+    doc: dict[str, Any] = {"commands": cmds}
+    fixes = verify.get("max_fix_attempts")
+    if isinstance(fixes, int) and not isinstance(fixes, bool):
+        doc["max_fix_attempts"] = fixes
+    (repo / ".memfun" / "verify.json").write_text(json.dumps(doc), encoding="utf-8")
 
 
 def swarm_cmd(

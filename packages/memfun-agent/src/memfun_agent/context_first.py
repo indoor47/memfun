@@ -642,6 +642,9 @@ class ContextGatherer:
 
 # ── Single-Shot Solver ────────────────────────────────────────
 
+#: Extra attempts when the solver's reply parses to no operations at all.
+UNPARSEABLE_RETRIES = 1
+
 
 class SingleShotSolver(dspy.Module):
     """Solve a coding task in one LLM call given full context."""
@@ -655,22 +658,31 @@ class SingleShotSolver(dspy.Module):
         query: str,
         full_context: str,
     ) -> SolveResult:
-        """Solve the task and return structured operations."""
-        result = await asyncio.to_thread(
-            self.predictor,
-            query=query,
-            full_context=full_context,
-        )
+        """Solve the task and return structured operations.
 
-        reasoning = str(getattr(result, "reasoning", ""))
-        answer = str(getattr(result, "answer", ""))
-        raw_ops = str(getattr(result, "operations", "[]"))
+        An unparseable reply (substantial text, 0 operations) is retried ONCE with a fresh
+        sample before it is reported as truncated: at temperature > 0 the second attempt
+        usually parses, and with no planner there is nothing to escalate to.
+        """
+        for attempt in range(1, UNPARSEABLE_RETRIES + 2):
+            result = await asyncio.to_thread(
+                self.predictor,
+                query=query,
+                full_context=full_context,
+            )
 
-        operations = _parse_operations(raw_ops)
+            reasoning = str(getattr(result, "reasoning", ""))
+            answer = str(getattr(result, "answer", ""))
+            raw_ops = str(getattr(result, "operations", "[]"))
 
-        # Detect truncation: if the raw operations string doesn't
-        # close the JSON array, the LLM response was likely cut off.
-        truncated = _detect_truncation(raw_ops, operations)
+            operations = _parse_operations(raw_ops)
+
+            # Detect truncation: if the raw operations string doesn't
+            # close the JSON array, the LLM response was likely cut off.
+            truncated = _detect_truncation(raw_ops, operations)
+            if not truncated or operations or attempt > UNPARSEABLE_RETRIES:
+                break
+            logger.warning("Solver reply had no parseable operations; retrying once")
 
         return SolveResult(
             reasoning=reasoning,
@@ -1078,6 +1090,30 @@ def _detect_verify_commands(
         cmds.append("cargo check")
 
     return cmds
+
+
+#: A project may carry its own verification (e.g. the visible tests of the function to
+#: implement): ``.memfun/verify.json`` = ``{"commands": ["..."], "max_fix_attempts": 4}``.
+PROJECT_VERIFY_FILE = ".memfun/verify.json"
+
+
+def read_project_verify(project_root: Path) -> tuple[list[str], int | None]:
+    """``(commands, max_fix_attempts)`` from ``.memfun/verify.json``; empty when absent/invalid."""
+    try:
+        data = json.loads((project_root / PROJECT_VERIFY_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return [], None
+    if not isinstance(data, dict):
+        return [], None
+    raw_cmds = data.get("commands")
+    cmds = (
+        [c for c in raw_cmds if isinstance(c, str) and c.strip()]
+        if isinstance(raw_cmds, list)
+        else []
+    )
+    fixes = data.get("max_fix_attempts")
+    ok = isinstance(fixes, int) and not isinstance(fixes, bool) and 1 <= fixes <= 10
+    return cmds, (fixes if ok else None)
 
 
 @dataclass
@@ -1676,7 +1712,14 @@ class ContextFirstSolver:
         """Get verification commands: explicit config or auto-detected."""
         if self.config.verify_commands:
             return list(self.config.verify_commands)
+        project_cmds, _ = read_project_verify(self.project_root)
+        if project_cmds:
+            return project_cmds  # the project's own checks (e.g. its visible tests)
         return _detect_verify_commands(self.project_root)
+
+    def _max_fix_attempts(self) -> int:
+        _, fixes = read_project_verify(self.project_root)
+        return fixes or self.config.max_fix_attempts
 
     async def _verify_and_fix(
         self,
@@ -1689,8 +1732,9 @@ class ContextFirstSolver:
 
         Mutates *executor* by appending fix operations and files.
         """
-        for attempt in range(1, self.config.max_fix_attempts + 1):
-            self._status(f"Verifying (attempt {attempt}/{self.config.max_fix_attempts})...")
+        max_fix = self._max_fix_attempts()
+        for attempt in range(1, max_fix + 1):
+            self._status(f"Verifying (attempt {attempt}/{max_fix})...")
             vr = await self.verifier.averify(verify_cmds)
 
             if vr.passed:
@@ -1703,11 +1747,11 @@ class ContextFirstSolver:
                 vr.errors[:200],
             )
 
-            if attempt >= self.config.max_fix_attempts:
+            if attempt >= max_fix:
                 self._status("Verification failed, max fix attempts reached")
                 logger.warning(
                     "Verification still failing after %d fix attempts",
-                    self.config.max_fix_attempts,
+                    max_fix,
                 )
                 return
 
