@@ -363,6 +363,7 @@ async def _run_swarm(
     auto_push: bool | None,
     auto_branch: str | None,
     gh_pr: bool | None,
+    decompose: bool = True,
 ) -> int:
     """Execute the swarm workflow.  Returns the desired exit code."""
     # Lazy imports — keep CLI startup cheap when other commands run.
@@ -538,6 +539,7 @@ async def _run_swarm(
         auto_commit=effective_auto_commit,
         auto_push=effective_auto_push,
         project_root=project_root,
+        decompose=decompose,
         gh_pr=effective_gh_pr,
     )
     # Expose the per-instance pool cap so _execute_group can read it.
@@ -631,6 +633,12 @@ def swarm_command(
         help="Maximum number of agent instances spun up per agent type. "
         "Drives the orchestrator semaphore and per-pool fan-out.",
     ),
+    decompose: bool = typer.Option(
+        True,
+        "--decompose/--no-decompose",
+        help="Let the LLM planner split the spec into sub-tasks (default).  "
+        "--no-decompose skips the planner and runs the whole spec as ONE coding task.",
+    ),
     use_worktrees: bool = typer.Option(
         True,
         "--use-worktrees/--no-use-worktrees",
@@ -696,6 +704,7 @@ def swarm_command(
             auto_push=push,
             auto_branch=branch,
             gh_pr=gh_pr,
+            decompose=decompose,
         )
     )
     if exit_code != 0:

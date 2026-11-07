@@ -22,6 +22,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import errno
+import fnmatch
 import ipaddress
 import json
 import os
@@ -916,7 +917,13 @@ def create_episode_repo(
     (repo / ".memfun").mkdir(exist_ok=True)
 
 
-def swarm_cmd(memfun_cmd: list[str], spec: str, max_agents: int, task_timeout: int) -> list[str]:
+def swarm_cmd(
+    memfun_cmd: list[str],
+    spec: str,
+    max_agents: int,
+    task_timeout: int,
+    decompose: bool = True,
+) -> list[str]:
     return [
         *memfun_cmd,
         "swarm",
@@ -926,6 +933,7 @@ def swarm_cmd(memfun_cmd: list[str], spec: str, max_agents: int, task_timeout: i
         "--timeout",
         str(task_timeout),
         "--no-push",
+        *([] if decompose else ["--no-decompose"]),
     ]
 
 
@@ -1459,6 +1467,7 @@ class RunContext:
     episode_timeout: float
     grader_timeout: float
     max_tokens: int
+    decompose: bool = True
     sampling: Sampling = dataclasses.field(default_factory=Sampling)
     constrained_json: bool = True
     dashboard: SharedDashboard | None = None
@@ -1589,7 +1598,9 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
             forwarder = EventForwarder(plan.repo / ".memfun" / "memfun.db", ctx.dashboard.port)
             forwarder.start()
 
-        cmd = swarm_cmd(ctx.memfun_cmd, episode_spec(bundle), ctx.max_agents, ctx.task_timeout)
+        cmd = swarm_cmd(
+            ctx.memfun_cmd, episode_spec(bundle), ctx.max_agents, ctx.task_timeout, ctx.decompose
+        )
         result_json = plan.ep_dir / SWARM_RESULT_NAME  # must not exist yet: memfun uses O_EXCL
         proc = run_in_group(
             cmd,
@@ -2017,6 +2028,20 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "for the decomposer plan and the auditor findings (default on; needs an SGLang/vLLM-style "
         "server)",
     )
+    ap.add_argument(
+        "--decompose",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="let `memfun swarm` plan sub-tasks with the LLM (default: yes for --suite smoke, "
+        "no for --suite commit0: each episode is one coding task)",
+    )
+    ap.add_argument(
+        "--progress-file",
+        type=Path,
+        default=None,
+        help="append one line per finished episode (tests passed/kept, wall, tokens, "
+        "failure-mode counts, outcome) as the episodes finish",
+    )
     ap.add_argument("--memfun-cmd", default="memfun", help="memfun executable (shell-split)")
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--run-id", default="")
@@ -2035,6 +2060,55 @@ def _bounded(value: int, lo: int, hi: int, flag: str) -> None:
         raise UsageError(f"{flag} must be in {lo}..{hi}, got {value}")
 
 
+def tests_kept(bundle_path: Path | None) -> int | None:
+    """``[source] tests_kept`` of a Commit0 bundle (the pass-rate denominator), if any."""
+    if bundle_path is None:
+        return None
+    try:
+        task = tomllib.loads((bundle_path / "task.toml").read_text(encoding="utf-8"))
+        kept = task["source"]["tests_kept"]
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        return None
+    return kept if isinstance(kept, int) and not isinstance(kept, bool) else None
+
+
+def progress_line(ep: dict[str, Any], kept: int | None) -> str:
+    """One human-readable line for a finished episode."""
+    grade = ep.get("grade") or {}
+    tok = (ep.get("metrics") or {}).get("tokens") or {}
+    passed = grade.get("hidden_passed", "?")
+    total = (
+        kept
+        if kept is not None
+        else (
+            passed + grade["hidden_failed"]
+            if isinstance(passed, int) and "hidden_failed" in grade
+            else "?"
+        )
+    )
+    reason = f" ({ep['reason']})" if ep.get("reason") else ""
+    return (
+        f"- {time.strftime('%H:%M:%S')} {ep['episode']}: tests {passed}/{total}"
+        f" | wall {round(float(ep.get('wall_s') or 0) / 60, 1)} min"
+        f" | tokens {tok.get('prompt', '?')} in / {tok.get('completion', '?')} out"
+        f" | stalled {ep.get('stalled_stops', 0)}, truncated {ep.get('truncated_responses', 0)},"
+        f" loop-aborts {ep.get('loop_aborts', 0)}, no-edits {int(bool(ep.get('no_edits')))},"
+        f" reviewer-json-rej {ep.get('reviewer_json_rejections', 0)}"
+        f" | {ep.get('outcome')}{reason}\n"
+    )
+
+
+def append_progress(path: Path, ep: dict[str, Any], plan: EpisodePlan | None) -> None:
+    """Append the episode's line to *path* (best effort: never fails the run)."""
+    kept = tests_kept(plan.bundle.path) if plan is not None else None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(progress_line(ep, kept))
+    except OSError as exc:
+        print(f"WARNING: cannot write --progress-file {path}: {exc}", file=sys.stderr)
+
+
 def _apply_suite_defaults(args: argparse.Namespace) -> None:
     commit0 = args.suite == "commit0"
     if args.episode_timeout is None:
@@ -2043,6 +2117,10 @@ def _apply_suite_defaults(args: argparse.Namespace) -> None:
         args.task_timeout = int(args.episode_timeout) if commit0 else 900
     if args.grader_timeout is None:
         args.grader_timeout = COMMIT0_GRADER_TIMEOUT if commit0 else 300.0
+    if args.decompose is None:
+        # Commit0 knows what to build: no LLM planner (its read-only "analysis" sub-tasks
+        # burned the whole first runs); the smoke bundles keep the planner they exercise.
+        args.decompose = not commit0
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -2084,6 +2162,12 @@ def _validate_args(args: argparse.Namespace) -> None:
     for item in args.bundles:
         for bid in (b.strip() for b in item.split(",")):
             if not bid:
+                continue
+            if any(c in bid for c in "*?["):  # fnmatch pattern, e.g. c0s-wcwidth-*
+                matches = fnmatch.filter(sorted(known), bid)
+                if not matches:
+                    raise UsageError(f"--bundles pattern {bid!r} matches no bundle")
+                selected.extend(m for m in matches if m not in selected)
                 continue
             if not BUNDLE_ID_RE.match(bid) or bid not in known:
                 raise UsageError(f"unknown bundle {bid!r} (known: {', '.join(sorted(known))})")
@@ -2148,7 +2232,9 @@ def dry_plan(args: argparse.Namespace, run_dir: Path, plans: list[EpisodePlan]) 
     for p in plans:
         spec = episode_spec(p.bundle)
         first = spec.strip().splitlines()[0][:60] if spec.strip() else ""
-        cmd = swarm_cmd(memfun_cmd, f"<spec: {first}...>", args.max_agents, args.task_timeout)
+        cmd = swarm_cmd(
+            memfun_cmd, f"<spec: {first}...>", args.max_agents, args.task_timeout, args.decompose
+        )
         problem = f"  !! {'; '.join(p.bundle.problems)}" if p.bundle.problems else ""
         out.append(f"  {p.name:<18} kind={p.bundle.kind:<8} units={len(p.bundle.units)}{problem}")
         out.append(f"      repo : {p.repo}")
@@ -2264,6 +2350,7 @@ def run(args: argparse.Namespace) -> int:
             episode_timeout=args.episode_timeout,
             grader_timeout=args.grader_timeout,
             max_tokens=args.max_tokens,
+            decompose=args.decompose,
             sampling=Sampling(
                 temperature=args.temperature,
                 frequency_penalty=args.frequency_penalty,
@@ -2280,11 +2367,14 @@ def run(args: argparse.Namespace) -> int:
             run_dir=run_dir,
         )
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel_tasks)
+        plans_by_name = {p.name: p for p in plans}
         futures = [pool.submit(run_episode, p, ctx) for p in plans]
         for fut in concurrent.futures.as_completed(futures):
             ep = fut.result()
             print(f"  {ep['episode']:<18} {ep['outcome']:<14} {ep['reason'][:80]}", flush=True)
             episodes.append(ep)
+            if args.progress_file is not None:
+                append_progress(args.progress_file, ep, plans_by_name.get(ep["episode"]))
             # Partial results after every episode: survive a SIGKILL of the runner.
             write_json_atomic(run_dir / "results.json", aggregate(episodes, meta()))
     except (KeyboardInterrupt, SystemExit):

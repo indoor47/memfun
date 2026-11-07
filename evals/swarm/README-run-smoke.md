@@ -426,3 +426,29 @@ The runner checks the model server before every run and reuses the dashboard alr
 8081 without stopping it; per-run server token counters come from `--metrics-url`. Change
 the swarm code or `memfun.toml` limits between runs; changing SGLang flags needs a relaunch.
 The pod stops itself at `--max-minutes` regardless of how many runs are in flight.
+
+## One library as many small function tasks (`commit0_adapter.py split`)
+
+Whole-library episodes made the LLM planner emit read-only "analysis" sub-tasks and burned
+their time before any edit. For quality iteration on ONE library, split it into one task per
+stubbed function and give each its own episode, with no planner:
+
+```bash
+python evals/swarm/commit0_adapter.py build wcwidth --cache C --split      # or: split wcwidth
+python evals/swarm/run_smoke.py --suite commit0 --commit0-dir C \
+    --bundles 'c0s-wcwidth-*' ... --max-agents 1 --parallel-tasks 6 \
+    --progress-file .memfun/progress.md
+```
+
+- Each `c0s-<lib>-<function>` bundle has the **rest of the library as the reference
+  implementation**, and only that function is `pass` (everything else stays as in the
+  reference: the task is "implement this function in its context", not "rebuild the library").
+  The unit owns just that file and is graded by the tests that **execute the function**,
+  found with coverage contexts on the reference run (`[source] tests_kept` is their number);
+  every other test is deselected for this task. A function no test executes is skipped.
+  Each task is validated like any bundle (reference solution passes, the stub fails).
+- The runner's `--suite commit0` default is `--no-decompose`: `memfun swarm --no-decompose`
+  runs the spec as ONE coding task (no LLM planner call). `--decompose` restores the planner.
+- `--progress-file` appends one line per finished episode: tests passed/kept, wall-clock,
+  tokens, stalled / truncated / loop-abort / no-edit / reviewer-JSON counts and the outcome.
+  `--bundles` also takes `fnmatch` patterns such as `c0s-wcwidth-*`.
