@@ -373,10 +373,96 @@ def test_extraction_rejects_with_code_computed_verdict(server: FakeServer, engin
     assert _schema_of(server.bodies[0])["properties"]["review_id"]["enum"] == [RID]
 
 
-def test_extraction_low_only_approves(server: FakeServer) -> None:
+def test_extraction_can_only_reject_never_approve(server: FakeServer) -> None:
+    """Audit finding: extraction must not turn an unparseable review into an approval."""
     _enable(server)
-    _extraction_server(server, _findings_json(RID, [LOW]))
-    assert _review(server, _result(PROSE)).status == "approved"
+    for findings in ([LOW], []):  # LOW-only and empty both stay an error
+        _extraction_server(server, _findings_json(RID, findings))
+        assert _review(server, _result(PROSE)).status == "error"
+    # prose that says LGTM, extractor says no findings: still not approved
+    _extraction_server(server, _findings_json(RID, []))
+    assert _review(server, _result("LGTM, no issues found anywhere. " * 5)).status == "error"
+
+
+def test_extraction_is_skipped_when_the_answer_has_a_rejected_block(server: FakeServer) -> None:
+    _enable(server)
+    _extraction_server(server, _findings_json(RID, [HIGH]))
+    stale = _result(f"```json\n{_findings_json('stale-nonce', [HIGH])}\n```")
+    assert _review(server, stale).status == "error"
+    malformed = _result('{"review_id": "' + RID + '", "findings": "oops"}')
+    assert _review(server, malformed).status == "error"
+    assert server.bodies == []  # no extraction call was made for either
+
+
+def test_extraction_is_skipped_for_an_oversized_answer(server: FakeServer) -> None:
+    from memfun_agent.workflow import MAX_EXTRACT_ANSWER_CHARS
+
+    _enable(server)
+    _extraction_server(server, _findings_json(RID, [HIGH]))
+    big = "findings are discussed in prose. " * (MAX_EXTRACT_ANSWER_CHARS // 30 + 10)
+    assert _review(server, _result(big)).status == "error"
+    assert server.bodies == []
+
+
+def test_decomposer_retries_unconstrained_when_the_server_rejects_the_schema(
+    server: FakeServer,
+) -> None:
+    import types
+
+    from memfun_agent.decomposer import TaskDecomposer
+
+    _enable(server)
+    adapters: list[Any] = []
+
+    def fake_predict(**_kw: Any) -> Any:
+        adapters.append(dspy.settings.adapter)
+        if len(adapters) == 1:
+            raise RuntimeError("HTTP 400: Unsupported schema: maxLength")
+        return types.SimpleNamespace(
+            sub_tasks=[
+                {
+                    "id": "T1",
+                    "description": "a",
+                    "agent_type": "coder",
+                    "inputs": [],
+                    "outputs": [],
+                },
+                {
+                    "id": "T2",
+                    "description": "b",
+                    "agent_type": "coder",
+                    "inputs": [],
+                    "outputs": [],
+                },
+            ],
+            shared_spec="spec",
+            parallelism_groups=[["T1", "T2"]],
+        )
+
+    dec = TaskDecomposer()
+    dec.decomposer = fake_predict  # type: ignore[assignment]
+    result = asyncio.run(dec.adecompose("build it", "ctx"))
+    assert len(adapters) == 2  # constrained attempt, then ONE plain retry
+    assert adapters[0] is not None and adapters[0] is not adapters[1]
+    assert len(result.sub_tasks) == 2 and not result.is_single_task  # the plan was used
+
+    adapters.clear()
+
+    def other_error(**_kw: Any) -> Any:
+        adapters.append(1)
+        raise RuntimeError("connection reset by peer")
+
+    dec.decomposer = other_error  # type: ignore[assignment]
+    assert asyncio.run(dec.adecompose("build it", "ctx")).is_single_task  # old fallback
+    assert len(adapters) == 1  # no retry for unrelated errors
+
+
+def test_schema_rejection_detector() -> None:
+    from memfun_agent.decomposer import _is_schema_rejection  # pyright: ignore[reportPrivateUsage]
+
+    assert _is_schema_rejection(RuntimeError("HTTP 400: Unsupported schema: maxLength"))
+    assert _is_schema_rejection(ValueError("BadRequestError: response_format json_schema"))
+    assert not _is_schema_rejection(RuntimeError("connection reset by peer"))
 
 
 @pytest.mark.parametrize(
