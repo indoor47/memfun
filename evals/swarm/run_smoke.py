@@ -1678,6 +1678,12 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
         rec["loop_aborts"] = signals["loop_aborts"]
         swarm_doc, swarm_problem = load_swarm_result(plan.ep_dir, metrics["workflow_ids"])
         rec["truncated_responses"] = signals["truncated_responses"]
+        doc_reasoning = (swarm_doc or {}).get("reasoning_tokens") if swarm_doc else None
+        rec["reasoning_tokens"] = (
+            doc_reasoning
+            if isinstance(doc_reasoning, int) and not isinstance(doc_reasoning, bool)
+            else 0
+        )
         # Max of log count and result-file count: same events, never summed.
         doc_truncated = (swarm_doc or {}).get("truncated_responses") if swarm_doc else None
         if isinstance(doc_truncated, int) and not isinstance(doc_truncated, bool):
@@ -1864,6 +1870,7 @@ def aggregate(episodes: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str,
             "peak_concurrency": max((m["peak_concurrency"] for m in mets), default=0),
             "reviewer_json_rejections": sum(e.get("reviewer_json_rejections", 0) for e in eps),
             "truncated_responses": sum(e.get("truncated_responses", 0) for e in eps),
+            "reasoning_tokens": sum(e.get("reasoning_tokens", 0) for e in eps),
             "loop_aborts": sum(e.get("loop_aborts", 0) for e in eps),
             "stalled_stops": sum(e.get("stalled_stops", 0) for e in eps),
             "no_edit_episodes": sum(1 for e in eps if e.get("no_edits")),
@@ -2138,6 +2145,7 @@ def progress_line(ep: dict[str, Any], kept: int | None) -> str:
         f"- {time.strftime('%H:%M:%S')} {ep['episode']}: tests {passed}/{total}"
         f" | wall {round(float(ep.get('wall_s') or 0) / 60, 1)} min"
         f" | tokens {tok.get('prompt', '?')} in / {tok.get('completion', '?')} out"
+        f" (reasoning {ep.get('reasoning_tokens', 0)})"
         f" | stalled {ep.get('stalled_stops', 0)}, truncated {ep.get('truncated_responses', 0)},"
         f" loop-aborts {ep.get('loop_aborts', 0)}, no-edits {int(bool(ep.get('no_edits')))},"
         f" reviewer-json-rej {ep.get('reviewer_json_rejections', 0)}"

@@ -89,9 +89,52 @@ def truncation_advice(role: str | None = None) -> str:
 
 
 def reset_truncations() -> None:
-    """Forget recorded truncations (a fresh swarm run starts from zero)."""
+    """Forget recorded truncations and reasoning tokens (a fresh swarm run starts from zero)."""
     with _TRUNCATIONS_LOCK:
         _TRUNCATIONS.clear()
+        _REASONING_TOKENS.clear()
+
+
+# Reasoning ("thinking") tokens: with a server-side reasoning parser (e.g. SGLang
+# ``--reasoning-parser qwen3``) the model's reasoning arrives as ``reasoning_content``, apart
+# from ``content``, and is counted in ``usage.completion_tokens_details.reasoning_tokens``.
+_REASONING_TOKENS: dict[str, int] = {}
+
+
+def reasoning_token_counts() -> dict[str, int]:
+    """Reasoning tokens reported by the server in this process, by role."""
+    with _TRUNCATIONS_LOCK:
+        return dict(_REASONING_TOKENS)
+
+
+def total_reasoning_tokens() -> int:
+    """Reasoning tokens reported by the server in this process, summed over roles."""
+    return sum(reasoning_token_counts().values())
+
+
+def _record_reasoning_tokens(role: str, tokens: int) -> None:
+    if tokens > 0:
+        with _TRUNCATIONS_LOCK:
+            _REASONING_TOKENS[role] = _REASONING_TOKENS.get(role, 0) + tokens
+
+
+def _reasoning_tokens(instance: Any) -> int:
+    """``usage.completion_tokens_details.reasoning_tokens`` of the call that just ended."""
+    history = getattr(instance, "history", None)
+    if not (isinstance(history, list) and history and isinstance(history[-1], dict)):
+        return 0
+    usage = history[-1].get("usage")
+    details = (
+        usage.get("completion_tokens_details")
+        if isinstance(usage, dict)
+        else getattr(usage, "completion_tokens_details", None)
+    )
+    value = (
+        details.get("reasoning_tokens")
+        if isinstance(details, dict)
+        else getattr(details, "reasoning_tokens", None)
+    )
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
 def total_truncations() -> int:
@@ -478,6 +521,9 @@ class MemfunDSPyCallback:
 
             success = exception is None
             error = str(exception) if exception else None
+
+            if exception is None:
+                _record_reasoning_tokens(current_role(), _reasoning_tokens(instance))
 
             # A response cut off by max_tokens is a failure, never a silent success.
             if exception is None and _finish_reason(instance, outputs) == "length":
