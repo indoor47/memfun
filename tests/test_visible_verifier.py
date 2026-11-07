@@ -75,11 +75,7 @@ def test_the_project_verify_file_is_ignored_unless_trusted(
 
 def test_the_runner_trusts_its_own_episode_verify_file(tmp_path: Path) -> None:
     env = rs.child_env(tmp_path, {"PATH": "/usr/bin"})
-    assert (
-        env[rs.TRUST_PROJECT_VERIFY_ENV]
-        == cf.TRUST_PROJECT_VERIFY_ENV
-        == "MEMFUN_TRUST_PROJECT_VERIFY"
-    )
+    assert rs.TRUST_PROJECT_VERIFY_ENV == cf.TRUST_PROJECT_VERIFY_ENV  # the same variable
     assert env[rs.TRUST_PROJECT_VERIFY_ENV] == "1"
 
 
@@ -375,3 +371,30 @@ def test_cli_and_runner_pass_the_solver_choice(tmp_path: Path) -> None:
     assert "--single-task-solver" not in rs.swarm_cmd(["m"], "s", 1, 60)
     cmd = rs.swarm_cmd(["m"], "s", 1, 60, decompose=False, single_task_solver="rlm")
     assert cmd[-2:] == ["--single-task-solver", "rlm"] and "--no-decompose" in cmd
+
+
+def test_the_attempt_salt_is_reset_after_the_single_task_retry() -> None:
+    import asyncio as _a
+
+    async def go() -> int:
+        out, _calls = await _single([_noedit(), _edit()])
+        assert out.success
+        return cf._ATTEMPT_SALT  # pyright: ignore[reportPrivateUsage]
+
+    cf.set_attempt_salt(0)
+    assert _a.run(go()) == 0  # bumped for the retry, back to 0 afterwards
+
+
+def test_step_retries_are_only_for_unparseable_replies() -> None:
+    from memfun_agent.rlm import _is_parse_failure  # pyright: ignore[reportPrivateUsage]
+
+    class AdapterParseError(Exception):
+        pass
+
+    class SubError(AdapterParseError):
+        pass
+
+    assert _is_parse_failure(AdapterParseError("x")) and _is_parse_failure(SubError("x"))
+    assert _is_parse_failure(json.JSONDecodeError("m", "d", 0))
+    assert not _is_parse_failure(TimeoutError("slow"))
+    assert not _is_parse_failure(ConnectionError("reset"))

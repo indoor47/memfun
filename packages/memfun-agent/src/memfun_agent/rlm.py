@@ -40,6 +40,13 @@ logger = get_logger("agent.rlm")
 _DEFAULT_MAX_ITERATIONS = 10
 #: Re-asks of ONE loop step whose reply could not be parsed, before the loop gives up.
 STEP_RETRIES = 2
+
+
+def _is_parse_failure(exc: BaseException) -> bool:
+    """Is *exc* DSPy's "the reply does not fit the output fields" error?"""
+    return any(c.__name__ in ("AdapterParseError", "JSONDecodeError") for c in type(exc).__mro__)
+
+
 _DEFAULT_MAX_OUTPUT_CHARS = 0  # 0 = no limit (rely on history window)
 _PREVIEW_LENGTH = 500
 _MAX_HISTORY_CHARS = 120_000
@@ -592,7 +599,9 @@ class RLMModule(dspy.Module):
                         )
                         break
                     except Exception as step_exc:
-                        if step_try >= STEP_RETRIES:
+                        # Only an unparseable reply is worth re-asking; a timeout or a
+                        # connection error already has its own retries and must not cost 3x.
+                        if step_try >= STEP_RETRIES or not _is_parse_failure(step_exc):
                             raise
                         logger.warning(
                             "RLM step %d: model reply unusable (%s); retry %d/%d",

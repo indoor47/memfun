@@ -566,6 +566,33 @@ def test_splice_function_replaces_only_the_named_function() -> None:
     assert c0.splice_function(stub, ref, "b") == "def a():\n    pass\n\ndef b():\n    return 2\n"
 
 
+def test_splice_carries_over_new_imports_and_helpers_the_function_needs() -> None:
+    """Audit finding: only the function's lines were copied -> NameError at runtime."""
+    stub = '"""m."""\nimport os\n\nK = 1\n\n\ndef f(x):\n    pass\n\n\ndef g(x):\n    return x\n'
+    agent = (
+        '"""m."""\nimport os\nimport re\nfrom math import floor\n\nK = 1\n'
+        'PAT = re.compile("a+")\n\n\n'
+        "def _h(x):\n    return floor(x)\n\n\n"
+        "def f(x):\n    return _h(len(PAT.findall(str(x)))) + K\n\n\ndef g(x):\n    return x\n"
+    )
+    merged = c0.splice_function(stub, agent, "f")
+    ns: dict[str, object] = {}
+    exec(compile(merged, "m.py", "exec"), ns)
+    assert ns["f"]("aa a") == 3  # type: ignore[operator]  (uses re, PAT, floor and _h)
+    assert merged.count("import re") == 1 and merged.count("def g(") == 1
+    assert c0.function_spans(merged)["f"] and ast_ok(merged)
+    # nothing new in the agent's file: output equals the plain function splice
+    plain = "def f(x):\n    return 1\n"
+    assert c0.splice_function("def f(x):\n    pass\n", plain, "f") == plain
+
+
+def ast_ok(text: str) -> bool:
+    import ast
+
+    ast.parse(text)
+    return True
+
+
 def test_merge_check_needs_a_built_bundle_and_episodes(tmp_path: Path) -> None:
     with pytest.raises(c0.AdapterError, match="build"):
         c0.merge_check("minilib", tmp_path, [tmp_path], log=lambda _m: None)

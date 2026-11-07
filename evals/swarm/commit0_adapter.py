@@ -846,15 +846,97 @@ def split_lib(
 # runs the library's complete test suite once.
 
 
+def _top_level_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
+def _node_text(lines: list[str], node: ast.stmt) -> str:
+    start = min([node.lineno, *(d.lineno for d in getattr(node, "decorator_list", []))])
+    seg = "".join(lines[start - 1 : node.end_lineno])
+    return seg if seg.endswith("\n") else seg + "\n"
+
+
 def splice_function(target_text: str, source_text: str, qualname: str) -> str:
-    """*target_text* with ``qualname`` replaced by its implementation from *source_text*."""
+    """*target_text* with ``qualname`` replaced by its implementation from *source_text*.
+
+    The agent may also have added module-level imports, helpers or constants the function
+    needs.  Those top-level statements of *source_text* that *target_text* lacks (a new
+    ``import`` line, a new top-level function / class / assignment) are carried over too:
+    imports after the target's last import, the rest just before the code that holds the
+    function.  Nested additions (new methods in a class) are not carried over.
+    """
     tgt = function_spans(target_text)[qualname]
     src = function_spans(source_text)[qualname]
     seg = source_text.splitlines(keepends=True)[src.start - 1 : src.end]
     if seg and not seg[-1].endswith("\n"):
         seg[-1] += "\n"
     lines = target_text.splitlines(keepends=True)
-    return "".join(lines[: tgt.start - 1] + seg + lines[tgt.end :])
+    out = "".join(lines[: tgt.start - 1] + seg + lines[tgt.end :])
+    try:
+        src_tree, tgt_tree = ast.parse(source_text), ast.parse(target_text)
+    except SyntaxError:
+        return out
+    have_names = _top_level_names(tgt_tree)
+    have_imports = {
+        ast.unparse(n) for n in tgt_tree.body if isinstance(n, ast.Import | ast.ImportFrom)
+    }
+    src_lines = source_text.splitlines(keepends=True)
+    top = qualname.split(".")[0]
+    new_imports: list[str] = []
+    new_helpers: list[str] = []
+    for node in src_tree.body:
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            if ast.unparse(node) not in have_imports:
+                new_imports.append(_node_text(src_lines, node))
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            if node.name not in have_names and node.name != top:
+                new_helpers.append(_node_text(src_lines, node))
+        elif isinstance(node, ast.Assign | ast.AnnAssign):
+            names = (
+                [t.id for t in node.targets if isinstance(t, ast.Name)]
+                if isinstance(node, ast.Assign)
+                else ([node.target.id] if isinstance(node.target, ast.Name) else [])
+            )
+            if names and all(n not in have_names for n in names):
+                new_helpers.append(_node_text(src_lines, node))
+    if not (new_imports or new_helpers):
+        return out
+    tree = ast.parse(out)
+    out_lines = out.splitlines(keepends=True)
+    holder = next(
+        (
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+            and n.name == top
+        ),
+        None,
+    )
+    if new_helpers and holder is not None:  # later lines first, so earlier line numbers hold
+        at = min([holder.lineno, *(d.lineno for d in holder.decorator_list)]) - 1
+        out_lines[at:at] = ["".join(new_helpers) + "\n\n"]
+    if new_imports:
+        imports = [n for n in tree.body if isinstance(n, ast.Import | ast.ImportFrom)]
+        if imports:
+            at = imports[-1].end_lineno or imports[-1].lineno
+        else:
+            first = tree.body[0] if tree.body else None
+            has_doc = (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            )
+            at = (first.end_lineno or first.lineno) if has_doc and first is not None else 0
+        out_lines[at:at] = new_imports
+    return "".join(out_lines)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -923,7 +1005,13 @@ def merge_check(
     timeout: float = GRADER_TIMEOUT,
     log: Callable[[str], None] = print,
 ) -> dict[str, Any]:
-    """Merge the best trial per function into one tree and run the full suite once."""
+    """Merge the best trial per function into one tree and run the full suite once.
+
+    Only the target function plus the agent's new top-level imports / helpers / constants are
+    carried over (see :func:`splice_function`); a nested addition elsewhere is not.  The
+    visible-test command of each task is run with ``shell=True`` from the (operator-owned)
+    bundle cache, in the episode's repo: run this on your own runs only.
+    """
     full = cache / "bundles" / f"c0-{lib}"
     if not (full / "task.toml").is_file():
         raise AdapterError(f"{full} not built yet: run `build {lib}` first")

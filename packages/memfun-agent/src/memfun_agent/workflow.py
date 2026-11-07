@@ -800,24 +800,27 @@ class WorkflowEngine:
             )
             # A successful dispatch that changed nothing (or escalated with nowhere to go)
             # is retried once with a fresh sample before it becomes a failure.
-            for retry in range(1, SINGLE_TASK_NO_EDIT_RETRIES + 1):
-                data_ = result.result or {}
-                if not (
-                    result.success
-                    and (
-                        no_edit_reason("rlm-coder", data_, self._project_root)
-                        or data_.get("_escalate")
-                    )
-                ):
-                    break
-                logger.warning("single task made no file change; retry %d", retry)
-                from memfun_agent.context_first import set_attempt_salt
+            from memfun_agent.context_first import set_attempt_salt
 
-                set_attempt_salt(retry)  # a fresh sample, not DSPy's cached reply
-                result = await self._orchestrator.dispatch(
-                    dataclasses.replace(task_msg, task_id=f"{task_msg.task_id}_r{retry}"),
-                    "rlm-coder",
-                )
+            try:
+                for retry in range(1, SINGLE_TASK_NO_EDIT_RETRIES + 1):
+                    data_ = result.result or {}
+                    if not (
+                        result.success
+                        and (
+                            no_edit_reason("rlm-coder", data_, self._project_root)
+                            or data_.get("_escalate")
+                        )
+                    ):
+                        break
+                    logger.warning("single task made no file change; retry %d", retry)
+                    set_attempt_salt(retry)  # a fresh sample, not DSPy's cached reply
+                    result = await self._orchestrator.dispatch(
+                        dataclasses.replace(task_msg, task_id=f"{task_msg.task_id}_r{retry}"),
+                        "rlm-coder",
+                    )
+            finally:
+                set_attempt_salt(0)  # the salt is for the retry only, never left behind
 
         state.status = WorkflowStatus.COMPLETED
         state.completed_at = time.time()

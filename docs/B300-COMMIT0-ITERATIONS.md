@@ -90,12 +90,17 @@ load, idle time and the analysis between runs.
    emoji rules.
 8. **Best of 3 by visible tests = 5 of 6 functions** (21/21, 9/9, 13/13, 12/12, 22/22; `wcswidth`
    19/23), identically in each cycle, and still 5 of 6 pooled over all 54 episodes. Selection
-   cannot rescue `wcswidth`: its best trial in nine is 19/23.
+   cannot rescue `wcswidth`: its best trial in nine is 19/23. (Retries resample only at a
+   temperature above 0: DSPy ignores `rollout_id` at 0.)
 9. **Whole-library check** (`commit0_adapter.py merge-check wcwidth --run ...`): the best trial
    per function, ranked by visible tests, spliced into one stubbed wcwidth tree and run against
    the full suite: **33 of 37 pass**, for the best of each cycle and for the pooled best of nine.
    The only failures are the same 4 `wcswidth` emoji tests, so the pieces compose without
-   breaking one another.
+   breaking one another. The splice carries over the agent's new top-level imports, helpers and
+   constants as well as the function (an audit found the first version dropped them); nested
+   additions, such as a new method elsewhere in a class, are not carried over. `merge-check` runs
+   each task's visible-test command from the operator's bundle cache with a shell: use it on your
+   own runs only.
 
 ### Failure modes seen on this pod
 
