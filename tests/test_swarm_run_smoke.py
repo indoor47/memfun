@@ -1323,15 +1323,29 @@ def test_result_file_with_a_foreign_workflow_id_is_ignored(tmp_path: Path) -> No
 def test_signal_right_after_dashboard_spawn_still_stops_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """SIGTERM arrives the instant Popen returns (before register): no orphan."""
+    """SIGTERM arrives the instant Popen returns (before register): no orphan.
+
+    The signal is sent to the MAIN thread (``pthread_kill``), the thread whose mask the
+    deferral blocks.  ``os.kill(os.getpid(), ...)`` is process-directed: on Linux the
+    kernel may hand it to any thread that does not block SIGTERM (a leftover server
+    thread from an earlier test is enough), CPython then runs the Python-level handler
+    in the main thread at once and the test raced ``register()`` (issue #73).  A few idle
+    threads are started on purpose so that situation exists here too.
+    """
     state = tmp_path / "state"
     spawned: list[int] = []
     real_popen = subprocess.Popen
+    release = threading.Event()
+    idle = [threading.Thread(target=release.wait, daemon=True) for _ in range(4)]
+    for t in idle:
+        t.start()
 
     def popen_then_sigterm(*args: Any, **kwargs: Any) -> Any:
         proc = real_popen(*args, **kwargs)
         spawned.append(proc.pid)
-        os.kill(os.getpid(), signal.SIGTERM)  # handled at the next bytecode boundary
+        main = threading.main_thread().ident
+        assert main is not None
+        signal.pthread_kill(main, signal.SIGTERM)  # pending behind the main thread's mask
         return proc
 
     previous = rs._install_signals()  # pyright: ignore[reportPrivateUsage]
@@ -1348,6 +1362,7 @@ def test_signal_right_after_dashboard_spawn_still_stops_it(
         rs._restore_signals(previous)  # pyright: ignore[reportPrivateUsage]
         for dash in started:  # what run()'s finally does
             dash.stop()
+        release.set()
     assert spawned and started and started[0].lock_pid == spawned[0]
     assert _wait_dead(spawned[0])
 
