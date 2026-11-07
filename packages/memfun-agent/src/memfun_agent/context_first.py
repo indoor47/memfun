@@ -645,6 +645,22 @@ class ContextGatherer:
 #: Extra attempts when the solver's reply parses to no operations at all.
 UNPARSEABLE_RETRIES = 1
 
+# A retry must not be answered from DSPy's response cache (it would replay the same bad
+# reply byte for byte).  ``rollout_id`` is part of DSPy's cache key and only matters when
+# the temperature is non-zero.  The workflow bumps the salt before re-dispatching the task.
+_ATTEMPT_SALT = 0
+
+
+def set_attempt_salt(value: int) -> None:
+    """Set the process-wide retry salt (0 = first attempt, no rollout id)."""
+    global _ATTEMPT_SALT
+    _ATTEMPT_SALT = max(0, int(value))
+
+
+def _rollout_config(attempt: int) -> dict[str, Any]:
+    rollout_id = _ATTEMPT_SALT * 10 + (attempt - 1)
+    return {"rollout_id": rollout_id} if rollout_id else {}
+
 
 class SingleShotSolver(dspy.Module):
     """Solve a coding task in one LLM call given full context."""
@@ -665,10 +681,12 @@ class SingleShotSolver(dspy.Module):
         usually parses, and with no planner there is nothing to escalate to.
         """
         for attempt in range(1, UNPARSEABLE_RETRIES + 2):
+            cfg = _rollout_config(attempt)
             result = await asyncio.to_thread(
                 self.predictor,
                 query=query,
                 full_context=full_context,
+                **({"config": cfg} if cfg else {}),
             )
 
             reasoning = str(getattr(result, "reasoning", ""))

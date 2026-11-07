@@ -397,6 +397,7 @@ class WorkflowEngine:
         auto_push: bool = False,
         project_root: Path | None = None,
         decompose: bool = True,
+        single_task_solver: str = "context-first",
         gh_pr: bool = False,
         gh_pr_base: str = "main",
         gh_pr_merge_strategy: str = "squash",
@@ -407,6 +408,8 @@ class WorkflowEngine:
         self._decomposer = TaskDecomposer()
         # False: skip the LLM planner and run the whole task as one sub-task.
         self._decompose = decompose
+        # "context-first" (one-shot solver, default) or "rlm" (iterative agent loop).
+        self._single_task_solver = single_task_solver
         self._spec_store = SharedSpecStore(context.state_store)
         self._on_workflow_status = on_workflow_status
         self._on_sub_task_status = on_sub_task_status
@@ -777,6 +780,11 @@ class WorkflowEngine:
                 "query": task_description,
                 "context": project_context,
                 "conversation_history": history,
+                **(
+                    {"solver": "rlm"}
+                    if getattr(self, "_single_task_solver", "context-first") == "rlm"
+                    else {}
+                ),
             },
             correlation_id=state.workflow_id,
         )
@@ -803,6 +811,9 @@ class WorkflowEngine:
                 ):
                     break
                 logger.warning("single task made no file change; retry %d", retry)
+                from memfun_agent.context_first import set_attempt_salt
+
+                set_attempt_salt(retry)  # a fresh sample, not DSPy's cached reply
                 result = await self._orchestrator.dispatch(
                     dataclasses.replace(task_msg, task_id=f"{task_msg.task_id}_r{retry}"),
                     "rlm-coder",

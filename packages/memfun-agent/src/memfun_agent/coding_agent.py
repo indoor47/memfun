@@ -351,10 +351,15 @@ class RLMCodingAgent(BaseAgent):
         # Extract conversation history from payload
         history = payload.get("conversation_history")
 
+        # ``solver: "rlm"`` (payload, set by ``memfun swarm --single-task-solver rlm``) skips
+        # the one-shot context-first solver: the iterative RLM loop reads files, runs the
+        # tests and sees their output, which a single-shot fix call cannot.
+        use_rlm = payload.get("solver") == "rlm"
+
         # Try context-first approach (fewer LLM calls).
         # Web queries are handled via context-first's built-in
         # web search (planner plans searches, gatherer executes them).
-        if self._context_solver is not None:
+        if self._context_solver is not None and not use_rlm:
             try:
                 cf_result = await self._context_solver.asolve(
                     query=full_query,

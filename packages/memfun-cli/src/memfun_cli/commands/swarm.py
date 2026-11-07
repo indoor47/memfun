@@ -364,6 +364,7 @@ async def _run_swarm(
     auto_branch: str | None,
     gh_pr: bool | None,
     decompose: bool = True,
+    single_task_solver: str = "context-first",
 ) -> int:
     """Execute the swarm workflow.  Returns the desired exit code."""
     # Lazy imports — keep CLI startup cheap when other commands run.
@@ -540,6 +541,7 @@ async def _run_swarm(
         auto_push=effective_auto_push,
         project_root=project_root,
         decompose=decompose,
+        single_task_solver=single_task_solver,
         gh_pr=effective_gh_pr,
     )
     # Expose the per-instance pool cap so _execute_group can read it.
@@ -639,6 +641,13 @@ def swarm_command(
         help="Let the LLM planner split the spec into sub-tasks (default).  "
         "--no-decompose skips the planner and runs the whole spec as ONE coding task.",
     ),
+    single_task_solver: str = typer.Option(
+        "context-first",
+        "--single-task-solver",
+        help="How a single (undecomposed) task is solved: 'context-first' (one-shot solver "
+        "with a verify->fix loop, default) or 'rlm' (the iterative agent loop that sees "
+        "tool and test output).",
+    ),
     use_worktrees: bool = typer.Option(
         True,
         "--use-worktrees/--no-use-worktrees",
@@ -693,6 +702,10 @@ def swarm_command(
     isolation, rather than handled in one shot by the context-first
     solver.
     """
+    if single_task_solver not in ("context-first", "rlm"):
+        raise typer.BadParameter(
+            f"--single-task-solver must be 'context-first' or 'rlm', got {single_task_solver!r}"
+        )
     exit_code = asyncio.run(
         _run_swarm(
             spec,
@@ -705,6 +718,7 @@ def swarm_command(
             auto_branch=branch,
             gh_pr=gh_pr,
             decompose=decompose,
+            single_task_solver=single_task_solver,
         )
     )
     if exit_code != 0:

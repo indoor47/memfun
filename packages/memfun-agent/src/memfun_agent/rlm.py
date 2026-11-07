@@ -38,6 +38,8 @@ logger = get_logger("agent.rlm")
 # ── Constants ──────────────────────────────────────────────────
 
 _DEFAULT_MAX_ITERATIONS = 10
+#: Re-asks of ONE loop step whose reply could not be parsed, before the loop gives up.
+STEP_RETRIES = 2
 _DEFAULT_MAX_OUTPUT_CHARS = 0  # 0 = no limit (rely on history window)
 _PREVIEW_LENGTH = 500
 _MAX_HISTORY_CHARS = 120_000
@@ -571,13 +573,34 @@ class RLMModule(dspy.Module):
                         + code_history[-self.config.max_history_chars :]
                     )
 
-                # Ask LLM for next exploration step
-                prediction = await asyncio.to_thread(
-                    self.explorer,
-                    context_metadata=ctx_meta,
-                    query=query,
-                    code_history=code_history or "(no history yet)",
-                )
+                # Ask LLM for next exploration step.  A reply the adapter cannot parse
+                # (AdapterParseError) used to end the whole loop; retry the STEP with a
+                # fresh sample (rollout_id changes DSPy's cache key) up to STEP_RETRIES times.
+                prediction = None
+                for step_try in range(STEP_RETRIES + 1):
+                    try:
+                        prediction = await asyncio.to_thread(
+                            self.explorer,
+                            context_metadata=ctx_meta,
+                            query=query,
+                            code_history=code_history or "(no history yet)",
+                            **(
+                                {"config": {"rollout_id": 1000 * iteration + step_try}}
+                                if step_try
+                                else {}
+                            ),
+                        )
+                        break
+                    except Exception as step_exc:
+                        if step_try >= STEP_RETRIES:
+                            raise
+                        logger.warning(
+                            "RLM step %d: model reply unusable (%s); retry %d/%d",
+                            iteration,
+                            type(step_exc).__name__,
+                            step_try + 1,
+                            STEP_RETRIES,
+                        )
 
                 reasoning = getattr(prediction, "reasoning", "")
                 raw_code = getattr(prediction, "next_code", "")

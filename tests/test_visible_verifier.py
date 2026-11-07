@@ -139,6 +139,30 @@ def test_two_unparseable_replies_still_report_truncated_after_one_retry() -> Non
     assert len(calls) == 2 and out.truncated and not out.operations  # bounded: ONE retry
 
 
+def test_the_retry_asks_for_a_fresh_sample_not_the_cached_reply() -> None:
+    """The retry events replayed the same 1222-char reply: rollout_id changes DSPy's cache key."""
+    seen: list[dict[str, Any]] = []
+    solver = cf.SingleShotSolver.__new__(cf.SingleShotSolver)
+    replies = iter([BAD, GOOD])
+
+    def predictor(**kw: Any) -> Any:
+        seen.append(kw.get("config", {}))
+        return types.SimpleNamespace(reasoning="r", answer="a", operations=next(replies))
+
+    solver.predictor = predictor  # type: ignore[assignment]
+    cf.set_attempt_salt(0)
+    asyncio.run(solver.asolve("q", "ctx"))
+    assert seen == [{}, {"rollout_id": 1}]  # attempt 1 unchanged, the retry differs
+    seen.clear()
+    replies = iter([BAD, GOOD])
+    cf.set_attempt_salt(1)  # workflow-level retry: every attempt gets its own key
+    try:
+        asyncio.run(solver.asolve("q", "ctx"))
+    finally:
+        cf.set_attempt_salt(0)
+    assert seen == [{"rollout_id": 10}, {"rollout_id": 11}]
+
+
 def test_a_good_first_reply_is_not_retried() -> None:
     solver, calls = _solver_with([GOOD])
     assert asyncio.run(solver.asolve("q", "ctx")).operations
@@ -240,3 +264,82 @@ def test_runner_writes_the_episode_verify_file(tmp_path: Path) -> None:
         bundle, tmp_path / "repo2", tmp_path / "home2", "http://h/v1", "m", 1024
     )
     assert not (tmp_path / "repo2" / ".memfun" / "verify.json").exists()
+
+
+# ── --single-task-solver rlm (the iterative loop, which sees test output) ────
+
+
+def _agent(rlm_result: Any) -> Any:
+    from memfun_agent.coding_agent import RLMCodingAgent
+
+    agent = RLMCodingAgent.__new__(RLMCodingAgent)
+    agent._rlm = MagicMock()  # type: ignore[attr-defined]
+    agent._rlm.aforward = AsyncMock(return_value=rlm_result)
+    agent._context_solver = MagicMock()  # type: ignore[attr-defined]
+    agent._context_solver.asolve = AsyncMock(side_effect=AssertionError("context-first used"))
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_solver_rlm_skips_the_context_first_solver() -> None:
+    from memfun_agent.rlm import RLMResult
+
+    res = RLMResult(
+        answer="done",
+        iterations=7,
+        ops=[("edit", "a.py", "10"), ("cmd", "python -m pytest -q", 0)],
+        files_created=["a.py"],
+    )
+    agent = _agent(res)
+    out = await agent._handle_rlm(  # pyright: ignore[reportPrivateUsage]
+        "ask", "implement f", "ctx", {"solver": "rlm"}, category="task"
+    )
+    assert out["method"] == "rlm" and out["iterations"] == 7
+    assert [o["type"] for o in out["ops"]] == ["edit", "cmd"]
+    agent._context_solver.asolve.assert_not_called()  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_default_solver_is_still_context_first() -> None:
+    agent = _agent(MagicMock())
+    cf_result = MagicMock(success=True)
+    cf_result.to_result_dict.return_value = {"answer": "x", "method": "context_first"}
+    agent._context_solver.asolve = AsyncMock(return_value=cf_result)  # pyright: ignore[reportPrivateUsage]
+    out = await agent._handle_rlm(  # pyright: ignore[reportPrivateUsage]
+        "ask", "implement f", "ctx", {}, category="task"
+    )
+    assert out["method"] == "context_first"
+    agent._rlm.aforward.assert_not_called()  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_workflow_sends_the_solver_choice_in_the_task_payload() -> None:
+    for mode, expected in (("rlm", "rlm"), ("context-first", None)):
+        eng = _engine([_edit()])
+        eng._single_task_solver = mode  # type: ignore[attr-defined]
+        await eng._execute_single_task(  # pyright: ignore[reportPrivateUsage]
+            WorkflowState(workflow_id="wf"), "implement f", "", None, time.perf_counter()
+        )
+        sent = eng._orchestrator.dispatch.await_args.args[0]  # pyright: ignore[reportPrivateUsage]
+        assert sent.payload.get("solver") == expected
+
+
+def test_cli_and_runner_pass_the_solver_choice(tmp_path: Path) -> None:
+    from unittest.mock import patch
+
+    import typer
+    from memfun_cli.commands.swarm import swarm_command
+    from typer.testing import CliRunner
+
+    app = typer.Typer()
+    app.command("swarm")(swarm_command)
+    for extra, expected in (([], "context-first"), (["--single-task-solver", "rlm"], "rlm")):
+        with patch("memfun_cli.commands.swarm._run_swarm", new=AsyncMock(return_value=0)) as run:
+            result = CliRunner().invoke(app, ["do it", *extra])
+        assert result.exit_code == 0, result.output
+        assert run.call_args.kwargs["single_task_solver"] == expected
+    bad = CliRunner().invoke(app, ["do it", "--single-task-solver", "bogus"])
+    assert bad.exit_code != 0
+    assert "--single-task-solver" not in rs.swarm_cmd(["m"], "s", 1, 60)
+    cmd = rs.swarm_cmd(["m"], "s", 1, 60, decompose=False, single_task_solver="rlm")
+    assert cmd[-2:] == ["--single-task-solver", "rlm"] and "--no-decompose" in cmd
