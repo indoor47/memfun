@@ -38,6 +38,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -672,17 +673,63 @@ def function_task_id(name: str, rel: str, qualname: str, used: set[str]) -> str:
     return tid
 
 
-def func_task_spec(row_name: str, rel: str, qualname: str, tests: list[str]) -> str:
-    listed = ", ".join(f"`{t}`" for t in tests[:MAX_LISTED_TESTS])
-    more = f" (and {len(tests) - MAX_LISTED_TESTS} more)" if len(tests) > MAX_LISTED_TESTS else ""
+MAX_VERIFY_IDS = 40
+VERIFY_FIX_ATTEMPTS = 4
+
+
+def visible_test_command(repo: Path, relevant: list[str]) -> str | None:
+    """A pytest command running the task's relevant tests as they sit in the VISIBLE tree.
+
+    The ids in *relevant* are relative to the hidden-test copy (``test_core.py::test_x``);
+    in the episode repo the same files live under the library's own test directory.  The
+    agent may run these while it works (they are the tests it can already read); the
+    hidden grader copy is never involved.  ``None`` when a test file cannot be located.
+    """
+    ids: list[str] = []
+    files: list[str] = []
+    for tid in relevant:
+        fname, sep, rest = tid.partition("::")
+        hits = sorted(
+            (p for p in repo.rglob(PurePosixPath(fname).name) if p.is_file()),
+            key=lambda p: len(p.parts),
+        )
+        hits = [h for h in hits if h.relative_to(repo).as_posix().endswith(fname)]
+        if not hits:
+            return None
+        rel = hits[0].relative_to(repo).as_posix()
+        if rel not in files:
+            files.append(rel)
+        ids.append(f"{rel}{sep}{rest}")
+    targets = ids if len(ids) <= MAX_VERIFY_IDS else files
+    quoted = " ".join(shlex.quote(t) for t in targets)
+    return f"python -m pytest -q --tb=short -p no:cacheprovider {quoted}"
+
+
+def func_task_spec(
+    row_name: str, rel: str, qualname: str, tests: list[str], verify_cmd: str | None = None
+) -> str:
+    """The task text.  With *verify_cmd* it names the COMPLETE test command: listing only the
+    first few ids (sorted, so all from one file) hid the failing tests in another file."""
+    if verify_cmd:
+        run = (
+            "Run the tests that exercise this function with exactly this command, from the "
+            f"repository root, and keep working until ALL of them pass: `{verify_cmd}`."
+        )
+    else:
+        listed = ", ".join(f"`{t}`" for t in tests[:MAX_LISTED_TESTS])
+        more = (
+            f" (and {len(tests) - MAX_LISTED_TESTS} more)" if len(tests) > MAX_LISTED_TESTS else ""
+        )
+        run = (
+            f"The unit tests that exercise this function: {listed}{more}. Run them with "
+            "`python -m pytest <test file> -q -k <name>`; finish when they pass."
+        )
     return (
         f"Implement the function `{qualname}` in `{rel}` of the Python library `{row_name}`. "
         "Its body is currently `pass`; everything else in the library is already implemented, "
         f"so change ONLY `{rel}` and keep the function's name and signature. The docstring and "
         f"signature are in the file; the library's documentation is `{SPEC_NAME}` (search it, "
-        f"e.g. grep for `{qualname.split('.')[-1]}`; do not read it all). The unit tests that "
-        f"exercise this function: {listed}{more}. Run them with "
-        "`python -m pytest <test file> -q -k <name>`; finish when they pass. No network access."
+        f"e.g. grep for `{qualname.split('.')[-1]}`; do not read it all). {run} No network access."
     )
 
 
@@ -754,7 +801,14 @@ def split_lib(
             (dest / "hidden" / vb.DESELECT_FILE).write_text(
                 "\n".join(deselect) + ("\n" if deselect else ""), "utf-8"
             )
-            spec = func_task_spec(name, rel, span.qualname, relevant)
+            verify_cmd = visible_test_command(dest / "repo", relevant)
+            spec = func_task_spec(name, rel, span.qualname, relevant, verify_cmd)
+            verify_toml = (
+                f"\n[verify]\ncommands = [{json.dumps(verify_cmd)}]\n"
+                f"max_fix_attempts = {VERIFY_FIX_ATTEMPTS}\n"
+                if verify_cmd
+                else ""
+            )
             (dest / "task.toml").write_text(
                 f'id = "{tid}"\nkind = "control"\nspec = {json.dumps(spec)}\n\n'
                 f'[[units]]\nid = "fn"\nowns = [{json.dumps(rel)}]\n'
@@ -762,7 +816,7 @@ def split_lib(
                 f"[source]\nlibrary = {json.dumps(name)}\nfunction = {json.dumps(span.qualname)}\n"
                 f"file = {json.dumps(rel)}\ntests_kept = {len(relevant)}\n"
                 f"parent = {json.dumps(f'c0-{name}')}\n"
-                f"weak = {'true' if len(relevant) < WEAK_TESTS else 'false'}\n",
+                f"weak = {'true' if len(relevant) < WEAK_TESTS else 'false'}\n" + verify_toml,
                 "utf-8",
             )
             report = vb.validate_bundle(dest, timeout)
@@ -782,6 +836,248 @@ def split_lib(
             )
             log(f"[{tid}] {len(relevant)} tests, {span.end - span.start + 1} lines")
         return summaries
+
+
+# ── Whole-library check (``merge-check``) ────────────────────────────────────────
+#
+# Function tasks are independent (the rest of the library is the reference), so they say
+# nothing about whether the pieces work TOGETHER.  merge-check takes the best trial per
+# function from finished runs, splices those implementations into the stubbed library and
+# runs the library's complete test suite once.
+
+
+def _top_level_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
+def _node_text(lines: list[str], node: ast.stmt) -> str:
+    start = min([node.lineno, *(d.lineno for d in getattr(node, "decorator_list", []))])
+    seg = "".join(lines[start - 1 : node.end_lineno])
+    return seg if seg.endswith("\n") else seg + "\n"
+
+
+def splice_function(target_text: str, source_text: str, qualname: str) -> str:
+    """*target_text* with ``qualname`` replaced by its implementation from *source_text*.
+
+    The agent may also have added module-level imports, helpers or constants the function
+    needs.  Those top-level statements of *source_text* that *target_text* lacks (a new
+    ``import`` line, a new top-level function / class / assignment) are carried over too:
+    imports after the target's last import, the rest just before the code that holds the
+    function.  Nested additions (new methods in a class) are not carried over.
+    """
+    tgt = function_spans(target_text)[qualname]
+    src = function_spans(source_text)[qualname]
+    seg = source_text.splitlines(keepends=True)[src.start - 1 : src.end]
+    if seg and not seg[-1].endswith("\n"):
+        seg[-1] += "\n"
+    lines = target_text.splitlines(keepends=True)
+    out = "".join(lines[: tgt.start - 1] + seg + lines[tgt.end :])
+    try:
+        src_tree, tgt_tree = ast.parse(source_text), ast.parse(target_text)
+    except SyntaxError:
+        return out
+    have_names = _top_level_names(tgt_tree)
+    have_imports = {
+        ast.unparse(n) for n in tgt_tree.body if isinstance(n, ast.Import | ast.ImportFrom)
+    }
+    src_lines = source_text.splitlines(keepends=True)
+    top = qualname.split(".")[0]
+    new_imports: list[str] = []
+    new_helpers: list[str] = []
+    for node in src_tree.body:
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            if ast.unparse(node) not in have_imports:
+                new_imports.append(_node_text(src_lines, node))
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            if node.name not in have_names and node.name != top:
+                new_helpers.append(_node_text(src_lines, node))
+        elif isinstance(node, ast.Assign | ast.AnnAssign):
+            names = (
+                [t.id for t in node.targets if isinstance(t, ast.Name)]
+                if isinstance(node, ast.Assign)
+                else ([node.target.id] if isinstance(node.target, ast.Name) else [])
+            )
+            if names and all(n not in have_names for n in names):
+                new_helpers.append(_node_text(src_lines, node))
+    if not (new_imports or new_helpers):
+        return out
+    tree = ast.parse(out)
+    out_lines = out.splitlines(keepends=True)
+    holder = next(
+        (
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+            and n.name == top
+        ),
+        None,
+    )
+    if new_helpers and holder is not None:  # later lines first, so earlier line numbers hold
+        at = min([holder.lineno, *(d.lineno for d in holder.decorator_list)]) - 1
+        out_lines[at:at] = ["".join(new_helpers) + "\n\n"]
+    if new_imports:
+        imports = [n for n in tree.body if isinstance(n, ast.Import | ast.ImportFrom)]
+        if imports:
+            at = imports[-1].end_lineno or imports[-1].lineno
+        else:
+            first = tree.body[0] if tree.body else None
+            has_doc = (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            )
+            at = (first.end_lineno or first.lineno) if has_doc and first is not None else 0
+        out_lines[at:at] = new_imports
+    return "".join(out_lines)
+
+
+@dataclasses.dataclass(frozen=True)
+class Candidate:
+    run: str
+    trial: str
+    function: str
+    file: str
+    passed: int  # hidden-grader count of this episode (reported, never used to rank)
+    kept: int
+    repo: Path
+    visible: int = -1  # visible tests of the task passing on the final code (the ranking key)
+
+
+def visible_passed(verify_cmd: str | None, repo: Path) -> int:
+    """How many of the task's VISIBLE tests pass on the episode's final code (-1: unknown)."""
+    if not verify_cmd:
+        return -1
+    env = {**os.environ, "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}"}
+    try:
+        proc = subprocess.run(
+            verify_cmd, shell=True, cwd=repo, capture_output=True, text=True, timeout=300, env=env
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return -1
+    m = re.search(r"(\d+) passed", re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout + proc.stderr))
+    return int(m.group(1)) if m else 0
+
+
+def collect_candidates(cache: Path, runs: list[Path], lib: str) -> list[Candidate]:
+    """Every graded function-task episode of *lib* in the given run directories."""
+    out: list[Candidate] = []
+    for run in runs:
+        for ep_json in sorted(run.glob(f"{FUNC_PREFIX}-{lib}-*/*/episode.json")):
+            ep = json.loads(ep_json.read_text("utf-8"))
+            bundle = cache / "bundles" / str(ep.get("bundle"))
+            try:
+                task = tomllib.loads((bundle / "task.toml").read_text("utf-8"))
+                src = task["source"]
+            except (OSError, KeyError, tomllib.TOMLDecodeError):
+                continue
+            cmds = (task.get("verify") or {}).get("commands") or []
+            grade = ep.get("grade") or {}
+            repo = Path(str(ep.get("repo", "")))
+            if not repo.is_dir() or "hidden_passed" not in grade:
+                continue
+            out.append(
+                Candidate(
+                    run.name,
+                    str(ep.get("trial")),
+                    str(src["function"]),
+                    str(src["file"]),
+                    int(grade["hidden_passed"]),
+                    int(src["tests_kept"]),
+                    repo,
+                    visible_passed(cmds[0] if cmds else None, repo),
+                )
+            )
+    return out
+
+
+def merge_check(
+    lib: str,
+    cache: Path,
+    runs: list[Path],
+    timeout: float = GRADER_TIMEOUT,
+    log: Callable[[str], None] = print,
+) -> dict[str, Any]:
+    """Merge the best trial per function into one tree and run the full suite once.
+
+    Only the target function plus the agent's new top-level imports / helpers / constants are
+    carried over (see :func:`splice_function`); a nested addition elsewhere is not.  The
+    visible-test command of each task is run with ``shell=True`` from the (operator-owned)
+    bundle cache, in the episode's repo: run this on your own runs only.
+    """
+    full = cache / "bundles" / f"c0-{lib}"
+    if not (full / "task.toml").is_file():
+        raise AdapterError(f"{full} not built yet: run `build {lib}` first")
+    owned = [
+        str(p) for p in tomllib.loads((full / "task.toml").read_text("utf-8"))["units"][0]["owns"]
+    ]
+    cands = collect_candidates(cache, runs, lib)
+    if not cands:
+        raise AdapterError(f"no graded {FUNC_PREFIX}-{lib}-* episodes in {[str(r) for r in runs]}")
+    best: dict[tuple[str, str], Candidate] = {}
+
+    # Rank by the VISIBLE tests passing on the final code (what a real selector could see);
+    # fall back to the hidden count only for tasks without a visible-test command.  The first
+    # such trial wins a tie.
+    def rank(c: Candidate) -> int:
+        return c.visible if c.visible >= 0 else c.passed
+
+    for c in cands:
+        key = (c.file, c.function)
+        if key not in best or rank(c) > rank(best[key]):
+            best[key] = c
+    with tempfile.TemporaryDirectory(prefix=f"c0-merge-{lib}-") as tmp_s:
+        tmp = Path(tmp_s)
+        cand_dir = tmp / "candidate"
+        texts: dict[str, str] = {}
+        picks: list[dict[str, Any]] = []
+        for (rel, qual), c in sorted(best.items()):
+            base = texts.get(rel) or (full / "repo" / rel).read_text("utf-8")
+            agent_file = c.repo / rel
+            try:
+                texts[rel] = splice_function(base, agent_file.read_text("utf-8"), qual)
+            except (KeyError, OSError, SyntaxError) as exc:
+                picks.append({"function": qual, "error": f"could not splice: {exc}"})
+                texts[rel] = base
+                continue
+            picks.append(
+                {
+                    "function": qual,
+                    "file": rel,
+                    "from": f"{c.run}/t{c.trial}",
+                    "visible_passed": c.visible,
+                    "hidden_passed": c.passed,
+                    "kept": c.kept,
+                    "of_trials": sum(1 for x in cands if (x.file, x.function) == (rel, qual)),
+                }
+            )
+        for rel, text in texts.items():
+            (cand_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+            (cand_dir / rel).write_text(text, "utf-8")
+        tree = vb.graded_tree(full, owned, cand_dir, tmp / "tree")
+        res = vb.run_grader(tree, full / "hidden", tmp / "run", timeout)
+        failing = sorted(set(re.findall(r"FAILED [^\s]*?([\w./-]+\.py::\S+)", res.output_tail)))
+        summary = {
+            "library": lib,
+            "functions": picks,
+            "suite_passed": res.passed,
+            "suite_failed": res.failed,
+            "suite_total": res.passed + res.failed,
+            "returncode": res.returncode,
+            "failing_tests": failing,
+        }
+    log(
+        f"[{lib}] merged {len(picks)} functions; full suite: "
+        f"{res.passed}/{res.passed + res.failed} pass"
+    )
+    return summary
 
 
 def format_table(rows: list[dict[str, Any]]) -> str:
@@ -812,6 +1108,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="after building, also split each library into one bundle per stubbed function",
     )
+    mc = sub.add_parser(
+        "merge-check",
+        help="merge the best trial per function into one tree; run the full suite once",
+    )
+    mc.add_argument("lib")
+    mc.add_argument("--run", type=Path, action="append", required=True, help="a run dir (repeat)")
+    mc.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
+    mc.add_argument("--timeout", type=float, default=GRADER_TIMEOUT)
     sp = sub.add_parser("split", help="split built libraries into one bundle per stubbed function")
     sp.add_argument("libs", nargs="+")
     sp.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
@@ -835,6 +1139,16 @@ def _print_split(name: str, rows: list[dict[str, Any]]) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cache = args.cache.expanduser().resolve()
+    if args.cmd == "merge-check":
+        try:
+            out = merge_check(
+                args.lib, cache, [r.expanduser().resolve() for r in args.run], args.timeout
+            )
+        except (AdapterError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            print(f"[{args.lib}] MERGE-CHECK FAILED: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(out, indent=2))
+        return 0 if out["suite_failed"] == 0 and out["suite_passed"] else 2
     names = [n for lib in args.libs for n in (LITE if lib == "lite" else [lib])]
     if args.cmd == "split":
         failed = 0

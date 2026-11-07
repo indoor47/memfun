@@ -6,6 +6,7 @@ touches the network.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -497,3 +498,101 @@ def test_huge_deselect_lists_do_not_overflow_the_command_line(tmp_path: Path) ->
     # exact matching: `test_a` is dropped, `test_a_long` (same prefix) still runs
     assert res.returncode == 0 and (res.passed, res.failed) == (1, 0)
     assert res.by_file["test_x"]["passed"] == 1
+
+
+# ── whole-library check (merge-check) ────────────────────────────────────────
+
+
+def _fake_run(
+    tmp_path: Path, cache: Path, rows: list[dict[str, object]], trials: dict[str, str]
+) -> Path:
+    """Episodes for each function task. *trials* maps function -> 'good' | 'bad' | 'both'."""
+    import shutil
+
+    run = tmp_path / "run"
+    for r in rows:
+        bdir = cache / "bundles" / str(r["id"])
+        kinds = {"good": ["good"], "bad": ["bad"], "both": ["bad", "good"]}[
+            trials[str(r["function"])]
+        ]
+        for n, kind in enumerate(kinds, start=1):
+            ep = run / str(r["id"]) / str(n)
+            repo = ep / f"{r['id']}-t{n}"
+            shutil.copytree(bdir / "repo", repo)
+            if kind == "good":  # the reference file: the function (and every other) implemented
+                shutil.copy(bdir / "solution/minilib/__init__.py", repo / "minilib/__init__.py")
+            (ep / "episode.json").write_text(
+                json.dumps(
+                    {
+                        "bundle": r["id"],
+                        "trial": n,
+                        "repo": str(repo),
+                        "grade": {
+                            "hidden_passed": int(kind == "good"),
+                            "hidden_failed": int(kind != "good"),
+                        },
+                    }
+                )
+            )
+    return run
+
+
+def test_merge_check_merges_the_best_trial_per_function_and_runs_the_full_suite(
+    tmp_path: Path, fake_origin: tuple[Path, c0.Row]
+) -> None:
+    pytest.importorskip("coverage")
+    _build(tmp_path, fake_origin)
+    cache = tmp_path / "cache"
+    rows = c0.split_lib("minilib", cache, timeout=180, log=lambda _m: None)
+    run = _fake_run(tmp_path, cache, rows, {"add": "both", "sub": "both"})
+    out = c0.merge_check("minilib", cache, [run], timeout=180, log=lambda _m: None)
+    picks = {p["function"]: p for p in out["functions"]}
+    assert set(picks) == {"add", "sub"}
+    assert all(p["from"].endswith("/t2") and p["visible_passed"] == 1 for p in picks.values())
+    assert (out["suite_passed"], out["suite_failed"]) == (2, 0)  # the merged tree passes it all
+    assert out["failing_tests"] == []
+
+    # one function only has a wrong implementation: the whole-library suite shows it
+    shutil_run = _fake_run(tmp_path / "second", cache, rows, {"add": "good", "sub": "bad"})
+    out2 = c0.merge_check("minilib", cache, [shutil_run], timeout=180, log=lambda _m: None)
+    assert (out2["suite_passed"], out2["suite_failed"]) == (1, 1)
+    assert any("test_sub" in t for t in out2["failing_tests"])
+
+
+def test_splice_function_replaces_only_the_named_function() -> None:
+    ref = "def a():\n    return 1\n\ndef b():\n    return 2\n"
+    stub = "def a():\n    pass\n\ndef b():\n    pass\n"
+    assert c0.splice_function(stub, ref, "a") == "def a():\n    return 1\n\ndef b():\n    pass\n"
+    assert c0.splice_function(stub, ref, "b") == "def a():\n    pass\n\ndef b():\n    return 2\n"
+
+
+def test_splice_carries_over_new_imports_and_helpers_the_function_needs() -> None:
+    """Audit finding: only the function's lines were copied -> NameError at runtime."""
+    stub = '"""m."""\nimport os\n\nK = 1\n\n\ndef f(x):\n    pass\n\n\ndef g(x):\n    return x\n'
+    agent = (
+        '"""m."""\nimport os\nimport re\nfrom math import floor\n\nK = 1\n'
+        'PAT = re.compile("a+")\n\n\n'
+        "def _h(x):\n    return floor(x)\n\n\n"
+        "def f(x):\n    return _h(len(PAT.findall(str(x)))) + K\n\n\ndef g(x):\n    return x\n"
+    )
+    merged = c0.splice_function(stub, agent, "f")
+    ns: dict[str, object] = {}
+    exec(compile(merged, "m.py", "exec"), ns)
+    assert ns["f"]("aa a") == 3  # type: ignore[operator]  (uses re, PAT, floor and _h)
+    assert merged.count("import re") == 1 and merged.count("def g(") == 1
+    assert c0.function_spans(merged)["f"] and ast_ok(merged)
+    # nothing new in the agent's file: output equals the plain function splice
+    plain = "def f(x):\n    return 1\n"
+    assert c0.splice_function("def f(x):\n    pass\n", plain, "f") == plain
+
+
+def ast_ok(text: str) -> bool:
+    import ast
+
+    ast.parse(text)
+    return True
+
+
+def test_merge_check_needs_a_built_bundle_and_episodes(tmp_path: Path) -> None:
+    with pytest.raises(c0.AdapterError, match="build"):
+        c0.merge_check("minilib", tmp_path, [tmp_path], log=lambda _m: None)

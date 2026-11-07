@@ -79,6 +79,9 @@ DUMMY_KEY_VALUE = "dummy-not-a-secret"
 #: take the port the shared dashboard needs).  Episodes only reuse the one named by their
 #: ``.memfun/dashboard.lock``; the runner owns the single real dashboard.
 NO_DASHBOARD_ENV = "MEMFUN_NO_DASHBOARD_AUTOSTART"
+#: memfun_agent.context_first.TRUST_PROJECT_VERIFY_ENV: episodes may run the verify commands
+#: the runner wrote into their own ``.memfun/verify.json``.
+TRUST_PROJECT_VERIFY_ENV = "MEMFUN_TRUST_PROJECT_VERIFY"
 #: memfun_runtime.distributed.EVENT_TOPIC (kept literal so the runner is stdlib-only).
 EVENT_TOPIC = "memfun.distributed.events"
 VOID_THRESHOLD = 0.05
@@ -501,6 +504,7 @@ def child_env(
     env["COLUMNS"] = "160"
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env[NO_DASHBOARD_ENV] = "1"  # the token is never passed to episodes (not in ENV_ALLOW)
+    env[TRUST_PROJECT_VERIFY_ENV] = "1"  # the episode's own .memfun/verify.json (runner-written)
     if result_json is not None:
         env[SWARM_RESULT_ENV] = str(result_json)
     return env
@@ -915,6 +919,30 @@ def create_episode_repo(
     _git(["add", "-A"], repo, env)
     _git(["commit", "-q", "-m", f"smoke start tree: {bundle.id}"], repo, env)
     (repo / ".memfun").mkdir(exist_ok=True)
+    write_project_verify(bundle, repo)
+
+
+def write_project_verify(bundle: Bundle, repo: Path) -> None:
+    """Give the episode its own verification: ``[verify]`` of the bundle's task.toml.
+
+    Commit0 function tasks list their relevant VISIBLE tests there; the solver runs them
+    after its edit and feeds failures back (see ``context_first.read_project_verify``).
+    """
+    try:
+        task = tomllib.loads((bundle.path / "task.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return
+    verify = task.get("verify")
+    if not isinstance(verify, dict):
+        return
+    cmds = [c for c in verify.get("commands", []) if isinstance(c, str)]
+    if not cmds:
+        return
+    doc: dict[str, Any] = {"commands": cmds}
+    fixes = verify.get("max_fix_attempts")
+    if isinstance(fixes, int) and not isinstance(fixes, bool):
+        doc["max_fix_attempts"] = fixes
+    (repo / ".memfun" / "verify.json").write_text(json.dumps(doc), encoding="utf-8")
 
 
 def swarm_cmd(
@@ -923,6 +951,7 @@ def swarm_cmd(
     max_agents: int,
     task_timeout: int,
     decompose: bool = True,
+    single_task_solver: str = "context-first",
 ) -> list[str]:
     return [
         *memfun_cmd,
@@ -934,6 +963,11 @@ def swarm_cmd(
         str(task_timeout),
         "--no-push",
         *([] if decompose else ["--no-decompose"]),
+        *(
+            []
+            if single_task_solver == "context-first"
+            else ["--single-task-solver", single_task_solver]
+        ),
     ]
 
 
@@ -1468,6 +1502,7 @@ class RunContext:
     grader_timeout: float
     max_tokens: int
     decompose: bool = True
+    single_task_solver: str = "context-first"
     sampling: Sampling = dataclasses.field(default_factory=Sampling)
     constrained_json: bool = True
     dashboard: SharedDashboard | None = None
@@ -1599,7 +1634,12 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
             forwarder.start()
 
         cmd = swarm_cmd(
-            ctx.memfun_cmd, episode_spec(bundle), ctx.max_agents, ctx.task_timeout, ctx.decompose
+            ctx.memfun_cmd,
+            episode_spec(bundle),
+            ctx.max_agents,
+            ctx.task_timeout,
+            ctx.decompose,
+            ctx.single_task_solver,
         )
         result_json = plan.ep_dir / SWARM_RESULT_NAME  # must not exist yet: memfun uses O_EXCL
         proc = run_in_group(
@@ -2036,6 +2076,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "no for --suite commit0: each episode is one coding task)",
     )
     ap.add_argument(
+        "--single-task-solver",
+        choices=("context-first", "rlm"),
+        default="context-first",
+        help="how an undecomposed task is solved: the one-shot context-first solver (default) "
+        "or the iterative RLM agent loop that sees tool/test output",
+    )
+    ap.add_argument(
         "--progress-file",
         type=Path,
         default=None,
@@ -2233,7 +2280,12 @@ def dry_plan(args: argparse.Namespace, run_dir: Path, plans: list[EpisodePlan]) 
         spec = episode_spec(p.bundle)
         first = spec.strip().splitlines()[0][:60] if spec.strip() else ""
         cmd = swarm_cmd(
-            memfun_cmd, f"<spec: {first}...>", args.max_agents, args.task_timeout, args.decompose
+            memfun_cmd,
+            f"<spec: {first}...>",
+            args.max_agents,
+            args.task_timeout,
+            args.decompose,
+            args.single_task_solver,
         )
         problem = f"  !! {'; '.join(p.bundle.problems)}" if p.bundle.problems else ""
         out.append(f"  {p.name:<18} kind={p.bundle.kind:<8} units={len(p.bundle.units)}{problem}")
@@ -2351,6 +2403,7 @@ def run(args: argparse.Namespace) -> int:
             grader_timeout=args.grader_timeout,
             max_tokens=args.max_tokens,
             decompose=args.decompose,
+            single_task_solver=args.single_task_solver,
             sampling=Sampling(
                 temperature=args.temperature,
                 frequency_penalty=args.frequency_penalty,

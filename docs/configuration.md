@@ -301,6 +301,20 @@ cut off (`finish_reason=length`), so the truncation paths fail visibly, memfun l
 temperature 0.7, repetition penalty 1.05 and the guard on (`--temperature`,
 `--repetition-penalty`, `--frequency-penalty`, `--presence-penalty`, `--no-loop-guard`).
 
+### Project verify file (`.memfun/verify.json`)
+
+The single-task solver verifies its edit with a linter it auto-detects. A project can name its
+own checks, for example the unit tests of the function being implemented:
+
+```json
+{"commands": ["python -m pytest -q tests/test_core.py::test_x"], "max_fix_attempts": 4}
+```
+
+The commands run through a shell, so a repository must not be able to trigger them by itself:
+the file is read only when `MEMFUN_TRUST_PROJECT_VERIFY=1` is set in memfun's environment
+(`evals/swarm/run_smoke.py` sets it for its episodes, whose file it wrote itself). Failing
+output goes through the solver's verify-and-fix loop.
+
 ## Dashboard Environment Variables
 
 The live dashboard (`memfun dashboard`, or embedded in `memfun chat`) reads these at request time:
