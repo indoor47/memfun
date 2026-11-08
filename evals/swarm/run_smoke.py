@@ -560,6 +560,9 @@ class ProcOutcome:
     returncode: int | None
     timed_out: bool
     pid: int
+    #: The command wrote its result file but did not exit (``memfun swarm`` never exits
+    #: after printing its result): its group was killed ``done_grace`` seconds later.
+    reaped: bool = False
 
 
 def run_in_group(
@@ -572,6 +575,8 @@ def run_in_group(
     grace: float = 5.0,
     on_start: Callable[[int], object] | None = None,
     on_end: Callable[[int], object] | None = None,
+    done_path: Path | None = None,
+    done_grace: float = 20.0,
 ) -> ProcOutcome:
     """Run ``cmd`` in a NEW process group; at ``timeout`` kill only that group.
 
@@ -592,8 +597,27 @@ def run_in_group(
         if on_start is not None:
             on_start(proc.pid)
         timed_out = False
+        reaped = False
+        rc: int | None = None
+        deadline = time.monotonic() + timeout
+        done_at: float | None = None
         try:
-            rc: int | None = proc.wait(timeout=timeout)
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                try:
+                    rc = proc.wait(timeout=min(2.0, left))
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if done_path is not None:
+                    if done_at is None and _nonempty_file(done_path):
+                        done_at = time.monotonic()
+                    elif done_at is not None and time.monotonic() - done_at >= done_grace:
+                        reaped = True
+                        rc = 0
+                        break
         except subprocess.TimeoutExpired:
             timed_out = True
             rc = None
@@ -603,7 +627,15 @@ def run_in_group(
                 proc.wait(timeout=grace + 5)
             if on_end is not None:
                 on_end(proc.pid)
-    return ProcOutcome(returncode=rc, timed_out=timed_out, pid=proc.pid)
+    return ProcOutcome(returncode=rc, timed_out=timed_out, pid=proc.pid, reaped=reaped)
+
+
+def _nonempty_file(path: Path) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_size > 0
 
 
 # ── Events: read from the episode's event-bus DB, forward to the dashboard ─────────
@@ -851,6 +883,7 @@ def memfun_toml(
     max_tokens: int,
     sampling: Sampling | None = None,
     constrained_json: bool = True,
+    context_window: int = 0,
 ) -> str:
     sampling = sampling or Sampling()
     extra = ""
@@ -870,6 +903,7 @@ def memfun_toml(
         f"model = {json.dumps(model)}\n"
         f'api_key_env = "{DUMMY_KEY_ENV}"  # NAME of a dummy env var; the server needs no key\n'
         f"max_tokens = {int(max_tokens)}\n"
+        f"{f'context_window = {int(context_window)}{chr(10)}' if context_window else ''}"
         f"temperature = {sampling.temperature!r}\n"
         f"{extra}"
         f"constrained_json = {'true' if constrained_json else 'false'}\n"
@@ -900,6 +934,7 @@ def create_episode_repo(
     max_tokens: int,
     sampling: Sampling | None = None,
     constrained_json: bool = True,
+    context_window: int = 0,
 ) -> None:
     home.mkdir(parents=True, exist_ok=False)
     (home / ".gitconfig").write_text(
@@ -909,7 +944,8 @@ def create_episode_repo(
     )
     shutil.copytree(bundle.path / "repo", repo)
     (repo / "memfun.toml").write_text(
-        memfun_toml(base_url, model, max_tokens, sampling, constrained_json), "utf-8"
+        memfun_toml(base_url, model, max_tokens, sampling, constrained_json, context_window),
+        "utf-8",
     )
     (repo / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
     if not any((repo / name).exists() for name in PYTEST_CONFIG_FILES):
@@ -1678,6 +1714,7 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
                     ctx.max_tokens,
                     ctx.sampling,
                     ctx.constrained_json,
+                    ctx.context_window,
                 )
             except subprocess.CalledProcessError as exc:
                 err = (exc.stderr or b"").decode("utf-8", "replace")[-500:]
@@ -1735,7 +1772,11 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
             grace=ctx.kill_grace,
             on_start=lambda pgid: ctx.track(pgid, plan.name),
             on_end=ctx.untrack,
+            done_path=result_json,
         )
+        rec["reaped_after_result"] = proc.reaped
+        if proc.reaped:
+            rec["flags"].append("reaped_after_result")
         rec["returncode"] = proc.returncode
         rec["timed_out"] = proc.timed_out
         if forwarder is not None:
@@ -2214,7 +2255,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument(
         "--arm",
         choices=ALL_ARMS,
-        default="memfun",
+        default=None,
         help="which harness solves each episode (docs/HARNESS-BENCHMARK-2026-11.md): memfun "
         "(forced to --no-decompose, --max-agents 1) or one of the arms.py agents",
     )
@@ -2301,8 +2342,11 @@ def _apply_suite_defaults(args: argparse.Namespace) -> None:
         args.task_timeout = int(args.episode_timeout) if commit0 else 900
     if args.grader_timeout is None:
         args.grader_timeout = COMMIT0_GRADER_TIMEOUT if commit0 else 300.0
-    if args.arm == "memfun":
-        # The benchmark's memfun arm: one agent, no planner, verifier on (see steer-15).
+    if args.arm is None:
+        args.arm = "memfun"  # legacy runs: nothing forced
+    elif args.arm == "memfun":
+        # The benchmark's memfun arm (explicit --arm memfun): one agent, no planner,
+        # verifier on (steer-15).
         args.decompose = False
         args.max_agents = 1
     if args.decompose is None:

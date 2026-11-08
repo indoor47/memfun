@@ -232,3 +232,21 @@ def test_run_smoke_arm_cmd_is_identical_task_file(tmp_path: Path) -> None:
 def test_arm_crash_is_a_harness_error_not_a_partial() -> None:
     assert rs.classify(arm_crash="boom", any_output=False, hidden_passed=7)[0] == "harness_error"
     assert rs.classify(arm_crash="boom", any_output=True, hidden_passed=7)[0] == "partial"
+
+
+def test_run_in_group_reaps_a_command_that_wrote_its_result_but_never_exits(
+    tmp_path: Path,
+) -> None:
+    done = tmp_path / "result.json"
+    code = f"import pathlib,time; pathlib.Path({str(done)!r}).write_text('{{}}'); time.sleep(120)"
+    out = rs.run_in_group(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env=dict(os.environ),
+        log_path=tmp_path / "log",
+        timeout=60,
+        grace=1.0,
+        done_path=done,
+        done_grace=1.0,
+    )
+    assert out.reaped and not out.timed_out and out.returncode == 0
