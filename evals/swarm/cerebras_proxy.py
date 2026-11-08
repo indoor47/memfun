@@ -55,7 +55,7 @@ PRICE_IN, PRICE_OUT = 0.99, 1.49
 SAFETY = 0.8
 CHARS_PER_TOKEN = 3.2  # conservative for code (real is about 3.5 to 4)
 DEFAULT_KEY_FILE = Path.home() / ".config" / "cerebras" / "key"
-EPISODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+EPISODE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,79}$")
 MAX_BODY_BYTES = 12 * 1024 * 1024  # Cerebras' own limit is 10 MiB
 MAX_RETRIES = 10
 BACKOFF_BASE_S, BACKOFF_CAP_S = 2.0, 30.0
@@ -236,6 +236,15 @@ class Accounts:
         self.max_cost_usd = max_cost_usd
         self._lock = threading.Lock()
         self._eps: dict[str, EpisodeUsage] = {}
+        self._reserved = 0.0  # worst-case $ of requests in flight
+
+    def reserve(self, usd: float) -> None:
+        with self._lock:
+            self._reserved += usd
+
+    def release(self, usd: float) -> None:
+        with self._lock:
+            self._reserved = max(0.0, self._reserved - usd)
 
     def get(self, ep: str) -> EpisodeUsage:
         with self._lock:
@@ -259,7 +268,12 @@ class Accounts:
             return sum(cost_usd(u.prompt_tokens, u.completion_tokens) for u in self._eps.values())
 
     def over_cap(self) -> bool:
-        return self.max_cost_usd is not None and self.total_cost() >= self.max_cost_usd
+        """Spent plus the worst case of what is in flight has reached the cap."""
+        if self.max_cost_usd is None:
+            return False
+        with self._lock:
+            spent = sum(cost_usd(u.prompt_tokens, u.completion_tokens) for u in self._eps.values())
+            return spent + self._reserved >= self.max_cost_usd
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -399,6 +413,17 @@ class CerebrasProxy:
         h.wfile.write(data)
 
     def handle(self, h: http.server.BaseHTTPRequestHandler, method: str) -> None:
+        # Loopback only, and only for a request addressed to us as 127.0.0.1/localhost with a
+        # JSON body: a web page (DNS rebinding, text/plain form POST) cannot spend the quota.
+        port = self.server.server_address[1]
+        if (h.headers.get("host") or "").lower() not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            self._reply(h, 421, {"error": {"message": "bad Host header"}})
+            return
+        if method == "POST" and not (h.headers.get("content-type") or "").startswith(
+            "application/json"
+        ):
+            self._reply(h, 415, {"error": {"message": "content-type must be application/json"}})
+            return
         path = urllib.parse.urlsplit(h.path).path
         if method == "GET" and path.startswith("/_stats"):
             ep = path[len("/_stats") :].strip("/")
@@ -474,17 +499,14 @@ class CerebrasProxy:
                 return
             streaming = bool(doc.get("stream"))
             if self.reasoning_effort and "reasoning_effort" not in doc:
-                doc["reasoning_effort"] = (
-                    self.reasoning_effort
-                )  # default for requests that do not set it
+                doc["reasoning_effort"] = self.reasoning_effort  # default; never overrides
                 body = json.dumps(doc).encode()
         if self.accounts.over_cap():
             self.accounts.add(ep, spend_cap_refusals=1)
             msg = f"local spend cap reached (${self.accounts.max_cost_usd:.2f}); request refused"
             self._reply(h, 402, {"error": {"message": msg}})
             return
-        usage_acct = self.accounts.get(ep)
-        est_unc, est_tot = estimate_tokens(doc, len(body), usage_acct.cache_ratio)
+        est_unc, est_tot = estimate_tokens(doc, len(body), self.accounts.get(ep).cache_ratio)
         headers = {
             "Authorization": f"Bearer {self._key}",
             "Accept": "application/json",
@@ -497,134 +519,215 @@ class CerebrasProxy:
         last: tuple[int, bytes] | None = None
         for attempt in range(self.max_retries + 1):
             self._wait_pause()
-            res = self.limiter.acquire(est_unc, est_tot) if method == "POST" else None
-            conn = self._connect()
+            flight = (
+                Flight(self, ep, self.limiter.acquire(est_unc, est_tot), est_tot, len(body))
+                if method == "POST"
+                else None
+            )
+            try:
+                outcome = self._attempt(h, flight, method, path, body, headers, ep, streaming)
+            finally:
+                if flight is not None:
+                    flight.close()  # settles exactly once, whatever happened
+            if outcome is None:
+                return  # relayed (or the episode hung up): done
+            status, data, retry_after = outcome
+            last = (status, data)
+            if status == 429:
+                msg = ""
+                with contextlib.suppress(ValueError, AttributeError):
+                    msg = str((json.loads(data).get("error") or {}).get("message", ""))
+                self.limiter.penalize(_bucket_in(msg))
+                self.accounts.add(ep, retries_429=1)
+            else:
+                self.accounts.add(ep, retries_other=1)
+            if attempt >= self.max_retries:
+                break
+            if status == 429 or status in TRANSIENT:
+                self._pause(self._backoff(attempt, retry_after))
+            else:  # connection-level failure
+                self.sleep(self._backoff(attempt, None))
+        # retries exhausted: hand the provider's own error back (the runner never counts it as
+        # a model failure: see ``provider_stopped`` in run_smoke.classify)
+        self.accounts.add(ep, gave_up=1)
+        status, data = last if last is not None else (502, b"{}")
+        text = _redact(data.decode("utf-8", "replace"), self._key).encode()
+        with contextlib.suppress(OSError):
+            h.send_response(status)
+            h.send_header(GAVE_UP_HEADER, "1")
+            h.send_header("content-type", "application/json")
+            h.send_header("content-length", str(len(text)))
+            h.end_headers()
+            h.wfile.write(text)
+
+    def _attempt(
+        self,
+        h: http.server.BaseHTTPRequestHandler,
+        flight: Flight | None,
+        method: str,
+        path: str,
+        body: bytes,
+        headers: dict[str, str],
+        ep: str,
+        streaming: bool,
+    ) -> tuple[int, bytes, float | None] | None:
+        """One upstream try.  ``None`` = answered the episode; else ``(status, body, retry)``
+        of a retryable failure (connection errors are reported as status 0)."""
+        conn = self._connect()
+        try:
             try:
                 conn.request(
                     method, path, body=body if method == "POST" else None, headers=headers
                 )
+                if flight is not None:
+                    flight.started = True
                 resp = conn.getresponse()
             except (OSError, http.client.HTTPException):
-                conn.close()
-                if res is not None:
-                    self.limiter.settle(res, 0, 0)
-                if attempt >= self.max_retries:
-                    self.accounts.add(ep, gave_up=1)
-                    self._reply(
-                        h, 502, {"error": {"message": "upstream unreachable"}}, gave_up=True
-                    )
-                    return
-                self.accounts.add(ep, retries_other=1)
-                self.sleep(self._backoff(attempt, None))
-                continue
-            status = resp.status
-            if status == 429 or status in TRANSIENT:
-                data = resp.read()
-                retry_after = _retry_after(resp.msg)
-                conn.close()
-                if res is not None:
-                    self.limiter.settle(res, 0, 0)  # it never ran
-                last = (status, data)
-                if status == 429:
-                    msg = ""
-                    with contextlib.suppress(ValueError, AttributeError):
-                        msg = str((json.loads(data).get("error") or {}).get("message", ""))
-                    self.limiter.penalize(_bucket_in(msg))
-                    self.accounts.add(ep, retries_429=1)
-                else:
-                    self.accounts.add(ep, retries_other=1)
-                if attempt >= self.max_retries:
-                    break
-                wait = self._backoff(attempt, retry_after)
-                self._pause(wait)
-                continue
-            self._relay(h, resp, conn, ep, res, streaming)
-            return
-        # retries exhausted: hand the provider's own error back (the runner never counts it as
-        # a model failure: see ``provider_gave_up`` in run_smoke.classify)
-        self.accounts.add(ep, gave_up=1)
-        status, data = last if last is not None else (502, b"{}")
-        text = _redact(data.decode("utf-8", "replace"), self._key).encode()
-        h.send_response(status)
-        h.send_header(GAVE_UP_HEADER, "1")
-        h.send_header("content-type", "application/json")
-        h.send_header("content-length", str(len(text)))
-        h.end_headers()
-        h.wfile.write(text)
+                return (0, b"{}", None)
+            if resp.status == 429 or resp.status in TRANSIENT:
+                try:
+                    data = resp.read()
+                except (OSError, http.client.HTTPException):
+                    data = b"{}"
+                if flight is not None:
+                    flight.started = False  # a rejected request never ran
+                return (resp.status, data, _retry_after(resp.msg))
+            self._relay(h, resp, ep, flight, streaming)
+            return None
+        finally:
+            conn.close()
 
     def _relay(
         self,
         h: http.server.BaseHTTPRequestHandler,
         resp: http.client.HTTPResponse,
-        conn: http.client.HTTPConnection,
         ep: str,
-        res: Reservation | None,
+        flight: Flight | None,
         streaming: bool,
     ) -> None:
         ctype = resp.getheader("content-type") or "application/json"
-        got: tuple[int, int, int, int] | None = None
-        out_chars = 0
+        key = self._key.encode()
         try:
             if not streaming or "event-stream" not in ctype:
                 data = resp.read()
+                if flight is not None and resp.status < 400:
+                    flight.usage = _usage_in(data)  # BEFORE writing: a hang-up cannot lose it
+                    flight.settled_by_upstream = True
+                elif flight is not None:
+                    flight.started = False  # a 4xx/5xx body never ran the model
+                if flight is not None:
+                    flight.close()  # charge before the episode can see the answer
                 text = _redact(data.decode("utf-8", "replace"), self._key).encode()
                 h.send_response(resp.status)
                 h.send_header("content-type", ctype)
                 h.send_header("content-length", str(len(text)))
                 h.end_headers()
                 h.wfile.write(text)
-                try:
-                    got = usage_of(json.loads(data))
-                except ValueError:
-                    got = None
-            else:
-                h.send_response(resp.status)
-                h.send_header("content-type", ctype)
-                h.send_header("cache-control", "no-cache")
-                h.end_headers()
-                buf = b""
-                while True:
-                    chunk = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
-                    if not chunk:
-                        break
-                    h.wfile.write(chunk)
-                    h.wfile.flush()
+                return
+            h.send_response(resp.status)
+            h.send_header("content-type", ctype)
+            h.send_header("cache-control", "no-cache")
+            h.end_headers()
+            buf = b""
+            while True:
+                chunk = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
+                if not chunk:
+                    break
+                if flight is not None:
+                    # parse BEFORE writing: usage of a stream the episode abandons still counts
                     buf += chunk
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
-                        if line.startswith(b"data:") and b"[DONE]" not in line:
-                            try:
-                                evt = json.loads(line[5:])
-                            except ValueError:
-                                continue
-                            found = usage_of(evt)
-                            if found:
-                                got = found
-                            for choice in evt.get("choices") or []:
-                                delta = choice.get("delta") or {}
-                                for k in ("content", "reasoning", "reasoning_content"):
-                                    if isinstance(delta.get(k), str):
-                                        out_chars += len(delta[k])
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass  # the episode hung up (loop guard, timeout): still account what we saw
-        finally:
-            conn.close()
-        if res is None:
+                        flight.feed_sse_line(line)
+                    if resp.status >= 400:
+                        flight.started = False
+                h.wfile.write(chunk.replace(key, b"***") if key in chunk else chunk)
+                h.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError, http.client.HTTPException):
+            pass  # the episode hung up (loop guard, timeout): what we saw is still accounted
+
+
+def _usage_in(data: bytes) -> tuple[int, int, int, int] | None:
+    try:
+        return usage_of(json.loads(data))
+    except ValueError:
+        return None
+
+
+class Flight:
+    """One upstream attempt's claim on the limiter and the spend cap, settled exactly once."""
+
+    def __init__(
+        self,
+        proxy: CerebrasProxy,
+        ep: str,
+        res: Reservation,
+        est_tot: float,
+        body_len: int,
+    ) -> None:
+        self.proxy, self.ep, self.res = proxy, ep, res
+        self.est_in = int(body_len / CHARS_PER_TOKEN)
+        self.est_out_cap = max(0, int(est_tot - body_len / CHARS_PER_TOKEN))
+        self.cost_reserved = cost_usd(self.est_in, self.est_out_cap)
+        proxy.accounts.reserve(self.cost_reserved)
+        self.started = False  # the request reached the server (it may have been billed)
+        self.settled_by_upstream = False
+        self.usage: tuple[int, int, int, int] | None = None
+        self.out_chars = 0
+        self.streamed = False
+        self._closed = False
+
+    def feed_sse_line(self, line: bytes) -> None:
+        self.streamed = True
+        if not line.startswith(b"data:") or b"[DONE]" in line:
             return
-        if got is None:  # no usage block (a stream without include_usage, or an error body)
-            est_out = int(out_chars / CHARS_PER_TOKEN)
-            self.accounts.add(
-                ep, requests=1, completion_tokens=est_out, unmetered_streams=int(streaming)
+        try:
+            evt = json.loads(line[5:])
+            if not isinstance(evt, dict):
+                return
+            found = usage_of(evt)
+            if found:
+                self.usage = found
+            for choice in evt.get("choices") or []:
+                delta = choice.get("delta") if isinstance(choice, dict) else None
+                if not isinstance(delta, dict):
+                    continue
+                for k in ("content", "reasoning", "reasoning_content"):
+                    if isinstance(delta.get(k), str):
+                        self.out_chars += len(delta[k])
+        except (ValueError, AttributeError, TypeError):
+            return  # a malformed event must never break the relay or the accounting
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        acc, lim, res = self.proxy.accounts, self.proxy.limiter, self.res
+        acc.release(self.cost_reserved)
+        if not self.started:  # it never ran: the quota comes back
+            lim.settle(res, 0, 0)
+            return
+        if self.usage is None:  # ran, but no usage block seen: charge the estimate
+            est_out = int(self.out_chars / CHARS_PER_TOKEN)
+            acc.add(
+                self.ep,
+                requests=1,
+                prompt_tokens=self.est_in,
+                completion_tokens=est_out,
+                unmetered_streams=1,
             )
-            self.limiter.settle(res, res.uncached - 0, res.total - 0)  # keep the reservation
-            return
-        pt, ct, cached, reasoning = got
-        self.accounts.add(
-            ep, requests=1, prompt_tokens=pt, completion_tokens=ct, cached_tokens=cached,
+            return  # the reservation stays: the safe side for the limiter
+        pt, ct, cached, reasoning = self.usage
+        acc.add(
+            self.ep,
+            requests=1,
+            prompt_tokens=pt,
+            completion_tokens=ct,
+            cached_tokens=cached,
             reasoning_tokens=reasoning,
-        )  # fmt: skip
-        self.accounts.observe_cache(ep, pt, cached)
-        self.limiter.settle(res, max(0, pt - cached) + ct, pt + ct)
+        )
+        acc.observe_cache(self.ep, pt, cached)
+        lim.settle(res, max(0, pt - cached) + ct, pt + ct)
 
 
 # ── command line ─────────────────────────────────────────────────────────────

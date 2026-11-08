@@ -59,12 +59,14 @@ def test_each_episode_gets_its_own_proxy_path_and_sglang_keeps_the_base_url() ->
         proxy.stop()
 
 
-def test_provider_stop_is_a_harness_error_not_a_model_failure() -> None:
-    kw = {"hidden_passed": 0, "all_pass": False, "any_output": True}
-    out, reason = rs.classify(provider_stopped="provider gave up after retries", **kw)
+def test_provider_stop_is_a_harness_error_only_when_nothing_was_produced() -> None:
+    stop = "provider gave up after retries"
+    out, reason = rs.classify(provider_stopped=stop, any_output=False)
     assert out == "harness_error" and "provider" in reason
+    # output exists: graded on its merits, never excluded by a rate-limit blip
+    kw = {"hidden_passed": 0, "all_pass": False, "any_output": True}
+    assert rs.classify(provider_stopped=stop, **kw)[0] == "model_failure"
     assert rs.classify(**kw)[0] == "model_failure"
-    # a pass stays a pass even if some call hit a rate limit on the way
     assert rs.classify(provider_stopped="x", hidden_passed=3, all_pass=True)[0] == "pass"
 
 

@@ -1469,11 +1469,11 @@ def classify(
         return "harness_error", fatal
     if grade_error:
         return "harness_error", grade_error
-    if provider_stopped and not all_pass:
-        # A provider rate limit / outage / spend cap that outlasted the retries is never a
-        # model failure: the episode could not run, so it must not count against the model.
-        return "harness_error", provider_stopped
     if not any_output:
+        if provider_stopped:
+            # A provider rate limit / outage / spend cap that outlasted the retries is never a
+            # model failure: the episode could not run, so it must not count against the model.
+            return "harness_error", provider_stopped
         if timed_out:
             return "harness_error", f"episode timeout after {timeout_s:g}s with no output"
         if returncode not in (0, None) and not produced_result:
@@ -1892,6 +1892,8 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
             flags.append("swarm_crash")
         if server_errors:
             flags.append("server_errors")
+        if provider_stopped:
+            flags.append("provider_gave_up")
 
         grade_error = ""
         grade: dict[str, Any] | None = None

@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from evals.swarm import cerebras_proxy as cp  # noqa: E402
+from evals.swarm import run_smoke as rs  # noqa: E402
 
 SECRET = "csk-test-secret-value"
 USAGE = {
@@ -37,6 +38,8 @@ class Upstream:
         self.seen: list[dict[str, Any]] = []
         self.auth: list[str] = []
         self.agents: list[str] = []
+        self.stream_lines: list[bytes] | None = None  # raw SSE lines instead of the default
+        self.fail_status = 0  # answer every POST with this status (a non-retryable 4xx)
         up = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -62,6 +65,9 @@ class Upstream:
                 up.seen.append(body)
                 up.auth.append(self.headers.get("authorization", ""))
                 up.agents.append(self.headers.get("user-agent", ""))
+                if up.fail_status:
+                    self._send(up.fail_status, {"error": {"message": "bad request"}})
+                    return
                 if up.script:
                     status, headers = up.script.pop(0)
                     msg = "Too many tokens: uncached tokens per minute" if status == 429 else "x"
@@ -72,6 +78,10 @@ class Upstream:
                     self.send_response(200)
                     self.send_header("content-type", "text/event-stream")
                     self.end_headers()
+                    if up.stream_lines is not None:
+                        for raw in up.stream_lines:
+                            self.wfile.write(raw + b"\n\n")
+                        return
                     for delta in ({"reasoning": "think"}, {"content": "42"}):
                         chunk = {"choices": [{"index": 0, "delta": delta}]}
                         self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
@@ -275,5 +285,133 @@ def test_proxy_sends_its_own_user_agent_cloudflare_blocks_the_default(upstream: 
     try:
         _post(base, "ep1")
         assert upstream.agents == [cp.USER_AGENT] and "Python" not in cp.USER_AGENT
+    finally:
+        proxy.stop()
+
+
+def _stream(base: str, ep: str, max_tokens: int = 50) -> str:
+    body = {"model": "m", "messages": [], "stream": True, "max_tokens": max_tokens}
+    req = urllib.request.Request(
+        f"{base}/e/{ep}/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"content-type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read().decode()
+
+
+def test_the_runners_preflight_works_through_the_proxy(upstream: Upstream) -> None:
+    # the live run died here once: "_preflight" was rejected as an episode id (HTTP 400)
+    proxy = _proxy(upstream)
+    base = proxy.start()
+    try:
+        model, fatal = rs.preflight(f"{base}/e/_preflight/v1", None)
+        assert (model, fatal) == ("qwen-3.8-27b", "")
+    finally:
+        proxy.stop()
+
+
+def test_a_malformed_stream_event_neither_breaks_the_relay_nor_leaks_the_reservation(
+    upstream: Upstream,
+) -> None:
+    upstream.stream_lines = [
+        b"data: [1, 2]",
+        b'data: {"choices": [1, {"delta": 5}]}',
+        b"data: not json",
+        b'data: {"choices": [{"delta": {"content": "42"}}]}',
+        b"data: [DONE]",
+    ]
+    proxy = _proxy(upstream)
+    base = proxy.start()
+    try:
+        before = proxy.limiter.state()["uncached_available"]
+        text = _stream(base, "m1")
+        assert "42" in text and "[DONE]" in text
+        snap = proxy.accounts.get("m1")
+        assert snap.requests == 1 and snap.unmetered_streams == 1 and snap.prompt_tokens > 0
+        assert proxy.accounts.over_cap() is False
+        assert proxy.accounts._reserved == 0  # pyright: ignore[reportPrivateUsage]
+        # no usage block seen: the reservation is deliberately kept (safe side), not leaked twice
+        assert proxy.limiter.state()["uncached_available"] <= before
+    finally:
+        proxy.stop()
+
+
+def test_a_4xx_from_upstream_gives_the_quota_back_and_costs_nothing(upstream: Upstream) -> None:
+    upstream.fail_status = 400
+    proxy = _proxy(upstream)
+    base = proxy.start()
+    try:
+        before = proxy.limiter.state()["uncached_available"]
+        assert _post(base, "bad")[0] == 400
+        assert proxy.limiter.state()["uncached_available"] >= before - 5  # refilled, not held
+        snap = proxy.accounts.get("bad")
+        assert snap.requests == 0 and snap.prompt_tokens == 0
+    finally:
+        proxy.stop()
+
+
+def test_in_flight_worst_case_counts_against_the_cap(upstream: Upstream) -> None:
+    proxy = _proxy(upstream, max_cost_usd=0.10)
+    base = proxy.start()
+    try:
+        proxy.accounts.reserve(0.10)  # what a big request in flight holds
+        status, doc, _ = _post(base, "c")
+        assert status == 402 and "spend cap" in doc["error"]["message"]
+        proxy.accounts.release(0.10)
+        assert _post(base, "c")[0] == 200
+        assert proxy.accounts._reserved == 0  # pyright: ignore[reportPrivateUsage]
+    finally:
+        proxy.stop()
+
+
+def test_a_client_that_hangs_up_before_reading_still_gets_charged(upstream: Upstream) -> None:
+    import socket
+
+    proxy = _proxy(upstream)
+    base = proxy.start()
+    try:
+        port = int(base.rsplit(":", 1)[1])
+        body = json.dumps({"model": "m", "messages": [], "max_tokens": 50}).encode()
+        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        sock.sendall(
+            b"POST /e/hang/v1/chat/completions HTTP/1.0\r\nHost: 127.0.0.1:%d\r\n"
+            b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n"
+            % (port, len(body))
+            + body
+        )
+        sock.close()  # gone before the answer
+        for _ in range(100):
+            if proxy.accounts.get("hang").requests:
+                break
+            import time
+
+            time.sleep(0.05)
+        snap = proxy.accounts.get("hang")
+        assert snap.requests == 1 and snap.prompt_tokens == 1000  # usage parsed before writing
+    finally:
+        proxy.stop()
+
+
+def test_wrong_host_header_and_form_posts_are_refused(upstream: Upstream) -> None:
+    import http.client
+
+    proxy = _proxy(upstream)
+    base = proxy.start()
+    try:
+        port = int(base.rsplit(":", 1)[1])
+        for host, ctype, want in (
+            ("evil.example", "application/json", 421),  # DNS rebinding
+            (f"127.0.0.1:{port}", "text/plain", 415),  # cross-site form POST
+        ):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.putrequest("POST", "/e/x/v1/chat/completions", skip_host=True)
+            conn.putheader("Host", host)
+            conn.putheader("Content-Type", ctype)
+            conn.putheader("Content-Length", "2")
+            conn.endheaders(b"{}")
+            assert conn.getresponse().status == want
+            conn.close()
+        assert upstream.seen == []
     finally:
         proxy.stop()
