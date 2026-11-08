@@ -141,7 +141,10 @@ def _chunk_text(chunk: Any) -> str:
     try:
         delta = chunk.choices[0].delta
         text = getattr(delta, "content", None) or ""
-        reasoning = getattr(delta, "reasoning_content", None) or ""
+        # SGLang names the field ``reasoning_content``, Cerebras ``reasoning``.
+        reasoning = (
+            getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None) or ""
+        )
         return f"{reasoning}{text}"
     except (AttributeError, IndexError, TypeError):
         return ""

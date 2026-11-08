@@ -154,6 +154,9 @@ class LLMConfig:
     # streaming on DSPy's LiteLLM engine and disables DSPy's response cache for it.  Off by
     # default; the B300 runner turns it on.
     loop_guard: bool = False
+    # Reasoning effort for OpenAI-compatible servers that take ``reasoning_effort``
+    # (Cerebras: none = thinking off, low/medium/high).  None sends nothing.
+    reasoning_effort: str | None = None
     # Grammar-constrained decoding (structured outputs) for the decomposer's
     # plan and the auditor's findings.  Only effective for provider
     # openai/openai-compat with a base_url (SGLang / vLLM style servers);
@@ -171,6 +174,16 @@ class LLMConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.loop_guard, bool):
             raise ConfigError(f"[llm] loop_guard must be true or false, got {self.loop_guard!r}")
+        if self.reasoning_effort is not None and self.reasoning_effort not in (
+            "none",
+            "low",
+            "medium",
+            "high",
+        ):
+            raise ConfigError(
+                "[llm] reasoning_effort must be none, low, medium or high, "
+                f"got {self.reasoning_effort!r}"
+            )
         for name in ("frequency_penalty", "presence_penalty"):
             val = getattr(self, name)
             if isinstance(val, bool) or not isinstance(val, int | float) or not -2 <= val <= 2:
