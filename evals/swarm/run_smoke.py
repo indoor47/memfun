@@ -53,7 +53,7 @@ _REPO_ROOT = HERE.parents[1]
 if str(_REPO_ROOT) not in sys.path:  # also runnable as a plain script
     sys.path.insert(0, str(_REPO_ROOT))
 
-from evals.swarm import validate_bundles as vb  # noqa: E402
+from evals.swarm import arms, validate_bundles as vb  # noqa: E402, I001
 
 SCHEMA_VERSION = 1
 SMOKE_ROOT = HERE / "smoke"
@@ -971,6 +971,59 @@ def swarm_cmd(
     ]
 
 
+ARMS_SCRIPT = Path(__file__).resolve().with_name("arms.py")
+#: Every harness arm of the benchmark: memfun itself plus the ``arms.py`` agents.
+ALL_ARMS = ("memfun", *arms.ARMS)
+
+
+def arm_cmd(
+    arm: str,
+    spec_file: Path,
+    base_url: str,
+    model: str,
+    owned: Iterable[str],
+    *,
+    sampling: Sampling,
+    max_tokens: int,
+    timeout: float,
+    bin_: str = "",
+    edit_format: str = "diff",
+    anthropic_base_url: str = "",
+    context_window: int = 262144,
+) -> list[str]:
+    """The command running a non-memfun *arm* in the episode repo (same task text for all)."""
+    cmd = [
+        sys.executable,
+        str(ARMS_SCRIPT),
+        arm,
+        "--spec-file",
+        str(spec_file),
+        "--base-url",
+        base_url,
+        "--model",
+        model,
+        "--temperature",
+        repr(sampling.temperature),
+        "--max-tokens",
+        str(max_tokens),
+        "--timeout",
+        repr(float(timeout)),
+        "--edit-format",
+        edit_format,
+        "--context-window",
+        str(context_window),
+    ]
+    if sampling.repetition_penalty is not None:
+        cmd += ["--repetition-penalty", repr(sampling.repetition_penalty)]
+    if bin_:
+        cmd += ["--bin", bin_]
+    if anthropic_base_url:
+        cmd += ["--anthropic-base-url", anthropic_base_url]
+    for rel in owned:
+        cmd += ["--owned", rel]
+    return cmd
+
+
 # ── Owned-file collection (symlink-safe) ─────────────────────────────────────────
 
 _SKIP_PARTS = {".git", ".memfun", "__pycache__", ".pytest_cache", ".ruff_cache"}
@@ -1361,6 +1414,7 @@ def classify(
     truncated_failure: bool = False,
     no_edits: bool = False,
     context_length_exceeded: bool = False,
+    arm_crash: str = "",
 ) -> tuple[str, str]:
     """One of OUTCOMES plus a reason.  Same rules for passing and failing episodes.
 
@@ -1381,6 +1435,8 @@ def classify(
             return "harness_error", f"memfun swarm exited {returncode} without a result"
         if server_errors:
             return "harness_error", f"model server errors ({server_errors}) and no output"
+    if arm_crash and not any_output:  # the benchmark arm's own harness died: not the model's score
+        return "harness_error", f"arm harness crashed ({arm_crash})"
     if context_length_exceeded:  # its own class: the prompt did not fit the model's window
         return "model_failure", "context_length_exceeded"
     if no_edits:  # fail closed: the swarm changed no file, whatever else it reported
@@ -1506,6 +1562,12 @@ class RunContext:
     max_tokens: int
     decompose: bool = True
     single_task_solver: str = "context-first"
+    #: Which harness solves the episode: ``memfun`` (``memfun swarm``) or an ``arms.py`` arm.
+    arm: str = "memfun"
+    arm_bin: str = ""
+    aider_edit_format: str = "diff"
+    anthropic_base_url: str = ""
+    context_window: int = 262144
     sampling: Sampling = dataclasses.field(default_factory=Sampling)
     constrained_json: bool = True
     dashboard: SharedDashboard | None = None
@@ -1636,14 +1698,33 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
             forwarder = EventForwarder(plan.repo / ".memfun" / "memfun.db", ctx.dashboard.port)
             forwarder.start()
 
-        cmd = swarm_cmd(
-            ctx.memfun_cmd,
-            episode_spec(bundle),
-            ctx.max_agents,
-            ctx.task_timeout,
-            ctx.decompose,
-            ctx.single_task_solver,
-        )
+        if ctx.arm == "memfun":
+            cmd = swarm_cmd(
+                ctx.memfun_cmd,
+                episode_spec(bundle),
+                ctx.max_agents,
+                ctx.task_timeout,
+                ctx.decompose,
+                ctx.single_task_solver,
+            )
+        else:
+            spec_file = plan.ep_dir / "task.txt"  # byte-identical task text for every arm
+            spec_file.write_text(episode_spec(bundle), encoding="utf-8")
+            cmd = arm_cmd(
+                ctx.arm,
+                spec_file,
+                ctx.base_url,
+                ctx.model,
+                bundle.owned,
+                sampling=ctx.sampling,
+                max_tokens=ctx.max_tokens,
+                timeout=ctx.episode_timeout,
+                bin_=ctx.arm_bin,
+                edit_format=ctx.aider_edit_format,
+                anthropic_base_url=ctx.anthropic_base_url,
+                context_window=ctx.context_window,
+            )
+        rec["arm"] = ctx.arm
         result_json = plan.ep_dir / SWARM_RESULT_NAME  # must not exist yet: memfun uses O_EXCL
         proc = run_in_group(
             cmd,
@@ -1713,6 +1794,12 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
         rec["context_length_exceeded"] = bool(
             swarm_doc and swarm_doc.get("context_length_exceeded")
         )
+        if ctx.arm != "memfun" and swarm_doc:
+            rec["arm_failure_class"] = swarm_doc.get("failure_class") or ""
+            rec["harness_usage"] = swarm_doc.get("usage") or {}
+            rec["arm_settings"] = swarm_doc.get("settings") or {}
+            if swarm_doc.get("error"):
+                rec["warnings"].append(f"arm: {swarm_doc['error']}")
         if rec["context_length_exceeded"]:
             rec["flags"].append("context_length_exceeded")
 
@@ -1790,6 +1877,9 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
             ),
             no_edits=rec["no_edits"],
             context_length_exceeded=rec["context_length_exceeded"],
+            arm_crash=(rec.get("warnings") or [""])[-1][:200]
+            if rec.get("arm_failure_class") == "harness_crash"
+            else "",
         )
         rec.update(outcome=outcome, reason=reason, metrics=metrics)
         return rec
@@ -1819,6 +1909,15 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
 
 
 # ── Aggregation and summary ──────────────────────────────────────────────────────
+
+
+def _count_by(eps: list[dict[str, Any]], key: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for e in eps:
+        v = e.get(key)
+        if v:
+            out[str(v)] = out.get(str(v), 0) + 1
+    return out
 
 
 def _rate(num: int, den: int) -> float | None:
@@ -1884,6 +1983,11 @@ def aggregate(episodes: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str,
             "stalled_stops": sum(e.get("stalled_stops", 0) for e in eps),
             "no_edit_episodes": sum(1 for e in eps if e.get("no_edits")),
             "context_length_episodes": sum(1 for e in eps if e.get("context_length_exceeded")),
+            "arm_failure_classes": _count_by(eps, "arm_failure_class"),
+            "harness_usage": {
+                k: sum(int((e.get("harness_usage") or {}).get(k) or 0) for e in eps)
+                for k in ("prompt_tokens", "completion_tokens", "calls")
+            },
             "flags": sorted({f for e in eps for f in e.get("flags", [])}),
             "tool_usage": _tool_block(eps),
         }
@@ -2107,6 +2211,21 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "failure-mode counts, outcome) as the episodes finish",
     )
     ap.add_argument("--memfun-cmd", default="memfun", help="memfun executable (shell-split)")
+    ap.add_argument(
+        "--arm",
+        choices=ALL_ARMS,
+        default="memfun",
+        help="which harness solves each episode (docs/HARNESS-BENCHMARK-2026-11.md): memfun "
+        "(forced to --no-decompose, --max-agents 1) or one of the arms.py agents",
+    )
+    ap.add_argument("--arm-bin", default="", help="the arm's executable (mini / aider / claude)")
+    ap.add_argument("--aider-edit-format", choices=("whole", "diff"), default="diff")
+    ap.add_argument(
+        "--anthropic-base-url", default="", help="claude-code arm: an Anthropic /v1/messages URL"
+    )
+    ap.add_argument(
+        "--context-window", type=int, default=262144, help="served model's window (aider metadata)"
+    )
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--run-id", default="")
     ap.add_argument("--dashboard-port", type=int, default=8081)
@@ -2182,6 +2301,10 @@ def _apply_suite_defaults(args: argparse.Namespace) -> None:
         args.task_timeout = int(args.episode_timeout) if commit0 else 900
     if args.grader_timeout is None:
         args.grader_timeout = COMMIT0_GRADER_TIMEOUT if commit0 else 300.0
+    if args.arm == "memfun":
+        # The benchmark's memfun arm: one agent, no planner, verifier on (see steer-15).
+        args.decompose = False
+        args.max_agents = 1
     if args.decompose is None:
         # Commit0 knows what to build: no LLM planner (its read-only "analysis" sub-tasks
         # burned the whole first runs); the smoke bundles keep the planner they exercise.
@@ -2297,14 +2420,35 @@ def dry_plan(args: argparse.Namespace, run_dir: Path, plans: list[EpisodePlan]) 
     for p in plans:
         spec = episode_spec(p.bundle)
         first = spec.strip().splitlines()[0][:60] if spec.strip() else ""
-        cmd = swarm_cmd(
-            memfun_cmd,
-            f"<spec: {first}...>",
-            args.max_agents,
-            args.task_timeout,
-            args.decompose,
-            args.single_task_solver,
-        )
+        if args.arm == "memfun":
+            cmd = swarm_cmd(
+                memfun_cmd,
+                f"<spec: {first}...>",
+                args.max_agents,
+                args.task_timeout,
+                args.decompose,
+                args.single_task_solver,
+            )
+        else:
+            cmd = arm_cmd(
+                args.arm,
+                p.ep_dir / "task.txt",
+                args.base_url,
+                args.model or "<served model>",
+                p.bundle.owned,
+                sampling=Sampling(
+                    temperature=args.temperature,
+                    repetition_penalty=None
+                    if args.repetition_penalty == 1.0
+                    else args.repetition_penalty,
+                ),
+                max_tokens=args.max_tokens,
+                timeout=args.episode_timeout,
+                bin_=args.arm_bin,
+                edit_format=args.aider_edit_format,
+                anthropic_base_url=args.anthropic_base_url,
+                context_window=args.context_window,
+            )
         problem = f"  !! {'; '.join(p.bundle.problems)}" if p.bundle.problems else ""
         out.append(f"  {p.name:<18} kind={p.bundle.kind:<8} units={len(p.bundle.units)}{problem}")
         out.append(f"      repo : {p.repo}")
@@ -2370,6 +2514,14 @@ def run(args: argparse.Namespace) -> int:
             "base_url": args.base_url,
             "model": model,
             "memfun_cmd": memfun_cmd,
+            "arm": args.arm,
+            "arm_bin": args.arm_bin,
+            "aider_edit_format": args.aider_edit_format if args.arm == "aider" else None,
+            "sampling": {
+                "temperature": args.temperature,
+                "repetition_penalty": args.repetition_penalty,
+                "max_tokens": args.max_tokens,
+            },
             "bundles": args.bundles,
             "trials": args.trials,
             "max_agents": args.max_agents,
@@ -2422,6 +2574,11 @@ def run(args: argparse.Namespace) -> int:
             max_tokens=args.max_tokens,
             decompose=args.decompose,
             single_task_solver=args.single_task_solver,
+            arm=args.arm,
+            arm_bin=args.arm_bin,
+            aider_edit_format=args.aider_edit_format,
+            anthropic_base_url=args.anthropic_base_url,
+            context_window=args.context_window,
             sampling=Sampling(
                 temperature=args.temperature,
                 frequency_penalty=args.frequency_penalty,
