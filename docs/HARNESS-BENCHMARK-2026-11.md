@@ -8,9 +8,8 @@ Run on 2026-11-08 (UTC; evening in CET). The same model served by SGLang on one 
 On 15 function-level tasks (3 trials each, 45 episodes per arm) **mini-swe-agent solved the most (40 of 45
 episodes, 89%)**, memfun was close behind (38, 84%), then aider (32, 71%) and a plain single call (26, 58%).
 memfun matched mini-swe-agent's pass rate at about **one fourteenth of its input tokens and a third of its wall
-time**, but it did not beat it. memfun lost on `methodkey` and `mru_cache` and on `list_versions` (2/3), where
-mini-swe-agent was at 0/3 only for `methodkey`; everywhere else memfun was equal or better than aider and the
-single call. No arm solved `wcswidth` except mini-swe-agent (3/3), the one function the other three never got.
+time**, but it did not beat it. memfun trailed it on `wcswidth` (0/3 vs 3/3), `list_versions`, `mru_cache` and `wcwidth` (the last
+two by one trial) and beat it on `methodkey` (2/3 vs 0/3). No arm but mini-swe-agent solved `wcswidth`.
 
 ## Setup
 
@@ -50,8 +49,7 @@ Arms and their exact setup:
 
 Notes: token numbers are the harnesses' own counts (single-shot, aider, mini) or the server counters (memfun);
 aider's are rounded from its log lines. The pod cost is wall time times the pod's hourly rate, so it ignores grading
-and idle time; the arms ran one after another. memfun's hidden-test denominator is 717 rather than 723 because one
-episode's grade did not count 6 tests (see caveats).
+and idle time; the arms ran one after another. memfun's hidden-test denominator is 717 rather than 723; I did not trace why (see caveats).
 
 ## Per function (full-pass trials out of 3)
 
@@ -97,8 +95,8 @@ episode's grade did not count 6 tests (see caveats).
 - The arms' prompts can only be equalised so far: each harness adds its own system prompt and templates around the
   identical task text. aider got its default `diff` format (a `whole` run was not made) and a text-based mini config.
 - One run per arm; no repeated-run variance. The sampling was not greedy.
-- memfun's hidden-test count is 717 not 723 for one episode; the grade for it is worth a look before quoting
-  test-level numbers for memfun.
+- memfun's hidden-test total is 717 where the other arms have 723; the cause is not traced, so treat test-level
+  numbers for memfun with care (episode-level numbers are unaffected).
 - The agentic arms ran on the Mac with bash against the model on the B300; sandboxed (writes denied outside the
   output directory) after a local mini run once wandered into the working repo.
 - claude-code was not run.
