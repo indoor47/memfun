@@ -17,8 +17,13 @@
 #   MEMFUN    path of the memfun executable of the checkout under test (main after PR #77)
 #   MINI      mini-swe-agent v2 `mini`   (uv venv V && uv pip install --python V/bin/python mini-swe-agent)
 #   AIDER     aider-chat `aider`         (uv venv V && uv pip install --python V/bin/python aider-chat)
-# Agentic arms (memfun, mini, aider) run bash on THIS Mac, so they run under a sandbox-exec profile
-# that denies writes anywhere under $HOME except $OUT (a local mini run once wandered into the repo).
+# Agentic arms (memfun, mini, aider) run on THIS Mac as the user, so each episode is READ-ISOLATED
+# (evals/swarm/sandbox/episode.sb via run_in_episode_sandbox.sh): the agent can read only its episode
+# repo, its throwaway HOME and its own tool venvs; not the bundle cache (reference solutions, hidden
+# tests), the clones cache, other episodes, pip caches or this repo; writes only to its episode;
+# network only to loopback (the model tunnel).  A self-test refuses to start if that does not hold,
+# and a contamination audit runs after every arm.  (The first run had write-only isolation: one
+# mini episode read the reference solution.  See docs/HARNESS-BENCHMARK-2026-11.md.)
 set -euo pipefail
 
 REPO=${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
@@ -62,20 +67,36 @@ echo "expected total: ~45 min of arm time plus ~2 min grading per arm (< 70 min)
 [ "${PLAN:-0}" = 1 ] && exit 0
 
 mkdir -p "$OUT"
-SB="$OUT/nowrite.sb"
-cat > "$SB" <<EOF
-(version 1)
-(allow default)
-(deny file-write* (subpath "$HOME"))
-(allow file-write* (subpath "$OUT"))
-(allow file-write* (subpath "$HOME/.cache"))
-(allow file-write* (subpath "$HOME/.local"))
-EOF
 curl -fsS -m 10 "$BASE_URL/models" >/dev/null || { echo "model server not answering on $BASE_URL"; exit 2; }
-SANDBOX="sandbox-exec -f $SB"
+SANDBOX="$REPO/evals/swarm/sandbox/run_in_episode_sandbox.sh"
+real() { "$PY" -c "import os,sys;print(os.path.realpath(sys.argv[1]))" "$1"; }
+PYPFX=$(dirname "$(dirname "$(real "$PY")")")   # interpreter prefix (uv python)
+PYVENV=$(dirname "$(dirname "$PY")")            # the venv holding pytest + the test deps
+# Read-only paths each arm's harness needs besides its episode (max 6, colon separated).
+reads_for() { case "$1" in
+  memfun) echo "$PYVENV:$PYPFX:$REPO/.venv:$REPO/packages";;
+  mini-swe-agent) echo "$PYVENV:$PYPFX:$(dirname "$(dirname "$MINI")")";;
+  aider) echo "$PYVENV:$PYPFX:$(dirname "$(dirname "$AIDER")")";;
+  *) echo "$PYVENV:$PYPFX";; esac; }
+
+echo "== isolation self-test (the run does not start unless every line passes)"
+T="$OUT/isotest"; mkdir -p "$T/repo" "$T/home"
+( cd "$T/repo"; export HOME="$T/home" SANDBOX_READ_PATHS="$PYVENV:$PYPFX"
+  fail=0
+  "$SANDBOX" ls "$CACHE/bundles" >/dev/null 2>&1 && { echo "  FAIL: can read the bundle cache"; fail=1; } || echo "  ok: bundle cache (solutions, hidden tests) unreadable"
+  "$SANDBOX" ls "$CACHE" >/dev/null 2>&1 && { echo "  FAIL: can read the commit0 cache"; fail=1; } || echo "  ok: commit0 cache / clones unreadable"
+  "$SANDBOX" ls "$REPO" >/dev/null 2>&1 && { echo "  FAIL: can read the memfun repo"; fail=1; } || echo "  ok: memfun repo unreadable"
+  "$SANDBOX" ls "$OUT" >/dev/null 2>&1 && { echo "  FAIL: can read other episodes ($OUT)"; fail=1; } || echo "  ok: other episodes unreadable"
+  "$SANDBOX" sh -c "echo x > $T/escape" >/dev/null 2>&1 && { echo "  FAIL: can write outside the episode"; fail=1; } || echo "  ok: writes outside the episode denied"
+  "$SANDBOX" curl -s -m 6 -o /dev/null https://pypi.org/ >/dev/null 2>&1 && { echo "  FAIL: internet reachable"; fail=1; } || echo "  ok: internet unreachable"
+  "$SANDBOX" sh -c 'echo ok > f && cat f' >/dev/null 2>&1 && echo "  ok: the episode repo is readable and writable" || { echo "  FAIL: cannot use the episode repo"; fail=1; }
+  "$SANDBOX" "$PY" -c "import wcwidth" >/dev/null 2>&1 && { echo "  FAIL: wcwidth is installed for the agent"; fail=1; } || echo "  ok: no installed copy of wcwidth"
+  "$SANDBOX" "$PY" -c "import cachetools" >/dev/null 2>&1 && { echo "  FAIL: cachetools is installed for the agent"; fail=1; } || echo "  ok: no installed copy of cachetools"
+  exit $fail ) || { echo "isolation self-test FAILED: not starting"; exit 3; }
 
 run_arm() {
   local arm=$1; shift
+  export SANDBOX_READ_PATHS; SANDBOX_READ_PATHS=$(reads_for "$arm")
   echo; echo "=== arm $arm  $(date +%H:%M:%S)  expected $(expect "$arm")"
   "$PY" "$REPO/evals/swarm/run_smoke.py" --suite commit0 --commit0-dir "$CACHE" \
     --base-url "$BASE_URL" --metrics-url "$METRICS_URL" --arm "$arm" \
@@ -85,6 +106,9 @@ run_arm() {
     --context-window "$CONTEXT_WINDOW" --no-dashboard \
     --out-dir "$OUT" --run-id "bench-$arm" \
     --progress-file "$REPO/.memfun/bench-$arm-progress.md" "$@" || echo "arm $arm exited $?"
+  echo "-- contamination audit: $arm"
+  "$PY" "$REPO/evals/swarm/audit_contamination.py" --run "$OUT/bench-$arm" --bundles "$CACHE/bundles" \
+    --json "$OUT/bench-$arm/audit.json" || echo "audit failed for $arm"
 }
 
 for arm in $ARMS; do

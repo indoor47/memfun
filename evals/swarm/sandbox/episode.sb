@@ -1,0 +1,22 @@
+;; Read-isolation for ONE benchmark episode (macOS sandbox-exec).  Parameters (-D):
+;;   REPO     the episode repo (cwd of the agent)           HOME_EP  the episode's throwaway HOME
+;;   P0..P5   extra read-only paths (the agent's own venv / interpreter prefixes); unused = /nonexistent
+;; The agent may READ only: the system (/usr, /bin, /System, /Library, /private/var, /dev ...),
+;; REPO, HOME_EP and P0..P5.  It may NOT read the rest of /Users, /private/tmp, /tmp, /Volumes: no
+;; bundle cache (solution/, hidden/), no clones cache, no other episodes, no pip caches, no repo.
+; NOTE: a `(local ip "localhost:*")` allow would re-open the internet; keep outbound narrow.
+;; It may WRITE only REPO, HOME_EP and the temp dirs.  Network: loopback only (the model tunnel);
+;; no pip download, no git clone, no GitHub.
+(version 1)
+(allow default)
+(deny file-read* (subpath "/Users") (subpath "/private/tmp") (subpath "/tmp") (subpath "/Volumes"))
+(allow file-read* (subpath (param "REPO")) (subpath (param "HOME_EP"))
+  (subpath (param "P0")) (subpath (param "P1")) (subpath (param "P2"))
+  (subpath (param "P3")) (subpath (param "P4")) (subpath (param "P5")))
+(allow file-read-metadata)
+(deny file-write*)
+(allow file-write* (subpath (param "REPO")) (subpath (param "HOME_EP"))
+  (subpath "/private/var/folders") (subpath "/dev"))
+(deny network*)
+(allow network-outbound (remote ip "localhost:*") (remote unix-socket))
+(allow network-bind (local ip "localhost:*"))
