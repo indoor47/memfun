@@ -166,6 +166,8 @@ def lm_settings(llm: LLMConfig) -> tuple[str, dict[str, Any]]:
     if llm.repetition_penalty is not None and llm.repetition_penalty != 1.0:
         # Not an OpenAI field: SGLang reads it from the request body (extra_body is merged).
         kwargs["extra_body"] = {"repetition_penalty": llm.repetition_penalty}
+    if llm.reasoning_effort is not None:
+        kwargs["reasoning_effort"] = llm.reasoning_effort
     api_key = resolve_api_key(llm)
     if api_key:
         kwargs["api_key"] = api_key
@@ -216,6 +218,7 @@ def _cache_key(llm: LLMConfig) -> tuple[Any, ...]:
         llm.presence_penalty,
         llm.repetition_penalty,
         llm.loop_guard,
+        llm.reasoning_effort,
     )
 
 

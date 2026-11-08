@@ -36,6 +36,7 @@ class _Think:
 
     def __init__(self) -> None:
         self.reasoning = THINK
+        self.field = "reasoning_content"  # SGLang; Cerebras names it "reasoning"
         self.content = ANSWER
         self.reasoning_tokens = 321
         self.finish = "stop"
@@ -61,7 +62,7 @@ class _Think:
                     msg = {
                         "role": "assistant",
                         "content": fake.content,
-                        "reasoning_content": fake.reasoning,
+                        fake.field: fake.reasoning,
                     }
                     data = json.dumps(
                         {
@@ -94,13 +95,13 @@ class _Think:
                     if fake.loop:
                         words = (" wait,", " no,", " hmm,")
                         for i in range(200000):
-                            delta = {"reasoning_content": words[i % 3]}
+                            delta = {fake.field: words[i % 3]}
                             ev({"choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
                             if i % 100 == 0:
                                 time.sleep(0.001)
                     else:
                         for part in (fake.reasoning, fake.content):
-                            key = "reasoning_content" if part is fake.reasoning else "content"
+                            key = fake.field if part is fake.reasoning else "content"
                             for i in range(0, len(part), 16):
                                 delta = {key: part[i : i + 16]}
                                 ev(
@@ -124,9 +125,10 @@ class _Think:
         self.server.shutdown()
 
 
-@pytest.fixture
-def fake() -> Any:
+@pytest.fixture(params=["reasoning_content", "reasoning"], ids=["sglang-field", "cerebras-field"])
+def fake(request: pytest.FixtureRequest) -> Any:
     f = _Think()
+    f.field = request.param
     yield f
     f.close()
 
@@ -167,7 +169,8 @@ def test_answer_is_clean_and_reasoning_is_kept_separately(fake: Any, guard: bool
     out = entry["outputs"][0]
     assert isinstance(out, dict)
     assert "Let me think" not in out["text"]  # no reasoning in the parsed text
-    assert "Let me think" in str(out.get("reasoning_content", ""))  # kept apart, not lost
+    kept = f"{out.get('reasoning_content', '')}{out.get('reasoning', '')}"
+    assert "Let me think" in kept  # kept apart, not lost (either server's field name)
     details = entry["usage"].get("completion_tokens_details")
     reasoning = (
         details["reasoning_tokens"] if isinstance(details, dict) else details.reasoning_tokens

@@ -6,6 +6,32 @@ test counts of `evals/swarm/run_smoke.py --suite commit0`; the visible tests of 
 same files (checked byte for byte), so "visible" and "hidden" agree except for a few episodes
 where the agent edited other files.
 
+## Cerebras API (2026-11-08): `qwen-3.8-27b`, no GPU pod
+
+Run from the Mac through `evals/swarm/cerebras_proxy.py` (`run_smoke.py --backend cerebras`): the
+proxy holds the key, queues requests under the live limits (450 RPM, 150K tokens/min), retries
+429/5xx transparently, and accounts tokens and dollars per episode ($0.99/M in, $1.49/M out).
+Total spend for everything below: **$1.52** (cap $8). Cloudflare answers 403 (error 1010) to
+Python's default User-Agent: the proxy sends its own.
+
+| Run | Setup | Result | Cost |
+|---|---|---|---|
+| Probe A | `wcswidth` x3, thinking on, max_tokens 40,960 | 0/3: reasoning ate the whole budget (about 90K reasoning tokens, 5 truncations each), no edit | $0.52 |
+| Run B | 18 tasks, thinking off, max_tokens 16,384, 6 parallel | 9 pass, 3 partial (`wcswidth` 18 to 20 of 23), 6 fail | $0.74 |
+| Re-runs of the 6 failures | `wcwidth`, `_bisearch`, parallel 3 | 3 of 12 episodes pass, same failures | $0.27 |
+
+Speed: the 12 tasks that fit finished in 0.3 to 1.4 minutes each (about 1,600 tokens/s), the whole
+Run B in about 16 minutes against hours on the B300; cost about $0.04 per passing task.
+
+**The 6 failures are not rate limits.** The proxy absorbed every 429 (31 retries, 0 give-ups).
+They are `HTTP 400 context_length_exceeded`: the context-first solver dumps the whole project
+(`max_context_bytes` 200 KB) and for `wcwidth` and `_bisearch` that is about 170K tokens (the
+Unicode tables tokenize badly) against Cerebras' 131,072-token window. The B300 server had a
+larger window. A fix belongs in the solver: a context cap derived from the model's window.
+
+Probe A cannot be compared with the B300 thinking probe (20/23, 22/23): Cerebras caps output at
+40,960 tokens and wcswidth's reasoning does not fit.
+
 ## Pod (2026-11-07, 09:06 to 09:46 CET): thinking-on probe on `wcswidth`
 
 **Setup.** SGLang with `--reasoning-parser qwen3` and no `enable_thinking=false` default, so
