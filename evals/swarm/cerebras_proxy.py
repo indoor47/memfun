@@ -60,6 +60,7 @@ MAX_BODY_BYTES = 12 * 1024 * 1024  # Cerebras' own limit is 10 MiB
 MAX_RETRIES = 10
 BACKOFF_BASE_S, BACKOFF_CAP_S = 2.0, 30.0
 #: Set on a reply the proxy gave up retrying: a provider problem, not a model failure.
+USER_AGENT = "memfun-swarm/1.0"
 GAVE_UP_HEADER = "x-memfun-provider-gave-up"
 TRANSIENT = frozenset({500, 502, 503, 504})
 
@@ -484,7 +485,13 @@ class CerebrasProxy:
             return
         usage_acct = self.accounts.get(ep)
         est_unc, est_tot = estimate_tokens(doc, len(body), usage_acct.cache_ratio)
-        headers = {"Authorization": f"Bearer {self._key}", "Accept": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {self._key}",
+            "Accept": "application/json",
+            # Cloudflare in front of the API answers error 1010 to a client with no
+            # (or Python's default) User-Agent.
+            "User-Agent": USER_AGENT,
+        }
         if method == "POST":
             headers["Content-Type"] = "application/json"
         last: tuple[int, bytes] | None = None

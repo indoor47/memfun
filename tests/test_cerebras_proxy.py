@@ -36,6 +36,7 @@ class Upstream:
         self.script: list[tuple[int, dict[str, str]]] = []  # failures served before success
         self.seen: list[dict[str, Any]] = []
         self.auth: list[str] = []
+        self.agents: list[str] = []
         up = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -60,6 +61,7 @@ class Upstream:
                 body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))))
                 up.seen.append(body)
                 up.auth.append(self.headers.get("authorization", ""))
+                up.agents.append(self.headers.get("user-agent", ""))
                 if up.script:
                     status, headers = up.script.pop(0)
                     msg = "Too many tokens: uncached tokens per minute" if status == 429 else "x"
@@ -265,3 +267,13 @@ def test_read_key_never_echoes_the_key_in_errors(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as exc:
         cp.read_key(tmp_path / "missing")
     assert SECRET not in str(exc.value)
+
+
+def test_proxy_sends_its_own_user_agent_cloudflare_blocks_the_default(upstream: Upstream) -> None:
+    proxy = _proxy(upstream)
+    base = proxy.start()
+    try:
+        _post(base, "ep1")
+        assert upstream.agents == [cp.USER_AGENT] and "Python" not in cp.USER_AGENT
+    finally:
+        proxy.stop()
