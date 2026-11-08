@@ -180,6 +180,7 @@ class _SpecialistBase(BaseAgent):
                 gatherer = ContextGatherer(
                     max_bytes=100_000,
                     max_files=10,
+                    max_file_bytes=50_000,
                 )
                 extra = await gatherer.agather(
                     files=inputs,

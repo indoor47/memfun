@@ -19,8 +19,10 @@ from memfun_core.logging import get_logger
 from memfun_runtime.agent import BaseAgent, agent
 
 from memfun_agent.context_first import (
+    CONTEXT_LENGTH_METHOD,
     ContextFirstConfig,
     ContextFirstSolver,
+    is_context_length_error,
 )
 from memfun_agent.rlm import RLMConfig, RLMModule, RLMResult
 from memfun_agent.signatures import (
@@ -151,7 +153,7 @@ class RLMCodingAgent(BaseAgent):
         try:
             self._context_solver = ContextFirstSolver(
                 project_root=os.getcwd(),
-                config=ContextFirstConfig(),
+                config=ContextFirstConfig.for_llm(),
                 on_status=self.on_context_first_status,
                 on_dashboard=self.on_context_first_dashboard,
             )
@@ -393,6 +395,11 @@ class RLMCodingAgent(BaseAgent):
                     "ops": [],
                     "files_created": [],
                     "_escalate": True,
+                    **(
+                        {"failure_class": CONTEXT_LENGTH_METHOD}
+                        if cf_result.method == CONTEXT_LENGTH_METHOD
+                        else {}
+                    ),
                 }
             except LLMTruncatedError:
                 # Truncated by max_tokens: surface as a failed task, never escalate quietly.
@@ -405,7 +412,14 @@ class RLMCodingAgent(BaseAgent):
                 return {
                     "answer": "",
                     "task_type": task_type,
-                    "method": "context_first_error",
+                    "method": CONTEXT_LENGTH_METHOD
+                    if is_context_length_error(exc)
+                    else "context_first_error",
+                    **(
+                        {"failure_class": CONTEXT_LENGTH_METHOD}
+                        if is_context_length_error(exc)
+                        else {}
+                    ),
                     "iterations": 0,
                     "trajectory_length": 0,
                     "final_reasoning": str(exc),
