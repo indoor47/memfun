@@ -222,6 +222,7 @@ class EpisodeUsage:
     gave_up: int = 0
     spend_cap_refusals: int = 0
     unmetered_streams: int = 0  # streamed responses without a usage block (estimated)
+    last_error: str = ""  # last non-2xx answer seen: status and redacted start of its body
     cache_ratio: float = 0.0  # moving average, feeds the uncached estimate
 
     def as_dict(self) -> dict[str, Any]:
@@ -255,6 +256,11 @@ class Accounts:
             u = self._eps.setdefault(ep, EpisodeUsage())
             for k, v in kw.items():
                 setattr(u, k, getattr(u, k) + v)
+
+    def note_error(self, ep: str, status: int, body: bytes, key: str) -> None:
+        text = _redact(body[:400].decode("utf-8", "replace"), key)[:300]
+        with self._lock:
+            self._eps.setdefault(ep, EpisodeUsage()).last_error = f"{status} {text}"
 
     def observe_cache(self, ep: str, prompt: int, cached: int) -> None:
         if prompt <= 0:
@@ -533,6 +539,7 @@ class CerebrasProxy:
                 return  # relayed (or the episode hung up): done
             status, data, retry_after = outcome
             last = (status, data)
+            self.accounts.note_error(ep, status, data, self._key)
             if status == 429:
                 msg = ""
                 with contextlib.suppress(ValueError, AttributeError):
@@ -615,6 +622,8 @@ class CerebrasProxy:
                     flight.settled_by_upstream = True
                 elif flight is not None:
                     flight.started = False  # a 4xx/5xx body never ran the model
+                if resp.status >= 400:
+                    self.accounts.note_error(ep, resp.status, data, self._key)
                 if flight is not None:
                     flight.close()  # charge before the episode can see the answer
                 text = _redact(data.decode("utf-8", "replace"), self._key).encode()

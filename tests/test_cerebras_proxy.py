@@ -415,3 +415,16 @@ def test_wrong_host_header_and_form_posts_are_refused(upstream: Upstream) -> Non
         assert upstream.seen == []
     finally:
         proxy.stop()
+
+
+def test_a_429_before_a_streamed_answer_is_retried_transparently(upstream: Upstream) -> None:
+    upstream.script = [(429, {"retry-after": "0"})]
+    proxy = _proxy(upstream)
+    base = proxy.start()
+    try:
+        text = _stream(base, "s429")
+        assert '"content": "42"' in text and "[DONE]" in text
+        snap = proxy.accounts.get("s429")
+        assert snap.retries_429 == 1 and snap.requests == 1 and snap.completion_tokens == 300
+    finally:
+        proxy.stop()
