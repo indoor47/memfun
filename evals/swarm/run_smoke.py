@@ -1360,6 +1360,7 @@ def classify(
     server_errors: int = 0,
     truncated_failure: bool = False,
     no_edits: bool = False,
+    context_length_exceeded: bool = False,
 ) -> tuple[str, str]:
     """One of OUTCOMES plus a reason.  Same rules for passing and failing episodes.
 
@@ -1380,6 +1381,8 @@ def classify(
             return "harness_error", f"memfun swarm exited {returncode} without a result"
         if server_errors:
             return "harness_error", f"model server errors ({server_errors}) and no output"
+    if context_length_exceeded:  # its own class: the prompt did not fit the model's window
+        return "model_failure", "context_length_exceeded"
     if no_edits:  # fail closed: the swarm changed no file, whatever else it reported
         return "model_failure", "no file changes produced"
     if all_pass:
@@ -1707,6 +1710,11 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
         rec["no_edits"] = bool(swarm_doc and swarm_doc.get("no_edits"))
         if rec["no_edits"]:
             rec["flags"].append("no_edits")
+        rec["context_length_exceeded"] = bool(
+            swarm_doc and swarm_doc.get("context_length_exceeded")
+        )
+        if rec["context_length_exceeded"]:
+            rec["flags"].append("context_length_exceeded")
 
         collected_dir = private / "collected"
         collected_dir.mkdir()
@@ -1781,6 +1789,7 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
                 and (swarm_doc.get("success") is False if swarm_doc else proc.returncode != 0)
             ),
             no_edits=rec["no_edits"],
+            context_length_exceeded=rec["context_length_exceeded"],
         )
         rec.update(outcome=outcome, reason=reason, metrics=metrics)
         return rec
@@ -1874,6 +1883,7 @@ def aggregate(episodes: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str,
             "loop_aborts": sum(e.get("loop_aborts", 0) for e in eps),
             "stalled_stops": sum(e.get("stalled_stops", 0) for e in eps),
             "no_edit_episodes": sum(1 for e in eps if e.get("no_edits")),
+            "context_length_episodes": sum(1 for e in eps if e.get("context_length_exceeded")),
             "flags": sorted({f for e in eps for f in e.get("flags", [])}),
             "tool_usage": _tool_block(eps),
         }

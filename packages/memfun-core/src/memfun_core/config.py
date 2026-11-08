@@ -109,6 +109,24 @@ class LLMRoleConfig:
     constrained_json: bool | None = None
 
 
+#: Context windows (tokens) by provider.  Cerebras serves Qwen3.8-27B at 131072; the
+#: anthropic default is the standard 200k.  Any other OpenAI-compatible endpoint is
+#: assumed to be 131072 (the safe smaller size); set ``[llm] context_window`` for a
+#: bigger one (the B300 / SGLang pod serves 262144).
+_CONTEXT_WINDOW_CEREBRAS = 131_072
+_CONTEXT_WINDOW_ANTHROPIC = 200_000
+_CONTEXT_WINDOW_DEFAULT = 131_072
+
+
+def default_context_window(provider: str, base_url: str | None = None) -> int:
+    """The provider's default context window in tokens."""
+    if provider == "cerebras" or "cerebras" in (base_url or "").lower():
+        return _CONTEXT_WINDOW_CEREBRAS
+    if provider == "anthropic":
+        return _CONTEXT_WINDOW_ANTHROPIC
+    return _CONTEXT_WINDOW_DEFAULT
+
+
 def _no_roles() -> dict[str, LLMRoleConfig]:
     return {}
 
@@ -141,6 +159,10 @@ class LLMConfig:
     # openai/openai-compat with a base_url (SGLang / vLLM style servers);
     # off by default, so other providers see no change.  Inherited by roles.
     constrained_json: bool = False
+    # The model's context window in tokens (prompt + completion).  0 = the provider
+    # default (:func:`default_context_window`).  The context-first solver keeps the
+    # gathered context well inside it.
+    context_window: int = 0
     # Role -> overrides, from ``[llm.roles.<role>]``.  Empty = every role
     # uses this ``[llm]`` config (the pre-roles behaviour).  Excluded from
     # hashing so a resolved (role-free) LLMConfig stays hashable.
@@ -158,10 +180,18 @@ class LLMConfig:
             isinstance(rep, bool) or not isinstance(rep, int | float) or not 0 < rep <= 2
         ):
             raise ConfigError(f"[llm] repetition_penalty must be a number in (0, 2], got {rep!r}")
+        cw = self.context_window
+        if isinstance(cw, bool) or not isinstance(cw, int) or cw < 0:  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise ConfigError(f"[llm] context_window must be an integer >= 0, got {cw!r}")
         if not isinstance(self.constrained_json, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ConfigError(
                 f"[llm] constrained_json must be true or false, got {self.constrained_json!r}"
             )
+
+    @property
+    def context_window_effective(self) -> int:
+        """``context_window``, or the provider default when it is 0."""
+        return self.context_window or default_context_window(self.provider, self.base_url)
 
     @property
     def constrained_json_effective(self) -> bool:

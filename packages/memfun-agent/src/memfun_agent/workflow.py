@@ -277,6 +277,9 @@ class WorkflowResult:
     # :func:`no_edit_reason`); ``no_edits`` is True when there is any.
     no_edit_subtasks: int = 0
     no_edits: bool = False
+    # A code sub-task's model call was rejected for exceeding the model's context
+    # window (HTTP 400).  Its own failure class: such a run is NOT also ``no_edits``.
+    context_length_exceeded: bool = False
 
 
 # ── No-edit detection (fail-closed) ───────────────────────────
@@ -320,6 +323,15 @@ def _git_has_changes(root: Path | None) -> bool | None:
     return bool(proc.stdout.strip())
 
 
+#: Failure class of a call the provider rejected for an over-long prompt.
+CONTEXT_LENGTH_PREFIX = "context_length_exceeded"
+
+
+def context_length_failed(data: dict[str, Any] | None) -> bool:
+    """Whether an agent result records a context-window overflow."""
+    return bool(data) and (data or {}).get("failure_class") == CONTEXT_LENGTH_PREFIX
+
+
 def no_edit_reason(
     agent_name: str,
     data: dict[str, Any] | None,
@@ -338,6 +350,10 @@ def no_edit_reason(
     if agent_name not in CODE_WRITING_AGENTS:
         return None
     data = data or {}
+    if context_length_failed(data):
+        return (
+            f"{CONTEXT_LENGTH_PREFIX} (agent={agent_name}, prompt over the model's context window)"
+        )
     if data.get("files_created"):
         return None
     ops = list(data.get("ops") or [])
@@ -805,6 +821,8 @@ class WorkflowEngine:
             try:
                 for retry in range(1, SINGLE_TASK_NO_EDIT_RETRIES + 1):
                     data_ = result.result or {}
+                    if context_length_failed(data_):
+                        break  # the same prompt overflows again: retrying is wasted spend
                     if not (
                         result.success
                         and (
@@ -831,6 +849,7 @@ class WorkflowEngine:
         # Fail closed: the rlm-coder must have changed a file, and an
         # escalation signal / zero-iteration run is never a success.
         no_edit = no_edit_reason("rlm-coder", data, self._project_root)
+        ctx_len = context_length_failed(data)
         if result.success and (no_edit or data.get("_escalate")):
             result = dataclasses.replace(
                 result,
@@ -847,8 +866,9 @@ class WorkflowEngine:
             ops=data.get("ops", []),
             error=result.error,
             decomposition=state.decomposition,
-            no_edit_subtasks=1 if no_edit else 0,
-            no_edits=bool(no_edit),
+            no_edit_subtasks=1 if no_edit and not ctx_len else 0,
+            no_edits=bool(no_edit) and not ctx_len,
+            context_length_exceeded=ctx_len,
         )
         # Auto-commit single-task results too (issue #37), but only
         # when the task actually succeeded — never commit a failed
@@ -2054,7 +2074,7 @@ class WorkflowEngine:
         )
 
         project_root = str(self._project_root) if self._project_root else os.getcwd()
-        config = ContextFirstConfig()
+        config = ContextFirstConfig.for_llm()
         manifest = build_file_manifest(project_root)
 
         if not manifest:
@@ -2065,6 +2085,7 @@ class WorkflowEngine:
         gatherer = ContextGatherer(
             max_bytes=config.max_gather_bytes,
             max_files=config.max_files,
+            max_file_bytes=config.max_file_bytes,
         )
 
         if total_size <= config.max_context_bytes:
@@ -3068,6 +3089,12 @@ class WorkflowEngine:
             is not None
         )
 
+        ctx_len_subtasks = sum(
+            1
+            for ss in state.sub_task_statuses.values()
+            if ss.result is not None and context_length_failed(ss.result.result)
+        )
+
         if none_count:
             logger.error(
                 "%d/%d sub-tasks produced no result",
@@ -3114,8 +3141,9 @@ class WorkflowEngine:
             error="; ".join(error_parts) if error_parts else None,
             unaccepted_tasks=unaccepted,
             review_errors=review_errors,
-            no_edit_subtasks=no_edit_subtasks,
-            no_edits=no_edit_subtasks > 0,
+            no_edit_subtasks=no_edit_subtasks - ctx_len_subtasks,
+            no_edits=no_edit_subtasks - ctx_len_subtasks > 0,
+            context_length_exceeded=ctx_len_subtasks > 0,
             answer=merged_answer,
             sub_task_results=sub_results,
             review_summary=review.summary,

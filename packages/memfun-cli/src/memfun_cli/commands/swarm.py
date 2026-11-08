@@ -144,6 +144,11 @@ def _display_final_summary(
             "no_edits",
             f"[red]{result.no_edit_subtasks} code sub-task(s) produced no file changes[/red]",
         )
+    if result.context_length_exceeded:
+        table.add_row(
+            "context_length_exceeded",
+            "[red]a model call was rejected: the prompt exceeded the context window[/red]",
+        )
     if result.error:
         table.add_row("error", f"[red]{result.error}[/red]")
 
@@ -322,6 +327,9 @@ def _swarm_result_payload(
         "review_rounds": result.review_rounds if result is not None else 0,
         "no_edits": bool(result.no_edits) if result is not None else False,
         "no_edit_subtasks": result.no_edit_subtasks if result is not None else 0,
+        "context_length_exceeded": bool(result.context_length_exceeded)
+        if result is not None
+        else False,
         "files_created": list(result.files_created) if result is not None else [],
         "decomposition": None
         if decomposition is None
