@@ -225,3 +225,79 @@ def test_a_body_that_is_not_json_is_recorded_as_text_and_models_is_not_a_call(
         assert call(p.port, tok, None, method="GET", path="chat/completions")[0] == 405
     finally:
         p.stop()
+
+
+def _watch_answers(p: px.RecordingProxy, traj: Path) -> list[int]:
+    """Make *p* note, each time it starts answering a client, how many records are on disk."""
+    seen: list[int] = []
+
+    def on_disk() -> int:
+        f = traj / px.LLM_LOG
+        return len(f.read_text("utf-8").splitlines()) if f.exists() else 0
+
+    send, finish = p._send, p._finish_stream
+
+    def watched_send(h: Any, status: int, body: bytes, ctype: str) -> None:
+        seen.append(on_disk())
+        send(h, status, body, ctype)
+
+    def watched_finish(h: Any, held: bytes) -> None:
+        seen.append(on_disk())
+        assert held, "the end of a stream must be held back until the record is written"
+        finish(h, held)
+
+    p._send = watched_send  # type: ignore[method-assign]
+    p._finish_stream = watched_finish  # type: ignore[method-assign]
+    return seen
+
+
+def test_a_call_is_on_disk_before_its_answer_is_sent(upstream, tmp_path: Path) -> None:
+    """The order "record, then answer" for every kind of call that belongs in a trajectory.
+    (A client that reads the log right after a refusal used to find the record missing.)"""
+    p = make(upstream)
+    try:
+        traj = tmp_path / "t"
+        tok = p.register("i", traj, max_total_tokens=100)
+        seen = _watch_answers(p, traj)
+        assert call(p.port, tok, {"messages": []})[0] == 200  # forwarded
+        assert call(p.port, tok, {"messages": []})[0] == 403  # token budget spent
+        conn = http.client.HTTPConnection("127.0.0.1", p.port, timeout=10)
+        conn.putrequest("POST", f"/i/{tok}/v1/chat/completions")
+        conn.putheader("Content-Length", str(px.MAX_BODY_BYTES + 1))
+        conn.endheaders()
+        assert conn.getresponse().status == 413  # too large: refused unread, but recorded
+        conn.close()
+        p.close(tok)
+        assert call(p.port, tok, {"messages": []})[0] == 403  # rollout finished
+        assert seen == [1, 2, 3, 4]
+        recs = lines(traj)
+        assert [r["status"] for r in recs] == [200, 403, 413, 403]
+        assert recs[2]["declared_length"] == px.MAX_BODY_BYTES + 1 and recs[2]["request"] is None
+        assert p.usage(tok).refused == 3 and len(upstream.seen) == 1
+    finally:
+        p.stop()
+    dead = px.RecordingProxy("http://127.0.0.1:9/v1", sleep=lambda _s: None, max_retries=0)
+    dead.start()
+    try:
+        tok = dead.register("i", tmp_path / "d")
+        seen = _watch_answers(dead, tmp_path / "d")
+        assert call(dead.port, tok, {"messages": []})[0] == 502  # no answer from the model
+        assert seen == [1]
+    finally:
+        dead.stop()
+
+
+def test_the_end_of_a_stream_is_sent_only_after_the_record(tmp_path: Path) -> None:
+    up = Upstream(stream=True)
+    p = make(up)
+    try:
+        traj = tmp_path / "t"
+        tok = p.register("i", traj)
+        seen = _watch_answers(p, traj)
+        status, data = call(p.port, tok, {"messages": [], "stream": True})
+        assert status == 200 and data.endswith(b"data: [DONE]\n\n")
+        assert seen == [1]  # the last chunk left the proxy with the record already on disk
+        assert lines(traj)[0]["response"] == data.decode()
+    finally:
+        p.stop()
+        up.stop()

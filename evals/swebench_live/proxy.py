@@ -10,6 +10,10 @@ Every agent rollout of the SWE-bench-Live runner talks to the model ONLY through
   input and output, starting with the first prompt);
 * **accounts** calls, tokens and dollars, and **refuses** further calls once the instance's
   token budget or wall-clock deadline is spent (the refusal is recorded too);
+* keeps one **order** for every call that belongs in a trajectory (forwarded, failed upstream,
+  refused): the record is written and synced to disk BEFORE the agent gets the answer.  A
+  streamed answer is relayed as it arrives except for its last chunk, which is sent only after
+  the record is on disk;
 * **forwards** to one fixed OpenAI-compatible upstream (SGLang through a tunnel, or the local
   Cerebras proxy), optionally forcing a few request fields for every call (thinking off, a fixed
   ``reasoning_effort``, the served model name).  Forced fields are part of the frozen run
@@ -28,6 +32,7 @@ import dataclasses
 import http.client
 import http.server
 import json
+import os
 import re
 import secrets
 import ssl
@@ -245,12 +250,49 @@ class RecordingProxy:
             h.end_headers()
             h.wfile.write(body)
 
+    @staticmethod
+    def _error_body(kind: str, msg: str) -> bytes:
+        return json.dumps({"error": {"message": msg, "type": kind, "code": kind}}).encode()
+
     def _error(
         self, h: http.server.BaseHTTPRequestHandler, status: int, kind: str, msg: str
     ) -> bytes:
-        body = json.dumps({"error": {"message": msg, "type": kind, "code": kind}}).encode()
+        """Answer with an error that is NOT part of a trajectory (unknown path, wrong method).
+        Anything that belongs in a trajectory is recorded first: see :meth:`_refuse`."""
+        body = self._error_body(kind, msg)
         self._send(h, status, body, "application/json")
         return body
+
+    def _refuse(
+        self,
+        h: http.server.BaseHTTPRequestHandler,
+        inst: Instance,
+        status: int,
+        kind: str,
+        why: str,
+        t_req: float,
+        request_log: Any,
+        **extra: Any,
+    ) -> None:
+        """Refuse a call of a known instance: count it, RECORD it, and only then answer, the
+        same order as for a forwarded call (the record is on disk before the agent can act on
+        the answer)."""
+        body = self._error_body(kind, why)
+        with inst.lock:
+            inst.usage.refused += 1
+        self._record(
+            inst,
+            {
+                "t_request": t_req,
+                "t_response": self._clock(),
+                "request": request_log,
+                "status": status,
+                "response": _body_for_log(body),
+                "refused_by_proxy": why,
+                **extra,
+            },
+        )
+        self._send(h, status, body, "application/json")
 
     def _record(self, inst: Instance, rec: dict[str, Any]) -> None:
         with inst.lock:
@@ -258,6 +300,9 @@ class RecordingProxy:
             rec = {"seq": inst.seq, **rec}
             with (inst.traj_dir / LLM_LOG).open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fh.flush()
+                with contextlib.suppress(OSError):  # durable before anyone gets the answer
+                    os.fsync(fh.fileno())
 
     def _refusal(self, inst: Instance) -> str:
         with inst.lock:
@@ -284,11 +329,17 @@ class RecordingProxy:
         except ValueError:
             length = -1
         if length < 0 or length > MAX_BODY_BYTES:
-            self._error(h, 413, "too_large", "request body too large")
+            if method == "GET":
+                self._error(h, 413, "too_large", "request body too large")
+            else:  # an LLM call the agent tried: in the trajectory (the body is never read)
+                self._refuse(
+                    h, inst, 413, "too_large", "request body too large", self._clock(), None,
+                    declared_length=length,
+                )  # fmt: skip
             return
         raw = h.rfile.read(length) if length else b""
         if method == "GET":
-            status, _, data, _ = self._forward("GET", "/v1/models", b"", h, stream_ok=False)
+            status, _, data, _, _ = self._forward("GET", "/v1/models", b"", h, stream_ok=False)
             # /models is not an LLM call: relayed, not recorded, not budgeted.
             if status == 0:
                 self._error(h, 502, "upstream_error", "the model server did not answer")
@@ -299,20 +350,7 @@ class RecordingProxy:
         request_log = _body_for_log(raw)
         refusal = self._refusal(inst)
         if refusal:
-            body = self._error(h, 403, "budget_exhausted", refusal)
-            with inst.lock:
-                inst.usage.refused += 1
-            self._record(
-                inst,
-                {
-                    "t_request": t_req,
-                    "t_response": self._clock(),
-                    "request": request_log,
-                    "status": 403,
-                    "response": _body_for_log(body),
-                    "refused_by_proxy": refusal,
-                },
-            )
+            self._refuse(h, inst, 403, "budget_exhausted", refusal, t_req, request_log)
             return
         forced: dict[str, Any] = {}
         out = raw
@@ -324,7 +362,7 @@ class RecordingProxy:
                     doc[k] = v
             if forced:
                 out = json.dumps(doc).encode()
-        status, ctype, data, attempts = self._forward(
+        status, ctype, data, attempts, held = self._forward(
             "POST", "/v1/chat/completions", out, h, stream_ok=True
         )
         stream = "text/event-stream" in ctype
@@ -359,8 +397,12 @@ class RecordingProxy:
             rec["forced_by_proxy"] = forced  # run-wide settings applied on top of the request
         if attempts > 1:
             rec["upstream_attempts"] = attempts
-        self._record(inst, rec)  # recorded BEFORE the agent has the answer (streams: after)
-        if not stream:
+        # Recorded BEFORE the agent has the answer.  A stream was relayed as it arrived except
+        # for its last chunk, which is held back until the record is on disk.
+        self._record(inst, rec)
+        if stream:
+            self._finish_stream(h, held)
+        else:
             self._send(h, status, data, ctype)
 
     # ── upstream ─────────────────────────────────────────────────────────────────────────────
@@ -383,11 +425,12 @@ class RecordingProxy:
         h: http.server.BaseHTTPRequestHandler,
         *,
         stream_ok: bool,
-    ) -> tuple[int, str, bytes, int]:
+    ) -> tuple[int, str, bytes, int, bytes]:
         """Send to the upstream (retrying 429 / 5xx / connection errors).  A streamed answer is
-        relayed to the client as it arrives; any other answer is returned for the caller to
-        record first and send afterwards.  Returns ``(status, content_type, body, attempts)``;
-        status 0 = no answer (nothing was sent to the client)."""
+        relayed to the client as it arrives, except its last chunk; any other answer is
+        returned for the caller to record first and send afterwards.  Returns
+        ``(status, content_type, body, attempts, held)``: status 0 = no answer (nothing was
+        sent to the client); ``held`` = the last chunk of a stream, not sent yet."""
         headers = {"Content-Type": "application/json", "Accept": h.headers.get("Accept") or "*/*"}
         if self._key:
             headers["Authorization"] = f"Bearer {self._key}"
@@ -409,13 +452,14 @@ class RecordingProxy:
                     self._sleep(min(60.0, max(delay, 2.0**attempts)))
                     continue
                 if stream_ok and "text/event-stream" in ctype:
-                    return status, ctype, self._relay_stream(h, resp, status, ctype), attempts
-                return status, ctype, resp.read(), attempts
+                    got, held = self._relay_stream(h, resp, status, ctype)
+                    return status, ctype, got, attempts, held
+                return status, ctype, resp.read(), attempts, b""
             except (OSError, http.client.HTTPException):
                 if attempts <= self._max_retries:
                     self._sleep(min(60.0, 2.0**attempts))
                     continue
-                return 0, "", b"", attempts
+                return 0, "", b"", attempts, b""
             finally:
                 conn.close()
 
@@ -425,8 +469,12 @@ class RecordingProxy:
         resp: http.client.HTTPResponse,
         status: int,
         ctype: str,
-    ) -> bytes:
+    ) -> tuple[bytes, bytes]:
+        """Relay a streamed answer; returns ``(everything received, the last chunk)``.  Each
+        chunk is sent when the NEXT one arrives, so the last chunk (the end of the answer) is
+        still unsent on return: the caller records the call and then sends it."""
         got = bytearray()
+        held = b""
         client_ok = True
         try:
             h.send_response(status)
@@ -444,10 +492,19 @@ class RecordingProxy:
             if not chunk:
                 break
             got += chunk
-            if client_ok:
+            if client_ok and held:
                 try:
-                    h.wfile.write(chunk)
+                    h.wfile.write(held)
                     h.wfile.flush()
                 except OSError:
                     client_ok = False  # keep reading: the record must hold what the model sent
-        return bytes(got)
+            held = chunk
+        return bytes(got), (held if client_ok else b"")
+
+    @staticmethod
+    def _finish_stream(h: http.server.BaseHTTPRequestHandler, held: bytes) -> None:
+        """Send the held-back last chunk of a stream (called after the call is recorded)."""
+        if held:
+            with contextlib.suppress(OSError):
+                h.wfile.write(held)
+                h.wfile.flush()

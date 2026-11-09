@@ -35,14 +35,31 @@ up)
   UV_PYTHON_INSTALL_DIR="$B/python" "$UV" python install 3.12 >/dev/null
   PYBIN=$(ls "$B"/python/cpython-3.12*/bin/python3.12 | head -1)
   "$UV" venv --python "$PYBIN" "$B/venv" >/dev/null
-  "$UV" pip install --python "$B/venv/bin/python" --link-mode copy "$REPO"/packages/*/ >/dev/null
+  # Real wheels of every workspace package: a path install leaves workspace members as links
+  # into the checkout, which is NOT mounted in a task container.
+  (cd "$REPO" && "$UV" build --all-packages --wheel -o "$B/wheels" >/dev/null 2>&1) \
+    || { echo "wheel build failed"; exit 3; }
+  "$UV" pip install --python "$B/venv/bin/python" --link-mode copy --no-sources "$B"/wheels/*.whl >/dev/null
   git -C "$REPO" rev-parse HEAD > "$B/VERSION"
   [ -z "$(git -C "$REPO" status --porcelain)" ] || echo "dirty" >> "$B/VERSION"
   echo "== self-tests"
   "$B/venv/bin/memfun" --help >/dev/null && echo "  ok: memfun starts from the bundle"
   # everything the venv points at must live inside the bundle (it is the only thing mounted)
   out=$(find "$B/venv" -type l -exec readlink -f {} \; | grep -v "^$B/" | head -3 || true)
-  [ -z "$out" ] && echo "  ok: the bundle is self-contained" || { echo "  FAIL: links leave the bundle: $out"; exit 3; }
+  [ -z "$out" ] && echo "  ok: no symlink leaves the bundle" || { echo "  FAIL: links leave the bundle: $out"; exit 3; }
+  SP=$("$B/venv/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+  out=$( { cat "$SP"/*.pth 2>/dev/null | grep '^/' | grep -v "^$B/" ; \
+           grep -l '"url": "file://' "$SP"/*.dist-info/direct_url.json 2>/dev/null \
+             | xargs -r grep -L "file://$B/" ; } | head -3 || true)
+  [ -z "$out" ] && echo "  ok: no .pth or editable install points outside the bundle" \
+    || { echo "  FAIL: installs point outside the bundle: $out"; exit 3; }
+  # The real condition: a plain container, ONLY the bundle mounted, no network.
+  IMG=${SELFTEST_IMAGE:-debian:bookworm-slim}
+  docker run --rm --network none --platform linux/amd64 -v "$B:$B:ro" "$IMG" \
+      "$B/venv/bin/memfun" swarm --help >/dev/null 2>"$BASE/.selftest.err" \
+    && echo "  ok: memfun starts in a plain container with only the bundle mounted" \
+    || { echo "  FAIL: memfun does not start in a container: $(tail -3 "$BASE/.selftest.err")"; exit 3; }
+  rm -f "$BASE/.selftest.err"
   sh "$REPO/evals/swebench_live/lockdown.sh" --check "$REPO" >/dev/null 2>&1 \
     && echo "  note: this checkout itself has no future history" || echo "  ok: lockdown self-check runs (and flags a normal checkout)"
   echo "bundle ready: $B ($(cat "$B/VERSION" | tr '\n' ' '))  size $(du -sh "$B" | cut -f1)"

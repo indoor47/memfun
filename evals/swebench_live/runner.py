@@ -67,14 +67,32 @@ DUMMY_KEY_ENV, DUMMY_KEY_VALUE = "MEMFUN_SGLANG_DUMMY_KEY", "dummy-not-a-secret"
 MAX_ARG_BYTES = 120_000  # Linux refuses a single argv string over 128 KiB
 #: Never part of a patch: the agent's own state and scratch.
 PATCH_EXCLUDES = (".memfun", "memfun.toml")
+#: Junk a test run leaves behind when the repository does not ignore it (git glob pathspecs).
+PATCH_JUNK = (
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/.pytest_cache/**",
+    "**/.coverage",
+    "**/.coverage.*",
+    "**/htmlcov/**",
+    "**/*.egg-info/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+    "**/.hypothesis/**",
+    "**/.tox/**",
+    "**/.nox/**",
+    "build/**",
+    "dist/**",
+)
+#: A patch over this size is flagged (never cut): it probably carries generated files.
+PATCH_LARGE_BYTES = 1_000_000
 FINAL = "done"
 INFRA = "infra_error"
 
 FIND_REPO = (
     f"cd {REPO_ROOT_IN} && "
     "{ [ -d .git ] || { g=$(find . -maxdepth 2 -mindepth 2 -type d -name .git -print -quit); "
-    '[ -n "$g" ] && cd "${g%/.git}"; }; } && pwd && git rev-parse HEAD && '
-    "git status --porcelain | wc -l"
+    '[ -n "$g" ] && cd "${g%/.git}"; }; } && pwd && git rev-parse HEAD'
 )
 NETTEST = r"""
 import json, socket, sys
@@ -267,6 +285,58 @@ class Box:
             raise InfraError(f"{step} failed (exit {res.returncode}): {tail}")
         return text(res.stdout)
 
+    def rollout(
+        self,
+        argv: list[str],
+        *,
+        workdir: str,
+        env: dict[str, str],
+        log: Path,
+        timeout: float,
+        done_file: str,
+        grace: float = 20.0,
+        poll: float = 5.0,
+    ) -> tuple[str, int | None, float]:
+        """Run the agent, its output streamed to *log*.  Returns ``(how, exit_code, work_s)``:
+        ``exited`` on its own; ``reaped`` when it wrote *done_file* (its result) but was still
+        alive *grace* seconds later (a finished agent that does not exit must not burn the
+        whole timeout); ``timeout``.  In the last two cases the container is restarted, which
+        ends every process in it and keeps its files."""
+        cmd = [self.ctx.docker, "exec", "-e", "MFL_STEP=rollout"]
+        for k, v in env.items():
+            cmd += ["-e", f"{k}={v}"]
+        cmd += ["-w", workdir, self.name, *argv]
+        t0 = time.time()
+        done_at: float | None = None
+        with log.open("wb") as fh:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=fh)
+            try:
+                while True:
+                    try:
+                        code = proc.wait(timeout=poll)
+                        return "exited", code, (done_at or time.time()) - t0
+                    except subprocess.TimeoutExpired:
+                        pass
+                    now = time.time()
+                    if done_at is None:
+                        seen = self.exec("done", ["test", "-f", done_file], timeout=60)
+                        if seen.returncode == 0:
+                            done_at = now
+                    how = (
+                        "reaped"
+                        if done_at is not None and now - done_at >= grace
+                        else "timeout"
+                        if now - t0 >= timeout or self.ctx.stop.is_set()
+                        else ""
+                    )
+                    if how:
+                        self.restart()
+                        return how, None, (done_at or now) - t0
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=30)
+
     def restart(self) -> None:
         """Kill everything running in the container; its filesystem stays."""
         sh([self.ctx.docker, "restart", "-t", "0", self.name], timeout=120)
@@ -314,13 +384,46 @@ def network_selftest(box: Box, ctx: Context) -> dict[str, Any]:
     return doc
 
 
-def collect_patch(box: Box, repo: str, head: str) -> tuple[str, bool]:
-    """The agent's change as one diff against the starting commit, checked to apply cleanly to
-    a fresh checkout.  ``("", True)`` when nothing changed."""
-    excl = " ".join(f"':(exclude){p}'" for p in PATCH_EXCLUDES)
+def _pathspec() -> str:
+    return " ".join(
+        [f"':(exclude){p}'" for p in PATCH_EXCLUDES]
+        + [f"':(exclude,glob){p}'" for p in PATCH_JUNK]
+    )
+
+
+def _snapshot(name: str) -> str:
+    """Shell: write the working tree (tracked + untracked, minus junk) as a git tree object
+    through a PRIVATE index file, so the repository's own index stays exactly as found."""
+    idx = f"{HOME_IN}/index.{name}"
+    return (
+        f'mkdir -p {HOME_IN} && cp "$(git rev-parse --absolute-git-dir)/index" {idx} 2>/dev/null; '
+        f"GIT_INDEX_FILE={idx} git add -A -- . {_pathspec()} >/dev/null 2>&1; "
+        f"GIT_INDEX_FILE={idx} git write-tree"
+    )
+
+
+def baseline(box: Box, repo: str) -> tuple[str, list[str]]:
+    """The image's INITIAL working tree as a tree object, and what was dirty in it.
+
+    The official evaluator applies a patch to the image as it is, uncommitted changes and
+    all, so the patch must be the difference from this tree, not from HEAD."""
+    out = box.must(
+        "baseline",
+        ["sh", "-c", _snapshot("base") + " && git status --porcelain | head -200"],
+        workdir=repo,
+        timeout=900,
+    ).splitlines()
+    if not out or len(out[0].strip()) < 40:
+        raise InfraError(f"could not snapshot the initial tree: {out[:2]}")
+    return out[0].strip(), [ln for ln in out[1:] if ln.strip()]
+
+
+def collect_patch(box: Box, repo: str, base_tree: str) -> tuple[str, bool]:
+    """The agent's change as one diff against the image's initial tree, checked to apply
+    cleanly to a copy of that tree.  ``("", True)`` when nothing changed."""
     script = (
-        f"git add -A -- . {excl} >/dev/null 2>&1; "
-        f"git --no-pager diff --cached --text --no-color {head} -- . {excl} "
+        f"t=$({_snapshot('final')}) && "
+        f"git --no-pager diff --text --no-color {base_tree} $t -- . {_pathspec()} "
         f"> {HOME_IN}/patch.diff && cat {HOME_IN}/patch.diff"
     )
     res = box.exec("collect", ["sh", "-c", script], workdir=repo, timeout=600)
@@ -330,8 +433,8 @@ def collect_patch(box: Box, repo: str, head: str) -> tuple[str, bool]:
     if not patch.strip():
         return "", True
     check = (
-        "rm -rf /tmp/mfl-check && git clone -q --no-checkout . /tmp/mfl-check && "
-        f"cd /tmp/mfl-check && git checkout -q --detach {head} && "
+        "rm -rf /tmp/mfl-check && mkdir /tmp/mfl-check && "
+        f"git archive {base_tree} | tar -x -C /tmp/mfl-check && cd /tmp/mfl-check && "
         f"git apply --check --whitespace=nowarn {HOME_IN}/patch.diff"
     )
     ok = box.exec("patchcheck", ["sh", "-c", check], workdir=repo, timeout=900).returncode == 0
@@ -361,14 +464,12 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
         box = Box(ctx, task.docker_image)
         box.start()
         found = box.must("findrepo", ["sh", "-c", FIND_REPO]).split()
-        if len(found) != 3:
+        if len(found) != 2:
             raise InfraError(f"no git repository under {REPO_ROOT_IN}: {found}")
-        repo, head, dirty = found[0], found[1], found[2]
+        repo, head = found[0], found[1]
         rec.update(repo_dir=repo, head=head)
         if task.base_commit and head != task.base_commit:
             rec["flags"].append("head_is_not_base_commit")
-        if dirty != "0":
-            rec["flags"].append("image_tree_dirty")
         rec["lockdown"] = (
             box.must(
                 "lockdown", ["sh", "-s", "--", repo], stdin=LOCKDOWN.read_bytes(), timeout=1800
@@ -376,6 +477,10 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
             .strip()
             .splitlines()[-1]
         )
+        base_tree, dirty = baseline(box, repo)
+        rec.update(base_tree=base_tree, initial_dirty=dirty)
+        if dirty:
+            rec["flags"].append("image_tree_dirty")
         token = ctx.proxy.register(
             task.instance_id,
             idir,
@@ -398,25 +503,20 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
             "COLUMNS": "160",
         }
         t0 = time.time()
-        timed_out = False
-        try:
-            res = box.exec(
-                "rollout",
-                rollout_argv(ctx, prompt),
-                workdir=repo,
-                env=env,
-                timeout=s.instance_timeout,
-            )
-            rec["agent_exit"] = res.returncode
-            (idir / "agent.log").write_bytes(res.stdout + b"\n--- stderr ---\n" + res.stderr)
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            (idir / "agent.log").write_bytes(
-                (exc.stdout or b"") + b"\n--- stderr ---\n" + (exc.stderr or b"")
-            )
-            box.restart()  # nothing may keep editing while the patch is collected
-            rec["flags"].append("agent_timed_out")
-        rec["rollout_s"] = round(time.time() - t0, 1)
+        how, exit_code, work_s = box.rollout(
+            rollout_argv(ctx, prompt),
+            workdir=repo,
+            env=env,
+            log=idir / "agent.log",
+            timeout=s.instance_timeout,
+            done_file=f"{HOME_IN}/swarm-result.json",
+        )
+        rec["agent_exit"] = exit_code
+        timed_out = how == "timeout"
+        if how != "exited":  # nothing may keep editing while the patch is collected
+            rec["flags"].append("agent_timed_out" if timed_out else "reaped_after_result")
+        rec["rollout_s"] = round(time.time() - t0, 1)  # wall time including any wait to reap
+        rec["work_s"] = round(work_s, 1)  # until the agent wrote its result (or stopped)
         rec["timed_out"] = timed_out
         usage = ctx.proxy.close(token)
         rec["usage"] = dataclasses.asdict(usage)
@@ -429,10 +529,14 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
                 f"the agent got no answer from the model ({usage.calls} calls, "
                 f"{usage.errors} errors): see agent.log"
             )
-        patch, applies = collect_patch(box, repo, head)
+        patch, applies = collect_patch(box, repo, base_tree)
         (idir / "patch.diff").write_text(patch, "utf-8")
         rec["patch_bytes"] = len(patch.encode())
         rec["patch_applies"] = applies
+        rec["patch_files"] = patch.count("\ndiff --git ") + patch.startswith("diff --git ")
+        rec["patch_new_files"] = patch.count("\nnew file mode ")
+        if len(patch.encode()) > PATCH_LARGE_BYTES:
+            rec["flags"].append("patch_large")
         if not patch.strip():
             rec["flags"].append("empty_patch")
         elif not applies:
