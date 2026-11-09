@@ -33,8 +33,12 @@ import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from memfun_agent import fixloop
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 #: Directories never searched for tests.
 SKIP_DIRS = frozenset(
@@ -141,9 +145,7 @@ def _read_ini(path: Path, section: str) -> tuple[list[str], list[str]] | None:
 # ── discovery ────────────────────────────────────────────────────────────────────────────────
 
 
-def find_test_files(
-    project_root: Path, patterns: tuple[str, ...] = DEFAULT_PATTERNS
-) -> list[str]:
+def find_test_files(project_root: Path, patterns: tuple[str, ...] = DEFAULT_PATTERNS) -> list[str]:
     """Relative paths of every file whose name matches one of pytest's *patterns*."""
     out: list[str] = []
     root = project_root.resolve()
@@ -251,7 +253,9 @@ def changed_symbols(before: str, after: str) -> list[str]:
         old_lines.update(range(i1 + 1, i2 + 1))
         new_lines.update(range(j1 + 1, max(j2, j1 + 1) + 1))
     names = _enclosing_names(after, new_lines) | _enclosing_names(before, old_lines)
-    return sorted(n for n in names if len(n) >= 3 and not (n.startswith("__") and n.endswith("__")))
+    return sorted(
+        n for n in names if len(n) >= 3 and not (n.startswith("__") and n.endswith("__"))
+    )
 
 
 def module_names(rel_path: str) -> list[str]:
@@ -365,7 +369,8 @@ def test_command(
     if setup.runner == "pytest":
         return [
             setup.python, "-m", "pytest", "-q", "--no-header", "-rfE", "--tb=short",
-            "-p", "no:cacheprovider", *test_files, *[f"--deselect={d}" for d in deselect],
+            "-p", "no:cacheprovider", "--continue-on-collection-errors",
+            *test_files, *[f"--deselect={d}" for d in deselect],
         ]  # fmt: skip
     if setup.runner == "unittest":
         return [setup.python, "-m", "unittest", "-v", *test_files]
@@ -405,7 +410,7 @@ def run(argv: list[str], cwd: str | Path, timeout: float) -> tuple[int | None, s
 
 
 @contextlib.contextmanager
-def original_files(originals: dict[Path, str | None]):  # noqa: ANN201
+def original_files(originals: dict[Path, str | None]) -> Iterator[None]:
     """Temporarily put back the ORIGINAL contents of the changed files (``None`` = the file did
     not exist), restoring the current contents on exit whatever happens."""
     current: dict[Path, str | None] = {}
