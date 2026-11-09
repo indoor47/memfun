@@ -974,6 +974,40 @@ def create_episode_repo(
     write_project_verify(bundle, repo, fix_attempts, fix_detail, probe_rounds)
 
 
+MAX_FIX_ATTEMPTS_FLAG = 50  # = context_first.MAX_FIX_ATTEMPTS
+MAX_PROBE_ROUNDS_FLAG = 20  # = context_first.MAX_PROBE_ROUNDS
+
+
+def validate_look_step(fix_attempts: int | None, probe_rounds: int) -> None:
+    """Refuse out-of-range look-step flags (they were once silently ignored by the solver, and
+    an arm ran with the default instead of the requested depth)."""
+    if fix_attempts is not None and not 1 <= fix_attempts <= MAX_FIX_ATTEMPTS_FLAG:
+        raise ValueError(f"--fix-attempts must be 1..{MAX_FIX_ATTEMPTS_FLAG}, got {fix_attempts}")
+    if not 0 <= probe_rounds <= MAX_PROBE_ROUNDS_FLAG:
+        raise ValueError(f"--probe-rounds must be 0..{MAX_PROBE_ROUNDS_FLAG}, got {probe_rounds}")
+
+
+def effective_look_step(repo: Path) -> dict[str, Any]:
+    """The look-step settings the episode's ``.memfun/verify.json`` really carries (read back
+    from the file memfun reads, so the record cannot disagree with what ran)."""
+    try:
+        doc = json.loads((repo / ".memfun" / "verify.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"verify_json": "missing or unreadable"}
+    return {
+        k: doc.get(k) for k in ("max_fix_attempts", "fix_detail", "probe_rounds", "probe_strict")
+    }
+
+
+def probe_runs(repo: Path) -> int | None:
+    """How many probe runs the memfun episode logged (None: no log at all)."""
+    try:
+        text = (repo / ".memfun" / "probes.jsonl").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return sum(1 for ln in text.splitlines() if ln.strip())
+
+
 def write_project_verify(
     bundle: Bundle,
     repo: Path,
@@ -1002,10 +1036,11 @@ def write_project_verify(
         doc["max_fix_attempts"] = fixes
     if fix_attempts is not None:  # --fix-attempts: a deeper fix loop for this run
         doc["max_fix_attempts"] = fix_attempts
-    if fix_detail:  # --fix-detail: re-run failing tests with full assertion output
-        doc["fix_detail"] = True
-    if probe_rounds:  # --probe-rounds: differential probes on stalled rounds
-        doc["probe_rounds"] = probe_rounds
+    # The look-step settings are ALWAYS written, off values included, so that what an arm ran with
+    # is explicit in the episode and never depends on a default.
+    doc["fix_detail"] = bool(fix_detail)  # --fix-detail
+    doc["probe_rounds"] = int(probe_rounds)  # --probe-rounds (0 = off)
+    doc["probe_strict"] = True  # function benchmarks: probes see the project + stdlib only
     (repo / ".memfun" / "verify.json").write_text(json.dumps(doc), encoding="utf-8")
 
 
@@ -1770,6 +1805,7 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
                     ctx.fix_detail,
                     ctx.probe_rounds,
                 )
+                rec["look_step"] = effective_look_step(plan.repo)
             except subprocess.CalledProcessError as exc:
                 err = (exc.stderr or b"").decode("utf-8", "replace")[-500:]
                 fatal = f"git setup failed: {' '.join(map(str, exc.cmd[-3:]))}: {err}"
@@ -1993,6 +2029,8 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
             provider_stopped=provider_stopped,
         )
         rec.update(outcome=outcome, reason=reason, metrics=metrics)
+        if "look_step" in rec:
+            rec["look_step"]["probe_runs"] = probe_runs(plan.repo)
         return rec
     except OSError as exc:
         label = "disk full" if exc.errno == errno.ENOSPC else "OS error"
@@ -2399,7 +2437,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     ap.add_argument("--dry-plan", action="store_true", help="print the plan, run nothing")
     ap.add_argument("--kill-grace", type=float, default=5.0, help=argparse.SUPPRESS)
-    return ap.parse_args(argv)
+    parsed = ap.parse_args(argv)
+    try:
+        validate_look_step(parsed.fix_attempts, parsed.probe_rounds)
+    except ValueError as exc:
+        ap.error(str(exc))
+    return parsed
 
 
 def _bounded(value: int, lo: int, hi: int, flag: str) -> None:
@@ -2721,6 +2764,11 @@ def run(args: argparse.Namespace) -> int:
             "model": model,
             "memfun_cmd": memfun_cmd,
             "arm": args.arm,
+            "look_step": {  # requested; each episode.json carries what its verify.json really had
+                "fix_attempts": args.fix_attempts,
+                "fix_detail": args.fix_detail,
+                "probe_rounds": args.probe_rounds,
+            },
             "arm_bin": args.arm_bin,
             "aider_edit_format": args.aider_edit_format if args.arm == "aider" else None,
             "sampling": {
