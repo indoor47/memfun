@@ -42,6 +42,43 @@ python3 evals/swebench_live/grade.py grade --dir /root/memfun-live/eval --run-di
 
 Never develop on `lite` or `verified` instances: use `dataset.py dev-sample`.
 
+The agent's own verification is off unless switched on, per run and recorded in the frozen
+settings: `--agent-option discover_tests=true --agent-option reproduce=true --agent-option
+probe_guard=off` (the runner writes them to `.memfun/verify.json` in the repository, which is
+never part of a patch; `probe_guard=off` is right here because the container is disposable).
+
+## Gold check first
+
+`grade.py gold` runs the official evaluator with the reference patch. Do it for every instance
+before trusting a verdict on it: an instance whose reference patch does not pass cannot be
+resolved by anyone on that machine. On the first dev sample (from `full` minus the frozen
+splits), 2 of the first 8 instances judged failed their own gold patch, both because a
+pass-to-pass test needs the live internet:
+
+| Instance | Why the gold patch "fails" |
+|---|---|
+| `deepset-ai__haystack-6847` | the target test passes; 3 pass-to-pass tests fetch a web page whose content has changed |
+| `geopandas__geopandas-3240` | the target test passes; 1 pass-to-pass test downloads a file from a URL |
+
+A failed image pull is reported by the evaluator as "not found in registry" and counted as an
+error, not a failure: retry it. At the pinned commit the evaluator's gold mode exits with an
+error after writing its results whenever a gold patch passes; `grade.py` uses the results
+when they are fresh and complete.
+
+## Planning facts for a full run
+
+- **Image size and pull time vary a lot.** Most images of the dev sample are 2 to 4 GB and
+  pull in about a minute; one was 22.7 GB and took 5 minutes.
+- **Docker Hub limits unauthenticated pulls** to about 100 per 6 hours per address. 300
+  instances pulled once for the rollout and again for grading do not fit one machine in one
+  window. Options: several machines, authenticated pulls, or grading each instance right after
+  its own rollout while its image is cached (keeping every evaluation output away from every
+  agent, and never grading an instance whose rollout could still be repeated).
+- **Grading time is the instance's whole test suite**: from 1 to 12 minutes per instance on
+  an 8-core machine.
+- **A finished agent used to hang** instead of exiting (fixed in memfun since); the runner
+  still reaps an agent that wrote its result and does not exit (`reaped_after_result`).
+
 Known limits: the agent arm is memfun only (a baseline arm is planned); a problem statement
 over 120 KB cannot be passed (reported as an infrastructure error); images whose C library is
 not glibc cannot run the bundle; submodule repositories are flagged, not locked down.

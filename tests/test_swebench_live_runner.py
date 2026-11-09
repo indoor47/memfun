@@ -187,6 +187,37 @@ def test_only_the_problem_statement_reaches_the_container(env) -> None:
     assert set(SENTINELS) - {"problem_statement"} <= set(ds.FORBIDDEN_FIELDS)
 
 
+def test_agent_options_reach_the_agent_and_are_frozen_with_the_run(env) -> None:
+    """The switches of the agent's own verification: written into the repository's
+    ``.memfun`` (which is never part of a patch), trusted through the environment, recorded in
+    the frozen settings; without options neither the file nor the trust variable exists."""
+    e = env()
+    opts = ["--agent-option", "discover_tests=true", "--agent-option", "probe_guard=off"]
+    assert rn.main(e.argv(*opts)) == 0
+    written = next(c for c in e.calls() if "MFL_STEP=agentopts" in c)
+    assert written[-2] == "/testbed"
+    assert json.loads(written[-1]) == {"discover_tests": True, "probe_guard": "off"}
+    assert ".memfun" in rn.PATCH_EXCLUDES and ".memfun/verify.json" in rn.WRITE_OPTIONS
+    rollout = next(c for c in e.calls() if "MFL_STEP=rollout" in c)
+    assert f"{rn.TRUST_VERIFY_ENV}=1" in rollout
+    meta = json.loads((e.run_dir / "run.json").read_text())
+    assert meta["settings"]["agent_options"] == {"discover_tests": True, "probe_guard": "off"}
+    with pytest.raises(SystemExit, match="agent_options"):  # other options: another run
+        rn.main(e.argv("--agent-option", "discover_tests=false"))
+
+
+def test_a_run_created_before_agent_options_existed_can_be_resumed(env) -> None:
+    e = env()
+    assert rn.main(e.argv()) == 0
+    assert not any("MFL_STEP=agentopts" in c for c in e.calls())  # no options: no file,
+    rollout = next(c for c in e.calls() if "MFL_STEP=rollout" in c)
+    assert not any(a.startswith(rn.TRUST_VERIFY_ENV) for a in rollout)  # and no trust
+    meta = json.loads((e.run_dir / "run.json").read_text())
+    del meta["settings"]["agent_options"]
+    (e.run_dir / "run.json").write_text(json.dumps(meta))
+    assert rn.main(e.argv()) == 0  # same settings: accepted, nothing re-run
+
+
 def test_the_container_is_isolated_and_limited(env) -> None:
     e = env()
     assert rn.main(e.argv("--cpus", "3", "--memory", "5g")) == 0
