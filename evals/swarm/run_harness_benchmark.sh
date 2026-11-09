@@ -7,7 +7,7 @@
 #
 # Runs on the Mac against the B300 through the SSH tunnel (SGLang on 127.0.0.1:18000, model served
 # as qwen3.8-27b-fp8, thinking off).  Each arm = ONE run_smoke.py run with ALL tasks in parallel:
-# 15 function tasks (wcwidth 6 + cachetools 9) x 3 trials = 45 episodes, 25 min cap per episode.
+# 14 function tasks (wcwidth 6 + cachetools 8) x 3 trials = 42 episodes, 25 min cap per episode.
 # Results: $OUT/bench-<arm>/results.json ; progress: .memfun/bench-<arm>-progress.md
 #
 # Setup the script expects (override with env):
@@ -42,15 +42,16 @@ CONTEXT_WINDOW=${CONTEXT_WINDOW:-262144}
 AIDER_EDIT_FORMAT=${AIDER_EDIT_FORMAT:-diff}
 ARMS=${ARMS:-"single-shot memfun aider mini-swe-agent"}   # cheapest first; claude-code only if smoked
 
-# 15 tasks: wcwidth (6) + cachetools (9; typedmethodkey, 4 tests, is left out as too weak).
+# 14 tasks: wcwidth (6) + cachetools (8).  Left out: typedmethodkey (only 4 tests) and methodkey (its
+# visible and hidden tests already pass on the untouched stub, so it cannot tell the arms apart).
 BUNDLES=(c0s-wcwidth-_bisearch c0s-wcwidth-_wcmatch_version c0s-wcwidth-_wcversion_value
          c0s-wcwidth-list_versions c0s-wcwidth-wcswidth c0s-wcwidth-wcwidth
          c0s-cachetools-fifo_cache c0s-cachetools-lfu_cache c0s-cachetools-lru_cache
          c0s-cachetools-mru_cache c0s-cachetools-rr_cache c0s-cachetools-ttl_cache
-         c0s-cachetools-hashkey c0s-cachetools-methodkey c0s-cachetools-typedkey)
+         c0s-cachetools-hashkey c0s-cachetools-typedkey)
 PARALLEL=$(( ${#BUNDLES[@]} * TRIALS ))
 
-# Expected wall per arm (all 45 episodes at once; from the Cerebras smoke + the B300 wcwidth runs).
+# Expected wall per arm (all 42 episodes at once; from the Cerebras smoke + the B300 wcwidth runs).
 expect() { case "$1" in
   single-shot)    echo "~3 min  (one call per task)";;
   memfun)         echo "~8 min  (B300 runs: 3-7 min; the result reaper ends the lingering process)";;
