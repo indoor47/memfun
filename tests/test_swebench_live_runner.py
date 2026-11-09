@@ -72,6 +72,7 @@ if args[0] == "exec":
     elif step == "done": sys.exit(0 if has("result") else 1)
     elif step == "result": sys.exit(1)
     elif step == "collect": sys.stdout.write(scen.get("patch", ""))
+    elif step == "agentstate": sys.stdout.write(scen.get("state", {}).get(args[-1], ""))
     elif step == "patchcheck": sys.exit(0 if scen.get("applies", True) else 1)
     sys.exit(0)
 sys.exit(2)
@@ -162,7 +163,8 @@ def test_a_rollout_end_to_end_records_patch_trajectory_and_usage(env) -> None:
     steps = [a.split("=", 1)[1] for c in e.calls() for a in c if a.startswith("MFL_STEP=")]
     # the order is the contract: history lock-down and the network self-test BEFORE the rollout
     assert steps == [
-        "findrepo", "lockdown", "baseline", "nettest", "config", "rollout", "result", "collect", "patchcheck"
+        "findrepo", "lockdown", "baseline", "nettest", "config", "rollout", "result",
+        "agentstate", "agentstate", "agentstate", "collect", "patchcheck",
     ]  # fmt: skip
     kinds = [c[0] for c in e.calls()]
     assert kinds[-3:] == ["rm", "rmi", "network"]  # pull-run-delete, nothing left behind
@@ -216,6 +218,14 @@ def test_a_run_created_before_agent_options_existed_can_be_resumed(env) -> None:
     del meta["settings"]["agent_options"]
     (e.run_dir / "run.json").write_text(json.dumps(meta))
     assert rn.main(e.argv()) == 0  # same settings: accepted, nothing re-run
+
+
+def test_the_agents_own_check_log_is_kept_with_the_trajectory(env) -> None:
+    e = env(state={".memfun/checks.jsonl": '{"event": "verify"}\n'})
+    assert rn.main(e.argv()) == 0
+    idir = e.run_dir / "instances" / SENTINELS["instance_id"]
+    assert (idir / "checks.jsonl").read_text() == '{"event": "verify"}\n'
+    assert e.record()["agent_state"] == ["checks.jsonl"] and not (idir / "probes.jsonl").exists()
 
 
 def test_the_container_is_isolated_and_limited(env) -> None:

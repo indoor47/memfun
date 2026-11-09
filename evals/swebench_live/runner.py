@@ -520,6 +520,27 @@ def submitted_patch(box: Box, repo: str, base_tree: str, patch: str) -> bool:
     return box.exec("patchcheck", ["sh", "-c", check], workdir=repo, timeout=900).returncode == 0
 
 
+#: The agent's own record of what it checked (which tests it ran and what they said, its
+#: reproduction script, its experiments): kept with the trajectory, never part of a patch.
+AGENT_STATE = (
+    (".memfun/checks.jsonl", "checks.jsonl"),
+    (".memfun/probes.jsonl", "probes.jsonl"),
+    (".memfun/repro/issue_repro.py", "issue_repro.py"),
+)
+
+
+def collect_agent_state(box: Box, repo: str, idir: Path) -> list[str]:
+    """Copy the files of :data:`AGENT_STATE` that exist out of the container."""
+    got: list[str] = []
+    for rel, dest in AGENT_STATE:
+        script = 'f="$1/$2"; [ -f "$f" ] && head -c 5000000 "$f"'
+        res = box.exec("agentstate", ["sh", "-c", script, "sh", repo, rel], timeout=120)
+        if res.returncode == 0 and res.stdout:
+            (idir / dest).write_bytes(res.stdout)
+            got.append(dest)
+    return got
+
+
 def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str, Any]:
     """One rollout.  Returns the instance record (also written to ``instance.json``)."""
     s = ctx.settings
@@ -627,6 +648,7 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
                 f"the agent got no answer from the model ({usage.calls} calls, "
                 f"{usage.errors} errors): see agent.log"
             )
+        rec["agent_state"] = collect_agent_state(box, repo, idir)
         patch, applies = collect_patch(box, repo, base_tree)
         if s.arm == "mini":
             # The standard result of mini-swe-agent is the patch the agent SUBMITS; what else
