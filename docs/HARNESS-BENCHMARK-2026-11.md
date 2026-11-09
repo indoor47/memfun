@@ -414,7 +414,7 @@ three trajectories, not a controlled ablation.
 - A **differential probe**: when a round stalls, let the model run short experiments that load the failing test's data and print where its code
   and the expected values disagree. The earlier probe step (round 2 of the Cerebras experiments) fired rarely, was off by default, and was not told to
   compare against the test data, so that experiment does not rule this out.
-- Fix-loop depth: untested, because arm C was mis-configured. A real deeper arm is run in the look-step experiment below.
+- Fix-loop depth: untested, because arm C was mis-configured. (The look-step experiment below did not test it cleanly either; see its corrections.)
 
 ### Caveats
 
@@ -435,10 +435,17 @@ loop only reasons (see "Why mini solves `wcswidth`" above). This section builds 
   truncated repr, so it sees which items mismatch.
 - **Differential probes on a stall** (`probe_rounds`, `fix_probe_iterations`). When a round does not improve the score, the model is asked for a
   short read-only script that loads the failing tests' data, calls the candidate the way the test does and prints only the mismatching cases with a
-  count. It runs in the episode with a 30 s timeout and a 3 KB output cap, never writes files (a script that tries is refused), and its output goes
-  into the next fix call. Up to 3 probes are tried on one stalled round while each prints something new, and a stall at the base budget now probes
-  instead of stopping. Each probe and its output is logged to `.memfun/probes.jsonl` in the episode, and the contamination audit reads that file.
-  (That logging was added while the runs below were in progress, so those runs have no probe logs.)
+  count. It runs in the episode with a 30 s timeout and a 3 KB output cap, and its output goes into the next fix call. Up to 3 probes are tried on
+  one stalled round while each prints something new. Each probe and its output is logged to `.memfun/probes.jsonl` in the episode, and the
+  contamination audit reads that file. (That logging was added while the runs below were in progress, so those runs have no probe logs.)
+- **What "read-only" meant in the runs below, and what it means now.** In the runs below a keyword filter refused scripts containing `os.remove`,
+  `subprocess`, `socket`, `open(..., 'w')` and similar. That is a text match, not a guarantee: it did not stop `pathlib` writes or anything the
+  patterns did not name, so "never writes files" is **not** something those runs established. The probes also ran with whatever `python` was first on
+  `PATH`, and in that interpreter an installed copy of the original `wcwidth` / `cachetools` could be imported or read. The OS-level read isolation
+  covered the answer cache, the bundles and the user's files, but not the interpreter's own site-packages. Whether any probe used an installed copy
+  is unknown, because those probes were not logged. The probe interpreter is now isolated (see "Review corrections" below).
+- **When each part runs.** `fix_detail` runs on **every** failed verify round that has failing pytest tests, not only on a stall. The probes run
+  only on a round without improvement.
 - Both switches are **off by default**; the runner turns them on with `--fix-detail` and `--probe-rounds N`.
 - **What the old probe was:** off by default; up to 3 generic snippets on a stalled round, 20 s and 1.5 KB. It was tried once (round 2 of the
   Cerebras experiments, 14/20 against 16/20) and fired in barely any episode, so that test was inconclusive, and a stall at the base budget stopped
@@ -447,7 +454,14 @@ loop only reasons (see "Why mini solves `wcswidth`" above). This section builds 
   the H200 "arm C" asked for 12 and ran with 2 (see the correction in the H200 section). The limit is now 1 to 50 and out-of-range values log a
   warning.
 
-### Results
+### Results (first measurement; read "Review corrections" before using any of it)
+
+**These numbers are an unverified first measurement, one run per arm, and A against P is confounded.** In the code that produced P, `--probe-rounds`
+did more than switch probes on: it also let the loop run past the base fix budget when a round stalled, and so made the clean-slate rewrite
+reachable, even in an episode where no probe ran. So P differs from A in loop depth and in the rewrite as well as in the look step; the table cannot say
+which of them moved `wcswidth`. In addition the mini arm (17/18 on the H200) ran on a different backend (a local SGLang server) from these Cerebras
+runs, so the two are not a like-for-like comparison, and the gathered context of an episode included its `.memfun/verify.json`, whose look-step
+keys differed between arms (no longer the case: `.memfun/` is not gathered any more).
 
 Same six hard functions as the H200 arms (`wcswidth`, `_wcmatch_version`, `list_versions`, `wcwidth`, `mru_cache`, `hashkey`), 3 trials each, Cerebras
 Qwen3.8-27B (thinking off through the API setting, no repetition penalty, 131072 context), read isolation on, current `main` with the look-step code.
@@ -463,37 +477,59 @@ Qwen3.8-27B (thinking off through the API setting, no repetition penalty, 131072
 | `hashkey` | 2 | 3 |
 | `mru_cache`, `_wcmatch_version`, `list_versions`, `wcwidth` | 3 each | 3 each |
 
-- **The look step helps where it should.** It moves `wcswidth`, the function mini alone solved, from 0 to 2 of 3 and fixes one `hashkey` trial, and the
-  four easy functions are unchanged (it only acts on a stall). memfun's reference arm has now failed `wcswidth` in every run (0 of 3 on the B300 rerun,
-  the H200 and here: 0 of 9), against 2 of 3 with the look step.
-- **It costs about 40% more on this hard set** ($1.42 against $1.00; 1.10M against 0.75M prompt tokens), all of it in episodes that stall.
-  Easy tasks that pass on the first verify cost nothing extra.
+- **What was observed.** P moved `wcswidth`, the function mini alone solved, from 0 to 2 of 3 and one `hashkey` trial, and the four easy functions were
+  unchanged. memfun's reference arm had failed `wcswidth` in every earlier run (0 of 9). Whether the cause is the look step, the longer loop or the
+  rewrite is **not established** by this run (see the confound above).
+- **P cost about 40% more on this hard set** ($1.42 against $1.00; 1.10M against 0.75M prompt tokens). That is the cost of the whole bundle, not of the
+  probes alone.
 
-**Depth, properly tested this time (arm D).** The look step plus a real 12-round fix budget, on `wcswidth` only (the one function still failing), 3 valid trials:
+**Arm D (look step plus `max_fix_attempts` 12), `wcswidth` only, 3 valid trials: 2 of 3 (23, 23, 20 of 23), $1.37 over two runs.** The first D run hit its
+spending cap mid-run (the cap was too low: about $0.28 per `wcswidth` episode) and two of its trials were cut off by spend-cap refusals, so they were re-run
+(two trials) with an adequate cap; the three valid trials are the first run's trial 1 and the re-run's two.
 
-| arm | what | `wcswidth` | cost |
-|---|---|---|---|
-| D | look step + `max_fix_attempts` 12 | 2 of 3 (23, 23, 20 of 23) | $1.37 over two runs |
-
-The first D run hit its spending cap mid-run (the cap was too low: about $0.28 per `wcswidth` episode) and two of its trials were cut off by spend-cap refusals,
-so they were re-run (two trials) with an adequate cap. The three valid trials are the first run's trial 1 and the re-run's two. **D (2 of 3) is no better than P
-(2 of 3) on this sample, so a deeper loop adds nothing visible on top of the look step.** Three trials cannot rule out a small effect.
+**What D does and does not show.** An earlier version of this section said D "properly tested depth" and that a deeper loop adds nothing on top of the look
+step. That claim is withdrawn: P already ran a deeper loop than A (see the confound), so D against P compares two deep loops, not a deep loop against a
+shallow one, and three trials cannot show a small effect either way. Depth is **untested**.
 
 **Not run:** arm B (medium thinking on the solver) and arm PB did not fit the $4 cap. Total Cerebras spend for this experiment: **$3.79**.
 
 ### Contamination audit
 
-Clean for A, P, D and the D re-run: no leaks, no original-file exposures, no touches of the reference, hidden-test, bundle or clones paths. The audit sees memfun's
-recorded operations; the probe scripts of these runs were not logged, so it cannot show what they did. What guarantees they could not read outside the
-episode is the OS-level read isolation the episodes ran under, plus the scripts' write/network refusals. From now on probes are logged and audited.
+For A, P, D and the D re-run the audit found no leaks, no original-file exposures and no touches of the reference, hidden-test, bundle or clones paths, but
+**it could not see what the probes did**: it only read memfun's recorded operations, the leak checks were applied to the mini arm only, and these runs have
+no probe logs. The guarantee that probes could not read the answer was the OS-level read isolation, which did not cover the interpreter's site-packages
+(where the original libraries are installed for memfun itself). So "clean" here means "no evidence of contamination in what the audit could see", not
+"verified clean". The audit now checks memfun probe scripts and output like mini commands and fails loudly when the log is missing.
 
-### What this says, and a proposal
+### What this says
 
-- **One run per arm, 18 episodes (3 for D).** A 3-episode gap on 18 would be inside the noise on its own; what makes it more than noise is that it is concentrated in
-  the one function that has resisted every memfun run so far, in the direction the mechanism predicts (the look step supplies exactly what mini was observed doing).
-  It is still one run, and **the mechanism is not verified**: without probe logs I cannot say how many probes ran or what they found.
-- **Proposal (not applied):** make the look step the default, active only on a stall: `fix_detail = True`, `fix_probe_rounds = 3` in `ContextFirstConfig`
-  (two lines), after one confirmation run on the H200/B300 against the full 14-task set to check that nothing regresses and to read the probe logs. The look step costs nothing on tasks
-  that pass first time.
-- **Next:** that confirmation run, with probe logging on; arm B (thinking) on `wcswidth` alone, which this budget could not pay for.
+- **One run per arm, 18 episodes (3 for D), unverified.** A 3-episode gap on 18 is inside the noise on its own; it is concentrated in the one function that
+  has resisted every memfun run so far, which is suggestive and nothing more. With the confound, the missing probe logs and the cross-backend comparison to mini,
+  this section is a first measurement that motivated the review below, not evidence that the look step works.
+- **No proposal to enable it by default.** The earlier proposal to switch `fix_detail` and `fix_probe_rounds` on by default is withdrawn. The look step stays
+  off by default. It will be tested on real repository issues, not re-measured on these function tasks.
 
+### Review corrections (2026-11-09, night)
+
+An independent review of PR #87 found problems that made the arm P result unverifiable. What was wrong and what changed:
+
+1. **Probe interpreter.** Probes could import or read an installed copy of the library under repair, and the interpreter was whatever `python` was on `PATH`.
+   Now: the interpreter comes from the project (the verify command, else `.venv`), never memfun's own; project packages import from the project and
+   reading an installed copy of a project-owned package by path is denied; the function benchmarks use a strict mode (`python -I -S -B`: standard
+   library and project only). An audit hook also denies writes, child processes, network and ctypes. That hook is defence in depth, not a sandbox: native
+   code or a determined script can get around it. The runner's isolation self-test runs the strict mode under the episode sandbox.
+2. **Audit.** Leak and exposure checks now cover memfun probe scripts and output; a missing or malformed probe log (when probes were enabled), an
+   unrecorded look-step setting, an unknown arm or an empty run is an audit error and makes the audit exit non-zero.
+   `episode.json` records the look-step settings that really ran (read back from the `verify.json` the solver read) and the number of probe runs, and
+   `results.json` records the requested ones. The runner writes explicit off values for every look-step key.
+3. **Validation.** `--fix-attempts` (1..50) and `--probe-rounds` (0..20) are refused outside their range; an out-of-range or mistyped look-step value in
+   `verify.json` logs a warning (it used to switch probes off silently above 20).
+4. **Robustness.** An exception in the look step (probe proposal, probe run, failure detail) no longer ends the fix loop, and the best-state restore now
+   runs in a `finally`, so it also happens when the loop raises. An empty or refused probe no longer ends probing for the stall.
+5. **Confound.** The base-budget stop no longer depends on probes: with and without probes the loop stops at the same round, so a look-step arm differs
+   from the reference only in the look step. The failure detail is now sent in one prompt field instead of two.
+6. **Security fix, found while reviewing.** Context gathering included `.memfun/` and files with secret-looking names (`.json` and `*.env` were
+   accepted extensions), so `.memfun/credentials.json` or `verify.json` could be sent to the model. It now skips `.memfun/`, `.ssh`, `.aws`, `.gnupg`
+   and secret-named files. No benchmark run could have sent a real key (episode repos only held `verify.json`; the provider key lived in the proxy
+   process), and a search of the run directories found none; the case not ruled out is someone running memfun from a directory that contains their own
+   `~/.memfun` as a project `.memfun/`, for example with the home directory as the project root.
