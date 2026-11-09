@@ -894,6 +894,11 @@ class SingleShotSolver(dspy.Module):
             truncated = _detect_truncation(raw_ops, operations)
             if attempt > UNPARSEABLE_RETRIES:
                 break
+            if not operations and looks_like_tool_call(raw_ops, answer, reasoning):
+                # Tool calls written as text: this step has no tools, so nothing happened.
+                logger.warning("Solver reply was written as tool calls; retrying once")
+                ask = query + TOOL_CALL_NUDGE
+                continue
             if truncated and not operations:
                 # Cut off before the operations (the reasoning ate the budget): a plain
                 # re-sample tends to ramble again, so say what to do differently.
@@ -999,6 +1004,45 @@ def _detect_truncation(
 # ── Operation Executor ────────────────────────────────────────
 
 
+def repair_foreign_path(path_str: str, project_root: Path, *, for_write: bool) -> Path | None:
+    """Map an absolute path that does not exist onto the project, or return ``None``.
+
+    A model sometimes answers with paths of a place it imagines (``/workspace/pkg/mod.py``)
+    instead of the project it was shown.  An absolute path that exists (or, for a new file,
+    whose directory exists) is taken as given.  Otherwise the longest tail of the path that
+    names an existing project file (for a new file: an existing project directory) is used,
+    and when there is none the operation is refused: memfun never creates directories outside
+    the project for a path nobody has.
+    """
+    path = Path(path_str)
+    if path.is_file() or (for_write and path.parent.is_dir()):
+        return Path(os.path.abspath(path_str))
+    parts = path.parts[1:]
+    for i in range(1, len(parts)):
+        candidate = project_root.joinpath(*parts[i:])
+        if candidate.is_file() or (for_write and candidate.parent.is_dir() and i < len(parts) - 1):
+            return candidate
+    return None
+
+
+_CD_ABSOLUTE = re.compile(r"^\s*cd\s+(/[^\s;&|]*)")
+#: Markup of a tool call written as text: the solver steps have no tools, so such a reply is
+#: not an answer (seen with chat models that fall into their tool-calling habit).
+_TOOL_CALL_TEXT = re.compile(
+    r"<tool_call>|</tool_call>|<function=|<parameter=|<function_calls>|<invoke\s|\[TOOL_CALLS\]"
+)
+TOOL_CALL_NUDGE = (
+    "\n\nIMPORTANT: your previous reply was written as tool calls. You have NO tools in this "
+    "step and nothing will run them. Work only from the files shown above; their paths are "
+    "relative to the project root. Reply with the operations JSON and nothing else after it."
+)
+
+
+def looks_like_tool_call(*texts: str) -> bool:
+    """Whether any of *texts* is written as a tool call instead of an answer."""
+    return any(_TOOL_CALL_TEXT.search(t or "") for t in texts)
+
+
 class OperationExecutor:
     """Execute file operations produced by the SingleShotSolver.
 
@@ -1028,16 +1072,25 @@ class OperationExecutor:
         self.failed: int = 0  # operations that silently failed
         self.edit_diagnostics: list[EditDiagnostic] = []
 
-    def _resolve_path(self, path_str: str) -> Path | None:
+    def _resolve_path(self, path_str: str, *, for_write: bool = False) -> Path | None:
         """Resolve *path_str* and (when ``base_dir`` is set) confine it.
 
         Returns ``None`` if the path would escape ``base_dir``; the
         caller should treat that as a soft failure (increment
-        ``self.failed`` and continue).  When ``base_dir`` is unset
-        the legacy behaviour — ``Path(os.path.abspath(path_str))`` —
-        is preserved so existing tests / callers see no change.
+        ``self.failed`` and continue).  When ``base_dir`` is unset a
+        relative path resolves against the working directory as before;
+        an absolute path that does not exist is mapped onto the project
+        or refused (:func:`repair_foreign_path`).
         """
         if self.base_dir is None:
+            if os.path.isabs(path_str):
+                fixed = repair_foreign_path(path_str, self.project_root, for_write=for_write)
+                if fixed is None:
+                    logger.warning("Refusing a path that is not in the project: %s", path_str)
+                    self._status(f"Blocked path outside the project: {path_str}")
+                elif str(fixed) != os.path.abspath(path_str):
+                    logger.info("Mapped %s onto the project as %s", path_str, fixed)
+                return fixed
             return Path(os.path.abspath(path_str))
 
         candidate = Path(path_str)
@@ -1089,7 +1142,7 @@ class OperationExecutor:
             self.failed += 1
             return
 
-        path = self._resolve_path(path_str)
+        path = self._resolve_path(path_str, for_write=True)
         if path is None:
             self.failed += 1
             return
@@ -1221,6 +1274,13 @@ class OperationExecutor:
         cmd = op.get("cmd", "")
         if not cmd:
             return
+        m = _CD_ABSOLUTE.match(cmd)
+        if m and not Path(m.group(1)).is_dir():
+            # A command for a place that does not exist (an imagined /workspace): not run.
+            logger.warning("Skipped a command for a directory that does not exist: %s", cmd[:200])
+            self._status(f"Skipped command (no such directory {m.group(1)})")
+            self.ops.append(("cmd", cmd, "skipped: no such directory"))
+            return
 
         result = await asyncio.to_thread(
             subprocess.run,
@@ -1286,13 +1346,19 @@ def _detect_verify_commands(
     commands.  Returns an empty list if nothing is detected.
     """
     cmds: list[str] = []
+    import shutil
+
+    def installed(tool: str) -> bool:
+        # A linter that is not installed reports nothing about the code: asking for it only
+        # sends "command not found" into the fix loop.
+        return shutil.which(tool) is not None
 
     # Python: ruff (fast, preferred)
     has_python = (project_root / "pyproject.toml").is_file() or any(project_root.glob("*.py"))
     has_ruff_config = (project_root / ".ruff.toml").is_file() or (
         project_root / "pyproject.toml"
     ).is_file()
-    if has_python and has_ruff_config:
+    if has_python and has_ruff_config and installed("ruff"):
         cmds.append("ruff check .")
 
     # JavaScript/TypeScript: eslint
@@ -1301,15 +1367,15 @@ def _detect_verify_commands(
         or (project_root / ".eslintrc.js").is_file()
         or (project_root / "eslint.config.js").is_file()
     )
-    if (project_root / "package.json").is_file() and has_eslint:
+    if (project_root / "package.json").is_file() and has_eslint and installed("npx"):
         cmds.append("npx eslint .")
 
     # Go
-    if (project_root / "go.mod").is_file():
+    if (project_root / "go.mod").is_file() and installed("go"):
         cmds.append("go vet ./...")
 
     # Rust
-    if (project_root / "Cargo.toml").is_file():
+    if (project_root / "Cargo.toml").is_file() and installed("cargo"):
         cmds.append("cargo check")
 
     return cmds
@@ -1412,13 +1478,22 @@ class VerifyResult:
     passed: bool
     errors: str  # Combined stderr/stdout from failing commands
     commands_run: list[str]
+    #: Commands that could not start at all (the program is not installed): no evidence
+    #: about the code either way, so they are neither a pass nor a failure.
+    skipped: list[str] = field(default_factory=lambda: [])
+
+
+#: Seconds one verification command may run (the whole process group is killed after that).
+VERIFY_TIMEOUT_S = 120.0
+_NOT_FOUND = re.compile(r"not found|No such file or directory", re.I)
 
 
 class Verifier:
     """Run verification commands (lint, type check, tests) on a project."""
 
-    def __init__(self, project_root: str | Path) -> None:
+    def __init__(self, project_root: str | Path, timeout: float = VERIFY_TIMEOUT_S) -> None:
         self.project_root = Path(project_root).resolve()
+        self.timeout = timeout
 
     async def averify(
         self,
@@ -1426,27 +1501,35 @@ class Verifier:
     ) -> VerifyResult:
         """Run *commands* and collect any errors.
 
-        Returns a :class:`VerifyResult` with ``passed=True`` if all
-        commands succeed (exit code 0), or ``passed=False`` with the
-        combined error output.
+        Returns a :class:`VerifyResult` with ``passed=True`` if no command failed, or
+        ``passed=False`` with the combined error output.  Each command runs in its own
+        process group with a time limit, so a hung test run cannot outlive it.  A command
+        whose program is not installed (exit 127, "not found") says nothing about the code:
+        it is listed in ``skipped`` and is not an error.
         """
         import subprocess
 
         errors: list[str] = []
         commands_run: list[str] = []
+        skipped: list[str] = []
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
         for cmd in commands:
             commands_run.append(cmd)
             try:
                 result = await asyncio.to_thread(
-                    subprocess.run,
-                    cmd,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    cwd=str(self.project_root),
+                    fixloop._run_in_group,  # pyright: ignore[reportPrivateUsage]
+                    ["/bin/sh", "-c", cmd],
+                    str(self.project_root),
+                    env,
+                    self.timeout,
                 )
+                if result.returncode == 127 and _NOT_FOUND.search(result.stderr or ""):
+                    logger.warning(
+                        "Verification command could not start (not installed), skipped: %s", cmd
+                    )
+                    skipped.append(cmd)
+                    continue
                 if result.returncode != 0:
                     output = ""
                     if result.stdout:
@@ -1456,7 +1539,7 @@ class Verifier:
                         output += "\n" + fixloop.clip(result.stderr, 4_000)
                     errors.append(f"$ {cmd} (exit {result.returncode})\n{output.strip()}")
             except subprocess.TimeoutExpired:
-                errors.append(f"$ {cmd} (timed out after 120s)")
+                errors.append(f"$ {cmd} (timed out after {self.timeout:.0f}s)")
             except Exception as exc:
                 errors.append(f"$ {cmd} (error: {exc})")
 
@@ -1464,6 +1547,7 @@ class Verifier:
             passed=len(errors) == 0,
             errors="\n\n".join(errors),
             commands_run=commands_run,
+            skipped=skipped,
         )
 
 
@@ -1480,16 +1564,39 @@ class FixSolver(dspy.Module):
         full_context: str,
         verification_errors: str,
     ) -> list[dict[str, Any]]:
-        """Produce fix operations for the given verification errors."""
-        result = await asyncio.to_thread(
-            self.predictor,
-            query=query,
-            full_context=full_context,
-            verification_errors=verification_errors,
-        )
+        """Produce fix operations for the given verification errors.
 
-        raw_ops = str(getattr(result, "operations", "[]"))
-        return _parse_operations(raw_ops)
+        A reply written as tool calls (the step has no tools), or one the adapter cannot
+        parse at all, is not an answer: the model is asked once more, told so.
+        """
+        ask = query
+        for attempt in (1, 2):
+            try:
+                result = await asyncio.to_thread(
+                    self.predictor,
+                    query=ask,
+                    full_context=full_context,
+                    verification_errors=verification_errors,
+                )
+            except Exception as exc:
+                unparseable = any(
+                    c.__name__ in ("AdapterParseError", "JSONDecodeError")
+                    for c in type(exc).__mro__
+                )
+                if attempt == 1 and unparseable:
+                    logger.warning("Fix reply could not be parsed (%s); asking once more", exc)
+                    ask = query + TOOL_CALL_NUDGE
+                    continue
+                raise
+            raw_ops = str(getattr(result, "operations", "[]"))
+            ops = _parse_operations(raw_ops)
+            if ops or attempt == 2:
+                return ops
+            if not looks_like_tool_call(raw_ops, str(getattr(result, "reasoning", ""))):
+                return ops
+            logger.warning("Fix reply was written as tool calls; asking once more")
+            ask = query + TOOL_CALL_NUDGE
+        return []
 
 
 class ProbeSolver(dspy.Module):
