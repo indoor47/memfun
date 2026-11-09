@@ -73,12 +73,30 @@ answer. The context-first solver does exactly this:
    web results. Pure I/O.
 4. **Solve** (1 LLM call) -- Produces structured file operations (write, edit, run)
    in a single shot with all context available.
-5. **Execute + Verify** -- Applies operations, auto-detects your linter
-   (ruff/eslint/go vet/cargo check), runs it, fixes errors (up to 2 cycles).
+5. **Execute + Verify + Fix** -- Applies operations, then runs your checks (the
+   project's own tests if configured, otherwise an auto-detected linter:
+   ruff/eslint/go vet/cargo check). A failing run goes into a progress-aware fix
+   loop, see below.
 6. **Consistency Review** -- Semantic check: does the output match what was asked?
    If not, targeted polish in edit-only mode.
 
 Total: **2 LLM calls** for the happy path. ~30 seconds. No iteration loops.
+
+The gathered context is kept inside the model's window: set `[llm] context_window`
+(provider defaults apply, e.g. 131072 for Cerebras), and huge or generated files (unicode
+tables, files over 50 KB) are shown as a short outline instead of whole. A provider
+"context length exceeded" error is reported as its own failure, not as "no edits".
+
+**The fix loop** (when the first answer fails verification): each verify round is scored
+(an unimportable module is worst, then fewer failing tests), the files are snapshotted
+whenever a round beats the best score, and the best state is restored at the end, so a
+late bad edit can never leave you worse off. The fix step sees compact failures, the
+source of the failing tests and what earlier rounds changed (a diff per round; going back
+to an earlier file state is flagged as a dead end). It keeps going past the base budget
+only while rounds improve, and when patching stalls it restarts from the best state with
+a clean-slate rewrite. A reply that was cut off, or that held only commands and no edit,
+is retried with a targeted instruction. An optional probe step (the model runs small
+read-only experiments when stuck) exists but is off by default (`fix_probe_rounds = 0`).
 
 ### Multi-Agent Workflow (Tier 2)
 
@@ -133,9 +151,10 @@ Every code path -- context-first and each specialist -- runs the same post-proce
 ```
 Code produced
   │
-  ├─ Auto-detect linters (ruff, eslint, go vet, cargo check)
+  ├─ Auto-detect linters (ruff, eslint, go vet, cargo check) or use the project's own tests
   ├─ Run verification (subprocess, 0 LLM calls)
-  ├─ Fix lint errors if any (1 LLM call, edit-only)
+  ├─ Fix loop if it fails: score each round, keep the best state, fix with test + history
+  │  context, rewrite from the best state when stalled (1 LLM call per round, edit-only)
   ├─ Consistency review: does output match the request? (1 LLM call)
   └─ Polish if issues found (1 LLM call, edit-only)
 ```
@@ -412,6 +431,8 @@ model = "claude-opus-4-6"
 api_key_env = "ANTHROPIC_API_KEY"
 temperature = 0.0
 max_tokens = 128000
+# context_window = 131072             # model window in tokens; default depends on provider
+# reasoning_effort = "none"           # none | low | medium | high, for servers that take it
 
 [backend]
 tier = "sqlite"                       # in-process | sqlite | redis | nats
@@ -424,6 +445,29 @@ timeout_seconds = 30
 [web]
 search_backend = "duckduckgo"         # duckduckgo | brave | tavily | searxng
 ```
+
+## Benchmarks
+
+Beyond SWE-bench Lite (70% on the first 30 instances) and Terminal-Bench (Opus 4.6: 57.5%),
+the repo has a **harness benchmark** that asks one question: on the *same* model, tasks and
+hidden-test grader, does memfun's scaffolding beat other coding agents? The arms are a
+single model call, aider, mini-swe-agent and memfun (`evals/swarm/run_smoke.py --arm ...`,
+`evals/swarm/run_harness_benchmark.sh`). Tasks are 15 function-level tasks from two
+Commit0 libraries (wcwidth, cachetools), 3 trials each.
+
+First run (Qwen3.8-27B on one B300, episodes where every hidden test passes, out of 45):
+mini-swe-agent 43, memfun 39, aider 35, single call 28. mini wins by iterating far longer
+(about 105 commands on the hardest function against memfun's one edit and a short fix
+loop) at about 14 times the input tokens. **That run was not clean:** the agents could read
+the machine, and in one mini episode the agent read the reference solution (so mini is 42
+without it). The write-up, the audit script (`evals/swarm/audit_contamination.py`) and a
+read-isolated rerun setup (`evals/swarm/sandbox/`) are described in
+[docs/HARNESS-BENCHMARK-2026-11.md](docs/HARNESS-BENCHMARK-2026-11.md).
+
+The fix loop above was built from that run's failures. In an A/B on the hardest five
+functions (Cerebras, same model, 20 episodes), it raised the fully-passing count from
+10 to 17 and passed 18 of 18 on the easy functions. A clean B300 rerun with the new loop
+is the confirmation still to come; treat the numbers above as a first measurement.
 
 ## Packages
 
@@ -440,7 +484,8 @@ memfun/
 │   └── memfun-cli/         Interactive chat, setup wizard, live dashboard, CLI
 ├── skills/                 8 built-in Agent Skills (SKILL.md format)
 ├── agents/                 Built-in agent definitions (AGENT.md format)
-├── evals/                  SWE-bench + Terminal-Bench evaluation harnesses
+├── evals/                  SWE-bench, Terminal-Bench and the swarm / Commit0 harness
+│                           benchmark (arms, graders, contamination audit, sandbox)
 └── tests/                  854 tests (88 skipped for Redis/NATS without servers)
 ```
 
