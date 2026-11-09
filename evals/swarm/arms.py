@@ -268,6 +268,8 @@ def mini_command(a: argparse.Namespace, spec: str, traj: Path) -> list[str]:
         cfg.append(f"{mk}.top_p={a.top_p}")
     if a.repetition_penalty is not None:
         cfg.append(f"{mk}.extra_body.repetition_penalty={a.repetition_penalty}")
+    if a.step_limit:
+        cfg.append(f"agent.step_limit={a.step_limit}")
     cmd = [*shlex.split(a.bin or "mini"), "-c", MINI_CONFIG]
     for c in cfg:
         cmd += ["-c", c]
@@ -519,6 +521,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     ap.add_argument("--top-p", type=float, default=None)
     ap.add_argument("--repetition-penalty", type=float, default=None)
     ap.add_argument("--max-tokens", type=int, default=32768)
+    ap.add_argument("--step-limit", type=int, default=0, help="mini: agent.step_limit (0 = none)")
     ap.add_argument("--context-window", type=int, default=262144)
     ap.add_argument("--timeout", type=float, default=1500.0, help="wall seconds (25 min)")
     ap.add_argument("--bin", default="", help="the harness executable (shell-split)")

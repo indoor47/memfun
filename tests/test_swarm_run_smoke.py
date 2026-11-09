@@ -1421,3 +1421,59 @@ def test_swarm_does_not_start_its_own_dashboard_when_autostart_is_disabled(
     monkeypatch.delenv(rs.NO_DASHBOARD_ENV)
     asyncio.run(chat._start_dashboard_background(runtime))  # pyright: ignore[reportPrivateUsage]
     assert started == [1]
+
+
+def test_worker_reasoning_effort_becomes_a_role_override_in_the_episode_config() -> None:
+    import tomllib
+
+    doc = tomllib.loads(
+        rs.memfun_toml(
+            "http://h/v1",
+            "m",
+            1000,
+            rs.Sampling(reasoning_effort="none", worker_reasoning_effort="medium"),
+        )
+    )
+    assert doc["llm"]["reasoning_effort"] == "none"
+    assert doc["llm"]["roles"]["worker"] == {"reasoning_effort": "medium"}
+    plain = tomllib.loads(rs.memfun_toml("http://h/v1", "m", 1000, rs.Sampling()))
+    assert "roles" not in plain["llm"]
+
+
+def test_fix_attempts_override_lands_in_verify_json(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "b"
+    bundle_dir.mkdir()
+    (bundle_dir / "task.toml").write_text(
+        '[verify]\ncommands = ["pytest -q"]\nmax_fix_attempts = 4\n', "utf-8"
+    )
+    repo = tmp_path / "repo"
+    (repo / ".memfun").mkdir(parents=True)
+    bundle = rs.Bundle(id="b", path=bundle_dir)
+    rs.write_project_verify(bundle, repo)
+    assert json.loads((repo / ".memfun" / "verify.json").read_text())["max_fix_attempts"] == 4
+    rs.write_project_verify(bundle, repo, 12)
+    assert json.loads((repo / ".memfun" / "verify.json").read_text())["max_fix_attempts"] == 12
+
+
+def test_arm_step_limit_reaches_mini_and_arms_use_the_episode_url() -> None:
+    from evals.swarm import arms
+
+    cmd = rs.arm_cmd(
+        "mini-swe-agent",
+        Path("t.txt"),
+        "http://127.0.0.1:1/e/ep-t1/v1",
+        "m",
+        ["a.py"],
+        sampling=rs.Sampling(),
+        max_tokens=100,
+        timeout=60.0,
+        step_limit=40,
+    )
+    assert cmd[cmd.index("--base-url") + 1] == "http://127.0.0.1:1/e/ep-t1/v1"
+    ns = arms.parse_args(cmd[2:])
+    assert ns.step_limit == 40
+    assert "agent.step_limit=40" in arms.mini_command(ns, "TASK", Path("traj.json"))
+    ns0 = arms.parse_args(
+        ["mini-swe-agent", "--spec-file", "t", "--base-url", "u", "--model", "m"]
+    )
+    assert not any("step_limit" in c for c in arms.mini_command(ns0, "T", Path("x")))
