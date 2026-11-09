@@ -158,6 +158,25 @@ def test_a_run_that_does_not_finish_is_killed_and_unusable(tmp_path: Path) -> No
     assert rt.run(["/no/such/interpreter"], tmp_path, 5)[0] is None
 
 
+def test_importable_modules_use_the_projects_own_name_and_skip_risky_files(tmp_path: Path) -> None:
+    make(tmp_path, PROJECT)
+    make(tmp_path, {
+        "src/shop/broken.py": "import a_module_that_is_not_installed\n",
+        "setup.py": "raise SystemExit('never import me')\n",
+        "tools/script.py": "raise SystemExit('not in a package')\n",
+    })  # fmt: skip
+    files = ["src/shop/cart.py", "src/shop/broken.py", "setup.py", "tools/script.py",
+             "test/test_cart.py", "README.md", "src/shop/__init__.py"]  # fmt: skip
+    got = rt.importable_modules(sys.executable, tmp_path, files)
+    assert got == ["shop.cart", "shop"]  # not ``src.shop.cart``; the broken one is left out
+    assert rt.run(rt.import_command(sys.executable, got), tmp_path, 60)[0] == 0
+    (tmp_path / "src/shop/cart.py").write_text("from shop.tax import NO_SUCH_NAME\n", "utf-8")
+    code, out = rt.run(rt.import_command(sys.executable, got), tmp_path, 60)
+    assert code == 1 and "cannot import name 'NO_SUCH_NAME'" in out
+    assert rt.importable_modules(sys.executable, tmp_path, ["README.md"]) == []
+    assert rt.python_version(sys.executable, tmp_path) == sys.version.split()[0]
+
+
 def test_the_compile_check_reports_a_syntax_error_and_writes_nothing(tmp_path: Path) -> None:
     make(tmp_path, {"ok.py": "x = 1\n", "bad.py": "def f(:\n    pass\n"})
     code, out = rt.run(rt.compile_command(sys.executable, ["ok.py", "bad.py"]), tmp_path, 60)

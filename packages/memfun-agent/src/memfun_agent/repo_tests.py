@@ -450,6 +450,9 @@ def importable_modules(
         if not (root / path.parent / "__init__.py").is_file():
             continue
         names = [n for n in module_names(rel) if "." in n or path.name == "__init__.py"]
+        # ``src/pkg/mod.py`` is ``pkg.mod``; ``src.pkg.mod`` also imports (a namespace package)
+        # but is not the module the project uses, so it is tried last.
+        names.sort(key=lambda n: n.split(".")[0] in ("src", "lib"))
         if names:
             wanted.append((rel, names))
     if not wanted:

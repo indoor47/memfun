@@ -2322,7 +2322,9 @@ class ContextFirstSolver:
         verify_cmds = self._get_verify_commands()
         if executor.files_created:
             try:
-                verify_cmds = await self._own_checks(executor, repro, opts) + verify_cmds
+                verify_cmds = (
+                    await self._own_checks(executor, repro, opts, raw_query or query) + verify_cmds
+                )
             except Exception as exc:  # no check is better than a crash after the edits
                 logger.warning("Could not set up the project's own tests: %s", exc)
         if verify_cmds and executor.files_created:
@@ -2481,7 +2483,11 @@ class ContextFirstSolver:
         return None
 
     async def _own_checks(
-        self, executor: OperationExecutor, repro: Reproduction | None, opts: dict[str, Any]
+        self,
+        executor: OperationExecutor,
+        repro: Reproduction | None,
+        opts: dict[str, Any],
+        task: str = "",
     ) -> list[str]:
         """Verify commands from the project itself: a syntax check of the changed Python files,
         the reproduction script, and the project's tests relevant to the changed files with
@@ -2536,10 +2542,19 @@ class ContextFirstSolver:
                 with contextlib.suppress(OSError, UnicodeDecodeError):
                     symbols += repo_tests.changed_symbols(before or "", path.read_text("utf-8"))
         selected = repo_tests.select_tests(self.project_root, changed, setup, symbols=symbols)
-        if not selected:
+        files = [s.path for s in selected]
+        if len(files) < 2 and task:
+            # Few or no tests are tied to the changed files by name or import (common when a
+            # project tests through its public interface): add the tests that mention the
+            # names the task itself uses.
+            terms = repo_search.issue_terms(task)
+            by_task = await asyncio.to_thread(
+                repo_search.rank_files, self.project_root, list(setup.test_files), terms
+            )
+            files += [h.path for h in by_task if h.path not in files][: 2 - len(files)]
+        if not files:
             self._status("No existing test is related to the changed files")
             return cmds
-        files = [s.path for s in selected]
         new_files = {
             str(p.relative_to(self.project_root))
             for p, text in originals.items()

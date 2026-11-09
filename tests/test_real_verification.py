@@ -136,6 +136,28 @@ async def test_without_opt_in_no_project_test_is_run(root: Path, monkeypatch) ->
     assert (await solver.asolve(query=ISSUE)).success and model.fix_errors == []
 
 
+@pytest.mark.asyncio
+async def test_tests_that_mention_the_tasks_names_are_used_when_none_match_the_file(
+    root: Path,
+) -> None:
+    """A project that tests through its public interface: no test is named after or imports
+    the changed module, but one mentions what the task is about."""
+    (root / "shop/engine.py").write_text("def checkout_total(items):\n    return sum(items)\n")
+    (root / "test/test_api.py").write_text(
+        "import shop\n\n\ndef test_checkout_total_via_api():\n"
+        "    from shop import engine as e\n    assert e.checkout_total([1, 2]) == 3\n"
+    )
+    statuses: list[str] = []
+    solver = make_solver(root, statuses, verify_tests=True)
+    wrong = edit(root, "return sum(items)", "return sum(items) - 1", rel="shop/engine.py")
+    right = edit(root, "return sum(items) - 1", "return sum(items)", rel="shop/engine.py")
+    model = Model(solver, solve=[[wrong]], fixes=[[right]])
+    await solver.asolve(query="`checkout_total` returns the wrong sum for a basket.")
+    assert len(model.fix_errors) == 1
+    assert "test/test_api.py::test_checkout_total_via_api" in model.fix_errors[0]
+    assert any("Verification passed" in s for s in statuses)
+
+
 REPRO = (
     "import sys\nfrom shop.cart import total\ngot = total([100])\n"
     "if abs(got - 120) > 1e-9:\n    print('REPRO: FAIL - total([100]) is', got, 'expected 120')\n"
