@@ -119,3 +119,34 @@ def test_episode_sandbox_denies_reads_outside_the_episode(tmp_path: Path) -> Non
         for f in secret_dir.iterdir():
             f.unlink()
         secret_dir.rmdir()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="sandbox-exec is macOS only")
+def test_read_paths_must_travel_inside_the_command_not_the_environment(tmp_path: Path) -> None:
+    """run_smoke launches a harness with a CLEANED environment: SANDBOX_READ_PATHS exported by the
+    caller is dropped, so the harness cannot read its own interpreter (exit 126 in every episode).
+    The paths have to be passed with env(1) inside the command."""
+    tools = Path.home() / ".cache" / "memfun-sandbox-env-test"
+    tools.mkdir(parents=True, exist_ok=True)
+    (tools / "tool.txt").write_text("tool file")
+    repo, home = tmp_path / "repo", tmp_path / "home"
+    repo.mkdir()
+    home.mkdir()
+    wrapper = str(REPO_ROOT / "evals/swarm/sandbox/run_in_episode_sandbox.sh")
+    clean = {"PATH": "/usr/bin:/bin", "HOME": str(home)}  # what run_smoke's child_env gives
+
+    def run(*cmd: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            list(cmd), cwd=repo, env=clean, capture_output=True, text=True, check=False
+        )
+
+    try:
+        via_env = run(
+            "env", f"SANDBOX_READ_PATHS={tools}", wrapper, "cat", str(tools / "tool.txt")
+        )
+        assert via_env.returncode == 0 and via_env.stdout == "tool file"
+        assert run(wrapper, "cat", str(tools / "tool.txt")).returncode != 0  # variable missing
+    finally:
+        for f in tools.iterdir():
+            f.unlink()
+        tools.rmdir()

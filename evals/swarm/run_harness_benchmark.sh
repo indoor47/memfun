@@ -72,6 +72,10 @@ SANDBOX="$REPO/evals/swarm/sandbox/run_in_episode_sandbox.sh"
 real() { "$PY" -c "import os,sys;print(os.path.realpath(sys.argv[1]))" "$1"; }
 PYPFX=$(dirname "$(dirname "$(real "$PY")")")   # interpreter prefix (uv python)
 PYVENV=$(dirname "$(dirname "$PY")")            # the venv holding pytest + the test deps
+# run_smoke gives every episode a CLEANED environment (an allowlist), so SANDBOX_READ_PATHS cannot be
+# exported to the wrapper: it is passed INSIDE the command with env(1).  (Exporting it made every
+# sandboxed episode exit 126: the harness could not read its own interpreter.)
+sandbox_for() { echo "env SANDBOX_READ_PATHS=$(reads_for "$1") $SANDBOX"; }
 # Read-only paths each arm's harness needs besides its episode (max 6, colon separated).
 reads_for() { case "$1" in
   memfun) echo "$PYVENV:$PYPFX:$REPO/.venv:$REPO/packages";;
@@ -92,11 +96,20 @@ T="$OUT/isotest"; mkdir -p "$T/repo" "$T/home"
   "$SANDBOX" sh -c 'echo ok > f && cat f' >/dev/null 2>&1 && echo "  ok: the episode repo is readable and writable" || { echo "  FAIL: cannot use the episode repo"; fail=1; }
   "$SANDBOX" "$PY" -c "import wcwidth" >/dev/null 2>&1 && { echo "  FAIL: wcwidth is installed for the agent"; fail=1; } || echo "  ok: no installed copy of wcwidth"
   "$SANDBOX" "$PY" -c "import cachetools" >/dev/null 2>&1 && { echo "  FAIL: cachetools is installed for the agent"; fail=1; } || echo "  ok: no installed copy of cachetools"
+  # The way run_smoke launches a harness: cleaned environment, read paths passed via env(1).
+  for arm in $ARMS; do
+    bin=$PY; [ "$arm" = memfun ] && bin=$MEMFUN
+    [ "$arm" = mini-swe-agent ] && bin=$MINI
+    [ "$arm" = aider ] && bin=$AIDER
+    [ "$arm" = single-shot ] && continue
+    env -i PATH="$PATH" HOME="$T/home" sh -c "$(sandbox_for "$arm") $bin --help" >/dev/null 2>&1 \
+      && echo "  ok: $arm starts under the sandbox with a cleaned environment" \
+      || { echo "  FAIL: $arm cannot start under the sandbox with a cleaned environment"; fail=1; }
+  done
   exit $fail ) || { echo "isolation self-test FAILED: not starting"; exit 3; }
 
 run_arm() {
   local arm=$1; shift
-  export SANDBOX_READ_PATHS; SANDBOX_READ_PATHS=$(reads_for "$arm")
   echo; echo "=== arm $arm  $(date +%H:%M:%S)  expected $(expect "$arm")"
   "$PY" "$REPO/evals/swarm/run_smoke.py" --suite commit0 --commit0-dir "$CACHE" \
     --base-url "$BASE_URL" --metrics-url "$METRICS_URL" --arm "$arm" \
@@ -114,10 +127,10 @@ run_arm() {
 for arm in $ARMS; do
   case "$arm" in
     single-shot)    run_arm single-shot;;
-    memfun)         run_arm memfun --memfun-cmd "$SANDBOX $MEMFUN";;
-    aider)          run_arm aider --aider-edit-format "$AIDER_EDIT_FORMAT" --arm-bin "$SANDBOX $AIDER";;
-    mini-swe-agent) run_arm mini-swe-agent --arm-bin "$SANDBOX $MINI";;
-    claude-code)    run_arm claude-code --arm-bin "$SANDBOX ${CLAUDE:-claude}" --anthropic-base-url "${ANTHROPIC_BASE_URL_FOR_BENCH:?set it}";;
+    memfun)         run_arm memfun --memfun-cmd "$(sandbox_for memfun) $MEMFUN";;
+    aider)          run_arm aider --aider-edit-format "$AIDER_EDIT_FORMAT" --arm-bin "$(sandbox_for aider) $AIDER";;
+    mini-swe-agent) run_arm mini-swe-agent --arm-bin "$(sandbox_for mini-swe-agent) $MINI";;
+    claude-code)    run_arm claude-code --arm-bin "$(sandbox_for claude-code) ${CLAUDE:-claude}" --anthropic-base-url "${ANTHROPIC_BASE_URL_FOR_BENCH:?set it}";;
     *) echo "unknown arm $arm"; exit 2;;
   esac
 done
