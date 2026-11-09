@@ -13,12 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest accepted `.json` and `*.env` files and skipped only build and virtualenv
   directories, so `.memfun/credentials.json` (and `verify.json`) could be read into the model's
   prompt, and from there into provider logs and published trajectories. It now skips `.memfun/`,
-  `.ssh`, `.aws`, `.gnupg` and files such as `.env*`, `credentials*`, `secrets*`, `*.pem`, `*.key`.
+  `.ssh`, `.aws`, `.gnupg` and data/config files such as `.env*`, `credentials.json`, `secrets.yaml`,
+  `*.pem`, `*.key` (source modules like `credentials.py` stay visible).
   A project whose root contained a `~/.memfun`-style credentials file could have sent it.
 
 ### Added
 
-- Fix-loop look step (off by default): `fix_detail`, `probe_rounds`, `probe_strict` in
+- Fix-loop look step (off by default): `fix_detail`, `probe_rounds`, `probe_guard` in
   `.memfun/verify.json`; guarded differential probes. See `docs/configuration.md`.
 
 ## 0.2.7 (2026-02-16)

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import difflib
 import hashlib
 import json
@@ -239,6 +240,10 @@ _PROBE_FORBIDDEN = re.compile(
 #:   dependencies importable; reads of an INSTALLED COPY of a project-owned package (argv[4], a
 #:   comma separated list of top-level names) by path are denied, other site-packages reads work.
 #:
+#: * ``off`` (disposable sandboxes only, e.g. a throwaway task container): the project's
+#:   interpreter, project packages first, and NO audit hook: temp files, child processes, local
+#:   sockets and import-time caches all work.  Nothing stops the script; the caller's sandbox must.
+#:
 #: Defence in depth against accidents and curiosity, NOT a sandbox: native code, or a determined
 #: script, can get around an audit hook.
 PROBE_PREAMBLE = r"""
@@ -295,7 +300,8 @@ def _hook(event, args):
     elif event in ("os.listdir", "os.scandir", "glob.glob", "os.chdir") and args:
         if args[0] is not None and not isinstance(args[0], int) and not _inside(args[0]):
             raise PermissionError("probe: no listing outside the project: %s" % (args[0],))
-sys.addaudithook(_hook)
+if _mode != "off":
+    sys.addaudithook(_hook)
 os.chdir(_root)
 exec(compile(_snippet, "<probe>", "exec"), {"__name__": "__main__"})
 """
@@ -325,13 +331,38 @@ def owned_packages(project_root: Path) -> list[str]:
     return sorted(names)
 
 
+def _not_memfuns_own(path: str | None) -> str | None:
+    """*path* unless it is the interpreter memfun itself runs in (which has other dependencies
+    and may be another Python version)."""
+    if path and os.path.realpath(path) != os.path.realpath(sys.executable):
+        return path
+    return None
+
+
+def _shebang_python(script: str) -> str | None:
+    try:
+        with open(script, "rb") as fh:
+            first = fh.readline(300).decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    if not first.startswith("#!"):
+        return None
+    parts = first[2:].split()
+    if parts and parts[0].endswith("/env") and len(parts) > 1:
+        parts = parts[1:]
+    return parts[0] if parts and re.fullmatch(r".*python(\d+(\.\d+)?)?", parts[0]) else None
+
+
 def probe_python(verify_cmds: list[str], project_root: Path) -> str | None:
     """The interpreter the project's own tests run with, or None when it cannot be found.
 
-    From the verify command (``python -m pytest``, ``/venv/bin/pytest``, ``uv run pytest``...),
-    else ``<project>/.venv/bin/python``.  Never memfun's own interpreter: it has other
-    dependencies and may be another Python version.
+    From the verify command: an absolute ``python`` / ``.../pytest`` is taken as given (a
+    ``pytest`` script gives its sibling ``python`` or its shebang interpreter); a bare name is
+    resolved through ``PATH`` and accepted only if it is not memfun's own interpreter.  Then
+    ``<project>/.venv/bin/python``, then ``python3`` / ``python`` on ``PATH`` (again never memfun's
+    own).  Never memfun's own interpreter: it has other dependencies and may be another Python.
     """
+    uses_python = False
     for cmd in verify_cmds:
         try:
             tokens = shlex.split(cmd)
@@ -339,16 +370,34 @@ def probe_python(verify_cmds: list[str], project_root: Path) -> str | None:
             continue
         for t in tokens[:3]:
             name = Path(t).name
-            if re.fullmatch(r"python(\d+(\.\d+)?)?", name):
-                found = shutil.which(t)
-                if found:
-                    return found
-            if name == "pytest" and "/" in t:
-                sibling = Path(t).parent / "python"
-                if sibling.exists():
-                    return str(sibling)
+            is_python = re.fullmatch(r"python(\d+(\.\d+)?)?", name) is not None
+            if not (is_python or name == "pytest"):
+                continue
+            uses_python = True
+            explicit = "/" in t
+            found = t if explicit else shutil.which(t)
+            if not found:
+                continue
+            if is_python and explicit and not Path(found).exists():
+                continue
+            if is_python:
+                got = found if explicit else _not_memfuns_own(found)
+            else:
+                sibling = Path(found).parent / "python"
+                got = str(sibling) if sibling.exists() else _shebang_python(found)
+                if got and not explicit:
+                    got = _not_memfuns_own(got)
+            if got:
+                return got
     venv_python = project_root / ".venv" / "bin" / "python"
-    return str(venv_python) if venv_python.exists() else None
+    if venv_python.exists():
+        return str(venv_python)
+    if uses_python:
+        for name in ("python3", "python"):
+            got = _not_memfuns_own(shutil.which(name))
+            if got:
+                return got
+    return None
 
 
 def parse_probes(raw: str) -> list[str]:
@@ -375,28 +424,88 @@ def probe_refusal(snippet: str) -> str:
     return f"refused (uses {m.group(0)!r})" if m else ""
 
 
+PROBE_GUARDS = ("strict", "project", "off")
+#: Environment a guarded probe inherits (everything else is dropped: no keys, no tokens).
+PROBE_ENV_ALLOW = (
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "LD_LIBRARY_PATH",
+)
+
+
+def probe_env(guard: str) -> dict[str, str]:
+    """The environment of a probe process.  ``off`` (a disposable sandbox) inherits everything;
+    the guarded modes get ``PATH`` plus :data:`PROBE_ENV_ALLOW` only."""
+    if guard == "off":
+        return {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    env = {"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"}
+    if guard == "project":
+        env["PATH"] = os.environ.get("PATH", env["PATH"])
+        env.update({k: os.environ[k] for k in PROBE_ENV_ALLOW if k in os.environ})
+    return env
+
+
+def _run_in_group(
+    cmd: list[str], cwd: str, env: dict[str, str], timeout: float
+) -> subprocess.CompletedProcess[str]:
+    """``subprocess.run`` in its own process group; the whole group is killed on timeout, so a
+    child the probe started cannot outlive it."""
+    import signal
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+        raise
+    finally:
+        with contextlib.suppress(OSError):  # stragglers of a probe that exited early
+            os.killpg(proc.pid, signal.SIGKILL)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 async def run_probes(
     project_root: Path,
     snippets: list[str],
     *,
     python: str | None = None,
-    strict: bool = False,
+    guard: str = "project",
 ) -> str:
     """Run each snippet in a guarded interpreter (see :data:`PROBE_PREAMBLE`) from
     *project_root* (timeout, clipped output); return a text block of each snippet and its real
     output for the next fix round.
 
-    *strict*: ``python -I -S -B`` (standard library + the project only; the function-level
-    benchmarks).  Otherwise *python* (the project's interpreter, see :func:`probe_python`) with its
-    dependencies; None then means the probes cannot run, and each says so.
+    *guard* (see :data:`PROBE_PREAMBLE`): ``strict`` is ``python -I -S -B`` (standard library +
+    the project only; the function-level benchmarks); ``project`` is *python* (the project's
+    interpreter, see :func:`probe_python`) with its dependencies, read-only; ``off`` is the same
+    interpreter with no audit hook, ONLY for disposable sandboxes.  Without an interpreter
+    (None) the non-strict modes cannot run and each probe says so.
     """
-    interpreter = python or (sys.executable if strict else None)
-    flags = ["-I", "-S", "-B"] if strict else ["-I", "-B"]
-    mode = "strict" if strict else "project"
+    if guard not in PROBE_GUARDS:
+        raise ValueError(f"probe guard must be one of {PROBE_GUARDS}, got {guard!r}")
+    interpreter = python or (sys.executable if guard == "strict" else None)
+    flags = {"strict": ["-I", "-S", "-B"], "project": ["-I", "-B"], "off": ["-B"]}[guard]
+    mode = guard
     owned = ",".join(owned_packages(project_root))
     blocks: list[str] = []
     for i, snippet in enumerate(snippets[:MAX_PROBES], 1):
-        why = probe_refusal(snippet)
+        why = probe_refusal(snippet) if guard != "off" else ""
         if why:
             blocks.append(f"--- experiment {i} ---\n{snippet}\n=> {why}")
             continue
@@ -408,7 +517,7 @@ async def run_probes(
             continue
         try:
             res = await asyncio.to_thread(
-                subprocess.run,
+                _run_in_group,
                 [
                     interpreter,
                     *flags,
@@ -419,12 +528,9 @@ async def run_probes(
                     mode,
                     owned,
                 ],
-                cwd=str(project_root),
-                capture_output=True,
-                text=True,
-                timeout=PROBE_TIMEOUT_S,
-                env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
-                check=False,
+                str(project_root),
+                probe_env(guard),
+                PROBE_TIMEOUT_S,
             )
             out = (res.stdout + (("\n" + res.stderr) if res.stderr else "")).strip()
             body = clip(out or "(no output)", PROBE_OUTPUT_CHARS)

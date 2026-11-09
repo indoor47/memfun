@@ -1489,7 +1489,9 @@ def test_look_step_flags_land_in_verify_json(tmp_path: Path) -> None:
     rs.write_project_verify(bundle, repo)
     doc = json.loads((repo / ".memfun" / "verify.json").read_text())
     # off values are written explicitly, never left to a default
-    assert doc["fix_detail"] is False and doc["probe_rounds"] == 0 and doc["probe_strict"] is True
+    assert (
+        doc["fix_detail"] is False and doc["probe_rounds"] == 0 and doc["probe_guard"] == "strict"
+    )
     assert rs.effective_look_step(repo)["probe_rounds"] == 0
     rs.write_project_verify(bundle, repo, None, True, 3)
     doc = json.loads((repo / ".memfun" / "verify.json").read_text())

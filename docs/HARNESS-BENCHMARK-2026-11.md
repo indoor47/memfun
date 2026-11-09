@@ -515,7 +515,7 @@ An independent review of PR #87 found problems that made the arm P result unveri
 
 1. **Probe interpreter.** Probes could import or read an installed copy of the library under repair, and the interpreter was whatever `python` was on `PATH`.
    Now: the interpreter comes from the project (the verify command, else `.venv`), never memfun's own; project packages import from the project and
-   reading an installed copy of a project-owned package by path is denied; the function benchmarks use a strict mode (`python -I -S -B`: standard
+   reading an installed copy of a project-owned package by path is denied; the function benchmarks use `probe_guard = "strict"` (`python -I -S -B`: standard
    library and project only). An audit hook also denies writes, child processes, network and ctypes. That hook is defence in depth, not a sandbox: native
    code or a determined script can get around it. The runner's isolation self-test runs the strict mode under the episode sandbox.
 2. **Audit.** Leak and exposure checks now cover memfun probe scripts and output; a missing or malformed probe log (when probes were enabled), an

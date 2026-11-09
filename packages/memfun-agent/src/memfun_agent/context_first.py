@@ -236,9 +236,11 @@ class ContextFirstConfig:
     #: Re-run the failing pytest tests with full assertion output (``-vv``) and show that detail
     #: to the fix step instead of pytest's one-line truncated repr.
     fix_detail: bool = False
-    #: Probes run in ``python -I -S -B`` (standard library + the project only) instead of the
-    #: project's own interpreter: for benchmarks where an installed copy of the library is a leak.
-    fix_probe_strict: bool = False
+    #: How probe scripts are guarded: ``"project"`` (default: the project's interpreter, read-only
+    #: audit hook), ``"strict"`` (``python -I -S -B``: stdlib + the project only, for benchmarks
+    #: where an installed copy of the library is a leak) or ``"off"`` (no hook, for disposable
+    #: sandboxes only).
+    fix_probe_guard: str = "project"
     enable_edit_retry: bool = True
     enable_consistency_review: bool = True
 
@@ -457,7 +459,16 @@ _SKIP_DIRS = frozenset(
     }
 )
 
-#: Files that hold secrets, whatever their extension: never read into a prompt.
+#: Source-code suffixes: a module named ``credentials.py`` or ``secrets.py`` is code, not a secret.
+_CODE_SUFFIXES = frozenset(
+    {
+        ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".c", ".cpp", ".h",
+        ".hpp", ".rb", ".php", ".swift", ".r", ".jl", ".vue", ".svelte", ".astro", ".sql",
+        ".sh", ".bash", ".zsh", ".graphql", ".proto", ".html", ".css", ".scss",
+    }
+)  # fmt: skip
+
+#: Data/config files that hold secrets, by name: never read into a prompt.
 _SECRET_FILE = re.compile(
     r"(^\.env(\..*)?$|\.env$|^credentials?(\..*)?$|^secrets?(\..*)?$|\.pem$|\.key$|"
     r"^id_(rsa|dsa|ecdsa|ed25519)|^\.netrc$|^\.npmrc$|^\.pypirc$)",
@@ -483,8 +494,8 @@ def build_file_manifest(
         for fname in sorted(filenames):
             fpath = Path(dirpath) / fname
             suffix = fpath.suffix.lower()
-            if _SECRET_FILE.search(fname):
-                continue
+            if _SECRET_FILE.search(fname) and suffix not in _CODE_SUFFIXES:
+                continue  # data/config with a secret-looking name; source modules stay visible
 
             # Dockerfile has no extension
             if fname.lower() in ("dockerfile", "makefile", "rakefile"):
@@ -1370,14 +1381,15 @@ def read_project_verify_options(project_root: Path) -> dict[str, Any]:
                     data["fix_detail"],
                     PROJECT_VERIFY_FILE,
                 )
-        if "probe_strict" in data:
-            if isinstance(data["probe_strict"], bool):
-                out["probe_strict"] = data["probe_strict"]
+        if "probe_guard" in data:
+            if data["probe_guard"] in fixloop.PROBE_GUARDS:
+                out["probe_guard"] = data["probe_guard"]
             else:
                 logger.warning(
-                    "ignoring probe_strict=%r in %s (must be true or false)",
-                    data["probe_strict"],
+                    "ignoring probe_guard=%r in %s (must be one of %s); the default guard stays",
+                    data["probe_guard"],
                     PROJECT_VERIFY_FILE,
+                    ", ".join(fixloop.PROBE_GUARDS),
                 )
         if "probe_rounds" in data:
             pr = data["probe_rounds"]
@@ -2089,7 +2101,10 @@ class ContextFirstSolver:
         opts = read_project_verify_options(self.project_root)
         probes_left = max(0, int(opts.get("probe_rounds", self.config.fix_probe_rounds)))
         fix_detail = bool(opts.get("fix_detail", self.config.fix_detail))
-        strict = bool(opts.get("probe_strict", self.config.fix_probe_strict))
+        guard = str(opts.get("probe_guard", self.config.fix_probe_guard))
+        if guard not in fixloop.PROBE_GUARDS:
+            logger.warning("unknown fix_probe_guard %r; using 'project'", guard)
+            guard = "project"
         if probes_left > 0:
             fixloop.init_probe_log(self.project_root)
         experiments: list[str] = []  # real outputs of probe snippets, newest last
@@ -2181,7 +2196,7 @@ class ContextFirstSolver:
                         history,
                         experiments,
                         verify_cmds,
-                        strict,
+                        guard,
                     )
                 except Exception as exc:  # the look step must never end the fix loop
                     logger.warning("Look step failed: %s", exc)
@@ -2249,7 +2264,7 @@ class ContextFirstSolver:
         history: list[str],
         experiments: list[str],
         verify_cmds: list[str],
-        strict: bool,
+        guard: str,
     ) -> list[str]:
         """Differential probes for one stalled round: go on while a probe prints something new.
 
@@ -2282,8 +2297,10 @@ class ContextFirstSolver:
             out = await fixloop.run_probes(
                 self.project_root,
                 snippets,
-                python=None if strict else fixloop.probe_python(verify_cmds, self.project_root),
-                strict=strict,
+                python=None
+                if guard == "strict"
+                else fixloop.probe_python(verify_cmds, self.project_root),
+                guard=guard,
             )
             fixloop.log_probe(self.project_root, snippets, out)
             key = fixloop.probe_fingerprint(out)

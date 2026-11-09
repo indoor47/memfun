@@ -150,7 +150,7 @@ def test_a_stalled_round_runs_experiments_and_feeds_their_output_to_the_fix(
         max_fix_attempts=5,
         fix_restarts=0,
         fix_probe_rounds=1,
-        fix_probe_strict=True,
+        fix_probe_guard="strict",
     )
     proposals: list[str] = []
 
@@ -304,12 +304,12 @@ def test_out_of_range_look_options_are_loud_not_silently_off(
     _trust(monkeypatch)
     (tmp_path / ".memfun").mkdir()
     (tmp_path / ".memfun" / "verify.json").write_text(
-        json.dumps({"probe_rounds": 25, "fix_detail": "yes", "probe_strict": 1})
+        json.dumps({"probe_rounds": 25, "fix_detail": "yes", "probe_guard": "nope"})
     )
     with caplog.at_level("WARNING"):
         assert read_project_verify_options(tmp_path) == {}
     assert "probe_rounds=25" in caplog.text and "probes stay OFF" in caplog.text
-    assert "fix_detail='yes'" in caplog.text and "probe_strict=1" in caplog.text
+    assert "fix_detail='yes'" in caplog.text and "probe_guard='nope'" in caplog.text
 
 
 def test_full_failure_detail_reaches_the_fix_step(
@@ -351,7 +351,7 @@ def test_several_probes_per_stall_while_each_prints_something_new(tmp_path: Path
     outs = {"start": _out(3, 1), "a": _out(3, 1), "b": "PASS"}
     rig = Rig(
         tmp_path, outs, ["a", "b"], max_fix_attempts=6, fix_restarts=0,
-        fix_probe_rounds=1, fix_probe_iterations=3, fix_probe_strict=True,
+        fix_probe_rounds=1, fix_probe_iterations=3, fix_probe_guard="strict",
     )  # fmt: skip
     calls: list[str] = []
 
@@ -384,7 +384,7 @@ def test_probe_rounds_do_not_change_the_loop_only_the_look_step(tmp_path: Path) 
         (tmp_path / name).mkdir()
         rig = Rig(
             tmp_path / name, outs, ["a", "b"], max_fix_attempts=2, fix_restarts=0,
-            fix_patience=9, fix_probe_rounds=rounds, fix_probe_strict=True,
+            fix_patience=9, fix_probe_rounds=rounds, fix_probe_guard="strict",
         )  # fmt: skip
 
         async def apropose(q: str, c: str, v: str, h: str):
@@ -401,7 +401,7 @@ def test_an_exception_in_the_look_step_does_not_abort_the_loop(tmp_path: Path) -
     outs = {"start": _out(3, 1), "a": _out(3, 1), "b": "PASS"}
     rig = Rig(
         tmp_path, outs, ["a", "b"], max_fix_attempts=5, fix_restarts=0, fix_probe_rounds=2,
-        fix_probe_strict=True,
+        fix_probe_guard="strict",
     )  # fmt: skip
 
     async def run_probes_boom(*_a: Any, **_k: Any):

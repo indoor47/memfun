@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
 
+import pytest
 from memfun_agent import fixloop as fl
 
 FAIL = """\
@@ -31,11 +32,6 @@ ERROR tests/test_x.py
 !!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
 1 error in 0.05s
 """
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    import pytest
 
 
 def test_summarize_counts_and_ids() -> None:
@@ -125,7 +121,7 @@ def test_run_probes_shows_real_output_and_refusals(tmp_path: Path) -> None:
         fl.run_probes(
             tmp_path,
             ["from m import f\nprint(f(21))", "import os; os.remove('m.py')"],
-            strict=True,
+            guard="strict",
         )
     )
     assert "=> 42" in out and "refused" in out
@@ -135,7 +131,7 @@ def test_run_probes_shows_real_output_and_refusals(tmp_path: Path) -> None:
 def _probe(tmp_path: Path, snippet: str, **kw: object) -> str:
     import asyncio
 
-    kw = {"strict": True, **kw}
+    kw = {"guard": "strict", **kw}
     return asyncio.run(fl.run_probes(tmp_path, [snippet], **kw))  # type: ignore[arg-type]
 
 
@@ -204,7 +200,7 @@ def test_project_mode_uses_the_projects_dependencies_but_not_installed_copies_of
     (site / "dep.py").write_text("WHERE = 'dependency'\n")
     (proj / "thelib.py").write_text("WHERE = 'project'\n")
     pre = f"import sys; sys.path.append({str(site)!r}); "
-    kw = {"python": sys.executable, "strict": False}
+    kw = {"python": sys.executable, "guard": "project"}
     # a dependency installed for the project is importable, and its file readable
     out = _probe(proj, pre + "import dep; print(dep.WHERE)", **kw)
     assert "=> dependency" in out
@@ -234,7 +230,7 @@ def test_probe_python_comes_from_the_verify_command_never_memfuns_own(tmp_path: 
     (tmp_path / ".venv" / "bin" / "python").write_text("")
     assert fl.probe_python(["ruff check ."], tmp_path) == str(tmp_path / ".venv/bin/python")
     assert fl.probe_python([], tmp_path / "nowhere") is None
-    out = _probe(tmp_path, "print(1)", strict=False, python=None)
+    out = _probe(tmp_path, "print(1)", guard="project", python=None)
     assert "no project interpreter" in out and sys.executable not in out
 
 
@@ -356,3 +352,106 @@ def test_init_probe_log_creates_an_empty_log_so_a_missing_one_is_detectable(
     fl.init_probe_log(tmp_path)
     assert (tmp_path / fl.PROBE_LOG).read_text() == ""
     fl.init_probe_log(tmp_path / "missing" / "dir")  # still best effort
+
+
+def test_off_guard_allows_temp_files_children_and_sockets_and_kills_the_group(
+    tmp_path: Path,
+) -> None:
+    import sys
+    import time
+
+    kw = {"python": sys.executable, "guard": "off"}
+    out = _probe(
+        tmp_path,
+        "import tempfile, subprocess, socket, os\n"
+        "f = tempfile.NamedTemporaryFile(); print('tmp', os.path.exists(f.name))\n"
+        "print(subprocess.run(['echo', 'child'], capture_output=True, text=True).stdout.strip())\n"
+        "s = socket.socket(); s.bind(('127.0.0.1', 0)); print('sock')\n"
+        "open('cache.txt', 'w').write('x')",
+        **kw,
+    )
+    assert "tmp True" in out and "child" in out and "sock" in out
+    assert (tmp_path / "cache.txt").exists()
+    # a child that outlives the probe is killed with its process group on timeout
+    marker = tmp_path / "survivor.txt"
+    old = fl.PROBE_TIMEOUT_S
+    fl.PROBE_TIMEOUT_S = 1.0
+    try:
+        out = _probe(
+            tmp_path,
+            "import subprocess, time\n"
+            f"subprocess.Popen(['sh', '-c', 'sleep 3; echo x > {marker}'])\n"
+            "time.sleep(30)",
+            **kw,
+        )
+    finally:
+        fl.PROBE_TIMEOUT_S = old
+    assert "timed out" in out
+    time.sleep(3.5)
+    assert not marker.exists()  # the orphan did not survive the timeout
+
+
+def test_the_project_guard_passes_a_small_environment_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    monkeypatch.setenv("TZ", "UTC")
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    monkeypatch.setenv("SECRET_TOKEN", "hunter2")
+    monkeypatch.setenv("VIRTUAL_ENV", "/some/venv")
+    out = _probe(
+        tmp_path,
+        "import os; print(os.environ.get('TZ'), os.environ.get('VIRTUAL_ENV'), "
+        "os.environ.get('SECRET_TOKEN'))",
+        python=sys.executable,
+        guard="project",
+    )
+    assert "=> UTC /some/venv None" in out
+    env = fl.probe_env("strict")
+    assert set(env) == {"PATH", "PYTHONDONTWRITEBYTECODE"}  # strict: nothing inherited
+
+
+def test_an_unknown_guard_is_refused_loudly(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        _probe(tmp_path, "print(1)", guard="loose")
+
+
+def test_probe_python_resolves_a_bare_pytest_or_python_through_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    import sys
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake_python = bindir / "python"
+    fake_python.write_text("#!/bin/sh\n")
+    fake_python.chmod(0o755)
+    pytest_script = bindir / "pytest"
+    pytest_script.write_text("#!/bin/sh\n")
+    pytest_script.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    for cmd in ("pytest -q tests", "python -m pytest -q"):
+        assert fl.probe_python([cmd], proj) == str(fake_python), cmd
+    # pytest whose directory has no python: its shebang interpreter
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "pytest").write_text(f"#!{fake_python}\n")
+    (other / "pytest").chmod(0o755)
+    monkeypatch.setenv("PATH", str(other))
+    assert fl.probe_python(["pytest -q"], proj) == str(fake_python)
+    # a bare name that resolves to memfun's own interpreter is not accepted
+    own = Path(sys.executable)
+    monkeypatch.setenv("PATH", str(own.parent))
+    got = fl.probe_python(["python -m pytest"], proj)
+    assert got is None or os.path.realpath(got) != os.path.realpath(sys.executable)
+    # python3 from PATH is the fallback for a python-based verify command
+    monkeypatch.setenv("PATH", str(bindir))
+    (bindir / "python3").write_text("#!/bin/sh\n")
+    (bindir / "python3").chmod(0o755)
+    fake_python.unlink()
+    pytest_script.unlink()
+    assert fl.probe_python(["python -m pytest"], proj) == str(bindir / "python3")

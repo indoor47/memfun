@@ -995,7 +995,7 @@ def effective_look_step(repo: Path) -> dict[str, Any]:
     except (OSError, ValueError):
         return {"verify_json": "missing or unreadable"}
     return {
-        k: doc.get(k) for k in ("max_fix_attempts", "fix_detail", "probe_rounds", "probe_strict")
+        k: doc.get(k) for k in ("max_fix_attempts", "fix_detail", "probe_rounds", "probe_guard")
     }
 
 
@@ -1040,7 +1040,7 @@ def write_project_verify(
     # is explicit in the episode and never depends on a default.
     doc["fix_detail"] = bool(fix_detail)  # --fix-detail
     doc["probe_rounds"] = int(probe_rounds)  # --probe-rounds (0 = off)
-    doc["probe_strict"] = True  # function benchmarks: probes see the project + stdlib only
+    doc["probe_guard"] = "strict"  # function benchmarks: probes see the project + stdlib only
     (repo / ".memfun" / "verify.json").write_text(json.dumps(doc), encoding="utf-8")
 
 
