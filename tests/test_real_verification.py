@@ -124,6 +124,11 @@ async def test_a_good_change_passes_without_any_fix_call(root: Path) -> None:
     await solver.asolve(query=ISSUE)
     assert model.fix_errors == [] and any("Verification passed" in s for s in statuses)
     assert any("Verifying with 1 related test files" in s for s in statuses)
+    log = [json.loads(x) for x in (root / ".memfun/checks.jsonl").read_text("utf-8").splitlines()]
+    assert [r["event"] for r in log] == ["tests_selected", "verify"]
+    assert log[0]["files"] == ["test/test_cart.py"] and log[0]["runner"] == "pytest"
+    assert log[0]["left_out_failing_before"] == ["test/test_cart.py::test_old_failure"]
+    assert log[1]["passed"] is True and len(log[1]["commands"]) == 3  # syntax, import, tests
 
 
 @pytest.mark.asyncio
@@ -189,6 +194,28 @@ async def test_the_reproduction_is_shown_to_the_solver_and_checked_after_the_cha
     assert (root / cf.REPRO_FILE).read_text("utf-8") == REPRO + "\n"  # the script is not editable
     assert "(1 + RATE)" in (root / "shop/cart.py").read_text("utf-8")
     assert any("Verification passed" in s for s in statuses)
+    log = [json.loads(x) for x in (root / ".memfun/checks.jsonl").read_text("utf-8").splitlines()]
+    assert [r["event"] for r in log] == ["reproduction", "verify", "verify"]
+    assert log[0]["verdict"] == "reproduced" and log[0]["exit"] == 1
+    assert log[1]["passed"] is False and log[1]["commands"] == [cf.REPRO_LABEL]
+    assert "REPRO: FAIL" in log[1]["failed"][0] and log[2]["passed"] is True
+
+
+@pytest.mark.asyncio
+async def test_when_the_reproduction_never_passes_the_first_solution_is_kept(root: Path) -> None:
+    """A model-written check that no edit satisfies must not leave the code at the last
+    desperate attempt: on a tie the earliest best state wins."""
+    statuses: list[str] = []
+    solver = make_solver(root, statuses, reproduce=True, fix_probe_guard="off", fix_restarts=0)
+    first = edit(root, "return sum(items)", "return sum(items) * 2")
+    second = edit(root, "return sum(items) * 2", "return sum(items) * 3")
+    third = edit(root, "return sum(items) * 3", "return sum(items) * 4")
+    model = Model(solver, solve=[[first]], fixes=[[second], [third]])
+    model.scripts = [REPRO]
+    await solver.asolve(query=ISSUE)
+    assert len(model.fix_errors) >= 1
+    assert "return sum(items) * 2" in (root / "shop/cart.py").read_text("utf-8")
+    assert any("Restored the best state (round 1)" in s for s in statuses)
 
 
 @pytest.mark.asyncio

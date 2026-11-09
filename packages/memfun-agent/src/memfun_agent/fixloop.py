@@ -713,6 +713,20 @@ def probe_fingerprint(output: str) -> str:
 
 
 PROBE_LOG = ".memfun/probes.jsonl"
+CHECK_LOG = ".memfun/checks.jsonl"
+
+
+def log_check(project_root: Path, record: dict[str, object]) -> None:
+    """Append one record of what the solver's own checks did (a reproduction attempt, the
+    tests it selected, a verify round) to ``.memfun/checks.jsonl``: the evidence of which real
+    tests ran and what they said.  Best effort: a logging failure never affects the solve."""
+    try:
+        path = project_root / CHECK_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.time(), **record}, default=str) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def init_probe_log(project_root: Path) -> None:

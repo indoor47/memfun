@@ -695,11 +695,14 @@ class IssueReproduction(dspy.Signature):
     - the behaviour is what the task asks for: print ``REPRO: PASS`` and exit with code 0.
 
     Catch the exception the task talks about yourself and report it as ``REPRO: FAIL``; do not
-    let it escape.  Check only what the task states (do not invent requirements, names or
-    messages it does not give).  No network, no installing, nothing outside the project
-    directory, finish within seconds.  The same script is run again after the fix and must then
-    print ``REPRO: PASS``.  If the task cannot be checked by running code (for example it only
-    asks for documentation), return an empty script.
+    let it escape.  Check only what the task states concretely: an error that is or is not
+    raised, a value, an output it quotes.  Do not invent requirements, names, messages or
+    thresholds the task does not give; when the task describes the problem only in general
+    terms ("results are not relevant enough", "it should be faster"), there is nothing a script
+    can decide, so return an empty script.  No network, no installing, nothing outside the
+    project directory, finish within seconds.  The same script is run again after the fix and
+    must then print ``REPRO: PASS``.  If the task cannot be checked by running code (for
+    example it only asks for documentation), return an empty script.
     """
 
     query: str = dspy.InputField(desc="The task (an issue report or a change request)")

@@ -1858,6 +1858,13 @@ class ContextFirstSolver:
             print(result.answer)
     """
 
+    #: Set per solve.  ``_log_checks``: write ``.memfun/checks.jsonl`` (own checks are on).
+    #: ``_first_on_tie``: on a tie between verify rounds keep the EARLIEST best state (a
+    #: model-written check is in play, so later edits made to satisfy it are not trusted over
+    #: the first solution).
+    _log_checks: bool = False
+    _first_on_tie: bool = False
+
     def __init__(
         self,
         project_root: str | Path = ".",
@@ -2159,7 +2166,11 @@ class ContextFirstSolver:
         opts = read_project_verify_options(self.project_root)
         repro: Reproduction | None = None
         wants_repro = bool(opts.get("reproduce", self.config.reproduce))
-        if wants_repro or bool(opts.get("discover_tests", self.config.verify_tests)):
+        self._log_checks = wants_repro or bool(
+            opts.get("discover_tests", self.config.verify_tests)
+        )
+        self._first_on_tie = False
+        if self._log_checks:
             pythons = repo_tests.candidate_pythons(self.project_root)
             version = (
                 await asyncio.to_thread(repo_tests.python_version, pythons[0], self.project_root)
@@ -2178,6 +2189,7 @@ class ContextFirstSolver:
             except Exception as exc:  # the reproduction must never end the solve
                 logger.warning("Reproduction step failed: %s", exc)
             if repro is not None:
+                self._first_on_tie = True
                 full_context += (
                     "\n\n=== REPRODUCTION (this script was run on the current code and shows the "
                     "problem; it is run again after your change and must then print "
@@ -2454,6 +2466,7 @@ class ContextFirstSolver:
             script = await self.repro_solver.awrite(query, full_context, feedback)
             if not script:
                 logger.info("Reproduction: the model gave no script (attempt %d)", attempt)
+                self._check_log({"event": "reproduction", "attempt": attempt, "verdict": "none"})
                 break
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(script + "\n", "utf-8")
@@ -2463,6 +2476,15 @@ class ContextFirstSolver:
             )
             verdict = classify_repro(code, out)
             logger.info("Reproduction attempt %d: %s (exit %s)", attempt, verdict, code)
+            self._check_log(
+                {
+                    "event": "reproduction",
+                    "attempt": attempt,
+                    "verdict": verdict,
+                    "exit": code,
+                    "output": fixloop.clip(out, 1_500),
+                }
+            )
             if verdict == "reproduced":
                 self._status("The problem is reproduced")
                 return Reproduction(script=script, argv=argv, output=out)
@@ -2554,6 +2576,7 @@ class ContextFirstSolver:
             files += [h.path for h in by_task if h.path not in files][: 2 - len(files)]
         if not files:
             self._status("No existing test is related to the changed files")
+            self._check_log({"event": "tests_selected", "files": [], "changed": changed})
             return cmds
         new_files = {
             str(p.relative_to(self.project_root))
@@ -2581,6 +2604,16 @@ class ContextFirstSolver:
             self._status("The related tests do not run on the original code: not used")
             return cmds
         argv = repo_tests.test_command(setup, files, failing)
+        self._check_log(
+            {
+                "event": "tests_selected",
+                "files": files,
+                "by_file": {s.path: list(s.reasons) for s in selected},
+                "left_out_failing_before": failing,
+                "python": setup.python,
+                "runner": setup.runner,
+            }
+        )
         logger.info(
             "Verifying with %d test files (%s); %d failures that were already there left out",
             len(files),
@@ -2589,6 +2622,10 @@ class ContextFirstSolver:
         )
         self._status(f"Verifying with {len(files)} related test files")
         return [*cmds, repo_tests.shell(argv)]
+
+    def _check_log(self, record: dict[str, Any]) -> None:
+        if self._log_checks:
+            fixloop.log_check(self.project_root, record)
 
     def _get_verify_commands(self) -> list[str]:
         """Get verification commands: explicit config or auto-detected."""
@@ -2631,7 +2668,9 @@ class ContextFirstSolver:
             # Never finish worse than the best state this loop saw, whatever ended the loop
             # (a cap, a stall, an exception, a cancellation).
             sc = last[0]
-            if sc is not None and best.best_score is not None and sc > best.best_score:
+            worse = sc is not None and best.best_score is not None and sc > best.best_score
+            tie = sc is not None and sc == best.best_score and self._first_on_tie
+            if worse or tie:
                 changed = best.restore()
                 if changed:
                     logger.info(
@@ -2673,6 +2712,16 @@ class ContextFirstSolver:
         for attempt in range(1, cap + 1):
             self._status(f"Verifying (round {attempt}, base {base}, cap {cap})...")
             vr = await self.verifier.averify(verify_cmds)
+            self._check_log(
+                {
+                    "event": "verify",
+                    "round": attempt,
+                    "passed": vr.passed,
+                    "commands": [self.verifier.labels.get(c, c)[:300] for c in verify_cmds],
+                    "skipped": [self.verifier.labels.get(c, c)[:300] for c in vr.skipped],
+                    "failed": [b[:1_500] for b in vr.blocks],
+                }
+            )
             if vr.passed:
                 last[0] = None
                 self._status("Verification passed")
