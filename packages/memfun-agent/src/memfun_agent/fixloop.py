@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import difflib
+import hashlib
 import json
 import os
 import re
@@ -281,3 +283,43 @@ async def run_probes(project_root: Path, snippets: list[str]) -> str:
             body = f"(could not run: {exc})"
         blocks.append(f"--- experiment {i} ---\n{snippet}\n=> {body}")
     return "\n\n".join(blocks)
+
+
+# ── Round memory: what each round changed, and whether we have been here before ──
+
+
+def read_texts(paths: list[Path]) -> dict[Path, str]:
+    """Current text of every readable file in *paths*."""
+    out: dict[Path, str] = {}
+    for p in paths:
+        try:
+            out[p] = p.read_text("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+    return out
+
+
+def state_key(texts: dict[Path, str]) -> str:
+    """A hash of the file contents: two rounds with the same key left the code identical."""
+    h = hashlib.sha256()
+    for p in sorted(texts, key=str):
+        h.update(str(p).encode())
+        h.update(b"\0")
+        h.update(texts[p].encode())
+        h.update(b"\0")
+    return h.hexdigest()[:16]
+
+
+def short_diff(before: dict[Path, str], after: dict[Path, str], limit: int = 700) -> str:
+    """A compact unified diff of what a round changed (changed lines only), clipped."""
+    lines: list[str] = []
+    for p in sorted(after, key=str):
+        a, b = before.get(p, ""), after[p]
+        if a == b:
+            continue
+        for ln in difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=0):
+            if ln.startswith(("---", "+++", "@@")):
+                continue
+            lines.append(ln)
+    text = "\n".join(lines)
+    return text if len(text) <= limit else text[:limit] + "\n... [diff clipped]"

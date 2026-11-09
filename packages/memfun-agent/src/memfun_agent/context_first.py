@@ -228,8 +228,9 @@ class ContextFirstConfig:
     #: Clean-slate rewrites from the best state when the patches stall (the second loop).
     fix_restarts: int = 1
     #: Probe rounds: when a round makes no progress the model proposes up to 3 small python
-    #: experiments, they run, and their real output goes into the next fix (0 = off).
-    fix_probe_rounds: int = 2
+    #: experiments, they run, and their real output goes into the next fix.  Off (0) by default:
+    #: round 2 of the Cerebras A/B showed no gain, so it is opt-in.
+    fix_probe_rounds: int = 0
     enable_edit_retry: bool = True
     enable_consistency_review: bool = True
 
@@ -1950,6 +1951,7 @@ class ContextFirstSolver:
         paths = [Path(f) for f in dict.fromkeys(executor.files_created)]
         best = fixloop.BestSoFar(paths)
         history: list[str] = []
+        seen_states: dict[str, tuple[int, tuple[int, int, int]]] = {}  # state -> (round, score)
         stagnant = 0
         sc: tuple[int, int, int] = (1, 1, 0)
         for attempt in range(1, cap + 1):
@@ -1959,6 +1961,15 @@ class ContextFirstSolver:
                 self._status("Verification passed")
                 return
             sc = fixloop.score(vr.errors, False)
+            state = fixloop.state_key(fixloop.read_texts(paths))
+            revisit = seen_states.get(state)
+            seen_states.setdefault(state, (attempt, sc))
+            if revisit is not None and attempt > 1:
+                history.append(
+                    f"round {attempt}: the code is IDENTICAL to round {revisit[0]} (same failures "
+                    "again). That change was undone or repeated: it is a dead end, try something "
+                    "structurally different."
+                )
             improved = best.observe(attempt, sc)
             stagnant = 0 if improved else stagnant + 1
             summary = fixloop.summarize(vr.errors)
@@ -2014,6 +2025,7 @@ class ContextFirstSolver:
                         verification_errors=fixloop.compact_errors(vr.errors),
                         history="\n".join(history[-6:]),
                     )
+                    logger.info("Probe round: %d experiments proposed", len(snippets))
                     if snippets:
                         experiments.append(await fixloop.run_probes(self.project_root, snippets))
                         history.append(
@@ -2049,6 +2061,7 @@ class ContextFirstSolver:
                 continue
 
             self._status(f"Applying {len(fix_ops)} fix operations...")
+            before_texts = fixloop.read_texts(paths)
             # Use edit_only executor: fixes should be targeted edits, never full rewrites.
             fix_executor = OperationExecutor(
                 self.project_root,
@@ -2064,10 +2077,12 @@ class ContextFirstSolver:
                 if Path(f) not in paths:
                     paths.append(Path(f))  # BestSoFar shares this list
             ids = ", ".join(summary.failed_ids[:4]) or "lint/other errors"
+            change = fixloop.short_diff(before_texts, fixloop.read_texts(paths))
             history.append(
                 f"round {attempt}: {summary.failed} failing ({ids}); applied "
                 f"{fix_executor.attempted - fix_executor.failed}/{fix_executor.attempted} edits"
                 + (", some edits did not match the file" if fix_executor.failed else "")
+                + (f"; the change was:\n{change}" if change else "; the file did not change")
             )
 
         # Never finish worse than the best state this loop saw.

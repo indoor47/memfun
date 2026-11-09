@@ -47,8 +47,12 @@ class Rig:
             self.fix_queries.append(query)
             if not self.fixes:
                 return []
-            self.file.write_text(self.fixes.pop(0))
-            return [{"op": "run_cmd", "cmd": "true"}]
+            target = self.fixes.pop(0)
+            current = self.file.read_text()
+            if target == current:
+                return [{"op": "run_cmd", "cmd": "true"}]
+            # a real edit, applied by the loop's executor (so the loop can diff it)
+            return [{"op": "edit_file", "path": str(self.file), "old": current, "new": target}]
 
         async def asolve(query: str, full_context: str) -> SolveResult:
             self.fix_queries.append("RESTART:" + query)
@@ -170,4 +174,18 @@ def test_probes_can_be_switched_off(tmp_path: Path) -> None:
 
     rig.solver.probe_solver.apropose = boom  # type: ignore[method-assign]
     rig.run()
+    assert rig.file.read_text() == "b"
+
+
+def test_history_shows_what_each_round_changed_and_flags_a_revisited_state(
+    tmp_path: Path,
+) -> None:
+    # round 1 "start" -> fix to "a" -> fix back to "start" (an oscillation) -> fix to "b" (passes)
+    outs = {"start": _out(3, 1), "a": _out(3, 1), "b": "PASS"}
+    rig = Rig(tmp_path, outs, ["a", "start", "b"], max_fix_attempts=6, fix_restarts=0)
+    rig.run()
+    assert len(rig.fix_queries) == 3
+    second, third = rig.fix_queries[1], rig.fix_queries[2]
+    assert "the change was" in second and "-start" in second and "+a" in second
+    assert "IDENTICAL to round 1" in third  # the file went back to the state of round 1
     assert rig.file.read_text() == "b"

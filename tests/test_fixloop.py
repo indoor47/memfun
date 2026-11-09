@@ -129,3 +129,15 @@ def test_run_probes_shows_real_output_and_refusals(tmp_path: Path) -> None:
     )
     assert "=> 42" in out and "refused" in out and "ZeroDivisionError" in out
     assert (tmp_path / "m.py").exists()
+
+
+def test_state_key_and_short_diff(tmp_path: Path) -> None:
+    f = tmp_path / "m.py"
+    before = {f: "a = 1\nb = 2\n"}
+    after = {f: "a = 1\nb = 3\n"}
+    assert fl.state_key(before) == fl.state_key({f: "a = 1\nb = 2\n"})
+    assert fl.state_key(before) != fl.state_key(after)
+    d = fl.short_diff(before, after)
+    assert "-b = 2" in d and "+b = 3" in d and "a = 1" not in d
+    assert fl.short_diff(before, before) == ""
+    assert "clipped" in fl.short_diff({f: ""}, {f: "x\n" * 2000}, limit=50)
