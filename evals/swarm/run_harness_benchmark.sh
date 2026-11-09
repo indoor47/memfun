@@ -49,6 +49,16 @@ BUNDLES=(c0s-wcwidth-_bisearch c0s-wcwidth-_wcmatch_version c0s-wcwidth-_wcversi
          c0s-cachetools-fifo_cache c0s-cachetools-lfu_cache c0s-cachetools-lru_cache
          c0s-cachetools-mru_cache c0s-cachetools-rr_cache c0s-cachetools-ttl_cache
          c0s-cachetools-hashkey c0s-cachetools-typedkey)
+# Another library or task set: LIB=tinydb takes every c0s-tinydb-* bundle of the cache; BUNDLES_OVERRIDE
+# (space separated ids) wins over both.  LIBS (merge-check) defaults to the two original libraries.
+if [ -n "${BUNDLES_OVERRIDE:-}" ]; then
+  read -r -a BUNDLES <<< "$BUNDLES_OVERRIDE"
+elif [ -n "${LIB:-}" ]; then
+  BUNDLES=(); while IFS= read -r b; do BUNDLES+=("$b"); done < <(ls "$CACHE/bundles" | grep "^c0s-${LIB}-" | sort)
+  [ "${#BUNDLES[@]}" -gt 0 ] || { echo "no c0s-${LIB}-* bundles in $CACHE/bundles"; exit 2; }
+fi
+LIBS=${LIBS:-${LIB:-wcwidth cachetools}}
+RUN_TAG=${RUN_TAG:-}        # several runs of the same arm in one OUT (the concurrency ramp)
 PARALLEL=$(( ${#BUNDLES[@]} * TRIALS ))
 
 # Expected wall per arm (all 42 episodes at once; from the Cerebras smoke + the B300 wcwidth runs).
@@ -84,6 +94,7 @@ reads_for() { case "$1" in
   aider) echo "$PYVENV:$PYPFX:$(dirname "$(dirname "$AIDER")")";;
   *) echo "$PYVENV:$PYPFX";; esac; }
 
+if [ "${SKIP_SELFTEST:-0}" != 1 ]; then  # SKIP_SELFTEST=1: already passed on this pod (later ramp steps)
 echo "== isolation self-test (the run does not start unless every line passes)"
 T="$OUT/isotest"; mkdir -p "$T/repo" "$T/home"
 ( cd "$T/repo"; export HOME="$T/home" SANDBOX_READ_PATHS="$PYVENV:$PYPFX"
@@ -95,8 +106,9 @@ T="$OUT/isotest"; mkdir -p "$T/repo" "$T/home"
   "$SANDBOX" sh -c "echo x > $T/escape" >/dev/null 2>&1 && { echo "  FAIL: can write outside the episode"; fail=1; } || echo "  ok: writes outside the episode denied"
   "$SANDBOX" curl -s -m 6 -o /dev/null https://pypi.org/ >/dev/null 2>&1 && { echo "  FAIL: internet reachable"; fail=1; } || echo "  ok: internet unreachable"
   "$SANDBOX" sh -c 'echo ok > f && cat f' >/dev/null 2>&1 && echo "  ok: the episode repo is readable and writable" || { echo "  FAIL: cannot use the episode repo"; fail=1; }
-  "$SANDBOX" "$PY" -c "import wcwidth" >/dev/null 2>&1 && { echo "  FAIL: wcwidth is installed for the agent"; fail=1; } || echo "  ok: no installed copy of wcwidth"
-  "$SANDBOX" "$PY" -c "import cachetools" >/dev/null 2>&1 && { echo "  FAIL: cachetools is installed for the agent"; fail=1; } || echo "  ok: no installed copy of cachetools"
+  for pkg in wcwidth cachetools $LIBS; do
+    "$SANDBOX" "$PY" -c "import $pkg" >/dev/null 2>&1 && { echo "  FAIL: $pkg is installed for the agent"; fail=1; } || echo "  ok: no installed copy of $pkg"
+  done
   # The way run_smoke launches a harness: cleaned environment, read paths passed via env(1).
   for arm in $ARMS; do
     bin=$PY; [ "$arm" = memfun ] && bin=$MEMFUN
@@ -108,6 +120,7 @@ T="$OUT/isotest"; mkdir -p "$T/repo" "$T/home"
       || { echo "  FAIL: $arm cannot start under the sandbox with a cleaned environment"; fail=1; }
   done
   exit $fail ) || { echo "isolation self-test FAILED: not starting"; exit 3; }
+fi
 
 run_arm() {
   local arm=$1; shift
@@ -118,11 +131,12 @@ run_arm() {
     --episode-timeout "$EPISODE_TIMEOUT" --task-timeout $((EPISODE_TIMEOUT - 50)) --grader-timeout 900 \
     --temperature 0.7 --repetition-penalty 1.05 --max-tokens "$MAX_TOKENS" \
     --context-window "$CONTEXT_WINDOW" --no-dashboard \
-    --out-dir "$OUT" --run-id "bench-$arm" \
-    --progress-file "$REPO/.memfun/bench-$arm-progress.md" "$@" || echo "arm $arm exited $?"
+    --out-dir "$OUT" --run-id "bench-$arm${RUN_TAG:+-$RUN_TAG}" \
+    --progress-file "$REPO/.memfun/bench-$arm${RUN_TAG:+-$RUN_TAG}-progress.md" "$@" || echo "arm $arm exited $?"
   echo "-- contamination audit: $arm"
-  "$PY" "$REPO/evals/swarm/audit_contamination.py" --run "$OUT/bench-$arm" --bundles "$CACHE/bundles" \
-    --json "$OUT/bench-$arm/audit.json" || echo "audit failed for $arm"
+  "$PY" "$REPO/evals/swarm/audit_contamination.py" --run "$OUT/bench-$arm${RUN_TAG:+-$RUN_TAG}" \
+    --bundles "$CACHE/bundles" --json "$OUT/bench-$arm${RUN_TAG:+-$RUN_TAG}/audit.json" \
+    || echo "audit failed for $arm"
 }
 
 for arm in $ARMS; do
@@ -138,10 +152,10 @@ done
 
 echo; echo "== merge-check (whole-library score from the best trial per function), per arm"
 for arm in $ARMS; do
-  for lib in wcwidth cachetools; do
-    "$PY" "$REPO/evals/swarm/commit0_adapter.py" merge-check "$lib" --run "$OUT/bench-$arm" \
-      --cache "$CACHE" > "$OUT/bench-$arm/merge-check-$lib.json" 2>&1 || true
-    echo "$arm/$lib: $(tr -d '\n ' < "$OUT/bench-$arm/merge-check-$lib.json" | cut -c1-200)"
+  for lib in $LIBS; do
+    "$PY" "$REPO/evals/swarm/commit0_adapter.py" merge-check "$lib" --run "$OUT/bench-$arm${RUN_TAG:+-$RUN_TAG}" \
+      --cache "$CACHE" > "$OUT/bench-$arm${RUN_TAG:+-$RUN_TAG}/merge-check-$lib.json" 2>&1 || true
+    echo "$arm/$lib: $(tr -d '\n ' < "$OUT/bench-$arm${RUN_TAG:+-$RUN_TAG}/merge-check-$lib.json" | cut -c1-200)"
   done
 done
-echo "done: results in $OUT/bench-<arm>/results.json"
+echo "done: results in $OUT/bench-<arm>${RUN_TAG:+-$RUN_TAG}/results.json"

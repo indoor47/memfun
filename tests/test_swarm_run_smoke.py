@@ -1195,7 +1195,7 @@ def test_cross_host_redirect_is_refused(models_server: tuple[str, type[_Models]]
         ["--max-agents", "0"],
         ["--max-agents", "101"],
         ["--parallel-tasks", "0"],
-        ["--parallel-tasks", "65"],
+        ["--parallel-tasks", "257"],
         ["--trials", "0"],
         ["--run-id", "a..b"],
         ["--run-id", "a/b"],
