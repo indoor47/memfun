@@ -189,3 +189,54 @@ def test_history_shows_what_each_round_changed_and_flags_a_revisited_state(
     assert "the change was" in second and "-start" in second and "+a" in second
     assert "IDENTICAL to round 1" in third  # the file went back to the state of round 1
     assert rig.file.read_text() == "b"
+
+
+class _Pred:
+    """A fake dspy predictor: replies come from a script; every query is recorded."""
+
+    def __init__(self, replies: list[str]) -> None:
+        self.replies = list(replies)
+        self.queries: list[str] = []
+
+    def __call__(self, query: str, full_context: str, **_k: Any) -> Any:
+        self.queries.append(query)
+        ops = self.replies.pop(0)
+        return type("R", (), {"reasoning": "r", "answer": "a", "operations": ops})()
+
+
+EDIT = '[{"op":"edit_file","path":"m.py","old":"a","new":"b"}]'
+CMD = '[{"op":"run_cmd","cmd":"pytest"}]'
+
+
+def test_a_commands_only_reply_is_retried_with_an_edit_nudge() -> None:
+    from memfun_agent.context_first import NO_EDIT_NUDGE, SingleShotSolver
+
+    solver = SingleShotSolver()
+    solver.predictor = _Pred([CMD, EDIT])  # type: ignore[assignment]
+    res = asyncio.run(solver.asolve("do it", "ctx"))
+    assert [o["op"] for o in res.operations] == ["edit_file"]
+    assert solver.predictor.queries == ["do it", "do it" + NO_EDIT_NUDGE]  # type: ignore[attr-defined]
+
+
+def test_a_reply_cut_off_before_its_operations_is_retried_with_a_concision_nudge() -> None:
+    from memfun_agent.context_first import TRUNCATION_NUDGE, SingleShotSolver
+
+    solver = SingleShotSolver()
+    cut = '[{"op":"edit_file","path":"m.py","old":"a","new":"def f():\\n    w = wcwidth(c'
+    solver.predictor = _Pred([cut, EDIT])  # type: ignore[assignment]
+    res = asyncio.run(solver.asolve("do it", "ctx"))
+    assert [o["op"] for o in res.operations] == ["edit_file"] and not res.truncated
+    assert solver.predictor.queries[1] == "do it" + TRUNCATION_NUDGE  # type: ignore[attr-defined]
+
+
+def test_a_good_first_reply_is_not_retried_and_a_second_failure_is_returned() -> None:
+    from memfun_agent.context_first import SingleShotSolver
+
+    solver = SingleShotSolver()
+    solver.predictor = _Pred([EDIT])  # type: ignore[assignment]
+    asyncio.run(solver.asolve("q", "ctx"))
+    assert len(solver.predictor.queries) == 1  # type: ignore[attr-defined]
+    solver.predictor = _Pred([CMD, CMD])  # type: ignore[assignment]
+    res = asyncio.run(solver.asolve("q", "ctx"))
+    assert [o["op"] for o in res.operations] == ["run_cmd"]  # gave it one retry, then returned
+    assert len(solver.predictor.queries) == 2  # type: ignore[attr-defined]

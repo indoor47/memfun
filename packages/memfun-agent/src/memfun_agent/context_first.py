@@ -803,6 +803,25 @@ def _rollout_config(attempt: int) -> dict[str, Any]:
     return {"rollout_id": rollout_id} if rollout_id else {}
 
 
+#: Appended to the task on the retry after a reply was cut off before its operations.
+TRUNCATION_NUDGE = (
+    "\n\nIMPORTANT: your previous reply was cut off before the operations. Keep the reasoning "
+    "to at most 8 short lines, then write the operations JSON immediately. Do not think aloud "
+    "at length."
+)
+#: Appended on the retry after a reply held only commands and no edit.
+NO_EDIT_NUDGE = (
+    "\n\nIMPORTANT: your previous reply contained no edit_file or write_file operation, so no "
+    "file changed and the task is not done. Reply with the edit_file operation(s) that "
+    "implement the task in the file(s) named above. Commands alone do not count."
+)
+
+
+def _has_file_change(operations: list[dict[str, Any]]) -> bool:
+    """False only when every operation is a pure command or read (nothing would change)."""
+    return any(str(o.get("op")) not in ("run_cmd", "read_file") for o in operations)
+
+
 class SingleShotSolver(dspy.Module):
     """Solve a coding task in one LLM call given full context."""
 
@@ -821,11 +840,12 @@ class SingleShotSolver(dspy.Module):
         sample before it is reported as truncated: at temperature > 0 the second attempt
         usually parses, and with no planner there is nothing to escalate to.
         """
+        ask = query
         for attempt in range(1, UNPARSEABLE_RETRIES + 2):
             cfg = _rollout_config(attempt)
             result = await asyncio.to_thread(
                 self.predictor,
-                query=query,
+                query=ask,
                 full_context=full_context,
                 **({"config": cfg} if cfg else {}),
             )
@@ -839,9 +859,20 @@ class SingleShotSolver(dspy.Module):
             # Detect truncation: if the raw operations string doesn't
             # close the JSON array, the LLM response was likely cut off.
             truncated = _detect_truncation(raw_ops, operations)
-            if not truncated or operations or attempt > UNPARSEABLE_RETRIES:
+            if attempt > UNPARSEABLE_RETRIES:
                 break
-            logger.warning("Solver reply had no parseable operations; retrying once")
+            if truncated and not operations:
+                # Cut off before the operations (the reasoning ate the budget): a plain
+                # re-sample tends to ramble again, so say what to do differently.
+                logger.warning("Solver reply was cut off before its operations; retrying once")
+                ask = query + TRUNCATION_NUDGE
+                continue
+            if operations and not _has_file_change(operations):
+                # Only commands, no edit: nothing would change.  Ask for the edit.
+                logger.warning("Solver reply had no edit/write operation; retrying once")
+                ask = query + NO_EDIT_NUDGE
+                continue
+            break
 
         return SolveResult(
             reasoning=reasoning,
