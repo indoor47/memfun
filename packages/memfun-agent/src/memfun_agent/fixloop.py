@@ -26,11 +26,12 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _FAILED_LINE = re.compile(r"^(?:FAILED|ERROR)\s+(\S+?)(?:\s+-\s+(.*))?$", re.M)
@@ -46,9 +47,6 @@ _BROKEN_HINTS = (
     "errors during collection",
     "Interrupted:",
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def strip_ansi(text: str) -> str:
@@ -230,18 +228,32 @@ _PROBE_FORBIDDEN = re.compile(
     r"urllib|requests|httpx|http\.client|write_text|write_bytes)"
 )
 
-#: Runs before the probe in its own interpreter (``python -I -S -B``: no site-packages, no user
-#: site, no PYTHON* variables).  Imports resolve to the project and the standard library only, so a
-#: probe can never load an installed copy of the library under repair; an audit hook then makes
-#: reads outside the project / the interpreter's stdlib, any write, child process, network and
-#: ctypes use fail.  A guard against accidents and curiosity, not a hardened sandbox.
+#: Runs before the probe in its own interpreter.  The probe imports the project's own packages
+#: from the project (project root and ``src/`` first on sys.path); an audit hook makes writes,
+#: child processes, network and ctypes fail, and reads outside the project / the interpreter's
+#: own directories fail.  Two modes (argv[3]):
+#:
+#: * ``strict`` (function-level benchmarks): started as ``python -I -S -B`` so no site-packages
+#:   exist at all; any path under ``site-packages`` is unreadable.  Standard library + project.
+#: * ``project`` (real repositories): the project's own interpreter with its installed
+#:   dependencies importable; reads of an INSTALLED COPY of a project-owned package (argv[4], a
+#:   comma separated list of top-level names) by path are denied, other site-packages reads work.
+#:
+#: Defence in depth against accidents and curiosity, NOT a sandbox: native code, or a determined
+#: script, can get around an audit hook.
 PROBE_PREAMBLE = r"""
 import os, sys
 _root = os.path.realpath(sys.argv[1])
-_snippet = sys.argv[2]
+_snippet, _mode = sys.argv[2], sys.argv[3]
+_owned = set(filter(None, sys.argv[4].split(",")))
 sys.path[:0] = [_root, os.path.join(_root, "src")]
-_allowed = [_root] + [os.path.realpath(p) for p in {sys.base_prefix, sys.base_exec_prefix}]
-_allowed.append("/dev")
+_allowed = {_root, "/dev"}
+for _p in (sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix):
+    _allowed.add(os.path.realpath(_p))
+if _mode != "strict":
+    for _p in sys.path:
+        if _p and os.path.isdir(_p):
+            _allowed.add(os.path.realpath(_p))
 _BLOCKED = (
     "os.remove", "os.rename", "os.mkdir", "os.rmdir", "os.chmod", "os.chown", "os.truncate",
     "os.symlink", "os.link", "os.utime", "os.mkfifo", "os.mknod", "os.system", "os.exec",
@@ -249,17 +261,25 @@ _BLOCKED = (
     "shutil.", "subprocess.", "socket.", "ctypes.", "tempfile.", "pty.", "webbrowser.",
     "fcntl.", "mmap.", "multiprocessing.",
 )
+def _under(real, base):
+    return real == base or real.startswith(base + os.sep)
 def _inside(path):
     try:
         real = os.path.realpath(os.fsdecode(path))
     except (TypeError, ValueError):
         return True  # a file descriptor or None
-    if any(real == a or real.startswith(a + os.sep) for a in _allowed[:1]):
+    parts = real.split(os.sep)
+    for marker in ("site-packages", "dist-packages"):
+        if marker in parts:
+            if _mode == "strict":
+                return False
+            rest = parts[parts.index(marker) + 1:]
+            top = rest[0].split(".")[0] if rest else ""
+            if top in _owned:
+                return False  # an installed copy of a package this project owns
+    if _under(real, _root):
         return True
-    parts = set(real.split(os.sep))
-    if parts & {"site-packages", "dist-packages"}:
-        return False
-    return any(real == a or real.startswith(a + os.sep) for a in _allowed)
+    return any(_under(real, a) for a in _allowed)
 def _hook(event, args):
     if event.startswith(_BLOCKED):
         raise PermissionError("probe: %s is not allowed (read-only experiments)" % event)
@@ -279,6 +299,56 @@ sys.addaudithook(_hook)
 os.chdir(_root)
 exec(compile(_snippet, "<probe>", "exec"), {"__name__": "__main__"})
 """
+
+
+def owned_packages(project_root: Path) -> list[str]:
+    """Top-level importable names the project itself defines (root and ``src/``)."""
+    names: set[str] = set()
+    for base in (project_root, project_root / "src"):
+        try:
+            entries = list(base.iterdir())
+        except OSError:
+            continue
+        for e in entries:
+            if e.name.startswith((".", "_")) or e.name in {
+                "tests",
+                "test",
+                "docs",
+                "build",
+                "dist",
+            }:
+                continue
+            if e.is_dir() and (e / "__init__.py").exists():
+                names.add(e.name)
+            elif e.is_file() and e.suffix == ".py":
+                names.add(e.stem)
+    return sorted(names)
+
+
+def probe_python(verify_cmds: list[str], project_root: Path) -> str | None:
+    """The interpreter the project's own tests run with, or None when it cannot be found.
+
+    From the verify command (``python -m pytest``, ``/venv/bin/pytest``, ``uv run pytest``...),
+    else ``<project>/.venv/bin/python``.  Never memfun's own interpreter: it has other
+    dependencies and may be another Python version.
+    """
+    for cmd in verify_cmds:
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            continue
+        for t in tokens[:3]:
+            name = Path(t).name
+            if re.fullmatch(r"python(\d+(\.\d+)?)?", name):
+                found = shutil.which(t)
+                if found:
+                    return found
+            if name == "pytest" and "/" in t:
+                sibling = Path(t).parent / "python"
+                if sibling.exists():
+                    return str(sibling)
+    venv_python = project_root / ".venv" / "bin" / "python"
+    return str(venv_python) if venv_python.exists() else None
 
 
 def parse_probes(raw: str) -> list[str]:
@@ -305,28 +375,49 @@ def probe_refusal(snippet: str) -> str:
     return f"refused (uses {m.group(0)!r})" if m else ""
 
 
-async def run_probes(project_root: Path, snippets: list[str]) -> str:
-    """Run each snippet in an isolated interpreter (see :data:`PROBE_PREAMBLE`) from
+async def run_probes(
+    project_root: Path,
+    snippets: list[str],
+    *,
+    python: str | None = None,
+    strict: bool = False,
+) -> str:
+    """Run each snippet in a guarded interpreter (see :data:`PROBE_PREAMBLE`) from
     *project_root* (timeout, clipped output); return a text block of each snippet and its real
-    output for the next fix round."""
+    output for the next fix round.
+
+    *strict*: ``python -I -S -B`` (standard library + the project only; the function-level
+    benchmarks).  Otherwise *python* (the project's interpreter, see :func:`probe_python`) with its
+    dependencies; None then means the probes cannot run, and each says so.
+    """
+    interpreter = python or (sys.executable if strict else None)
+    flags = ["-I", "-S", "-B"] if strict else ["-I", "-B"]
+    mode = "strict" if strict else "project"
+    owned = ",".join(owned_packages(project_root))
     blocks: list[str] = []
     for i, snippet in enumerate(snippets[:MAX_PROBES], 1):
         why = probe_refusal(snippet)
         if why:
             blocks.append(f"--- experiment {i} ---\n{snippet}\n=> {why}")
             continue
+        if interpreter is None:
+            blocks.append(
+                f"--- experiment {i} ---\n{snippet}\n=> (could not run: no project interpreter "
+                "found; the verify command names none)"
+            )
+            continue
         try:
             res = await asyncio.to_thread(
                 subprocess.run,
                 [
-                    sys.executable,
-                    "-I",
-                    "-S",
-                    "-B",
+                    interpreter,
+                    *flags,
                     "-c",
                     PROBE_PREAMBLE,
                     str(project_root),
                     snippet,
+                    mode,
+                    owned,
                 ],
                 cwd=str(project_root),
                 capture_output=True,

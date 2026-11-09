@@ -55,7 +55,7 @@ def main(libs: list[str]) -> int:
 
 
 def fixloop_run(proj: Path, snippet: str) -> str:
-    return asyncio.run(fixloop.run_probes(proj, [snippet]))
+    return asyncio.run(fixloop.run_probes(proj, [snippet], strict=True))
 
 
 if __name__ == "__main__":

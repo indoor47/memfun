@@ -125,16 +125,18 @@ def test_run_probes_shows_real_output_and_refusals(tmp_path: Path) -> None:
         fl.run_probes(
             tmp_path,
             ["from m import f\nprint(f(21))", "import os; os.remove('m.py')"],
+            strict=True,
         )
     )
     assert "=> 42" in out and "refused" in out
     assert (tmp_path / "m.py").exists()
 
 
-def _probe(tmp_path: Path, snippet: str) -> str:
+def _probe(tmp_path: Path, snippet: str, **kw: object) -> str:
     import asyncio
 
-    return asyncio.run(fl.run_probes(tmp_path, [snippet]))
+    kw = {"strict": True, **kw}
+    return asyncio.run(fl.run_probes(tmp_path, [snippet], **kw))  # type: ignore[arg-type]
 
 
 def test_a_probe_imports_the_project_copy_never_an_installed_one(
@@ -188,6 +190,52 @@ def test_probes_are_read_only_and_local(tmp_path: Path) -> None:
         assert "Error" in out or "refused" in out, (bad, out)
     assert sorted(p.name for p in proj.iterdir()) == ["a.txt"]
     assert "hush" not in _probe(proj, f"print(open({str(secret)!r}).read())")
+
+
+def test_project_mode_uses_the_projects_dependencies_but_not_installed_copies_of_its_own_code(
+    tmp_path: Path,
+) -> None:
+    import sys
+
+    proj = tmp_path / "proj"
+    site = proj / ".venv" / "lib" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "thelib.py").write_text("WHERE = 'installed'\n")
+    (site / "dep.py").write_text("WHERE = 'dependency'\n")
+    (proj / "thelib.py").write_text("WHERE = 'project'\n")
+    pre = f"import sys; sys.path.append({str(site)!r}); "
+    kw = {"python": sys.executable, "strict": False}
+    # a dependency installed for the project is importable, and its file readable
+    out = _probe(proj, pre + "import dep; print(dep.WHERE)", **kw)
+    assert "=> dependency" in out
+    # a pytest plugin / third-party package from the interpreter's own site-packages works
+    assert "=> ok" in _probe(proj, "import pytest; print('ok')", **kw)
+    # the project's own package wins, and the installed copy cannot be read by path
+    assert "=> project" in _probe(proj, pre + "import thelib; print(thelib.WHERE)", **kw)
+    out = _probe(proj, f"print(open({str(site / 'thelib.py')!r}).read())", **kw)
+    assert "PermissionError" in out
+    # the same guard holds: no writes, no children
+    assert "Error" in _probe(proj, "open('x', 'w').write('1')", **kw)
+    assert "Error" in _probe(proj, "import os; os.fork()", **kw)
+    # strict mode has no site-packages at all
+    assert "ModuleNotFoundError" in _probe(proj, "import pytest")
+
+
+def test_probe_python_comes_from_the_verify_command_never_memfuns_own(tmp_path: Path) -> None:
+    import sys
+
+    assert fl.probe_python([f"{sys.executable} -m pytest -q"], tmp_path)
+    venv = tmp_path / "v" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text("")
+    assert fl.probe_python([f"{venv}/pytest -q tests"], tmp_path) == str(venv / "python")
+    assert fl.probe_python(["ruff check ."], tmp_path) is None  # no guess
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".venv" / "bin" / "python").write_text("")
+    assert fl.probe_python(["ruff check ."], tmp_path) == str(tmp_path / ".venv/bin/python")
+    assert fl.probe_python([], tmp_path / "nowhere") is None
+    out = _probe(tmp_path, "print(1)", strict=False, python=None)
+    assert "no project interpreter" in out and sys.executable not in out
 
 
 def test_a_probe_with_a_nul_byte_is_reported_not_raised(tmp_path: Path) -> None:

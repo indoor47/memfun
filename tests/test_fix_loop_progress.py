@@ -143,7 +143,15 @@ def test_a_stalled_round_runs_experiments_and_feeds_their_output_to_the_fix(
 ) -> None:
     (tmp_path / "m.py").write_text("start")  # replaced by Rig; the probe runs in tmp_path
     outs = {"start": _out(3, 1), "a": _out(3, 1), "b": "PASS"}
-    rig = Rig(tmp_path, outs, ["a", "b"], max_fix_attempts=5, fix_restarts=0, fix_probe_rounds=1)
+    rig = Rig(
+        tmp_path,
+        outs,
+        ["a", "b"],
+        max_fix_attempts=5,
+        fix_restarts=0,
+        fix_probe_rounds=1,
+        fix_probe_strict=True,
+    )
     proposals: list[str] = []
 
     async def apropose(query: str, full_context: str, verification_errors: str, history: str):
@@ -286,6 +294,24 @@ def test_verify_json_look_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert read_project_verify_options(tmp_path) == {}
 
 
+def test_out_of_range_look_options_are_loud_not_silently_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import json
+
+    from memfun_agent.context_first import read_project_verify_options
+
+    _trust(monkeypatch)
+    (tmp_path / ".memfun").mkdir()
+    (tmp_path / ".memfun" / "verify.json").write_text(
+        json.dumps({"probe_rounds": 25, "fix_detail": "yes", "probe_strict": 1})
+    )
+    with caplog.at_level("WARNING"):
+        assert read_project_verify_options(tmp_path) == {}
+    assert "probe_rounds=25" in caplog.text and "probes stay OFF" in caplog.text
+    assert "fix_detail='yes'" in caplog.text and "probe_strict=1" in caplog.text
+
+
 def test_full_failure_detail_reaches_the_fix_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -316,14 +342,16 @@ def test_full_failure_detail_reaches_the_fix_step(
     rig.solver.fix_solver.afix = spy  # type: ignore[method-assign]
     rig.run()
     assert asked == [["tests/t.py::test_x"]]
-    assert "FULL FAILURE DETAIL" in seen[0] and "mismatch: 7 expected 2 got 1" in seen[0]
+    # one prompt field only: the errors (it used to be sent twice, also as context)
+    assert "mismatch: 7 expected 2 got 1" in seen[0] and seen[0].count("mismatch: 7") == 1
+    assert "FULL FAILURE DETAIL" not in seen[0]
 
 
 def test_several_probes_per_stall_while_each_prints_something_new(tmp_path: Path) -> None:
     outs = {"start": _out(3, 1), "a": _out(3, 1), "b": "PASS"}
     rig = Rig(
         tmp_path, outs, ["a", "b"], max_fix_attempts=6, fix_restarts=0,
-        fix_probe_rounds=1, fix_probe_iterations=3,
+        fix_probe_rounds=1, fix_probe_iterations=3, fix_probe_strict=True,
     )  # fmt: skip
     calls: list[str] = []
 
@@ -347,25 +375,66 @@ def test_several_probes_per_stall_while_each_prints_something_new(tmp_path: Path
     assert "finding 0" in seen[-1] and "finding 1" in seen[-1]  # all reach the fix call
 
 
-def test_a_stall_at_the_base_budget_probes_instead_of_stopping(tmp_path: Path) -> None:
+def test_probe_rounds_do_not_change_the_loop_only_the_look_step(tmp_path: Path) -> None:
+    """A and P must differ ONLY in the look step: the same stop rule, the same number of rounds."""
     outs = {"start": _out(3, 1), "a": _out(3, 1), "b": _out(3, 1)}
-    (tmp_path / "off").mkdir()
-    (tmp_path / "on").mkdir()
-    off = Rig(
-        tmp_path / "off", outs, ["a", "b"], max_fix_attempts=2, fix_restarts=0, fix_patience=9
-    )
-    off.run()
-    assert off.verify_calls == 2  # base 2 reached without progress: stop (as before)
-    on = Rig(
-        tmp_path / "on", outs, ["a", "b"], max_fix_attempts=2, fix_restarts=0,
-        fix_patience=9, fix_probe_rounds=1,
-    )  # fmt: skip
+    calls: dict[str, int] = {}
     asked: list[int] = []
+    for name, rounds in (("off", 0), ("on", 5)):
+        (tmp_path / name).mkdir()
+        rig = Rig(
+            tmp_path / name, outs, ["a", "b"], max_fix_attempts=2, fix_restarts=0,
+            fix_patience=9, fix_probe_rounds=rounds, fix_probe_strict=True,
+        )  # fmt: skip
 
-    async def apropose(query: str, full_context: str, verification_errors: str, history: str):
-        asked.append(1)
-        return ["print('x')"]
+        async def apropose(q: str, c: str, v: str, h: str):
+            asked.append(1)
+            return ["print('x')"]
 
-    on.solver.probe_solver.apropose = apropose  # type: ignore[method-assign]
-    on.run()
-    assert asked and on.verify_calls == 3  # one probed round beyond the base, then it stops
+        rig.solver.probe_solver.apropose = apropose  # type: ignore[method-assign]
+        rig.run()
+        calls[name] = rig.verify_calls
+    assert calls["off"] == calls["on"] == 2  # base 2 without progress: stop, probes or not
+
+
+def test_an_exception_in_the_look_step_does_not_abort_the_loop(tmp_path: Path) -> None:
+    outs = {"start": _out(3, 1), "a": _out(3, 1), "b": "PASS"}
+    rig = Rig(
+        tmp_path, outs, ["a", "b"], max_fix_attempts=5, fix_restarts=0, fix_probe_rounds=2,
+        fix_probe_strict=True,
+    )  # fmt: skip
+
+    async def run_probes_boom(*_a: Any, **_k: Any):
+        raise RuntimeError("probe machinery broke")
+
+    import memfun_agent.fixloop as fl
+
+    async def apropose(q: str, c: str, v: str, h: str):
+        return ["print(1)"]
+
+    rig.solver.probe_solver.apropose = apropose  # type: ignore[method-assign]
+    orig = fl.run_probes
+    fl.run_probes = run_probes_boom  # type: ignore[assignment]
+    try:
+        rig.run()
+    finally:
+        fl.run_probes = orig  # type: ignore[assignment]
+    assert rig.file.read_text() == "b"  # the fix loop went on and solved it
+
+
+def test_the_best_state_is_restored_even_when_the_loop_raises(tmp_path: Path) -> None:
+    outs = {"start": _out(3, 1), "good": _out(1, 3), "worse": _out(5, 0)}
+    rig = Rig(tmp_path, outs, ["good", "worse"], max_fix_attempts=6, fix_restarts=0)
+    orig = rig.solver.verifier.averify
+    n = {"calls": 0}
+
+    async def flaky(cmds: list[str]) -> VerifyResult:
+        n["calls"] += 1
+        if n["calls"] == 4:
+            raise RuntimeError("verifier crashed")
+        return await orig(cmds)
+
+    rig.solver.verifier.averify = flaky  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        rig.run()
+    assert rig.file.read_text() == "good"  # not left at the worse state
