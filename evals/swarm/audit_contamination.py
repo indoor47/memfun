@@ -301,6 +301,10 @@ def audit_episode(ep: Path, arm: str, ref: Reference | None) -> dict[str, Any]:
 def audit_run(run: Path, bundles: Path) -> dict[str, Any]:
     meta = json.loads((run / "results.json").read_text("utf-8")).get("meta", {})
     arm = meta.get("arm") or run.name.removeprefix("bench-")
+    for known in ("mini-swe-agent", "single-shot", "claude-code", "memfun", "aider"):
+        if arm == known or arm.startswith(known + "-"):  # e.g. a tagged run: mini-swe-agent-hardD
+            arm = known
+            break
     refs: dict[str, Reference | None] = {}
     eps: list[dict[str, Any]] = []
     for f in sorted(run.glob("*/*/episode.json")):

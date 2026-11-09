@@ -107,6 +107,9 @@ class LLMRoleConfig:
     temperature: float | None = None
     max_tokens: int | None = None
     constrained_json: bool | None = None
+    #: none | low | medium | high: thinking budget for this role only (e.g. worker "medium"
+    #: while the planner and auditors stay at ``[llm]``'s "none").
+    reasoning_effort: str | None = None
 
 
 #: Context windows (tokens) by provider.  Cerebras serves Qwen3.8-27B at 131072; the
@@ -541,6 +544,11 @@ def _validate_role_value(role: str, key: str, val: Any) -> Any:
     if key == "constrained_json":
         if not isinstance(val, bool):
             msg = f"{where} must be true or false"
+            raise ConfigError(msg)
+        return val
+    if key == "reasoning_effort":
+        if val not in ("none", "low", "medium", "high"):
+            msg = f"{where} must be none, low, medium or high"
             raise ConfigError(msg)
         return val
     return val  # pragma: no cover - guarded by the allowed-keys check

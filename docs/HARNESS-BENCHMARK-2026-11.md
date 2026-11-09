@@ -337,3 +337,79 @@ experiments that led to the new loop cost about $7.8.
 - The agents ran on the Mac against the B300 through a tunnel, under a macOS sandbox profile; a stronger setup
   would be per-episode containers.
 - claude-code was not run.
+
+
+## Hard functions on the H200 (2026-11-09)
+
+The functions where some arm missed a full pass in the isolated rerun above, run again on a free H200 (Qwen3.8-27B FP8,
+thinking off, read isolation, one arm after another, all 18 episodes of an arm at once): six functions (`wcswidth`,
+`_wcmatch_version`, `list_versions`, `wcwidth` in wcwidth; `mru_cache`, `hashkey` in cachetools) x 3 trials.
+
+| arm | fully passing (of 18) | hidden tests | input / output tokens | wall |
+|---|---|---|---|---|
+| A: memfun as is (fix budget 4) | 14 | 447/459 | 0.71M / 0.15M | 481 s |
+| C: memfun, fix budget 12 | 11 | 441/459 | 0.54M / 0.13M | 411 s |
+| D: mini-swe-agent | **17** | **457/459** | 24.4M / 0.14M | 820 s |
+
+| function | A | C | D (mini) |
+|---|---|---|---|
+| `hashkey` | 3 | 1 | 3 |
+| `mru_cache` | 3 | 2 | 3 |
+| `_wcmatch_version` | 2 | 2 | 3 |
+| `list_versions` | 3 | 3 | 3 |
+| `wcwidth` | 3 | 3 | 3 |
+| `wcswidth` | **0** (18, 20, 20 of 23 tests) | **0** (20, 20, 21) | **2** (23, 23, 21) |
+
+Whole-library merge-check (best trial per function): wcwidth 34/37 (A), 35/37 (C), 37/37 (D); cachetools 215/215 for all three.
+Contamination audit: clean for all three arms (no leaks, no touches of the reference, hidden-test, bundle or clones paths).
+mini looked around outside its episode in 14 of 18 episodes (5 with output) and found nothing; it ran 38 commands on average, and
+112, 135 and 175 commands on `wcswidth`.
+
+### What this says
+
+- **A deeper fix loop does not help (arm C).** Raising the fix budget from 4 to 12 rounds gave 11 against 14 and did not lengthen the median
+  episode (116 s in both arms). Most of the gap is `hashkey` (3 passes to 1), which is plausibly sampling noise since both arms
+  share the same first attempt. More rounds of the same kind of fixing do not add information, so they do not unstick it.
+- **mini wins mainly on `wcswidth`** (2 of 3, memfun 0 of 6 across A and C), at about 34 times memfun's input tokens, and in this run it is the only
+  arm that solves `_wcmatch_version` every time (memfun got 2 of 3 on it in both arms). On the other four functions mini and memfun are level.
+- Arm B (thinking on for the solver) was not run here; it stays for Cerebras.
+
+### Why mini solves `wcswidth` and memfun does not
+
+I read mini's three `wcswidth` trajectories (112, 135 and 175 commands) and memfun's code and failures. This is a reading of
+three trajectories, not a controlled ablation.
+
+1. **Both see the same failure and get stuck at the same place.** The remaining failures are the emoji tests (variation selector 16 and
+   zero-width-joiner sequences). pytest prints them as one truncated line,
+   `AssertionError: assert [{'expected_w...': '3\ufe0f'}, ...] == []`, which hides *which* sequences are wrong and why. memfun's fix step receives
+   exactly this line plus the failing test's source. mini is stuck at "2 failed, 21 passed" for about 60 steps in its successful trial.
+2. **mini looks; memfun reasons.** In every trial mini wrote 59 to 130 small Python experiments and 38 to 46 commands that read the unicode
+   tables. The decisive habit: it loads the tests' own data files (`tests/emoji-zwj-sequences.txt`,
+   `tests/emoji-variation-sequences.txt`; 11, 14 and 35 commands across the trials), runs its candidate over *every* sequence, and prints the
+   mismatches. From the pattern it forms a hypothesis (one of them: the variation-selector bonus applies only when the base character starts the string, not
+   when it sits mid-sequence; that one still left 2 failures and was dropped, and the next passed all the data), tests it against every sequence in seconds
+   ("fails: 0"), and only then edits. In its successful trial this
+   took from step 33 to about step 104; the test count went from 21 to 23 only at the end.
+3. **memfun does not run experiments of its own.** Its first solve and its fix rounds are written from reading; essentially the only code run is the
+   verify command. Its final code is an elaborate hand-built emoji-sequence state machine (skin-tone skipping, "the whole joiner sequence is width 2"),
+   built from the model's general knowledge of emoji. The library's own description (`SPEC.txt`, which memfun could see) states a simpler rule,
+   and the data files show which sequences disagree with the model's version. memfun does read the same table
+   (`table_vs16.py`, 7 KB, fully visible to it), so this is not a context-size problem.
+4. **Persistence helps, but it is not the whole story.** mini's trial 1 ran 135 commands and never got past 2 failures; the two trials that passed used the
+   experiments to find the pattern. Arm C shows that more of memfun's kind of iteration (patch, rerun, patch) does not substitute for it.
+
+### What to try next (not done)
+
+- Show the fix step the **untruncated failure**: re-run the failing tests with full assertion output (`-vv`), or have the loop print the
+  mismatching items itself, so the model sees which sequences fail, not a truncated list.
+- A **differential probe**: when a round stalls, let the model run short experiments that load the failing test's data and print where its code
+  and the expected values disagree. The earlier probe step (round 2 of the Cerebras experiments) fired rarely, was off by default, and was not told to
+  compare against the test data, so that experiment does not rule this out.
+- Keep fix-loop depth as it is; arm C shows it is not the lever.
+
+### Caveats
+
+One run per arm, 18 episodes per arm: a difference of one or two episodes is noise, so the solid findings are "mini
+is ahead on `wcswidth`" and "a deeper fix loop does not help", not the exact counts. The H200 session also gave the
+[concurrency ramp](CONCURRENCY-RAMP-2026-11.md).
+\n

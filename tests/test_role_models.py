@@ -1301,3 +1301,23 @@ def test_docs_example_blocks_parse_and_match(tmp_path: Path) -> None:
         assert (llm.provider, llm.model, llm.base_url) == ("anthropic", "claude-opus-5-5", None)
     for role in ("worker", "auditor", "reviewer"):
         assert arm.llm_for_role(role).model == "qwen3.8-27b"
+
+
+def test_worker_reasoning_effort_overrides_only_the_worker(tmp_path: Path) -> None:
+    cfg = _cfg(
+        '[llm]\nprovider = "openai"\nmodel = "m"\nreasoning_effort = "none"\n'
+        '[llm.roles.worker]\nreasoning_effort = "medium"\n',
+        tmp_path,
+    )
+    assert cfg.llm_for_role("worker").reasoning_effort == "medium"
+    for role in LLM_ROLES:
+        if role != "worker":
+            assert cfg.llm_for_role(role).reasoning_effort == "none"
+    assert cfg.has_role_override("worker")
+
+
+def test_role_reasoning_effort_is_validated(tmp_path: Path) -> None:
+    from memfun_core.errors import ConfigError
+
+    with pytest.raises(ConfigError):
+        _cfg('[llm]\nmodel = "m"\n[llm.roles.worker]\nreasoning_effort = "extreme"\n', tmp_path)

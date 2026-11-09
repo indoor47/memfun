@@ -190,3 +190,19 @@ def test_the_runner_result_file_is_the_only_write_allowed_outside_the_episode(
         for f in out.iterdir():
             f.unlink()
         out.rmdir()
+
+
+def test_a_tagged_run_name_still_selects_the_arm_parser(tmp_path: Path) -> None:
+    """A RUN_TAG run name (bench-mini-swe-agent-hardD) is audited as mini, not an unknown arm."""
+    _bundle(tmp_path)
+    run = tmp_path / "bench-mini-swe-agent-hardD"
+    _episode(
+        run,
+        [("find / -name m.py", ""), ("cat /x/bundles/c0s-lib-target/solution/lib/m.py", REF)],
+        REF,
+    )
+    (run / "results.json").write_text(json.dumps({"meta": {}}))  # no "arm" recorded
+    res = ac.audit_run(run, tmp_path / "bundles")
+    assert res["arm"] == "mini-swe-agent"
+    d = res["details"][0]
+    assert d["commands"] == 2 and "find-root" in d["probes"] and d["leaks"]
