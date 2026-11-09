@@ -14,7 +14,7 @@ if [ -n "$res" ] && [ -d "$(dirname "$res")" ]; then
 else
   res=/nonexistent
 fi
-args+=(-D "RESULT=$res")
+args+=(-D "RESULT=$res" -D "RESULT_DIR=$(dirname "$res")")
 IFS=: read -r -a extra <<< "${SANDBOX_READ_PATHS:-}"
 for i in 0 1 2 3 4 5; do
   p=${extra[$i]:-/nonexistent}

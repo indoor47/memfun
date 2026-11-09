@@ -1,5 +1,6 @@
 ;; Read-isolation for ONE benchmark episode (macOS sandbox-exec).  Parameters (-D):
 ;;   REPO     the episode repo (cwd of the agent)           HOME_EP  the episode's throwaway HOME
+;;   RESULT_DIR  its directory (the temp file pattern is allowed there)
 ;;   RESULT   the one result file memfun may create (MEMFUN_SWARM_RESULT_JSON or /nonexistent)
 ;;   P0..P5   extra read-only paths (the agent's own venv / interpreter prefixes); unused = /nonexistent
 ;; The agent may READ only: the system (/usr, /bin, /System, /Library, /private/var, /dev ...),
@@ -21,6 +22,10 @@
 ;; The runner's result file (MEMFUN_SWARM_RESULT_JSON, created O_EXCL outside the episode) is the one
 ;; other thing memfun writes; without it the runner never sees the result and waits out the timeout.
 (allow file-write* (literal (param "RESULT")))
+;; ... which memfun writes through a temp file in the same directory (".swarm-result.json.<id>.tmp")
+;; and renames: allow that name pattern in that one directory only.
+(allow file-write* (require-all (subpath (param "RESULT_DIR"))
+  (regex #"/(swarm-result\.json|\.swarm-result\.json\.[0-9a-f]+\.tmp)$")))
 (deny network*)
 (allow network-outbound (remote ip "localhost:*") (remote unix-socket))
 (allow network-bind (local ip "localhost:*"))

@@ -180,6 +180,10 @@ def test_the_runner_result_file_is_the_only_write_allowed_outside_the_episode(
         # O_EXCL create, exactly as memfun does
         created = run(f"set -C; echo '{{}}' > {result}")
         assert created.returncode == 0 and result.read_text() == "{}\n"
+        result.unlink()
+        # memfun writes a temp file next to the result and renames it over the name
+        tmp = out / ".swarm-result.json.ab12cd.tmp"
+        assert run(f"echo '{{}}' > {tmp} && mv {tmp} {out}/swarm-result.json").returncode == 0
         assert run(f"echo x > {other}").returncode != 0 and not other.exists()
         assert run(f"echo x > {out}/swarm-result.json.bak").returncode != 0
     finally:
