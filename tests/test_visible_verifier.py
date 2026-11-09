@@ -285,7 +285,14 @@ def test_runner_writes_the_episode_verify_file(tmp_path: Path) -> None:
     bundle = rs.Bundle(id="c0s-x-f", path=bundle_dir)
     rs.create_episode_repo(bundle, tmp_path / "repo", tmp_path / "home", "http://h/v1", "m", 1024)
     doc = json.loads((tmp_path / "repo" / ".memfun" / "verify.json").read_text())
-    assert doc == {"commands": ["python -m pytest -q t"], "max_fix_attempts": 4}
+    assert doc == {
+        "commands": ["python -m pytest -q t"],
+        "max_fix_attempts": 4,
+        # the look-step settings are always written explicitly, off values included
+        "fix_detail": False,
+        "probe_rounds": 0,
+        "probe_guard": "strict",
+    }
     # a bundle without [verify] gets no file (smoke bundles are unchanged)
     (bundle_dir / "task.toml").write_text('id = "c0s-x-f"\n')
     rs.create_episode_repo(
