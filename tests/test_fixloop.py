@@ -35,6 +35,8 @@ ERROR tests/test_x.py
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
 
 def test_summarize_counts_and_ids() -> None:
     s = fl.summarize(FAIL)
@@ -110,9 +112,7 @@ def test_probes_that_change_things_or_reach_out_are_refused() -> None:
     for bad in (
         "import os; os.remove('x')",
         "import subprocess; subprocess.run(['ls'])",
-        "open('f','w').write('x')",
         "import urllib.request; urllib.request.urlopen('http://x')",
-        "exec('1')",
     ):
         assert fl.probe_refusal(bad), bad
 
@@ -129,6 +129,69 @@ def test_run_probes_shows_real_output_and_refusals(tmp_path: Path) -> None:
     )
     assert "=> 42" in out and "refused" in out
     assert (tmp_path / "m.py").exists()
+
+
+def _probe(tmp_path: Path, snippet: str) -> str:
+    import asyncio
+
+    return asyncio.run(fl.run_probes(tmp_path, [snippet]))
+
+
+def test_a_probe_imports_the_project_copy_never_an_installed_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The library under repair may also be installed (memfun's own venv has wcwidth and
+    cachetools as dependencies): the probe must see only the project's copy, even with the
+    installed one on PYTHONPATH."""
+    installed = tmp_path / "site" / "site-packages"
+    installed.mkdir(parents=True)
+    (installed / "thelib.py").write_text("WHERE = 'installed'\n")
+    (installed / "othlib.py").write_text("WHERE = 'installed'\n")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "thelib.py").write_text("WHERE = 'project'\n")
+    monkeypatch.setenv("PYTHONPATH", str(installed))
+    assert "=> project" in _probe(proj, "import thelib; print(thelib.WHERE)")
+    out = _probe(proj, "import othlib; print(othlib.WHERE)")  # only installed: must not import
+    assert "ModuleNotFoundError" in out and "installed" not in out.split("=>")[1].split("Error")[0]
+    # reading the installed copy's file directly is refused too
+    out = _probe(proj, f"print(open({str(installed / 'thelib.py')!r}).read())")
+    assert "PermissionError" in out and "WHERE" not in out.split("=>", 1)[1]
+
+
+def test_probes_are_read_only_and_local(tmp_path: Path) -> None:
+    secret = tmp_path / "outside" / "secret.txt"
+    secret.parent.mkdir()
+    secret.write_text("hush")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "a.txt").write_text("mine")
+    assert "=> mine" in _probe(proj, "print(open('a.txt').read())")  # a/w/x-free reads still work
+    for bad in (
+        "open('new.txt', 'w').write('x')",
+        "open('a.txt', 'a').write('x')",
+        "import pathlib; pathlib.Path('n.txt').write_text('x')",
+        "import os; os.mkdir('d')",
+        "import os; os.rename('a.txt', 'b.txt')",
+        "import socket; socket.socket().connect(('127.0.0.1', 9))",
+        "import os; os.system('touch z')",
+        "import subprocess; subprocess.Popen(['touch', 'z'])",
+        "import os; os.fork()",
+        "import ctypes; ctypes.CDLL(None)",
+        "import pathlib; w = getattr(pathlib.Path('n.txt'), 'write' + '_text'); w('x')",
+        "import os; getattr(os, 'sys' + 'tem')('touch z')",
+        f"print(open({str(secret)!r}).read())",
+        f"import os; print(os.listdir({str(secret.parent)!r}))",
+        f"import glob; print(glob.glob({str(secret.parent) + '/*'!r}))",
+    ):
+        out = _probe(proj, bad)
+        assert "Error" in out or "refused" in out, (bad, out)
+    assert sorted(p.name for p in proj.iterdir()) == ["a.txt"]
+    assert "hush" not in _probe(proj, f"print(open({str(secret)!r}).read())")
+
+
+def test_a_probe_with_a_nul_byte_is_reported_not_raised(tmp_path: Path) -> None:
+    assert "could not run" in _probe(tmp_path, "print(1)\x00")
 
 
 def test_state_key_and_short_diff(tmp_path: Path) -> None:

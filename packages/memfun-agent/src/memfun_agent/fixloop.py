@@ -26,7 +26,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import time
@@ -225,12 +224,61 @@ MAX_PROBES = 2
 MAX_PROBE_CHARS = 2_000
 PROBE_TIMEOUT_S = 30.0
 PROBE_OUTPUT_CHARS = 3_000
-#: Snippets touching these are refused (probes observe; they never change or fetch anything).
+#: A friendly early refusal of the obvious (the audit hook in PROBE_PREAMBLE is what enforces).
 _PROBE_FORBIDDEN = re.compile(
     r"\b(os\.(remove|unlink|rmdir|system|popen|rename|replace)|shutil\.|subprocess|socket|"
-    r"urllib|requests|httpx|http\.client|open\([^)]*['\"][wax+]|write_text|write_bytes|"
-    r"__import__|eval\(|exec\()"
+    r"urllib|requests|httpx|http\.client|write_text|write_bytes)"
 )
+
+#: Runs before the probe in its own interpreter (``python -I -S -B``: no site-packages, no user
+#: site, no PYTHON* variables).  Imports resolve to the project and the standard library only, so a
+#: probe can never load an installed copy of the library under repair; an audit hook then makes
+#: reads outside the project / the interpreter's stdlib, any write, child process, network and
+#: ctypes use fail.  A guard against accidents and curiosity, not a hardened sandbox.
+PROBE_PREAMBLE = r"""
+import os, sys
+_root = os.path.realpath(sys.argv[1])
+_snippet = sys.argv[2]
+sys.path[:0] = [_root, os.path.join(_root, "src")]
+_allowed = [_root] + [os.path.realpath(p) for p in {sys.base_prefix, sys.base_exec_prefix}]
+_allowed.append("/dev")
+_BLOCKED = (
+    "os.remove", "os.rename", "os.mkdir", "os.rmdir", "os.chmod", "os.chown", "os.truncate",
+    "os.symlink", "os.link", "os.utime", "os.mkfifo", "os.mknod", "os.system", "os.exec",
+    "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty", "os.putenv", "os.unsetenv",
+    "shutil.", "subprocess.", "socket.", "ctypes.", "tempfile.", "pty.", "webbrowser.",
+    "fcntl.", "mmap.", "multiprocessing.",
+)
+def _inside(path):
+    try:
+        real = os.path.realpath(os.fsdecode(path))
+    except (TypeError, ValueError):
+        return True  # a file descriptor or None
+    if any(real == a or real.startswith(a + os.sep) for a in _allowed[:1]):
+        return True
+    parts = set(real.split(os.sep))
+    if parts & {"site-packages", "dist-packages"}:
+        return False
+    return any(real == a or real.startswith(a + os.sep) for a in _allowed)
+def _hook(event, args):
+    if event.startswith(_BLOCKED):
+        raise PermissionError("probe: %s is not allowed (read-only experiments)" % event)
+    if event == "open":
+        path, mode, flags = args
+        write = (isinstance(mode, str) and any(c in mode for c in "wax+")) or (
+            isinstance(flags, int) and flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC)
+        )
+        if write:
+            raise PermissionError("probe: writing files is not allowed (read-only experiments)")
+        if not isinstance(path, int) and path is not None and not _inside(path):
+            raise PermissionError("probe: no reading outside the project: %s" % (path,))
+    elif event in ("os.listdir", "os.scandir", "glob.glob", "os.chdir") and args:
+        if args[0] is not None and not isinstance(args[0], int) and not _inside(args[0]):
+            raise PermissionError("probe: no listing outside the project: %s" % (args[0],))
+sys.addaudithook(_hook)
+os.chdir(_root)
+exec(compile(_snippet, "<probe>", "exec"), {"__name__": "__main__"})
+"""
 
 
 def parse_probes(raw: str) -> list[str]:
@@ -258,8 +306,9 @@ def probe_refusal(snippet: str) -> str:
 
 
 async def run_probes(project_root: Path, snippets: list[str]) -> str:
-    """Run each snippet with ``python -c`` from *project_root* (timeout, clipped output) and
-    return a text block of snippet + real output for the next fix round."""
+    """Run each snippet in an isolated interpreter (see :data:`PROBE_PREAMBLE`) from
+    *project_root* (timeout, clipped output); return a text block of each snippet and its real
+    output for the next fix round."""
     blocks: list[str] = []
     for i, snippet in enumerate(snippets[:MAX_PROBES], 1):
         why = probe_refusal(snippet)
@@ -269,19 +318,28 @@ async def run_probes(project_root: Path, snippets: list[str]) -> str:
         try:
             res = await asyncio.to_thread(
                 subprocess.run,
-                [shutil.which("python") or sys.executable, "-c", snippet],
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    PROBE_PREAMBLE,
+                    str(project_root),
+                    snippet,
+                ],
                 cwd=str(project_root),
                 capture_output=True,
                 text=True,
                 timeout=PROBE_TIMEOUT_S,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
                 check=False,
             )
             out = (res.stdout + (("\n" + res.stderr) if res.stderr else "")).strip()
             body = clip(out or "(no output)", PROBE_OUTPUT_CHARS)
         except subprocess.TimeoutExpired:
             body = f"(timed out after {PROBE_TIMEOUT_S:.0f}s)"
-        except OSError as exc:
+        except (OSError, ValueError) as exc:  # ValueError: a NUL byte in the snippet
             body = f"(could not run: {exc})"
         blocks.append(f"--- experiment {i} ---\n{snippet}\n=> {body}")
     return "\n\n".join(blocks)

@@ -446,7 +446,19 @@ _SKIP_DIRS = frozenset(
         ".next",
         ".nuxt",
         ".output",
+        # memfun's own state: credentials, verify.json, probe logs, memory. Never prompt content.
+        ".memfun",
+        ".ssh",
+        ".aws",
+        ".gnupg",
     }
+)
+
+#: Files that hold secrets, whatever their extension: never read into a prompt.
+_SECRET_FILE = re.compile(
+    r"(^\.env(\..*)?$|\.env$|^credentials?(\..*)?$|^secrets?(\..*)?$|\.pem$|\.key$|"
+    r"^id_(rsa|dsa|ecdsa|ed25519)|^\.netrc$|^\.npmrc$|^\.pypirc$)",
+    re.IGNORECASE,
 )
 
 
@@ -468,6 +480,8 @@ def build_file_manifest(
         for fname in sorted(filenames):
             fpath = Path(dirpath) / fname
             suffix = fpath.suffix.lower()
+            if _SECRET_FILE.search(fname):
+                continue
 
             # Dockerfile has no extension
             if fname.lower() in ("dockerfile", "makefile", "rakefile"):
