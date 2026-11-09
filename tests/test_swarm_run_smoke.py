@@ -1477,3 +1477,18 @@ def test_arm_step_limit_reaches_mini_and_arms_use_the_episode_url() -> None:
         ["mini-swe-agent", "--spec-file", "t", "--base-url", "u", "--model", "m"]
     )
     assert not any("step_limit" in c for c in arms.mini_command(ns0, "T", Path("x")))
+
+
+def test_look_step_flags_land_in_verify_json(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "b"
+    bundle_dir.mkdir()
+    (bundle_dir / "task.toml").write_text('[verify]\ncommands = ["pytest -q"]\n', "utf-8")
+    repo = tmp_path / "repo"
+    (repo / ".memfun").mkdir(parents=True)
+    bundle = rs.Bundle(id="b", path=bundle_dir)
+    rs.write_project_verify(bundle, repo)
+    doc = json.loads((repo / ".memfun" / "verify.json").read_text())
+    assert "fix_detail" not in doc and "probe_rounds" not in doc  # off unless asked
+    rs.write_project_verify(bundle, repo, None, True, 3)
+    doc = json.loads((repo / ".memfun" / "verify.json").read_text())
+    assert doc["fix_detail"] is True and doc["probe_rounds"] == 3

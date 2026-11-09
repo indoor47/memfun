@@ -102,7 +102,7 @@ def test_parse_probes_accepts_json_fences_and_a_bare_snippet() -> None:
     assert fl.parse_probes('```json\n["print(1)"]\n```') == ["print(1)"]
     assert fl.parse_probes("print(wc('x'))") == ["print(wc('x'))"]
     assert fl.parse_probes("no code here") == []
-    assert len(fl.parse_probes(str([f"print({i})" for i in range(9)]).replace("'", '"'))) == 3
+    assert len(fl.parse_probes(str([f"print({i})" for i in range(9)]).replace("'", '"'))) == 2
 
 
 def test_probes_that_change_things_or_reach_out_are_refused() -> None:
@@ -124,10 +124,10 @@ def test_run_probes_shows_real_output_and_refusals(tmp_path: Path) -> None:
     out = asyncio.run(
         fl.run_probes(
             tmp_path,
-            ["from m import f\nprint(f(21))", "import os; os.remove('m.py')", "print(1/0)"],
+            ["from m import f\nprint(f(21))", "import os; os.remove('m.py')"],
         )
     )
-    assert "=> 42" in out and "refused" in out and "ZeroDivisionError" in out
+    assert "=> 42" in out and "refused" in out
     assert (tmp_path / "m.py").exists()
 
 
@@ -141,3 +141,88 @@ def test_state_key_and_short_diff(tmp_path: Path) -> None:
     assert "-b = 2" in d and "+b = 3" in d and "a = 1" not in d
     assert fl.short_diff(before, before) == ""
     assert "clipped" in fl.short_diff({f: ""}, {f: "x\n" * 2000}, limit=50)
+
+
+# ── the LOOK step: untruncated failures, probe fingerprint ───────────────────────────────
+
+
+def test_pytest_detail_command_replaces_selectors_and_quietness() -> None:
+    cmd = (
+        "python -m pytest -q --tb=short -p no:cacheprovider tests/test_a.py::test_x "
+        "tests/test_b.py::TestC::test_y"
+    )
+    out = fl.pytest_detail_command([cmd], ["tests/test_a.py::test_x"])
+    assert out is not None
+    assert out[:3] == ["python", "-m", "pytest"] and "-vv" in out and "-q" not in out
+    assert (
+        "--tb=short" in out
+        and out[out.index("-p") : out.index("-p") + 2] == ["-p", "no:cacheprovider"]
+    )
+    assert out[-1] == "tests/test_a.py::test_x" and "tests/test_b.py::TestC::test_y" not in out
+    assert fl.pytest_detail_command(["ruff check ."], ["x"]) is None
+    assert fl.pytest_detail_command(["pytest tests"], ["t.py::a"])[-2:] == [
+        "--tb=short",
+        "t.py::a",
+    ]  # type: ignore[index]
+
+
+LONG = """\
+=================================== FAILURES ===================================
+____________________ test_emoji_sequences ____________________
+tests/test_e.py:9: in test_emoji_sequences
+    assert bad == []
+E   assert [{'seq': 'a', 'expected': 2, 'got': 1}, {'seq': 'b', 'expected': 2, 'got': 1}] == []
+E     Left contains 2 more items, first extra item: {'seq': 'a', 'expected': 2, 'got': 1}
+E     Full diff:
+E     + [
+E     +     {'seq': 'a', 'expected': 2, 'got': 1},
+E     +     {'seq': 'b', 'expected': 2, 'got': 1},
+E     + ]
+=========================== short test summary info ============================
+FAILED tests/test_e.py::test_emoji_sequences - assert [{'seq': 'a'...
+1 failed in 0.1s
+"""
+
+
+def test_extract_failure_detail_keeps_the_head_and_the_mismatching_items() -> None:
+    out = fl.extract_failure_detail(LONG)
+    assert "--- test_emoji_sequences ---" in out and "'seq': 'b', 'expected': 2, 'got': 1" in out
+    assert "tests/test_e.py:9" in out and "short test summary" not in out
+    big = LONG.replace("E     + ]", "".join(f"E     + {i}\n" for i in range(5000)))
+    clipped = fl.extract_failure_detail(big, per_test=1_000, total=1_500)
+    assert len(clipped) < 1_700 and "clipped" in clipped
+
+
+def test_run_detail_runs_the_failing_test_with_full_assertion_output(tmp_path: Path) -> None:
+    import asyncio
+    import sys
+
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text(
+        "def test_a():\n    got = [{'i': i, 'v': i * 2} for i in range(30)]\n"
+        "    want = [{'i': i, 'v': i * 2} for i in range(29)] + [{'i': 29, 'v': 0}]\n"
+        "    assert got == want\n"
+    )
+    cmd = f"{sys.executable} -m pytest -q --tb=short -p no:cacheprovider tests/test_x.py"
+    detail = asyncio.run(fl.run_detail(tmp_path, [cmd], ["tests/test_x.py::test_a"]))
+    assert (
+        ("test_a" in detail and "'v': 58" in detail) or "'v': 0" in detail
+    )  # the differing item shows
+    assert (
+        asyncio.run(fl.run_detail(tmp_path, ["ruff check ."], ["tests/test_x.py::test_a"])) == ""
+    )
+
+
+def test_probe_fingerprint_ignores_refusals_and_empty_output_and_matches_repeats() -> None:
+    a = "--- experiment 1 ---\nprint(1)\n=> mismatches: 3 of 9\n7 expected 2 got 1"
+    b = "--- experiment 1 ---\nDIFFERENT SCRIPT\n=> mismatches: 3 of 9\n7 expected 2 got 1"
+    assert fl.probe_fingerprint(a) and fl.probe_fingerprint(a) != ""
+    assert fl.probe_fingerprint("--- experiment 1 ---\nx\n=> (no output)") == ""
+    assert (
+        fl.probe_fingerprint("--- experiment 1 ---\nos.remove\n=> refused (uses 'os.remove')")
+        == ""
+    )
+    assert fl.probe_fingerprint(a.replace("=> ", "=> ")) == fl.probe_fingerprint(a)
+    assert fl.probe_fingerprint(b) != fl.probe_fingerprint(
+        "--- experiment 1 ---\nz\n=> 0 mismatches"
+    )

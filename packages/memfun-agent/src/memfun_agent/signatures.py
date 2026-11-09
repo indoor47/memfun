@@ -647,28 +647,36 @@ class VerificationFix(dspy.Signature):
 
 
 class ExperimentProposal(dspy.Signature):
-    """Design small experiments to learn what the failing code must do.
+    """Look before you fix: write a small experiment showing WHERE the code and the tests disagree.
 
-    A fix has not made progress.  Do not guess again: propose at most three short,
-    self-contained Python snippets (each printing its results) that probe the exact
-    behaviour the failing tests expect, for example calling the function with the
-    failing inputs and printing the values, or printing a table entry or a helper's output.
-    The snippets run from the project root with the project's own Python; they must not
-    modify files or use the network.  Their real output is shown to you next round.
+    The last fix did not make progress, so stop guessing.  Write ONE short, self-contained Python
+    script (two at most) that is DIFFERENTIAL: it loads the data the failing tests use (the data
+    files and constants named in the failing tests' source, found under the project root), calls
+    the candidate code exactly the way the test does, compares with what the test expects, and
+    prints ONLY the cases that mismatch, one per line (the input, the expected value, the value
+    you got), followed by a count such as ``mismatches: 7 of 120``.  Print at most 30 lines.  Look
+    for what the mismatching cases have in common; that pattern is the next hypothesis.
+
+    The script runs from the project root with the project's own Python.  It may read any project
+    file; it must not write or delete files, run commands or use the network.  If earlier
+    experiments are listed, do NOT repeat them: ask something new (a different subset or property).
     """
 
     query: str = dspy.InputField(desc="The original task")
     full_context: str = dspy.InputField(
-        desc="Current source of the affected files plus the failing tests' source"
+        desc="Current source of the affected files, the failing tests' source and the full "
+        "failure detail, plus the results of earlier experiments"
     )
     verification_errors: str = dspy.InputField(desc="The compact failures of the last verify run")
     history: str = dspy.InputField(desc="What earlier fix rounds tried (may be empty)")
 
-    reasoning: str = dspy.OutputField(desc="What is still unknown and what each experiment tests")
+    reasoning: str = dspy.OutputField(
+        desc="What is still unknown, and how the script exposes the difference"
+    )
     probes: str = dspy.OutputField(
         desc=(
-            "JSON array of at most 3 strings, each a complete Python snippet that prints its "
-            'result, e.g. ["from pkg.mod import f\\nprint(f(1), f(2))"]'
+            "JSON array of at most 2 strings, each a complete Python script that prints only the "
+            "mismatching cases and a count, e.g. [\"import json\\n...\\nprint('mismatches:', n)\"]"
         )
     )
 

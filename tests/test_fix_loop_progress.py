@@ -160,7 +160,8 @@ def test_a_stalled_round_runs_experiments_and_feeds_their_output_to_the_fix(
 
     rig.solver.fix_solver.afix = spy  # type: ignore[method-assign]
     rig.run()
-    assert len(proposals) == 1  # one probe round: round 1 is a first score, round 2 stalls
+    # one stalled round; the fake proposes the same script again, whose output is not new: stop
+    assert len(proposals) == 2
     assert "probe-says 42" in seen[-1] and "EXPERIMENT RESULTS" in seen[-1]
     assert "EXPERIMENT RESULTS" not in seen[0]
 
@@ -240,3 +241,131 @@ def test_a_good_first_reply_is_not_retried_and_a_second_failure_is_returned() ->
     res = asyncio.run(solver.asolve("q", "ctx"))
     assert [o["op"] for o in res.operations] == ["run_cmd"]  # gave it one retry, then returned
     assert len(solver.predictor.queries) == 2  # type: ignore[attr-defined]
+
+
+# ── the LOOK step in the loop ────────────────────────────────────────────────────────────
+
+
+def _trust(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MEMFUN_TRUST_PROJECT_VERIFY", "1")
+
+
+def test_a_12_round_budget_in_verify_json_is_read_and_out_of_range_is_loud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import json
+
+    from memfun_agent.context_first import read_project_verify
+
+    _trust(monkeypatch)
+    (tmp_path / ".memfun").mkdir()
+    vf = tmp_path / ".memfun" / "verify.json"
+    vf.write_text(json.dumps({"commands": ["pytest"], "max_fix_attempts": 12}))
+    assert read_project_verify(tmp_path) == (
+        ["pytest"],
+        12,
+    )  # it was silently dropped before (>10)
+    vf.write_text(json.dumps({"commands": ["pytest"], "max_fix_attempts": 500}))
+    with caplog.at_level("WARNING"):
+        assert read_project_verify(tmp_path) == (["pytest"], None)
+    assert "ignoring max_fix_attempts" in caplog.text
+
+
+def test_verify_json_look_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+
+    from memfun_agent.context_first import read_project_verify_options
+
+    (tmp_path / ".memfun").mkdir()
+    vf = tmp_path / ".memfun" / "verify.json"
+    vf.write_text(json.dumps({"fix_detail": True, "probe_rounds": 3, "commands": []}))
+    assert read_project_verify_options(tmp_path) == {}  # untrusted project: nothing
+    _trust(monkeypatch)
+    assert read_project_verify_options(tmp_path) == {"fix_detail": True, "probe_rounds": 3}
+    vf.write_text(json.dumps({"fix_detail": "yes", "probe_rounds": -1}))
+    assert read_project_verify_options(tmp_path) == {}
+
+
+def test_full_failure_detail_reaches_the_fix_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from memfun_agent import fixloop
+
+    _trust(monkeypatch)
+    (tmp_path / ".memfun").mkdir()
+    (tmp_path / ".memfun" / "verify.json").write_text(json.dumps({"fix_detail": True}))
+    asked: list[list[str]] = []
+
+    async def fake_detail(root: Path, cmds: list[str], ids: list[str]) -> str:
+        asked.append(list(ids))
+        return "--- test_x ---\nE   mismatch: 7 expected 2 got 1"
+
+    monkeypatch.setattr(fixloop, "run_detail", fake_detail)
+    rig = Rig(
+        tmp_path, {"start": _out(2, 1), "b": "PASS"}, ["b"], max_fix_attempts=4, fix_restarts=0
+    )
+    seen: list[str] = []
+    orig = rig.solver.fix_solver.afix
+
+    async def spy(query: str, full_context: str, verification_errors: str):
+        seen.append(full_context + "||" + verification_errors)
+        return await orig(query, full_context, verification_errors)
+
+    rig.solver.fix_solver.afix = spy  # type: ignore[method-assign]
+    rig.run()
+    assert asked == [["tests/t.py::test_x"]]
+    assert "FULL FAILURE DETAIL" in seen[0] and "mismatch: 7 expected 2 got 1" in seen[0]
+
+
+def test_several_probes_per_stall_while_each_prints_something_new(tmp_path: Path) -> None:
+    outs = {"start": _out(3, 1), "a": _out(3, 1), "b": "PASS"}
+    rig = Rig(
+        tmp_path, outs, ["a", "b"], max_fix_attempts=6, fix_restarts=0,
+        fix_probe_rounds=1, fix_probe_iterations=3,
+    )  # fmt: skip
+    calls: list[str] = []
+
+    async def apropose(query: str, full_context: str, verification_errors: str, history: str):
+        n = len(calls)
+        calls.append(full_context)
+        return [f"print('finding', {n})"] if n < 2 else ["print('finding', 1)"]  # 3rd repeats 2nd
+
+    rig.solver.probe_solver.apropose = apropose  # type: ignore[method-assign]
+    seen: list[str] = []
+    orig = rig.solver.fix_solver.afix
+
+    async def spy(query: str, full_context: str, verification_errors: str):
+        seen.append(full_context)
+        return await orig(query, full_context, verification_errors)
+
+    rig.solver.fix_solver.afix = spy  # type: ignore[method-assign]
+    rig.run()
+    assert len(calls) == 3  # two new findings, then a repeat stops the stall's probing
+    assert "EXPERIMENTS SO FAR" not in calls[0] and "finding 0" in calls[1]  # earlier ones shown
+    assert "finding 0" in seen[-1] and "finding 1" in seen[-1]  # all reach the fix call
+
+
+def test_a_stall_at_the_base_budget_probes_instead_of_stopping(tmp_path: Path) -> None:
+    outs = {"start": _out(3, 1), "a": _out(3, 1), "b": _out(3, 1)}
+    (tmp_path / "off").mkdir()
+    (tmp_path / "on").mkdir()
+    off = Rig(
+        tmp_path / "off", outs, ["a", "b"], max_fix_attempts=2, fix_restarts=0, fix_patience=9
+    )
+    off.run()
+    assert off.verify_calls == 2  # base 2 reached without progress: stop (as before)
+    on = Rig(
+        tmp_path / "on", outs, ["a", "b"], max_fix_attempts=2, fix_restarts=0,
+        fix_patience=9, fix_probe_rounds=1,
+    )  # fmt: skip
+    asked: list[int] = []
+
+    async def apropose(query: str, full_context: str, verification_errors: str, history: str):
+        asked.append(1)
+        return ["print('x')"]
+
+    on.solver.probe_solver.apropose = apropose  # type: ignore[method-assign]
+    on.run()
+    assert asked and on.verify_calls == 3  # one probed round beyond the base, then it stops

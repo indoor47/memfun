@@ -949,6 +949,8 @@ def create_episode_repo(
     constrained_json: bool = True,
     context_window: int = 0,
     fix_attempts: int | None = None,
+    fix_detail: bool = False,
+    probe_rounds: int = 0,
 ) -> None:
     home.mkdir(parents=True, exist_ok=False)
     (home / ".gitconfig").write_text(
@@ -969,10 +971,16 @@ def create_episode_repo(
     _git(["add", "-A"], repo, env)
     _git(["commit", "-q", "-m", f"smoke start tree: {bundle.id}"], repo, env)
     (repo / ".memfun").mkdir(exist_ok=True)
-    write_project_verify(bundle, repo, fix_attempts)
+    write_project_verify(bundle, repo, fix_attempts, fix_detail, probe_rounds)
 
 
-def write_project_verify(bundle: Bundle, repo: Path, fix_attempts: int | None = None) -> None:
+def write_project_verify(
+    bundle: Bundle,
+    repo: Path,
+    fix_attempts: int | None = None,
+    fix_detail: bool = False,
+    probe_rounds: int = 0,
+) -> None:
     """Give the episode its own verification: ``[verify]`` of the bundle's task.toml.
 
     Commit0 function tasks list their relevant VISIBLE tests there; the solver runs them
@@ -994,6 +1002,10 @@ def write_project_verify(bundle: Bundle, repo: Path, fix_attempts: int | None = 
         doc["max_fix_attempts"] = fixes
     if fix_attempts is not None:  # --fix-attempts: a deeper fix loop for this run
         doc["max_fix_attempts"] = fix_attempts
+    if fix_detail:  # --fix-detail: re-run failing tests with full assertion output
+        doc["fix_detail"] = True
+    if probe_rounds:  # --probe-rounds: differential probes on stalled rounds
+        doc["probe_rounds"] = probe_rounds
     (repo / ".memfun" / "verify.json").write_text(json.dumps(doc), encoding="utf-8")
 
 
@@ -1630,6 +1642,9 @@ class RunContext:
     context_window: int = 262144
     #: ``--fix-attempts``: overrides the fix-loop budget (``max_fix_attempts``) of every episode.
     fix_attempts: int | None = None
+    #: ``--fix-detail`` / ``--probe-rounds``: the look step (full failure detail, probes).
+    fix_detail: bool = False
+    probe_rounds: int = 0
     #: ``--arm-step-limit``: cap on the agent's steps (mini ``agent.step_limit``); 0 = none.
     arm_step_limit: int = 0
     sampling: Sampling = dataclasses.field(default_factory=Sampling)
@@ -1752,6 +1767,8 @@ def run_episode(plan: EpisodePlan, ctx: RunContext) -> dict[str, Any]:
                     ctx.constrained_json,
                     ctx.context_window,
                     ctx.fix_attempts,
+                    ctx.fix_detail,
+                    ctx.probe_rounds,
                 )
             except subprocess.CalledProcessError as exc:
                 err = (exc.stderr or b"").decode("utf-8", "replace")[-500:]
@@ -2239,6 +2256,17 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         type=int,
         default=None,
         help="override the fix-loop budget (max_fix_attempts) of every episode (memfun arm)",
+    )
+    ap.add_argument(
+        "--fix-detail",
+        action="store_true",
+        help="memfun arm: show the fix step the failing tests' full assertion output (pytest -vv)",
+    )
+    ap.add_argument(
+        "--probe-rounds",
+        type=int,
+        default=0,
+        help="memfun arm: differential probes on this many stalled fix rounds (0 = off)",
     )
     ap.add_argument(
         "--arm-step-limit",
@@ -2770,6 +2798,8 @@ def run(args: argparse.Namespace) -> int:
             anthropic_base_url=args.anthropic_base_url,
             context_window=args.context_window,
             fix_attempts=args.fix_attempts,
+            fix_detail=args.fix_detail,
+            probe_rounds=args.probe_rounds,
             arm_step_limit=args.arm_step_limit,
             sampling=Sampling(
                 temperature=args.temperature,

@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -219,10 +220,10 @@ class BestSoFar:
 
 # ── Probes: let the model look at real behaviour when patching stalls ─────────
 
-MAX_PROBES = 3
+MAX_PROBES = 2
 MAX_PROBE_CHARS = 2_000
-PROBE_TIMEOUT_S = 20.0
-PROBE_OUTPUT_CHARS = 1_500
+PROBE_TIMEOUT_S = 30.0
+PROBE_OUTPUT_CHARS = 3_000
 #: Snippets touching these are refused (probes observe; they never change or fetch anything).
 _PROBE_FORBIDDEN = re.compile(
     r"\b(os\.(remove|unlink|rmdir|system|popen|rename|replace)|shutil\.|subprocess|socket|"
@@ -323,3 +324,117 @@ def short_diff(before: dict[Path, str], after: dict[Path, str], limit: int = 700
             lines.append(ln)
     text = "\n".join(lines)
     return text if len(text) <= limit else text[:limit] + "\n... [diff clipped]"
+
+
+# ── The LOOK step: untruncated failures and differential probes ────────────────────────────
+
+
+def pytest_detail_command(
+    verify_cmds: list[str], failed_ids: list[str] | tuple[str, ...]
+) -> list[str] | None:
+    """A pytest command that re-runs only *failed_ids* with full assertion detail, or None.
+
+    pytest prints an assertion on a list or dict as one truncated line
+    (``assert [{'a...'}, ...] == []``) unless verbosity is 2 or more.  This takes the project's own
+    pytest verify command, drops its test selectors and ``-q``, adds ``-vv`` and the failing ids.
+    Other verify commands (linters) give None.
+    """
+    for cmd in verify_cmds:
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            continue
+        if "pytest" not in tokens and not any(t.endswith("pytest") for t in tokens):
+            continue
+        idx = next(i for i, t in enumerate(tokens) if t == "pytest" or t.endswith("/pytest"))
+        head, rest = tokens[: idx + 1], tokens[idx + 1 :]
+        opts: list[str] = []
+        skip_next = False
+        for i, t in enumerate(rest):
+            if skip_next:
+                opts.append(t)
+                skip_next = False
+                continue
+            if "::" in t or t.endswith(".py") or t in {"tests", "test"}:
+                continue  # a selector: replaced by the failing ids
+            if t in {"-q", "--quiet", "-qq"}:
+                continue
+            if t in {"-p", "-k", "-m", "-o", "--tb", "-c", "--rootdir"} and i + 1 < len(rest):
+                opts.append(t)
+                skip_next = True
+                continue
+            opts.append(t)
+        if not any(o.startswith("--tb") for o in opts):
+            opts.append("--tb=short")
+        return [*head, "-vv", *opts, *failed_ids]
+    return None
+
+
+def extract_failure_detail(output: str, per_test: int = 2_500, total: int = 9_000) -> str:
+    """The assertion detail of each failing test: its traceback head and its ``E`` lines.
+
+    Per-test and total byte budgets; the head and the first mismatching items are kept.
+    """
+    text = strip_ansi(output)
+    sections = re.split(r"\n_{3,}\s+(.+?)\s+_{3,}\n", text)
+    parts: list[str] = []
+    used = 0
+    for i in range(1, len(sections) - 1, 2):
+        name, body = sections[i], re.split(r"\n={3,}", sections[i + 1], maxsplit=1)[0]
+        lines = body.splitlines()
+        e_lines = [ln for ln in lines if ln.startswith("E ")]
+        head = [ln for ln in lines if not ln.startswith("E ")][:14]
+        keep = head + (["..."] if e_lines else []) + e_lines
+        chunk = clip(f"--- {name} ---\n" + "\n".join(keep), per_test)
+        if used + len(chunk) > total:
+            parts.append(clip(chunk, max(400, total - used)))
+            break
+        parts.append(chunk)
+        used += len(chunk)
+    return "\n\n".join(parts)
+
+
+async def run_detail(
+    project_root: Path,
+    verify_cmds: list[str],
+    failed_ids: list[str] | tuple[str, ...],
+    timeout: float = 120.0,
+) -> str:
+    """Re-run the failing tests with full assertion output and return the extracted detail."""
+    cmd = pytest_detail_command(verify_cmds, list(failed_ids)[:12])
+    if cmd is None:
+        return ""
+    try:
+        res = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return extract_failure_detail(res.stdout + "\n" + res.stderr)
+
+
+def probe_fingerprint(output: str) -> str:
+    """A short key for the OUTPUT of a probe run (not the script that produced it), empty when it
+    holds no information (nothing printed, only refusals / timeouts).  Two runs with the same key
+    told the model the same thing."""
+    bodies = re.findall(r"\n=> (.*?)(?=\n\n--- experiment|\Z)", output, re.S)
+    useful: list[str] = []
+    for body in bodies:
+        b = body.strip()
+        if (
+            not b
+            or b == "(no output)"
+            or b.startswith(("refused (", "(timed out", "(could not run"))
+        ):
+            continue
+        useful.append(b)
+    if not useful:
+        return ""
+    return hashlib.sha256("\n".join(useful).encode()).hexdigest()[:16]

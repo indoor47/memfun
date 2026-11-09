@@ -231,6 +231,11 @@ class ContextFirstConfig:
     #: experiments, they run, and their real output goes into the next fix.  Off (0) by default:
     #: round 2 of the Cerebras A/B showed no gain, so it is opt-in.
     fix_probe_rounds: int = 0
+    #: Differential probes tried on ONE stalled round while each produces new output.
+    fix_probe_iterations: int = 3
+    #: Re-run the failing pytest tests with full assertion output (``-vv``) and show that detail
+    #: to the fix step instead of pytest's one-line truncated repr.
+    fix_detail: bool = False
     enable_edit_retry: bool = True
     enable_consistency_review: bool = True
 
@@ -1284,6 +1289,8 @@ def _detect_verify_commands(
 
 #: A project may carry its own verification (e.g. the visible tests of the function to
 #: implement): ``.memfun/verify.json`` = ``{"commands": ["..."], "max_fix_attempts": 4}``.
+#: Upper bound for ``max_fix_attempts`` in ``.memfun/verify.json``.
+MAX_FIX_ATTEMPTS = 50
 PROJECT_VERIFY_FILE = ".memfun/verify.json"
 #: The file's commands run through a shell, so a repository must not be able to make memfun
 #: execute them on its own: they are read only when this variable is truthy (the benchmark
@@ -1311,8 +1318,36 @@ def read_project_verify(project_root: Path) -> tuple[list[str], int | None]:
         else []
     )
     fixes = data.get("max_fix_attempts")
-    ok = isinstance(fixes, int) and not isinstance(fixes, bool) and 1 <= fixes <= 10
+    ok = isinstance(fixes, int) and not isinstance(fixes, bool) and 1 <= fixes <= MAX_FIX_ATTEMPTS
+    if fixes is not None and not ok:
+        # Silently ignoring it once made a "12 rounds" experiment run with the default of 2.
+        logger.warning(
+            "ignoring max_fix_attempts=%r in %s (must be an integer 1..%d)",
+            fixes,
+            PROJECT_VERIFY_FILE,
+            MAX_FIX_ATTEMPTS,
+        )
     return cmds, (fixes if ok else None)
+
+
+def read_project_verify_options(project_root: Path) -> dict[str, Any]:
+    """The look-step switches of ``.memfun/verify.json`` (same trust rule as the commands):
+    ``fix_detail`` (bool: re-run failing pytest tests with full assertion output) and
+    ``probe_rounds`` (int >= 0: stalled rounds on which to run differential probes)."""
+    if os.environ.get(TRUST_PROJECT_VERIFY_ENV, "").lower() not in ("1", "true", "yes"):
+        return {}
+    try:
+        data = json.loads((project_root / PROJECT_VERIFY_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, Any] = {}
+    if isinstance(data, dict):
+        if isinstance(data.get("fix_detail"), bool):
+            out["fix_detail"] = data["fix_detail"]
+        pr = data.get("probe_rounds")
+        if isinstance(pr, int) and not isinstance(pr, bool) and 0 <= pr <= 20:
+            out["probe_rounds"] = pr
+    return out
 
 
 @dataclass
@@ -1977,7 +2012,9 @@ class ContextFirstSolver:
         cap = max(base, self.config.fix_hard_cap)
         patience = max(1, self.config.fix_patience)
         restarts_left = max(0, self.config.fix_restarts)
-        probes_left = max(0, self.config.fix_probe_rounds)
+        opts = read_project_verify_options(self.project_root)
+        probes_left = max(0, int(opts.get("probe_rounds", self.config.fix_probe_rounds)))
+        fix_detail = bool(opts.get("fix_detail", self.config.fix_detail))
         experiments: list[str] = []  # real outputs of probe snippets, newest last
         paths = [Path(f) for f in dict.fromkeys(executor.files_created)]
         best = fixloop.BestSoFar(paths)
@@ -2032,7 +2069,7 @@ class ContextFirstSolver:
                     continue
                 break
 
-            if attempt >= base and not improved:
+            if attempt >= base and not improved and probes_left <= 0:
                 self._status("Verification failed, no progress past the base budget")
                 break
 
@@ -2045,29 +2082,31 @@ class ContextFirstSolver:
                 current_context += (
                     "\n\n=== FAILING TESTS (read-only; do not edit) ===\n" + tests_src
                 )
+            errors_for_fix = fixloop.compact_errors(vr.errors)
+            if fix_detail and summary.failed_ids:
+                detail = await fixloop.run_detail(
+                    self.project_root, verify_cmds, list(summary.failed_ids)
+                )
+                if detail:
+                    current_context += (
+                        "\n\n=== FULL FAILURE DETAIL (untruncated assertions of the failing "
+                        "tests) ===\n" + detail
+                    )
+                    errors_for_fix += "\n\nFull assertion detail of the failing tests:\n" + detail
             if probes_left > 0 and not improved:
                 # A round without progress: stop guessing, look at real behaviour.
                 probes_left -= 1
-                self._status("No progress: running experiments...")
-                try:
-                    snippets = await self.probe_solver.apropose(
-                        query=query,
-                        full_context=current_context,
-                        verification_errors=fixloop.compact_errors(vr.errors),
-                        history="\n".join(history[-6:]),
-                    )
-                    logger.info("Probe round: %d experiments proposed", len(snippets))
-                    if snippets:
-                        experiments.append(await fixloop.run_probes(self.project_root, snippets))
-                        history.append(
-                            f"round {attempt}: ran {len(snippets)} experiments (results below)"
-                        )
-                except Exception as exc:
-                    logger.warning("Probe step failed: %s", exc)
+                self._status("No progress: running differential experiments...")
+                new_runs = await self._look(
+                    query, current_context, errors_for_fix, history, experiments
+                )
+                if new_runs:
+                    experiments.extend(new_runs)
+                    history.append(f"round {attempt}: ran {len(new_runs)} experiments (see below)")
             if experiments:
                 current_context += (
-                    "\n\n=== EXPERIMENT RESULTS (real output of snippets run here) ===\n"
-                    + "\n\n".join(experiments[-2:])
+                    "\n\n=== EXPERIMENT RESULTS (real output of scripts run in this project) ===\n"
+                    + "\n\n".join(experiments[-3:])
                 )
             fix_query = query
             if history:
@@ -2079,7 +2118,7 @@ class ContextFirstSolver:
                 fix_ops = await self.fix_solver.afix(
                     query=fix_query,
                     full_context=current_context,
-                    verification_errors=fixloop.compact_errors(vr.errors),
+                    verification_errors=errors_for_fix,
                 )
             except Exception as exc:
                 logger.warning("Fix solver failed: %s", exc)
@@ -2127,6 +2166,53 @@ class ContextFirstSolver:
                     sc,
                 )
                 self._status(f"Restored the best state (round {best.best_round})")
+
+    async def _look(
+        self,
+        query: str,
+        context: str,
+        errors: str,
+        history: list[str],
+        experiments: list[str],
+    ) -> list[str]:
+        """Differential probes for one stalled round: go on while a probe prints something new.
+
+        Each iteration the model sees this stall's earlier experiments and writes a new script.
+        It stops when the model proposes nothing, the output is empty, refused or timed out, or
+        it repeats an earlier output (no new information).  Read-only; at most
+        ``fix_probe_iterations`` per stalled round.
+        """
+        outs: list[str] = []
+        seen: set[str] = set()
+        for _ in range(max(1, self.config.fix_probe_iterations)):
+            ctx = context
+            shown = (experiments + outs)[-3:]
+            if shown:
+                ctx += "\n\n=== EXPERIMENTS SO FAR (do not repeat) ===\n" + "\n\n".join(shown)
+            try:
+                snippets = await self.probe_solver.apropose(
+                    query=query,
+                    full_context=ctx,
+                    verification_errors=errors,
+                    history="\n".join(history[-6:]),
+                )
+            except Exception as exc:
+                logger.warning("Probe proposal failed: %s", exc)
+                break
+            logger.info("Look step: %d experiments proposed", len(snippets))
+            if not snippets:
+                break
+            out = await fixloop.run_probes(self.project_root, snippets)
+            key = fixloop.probe_fingerprint(out)
+            if not key or key in seen:
+                if out:
+                    outs.append(
+                        out
+                    )  # still shown once: a refusal or an empty result is information
+                break
+            seen.add(key)
+            outs.append(out)
+        return outs
 
     async def _restart_from_best(
         self,
