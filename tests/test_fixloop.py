@@ -348,3 +348,11 @@ def test_log_probe_appends_a_record_for_audits(tmp_path: Path) -> None:
     rec = json.loads(lines[0])
     assert len(lines) == 2 and rec["scripts"] == ["print(1)"] and "=> 1" in rec["output"]
     fl.log_probe(tmp_path / "missing" / "deeper", ["x"], "y")  # best effort: never raises
+
+
+def test_init_probe_log_creates_an_empty_log_so_a_missing_one_is_detectable(
+    tmp_path: Path,
+) -> None:
+    fl.init_probe_log(tmp_path)
+    assert (tmp_path / fl.PROBE_LOG).read_text() == ""
+    fl.init_probe_log(tmp_path / "missing" / "dir")  # still best effort

@@ -593,6 +593,17 @@ def probe_fingerprint(output: str) -> str:
 PROBE_LOG = ".memfun/probes.jsonl"
 
 
+def init_probe_log(project_root: Path) -> None:
+    """Create the (empty) probe log when the look step is enabled, so that an audit can tell
+    "probes were on, none was needed" (an empty file) from "the log is gone" (no file)."""
+    try:
+        path = project_root / PROBE_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    except OSError:
+        pass
+
+
 def log_probe(project_root: Path, snippets: list[str], output: str) -> None:
     """Append one probe run (the scripts and their output) to ``.memfun/probes.jsonl``.
 

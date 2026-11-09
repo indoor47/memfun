@@ -2090,6 +2090,8 @@ class ContextFirstSolver:
         probes_left = max(0, int(opts.get("probe_rounds", self.config.fix_probe_rounds)))
         fix_detail = bool(opts.get("fix_detail", self.config.fix_detail))
         strict = bool(opts.get("probe_strict", self.config.fix_probe_strict))
+        if probes_left > 0:
+            fixloop.init_probe_log(self.project_root)
         experiments: list[str] = []  # real outputs of probe snippets, newest last
         history: list[str] = []
         seen_states: dict[str, tuple[int, tuple[int, int, int]]] = {}  # state -> (round, score)
