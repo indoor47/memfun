@@ -194,7 +194,7 @@ load, idle time and the analysis between runs.
    test command in the task text, cache-safe retries, per-step retry, `--single-task-solver
    rlm`, `merge-check`. It did not raise the wcwidth number; it removes real bugs and makes the
    next experiment cleaner.
-4. **Make `memfun swarm` exit after its result** instead of relying on a reaper.
+4. **Make `memfun swarm` exit after its result** instead of relying on a reaper. (Done: the process stayed alive because the runtime's aiosqlite connections run on non-daemon worker threads and nothing closed them; `swarm` now closes them. The runner's reaper stays as a safety net.)
 5. **Feed command output back in the one-shot fix step**, or route function tasks through the
    iterative loop by default once a model that can use it is in place.
 
