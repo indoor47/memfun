@@ -195,17 +195,47 @@ def mini_steps(ep: Path) -> list[tuple[str, str]]:
     return steps
 
 
+class AuditError(Exception):
+    """The audit cannot vouch for this episode (a log it needs is missing or malformed)."""
+
+
+def probe_steps(ep: Path) -> list[tuple[str, str]]:
+    """The look step's probe scripts (``.memfun/probes.jsonl`` in the episode repo): each is a
+    command that ran inside the episode, with its output.  A malformed log raises
+    :class:`AuditError`; a missing one gives no steps (the caller decides if that is an error)."""
+    steps: list[tuple[str, str]] = []
+    for log in ep.glob("*/.memfun/probes.jsonl"):
+        try:
+            for line in log.read_text("utf-8").splitlines():
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                scripts = rec["scripts"]
+                if not isinstance(scripts, list):
+                    raise TypeError("scripts is not a list")
+                out = str(rec.get("output", ""))
+                for script in scripts:
+                    steps.append((f"python -c {script}", out))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise AuditError(f"malformed probe log {log}: {exc}") from exc
+    return steps
+
+
+def probe_log_exists(ep: Path) -> bool:
+    return any(ep.glob("*/.memfun/probes.jsonl"))
+
+
 def memfun_steps(ep: Path) -> list[tuple[str, str]]:
     f = ep / "swarm-result.json"
     try:
         doc = json.loads(f.read_text("utf-8"))
     except (OSError, ValueError):
-        return []
+        return probe_steps(ep)  # no result file: the probe log is still audited
     steps: list[tuple[str, str]] = []
     for st in (doc.get("sub_tasks") or {}).values():
         for op in st.get("ops") or []:
             steps.append((f"{op.get('type')} {op.get('target')} {op.get('detail')}", ""))
-    return steps
+    return steps + probe_steps(ep)
 
 
 def aider_steps(ep: Path) -> list[tuple[str, str]]:
@@ -214,12 +244,27 @@ def aider_steps(ep: Path) -> list[tuple[str, str]]:
 
 
 STEPS = {"mini-swe-agent": mini_steps, "memfun": memfun_steps, "aider": aider_steps}
+#: Arms whose commands/probes have outputs the leak and exposure checks can compare.
+LEAK_CHECKED_ARMS = ("mini-swe-agent", "memfun")
 
 
 def audit_episode(ep: Path, arm: str, ref: Reference | None) -> dict[str, Any]:
     rec = json.loads((ep / "episode.json").read_text("utf-8"))
     repo = rec.get("repo", "")
-    steps = STEPS.get(arm, lambda _e: [])(ep)
+    errors: list[str] = []
+    look = rec.get("look_step") if isinstance(rec.get("look_step"), dict) else {}
+    try:
+        steps = STEPS.get(arm, lambda _e: [])(ep)
+    except AuditError as exc:
+        errors.append(str(exc))
+        steps = []
+    if arm == "memfun":
+        if (look or {}).get("probe_rounds") and not probe_log_exists(ep):
+            errors.append("probes were enabled but .memfun/probes.jsonl is missing")
+        if rec.get("outcome") in ("pass", "fail") and not (ep / "swarm-result.json").is_file():
+            errors.append("swarm-result.json is missing: memfun's operations were not audited")
+        if "look_step" not in rec:
+            errors.append("episode.json does not record which look-step settings ran")
     probes: dict[str, int] = {}
     probe_cmds: list[str] = []
     leaks: list[dict[str, str]] = []
@@ -253,7 +298,7 @@ def audit_episode(ep: Path, arm: str, ref: Reference | None) -> dict[str, Any]:
             )
         ):
             outside_reads += 1
-        if ref is not None and out and arm == "mini-swe-agent":
+        if ref is not None and out and arm in LEAK_CHECKED_ARMS:
             n_exposed = ref.file_exposed_in(
                 out, seen=seen | {norm(x) for x in cmd.replace("\\n", "\n").splitlines()}
             )
@@ -266,7 +311,7 @@ def audit_episode(ep: Path, arm: str, ref: Reference | None) -> dict[str, Any]:
                     }
                 )
         new_seen = seen | {norm(x) for x in cmd.replace("\\n", "\n").splitlines()}
-        if ref is not None and out and arm == "mini-swe-agent" and ref.leaked_in(out, new_seen):
+        if ref is not None and out and arm in LEAK_CHECKED_ARMS and ref.leaked_in(out, new_seen):
             leaks.append({"command": cmd.strip()[:200], "source": classify_source(cmd, out)})
         seen = new_seen | {norm(x) for x in out.splitlines()}
     if arm == "aider":
@@ -295,12 +340,23 @@ def audit_episode(ep: Path, arm: str, ref: Reference | None) -> dict[str, Any]:
         "reference_path_touches": touches,
         "original_file_exposures": exposures,
         "final_matches_reference": same,
+        "look_step": look,
+        "audit_errors": errors,
     }
 
 
 def audit_run(run: Path, bundles: Path) -> dict[str, Any]:
     meta = json.loads((run / "results.json").read_text("utf-8")).get("meta", {})
-    arm = meta.get("arm") or run.name.removeprefix("bench-")
+    arm = meta.get("arm") or ""
+    if not arm:  # run_smoke records the arm in every episode.json
+        for f in sorted(run.glob("*/*/episode.json")):
+            try:
+                arm = str(json.loads(f.read_text("utf-8")).get("arm") or "")
+            except (OSError, ValueError):
+                arm = ""
+            if arm:
+                break
+    arm = arm or run.name.removeprefix("bench-")
     for known in ("mini-swe-agent", "single-shot", "claude-code", "memfun", "aider"):
         if arm == known or arm.startswith(known + "-"):  # e.g. a tagged run: mini-swe-agent-hardD
             arm = known
@@ -317,11 +373,18 @@ def audit_run(run: Path, bundles: Path) -> dict[str, Any]:
                 print(f"WARNING: no reference for bundle {bid}: {exc}", file=sys.stderr)
                 refs[bid] = None
         eps.append(audit_episode(ep, arm, refs[bid]))
+    errors = [f"{e['episode']}: {m}" for e in eps for m in e["audit_errors"]]
+    if arm not in (*STEPS, "single-shot"):
+        errors.append(f"arm {arm!r} has no audit parser: nothing was audited")
+    if not eps:
+        errors.append("no episodes found in the run")
     probed = [e for e in eps if e["probes"]]
     leaked = [e for e in eps if e["leaks"] or e["original_file_exposures"]]
     return {
         "arm": arm,
         "episodes": len(eps),
+        "audit_errors": errors,
+        "look_step": sorted({json.dumps(e["look_step"], sort_keys=True) for e in eps}),
         "episodes_with_probe": len(probed),
         "episodes_with_leak": len(leaked),
         "leak_sources": sorted(
@@ -360,7 +423,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if a.json:
         a.json.write_text(json.dumps(out, indent=1), "utf-8")
-    return 0
+    bad = [e for r in out for e in r["audit_errors"]]
+    for e in bad:
+        print(f"AUDIT ERROR: {e}", file=sys.stderr)
+    return 2 if bad else 0
 
 
 if __name__ == "__main__":

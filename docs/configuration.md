@@ -315,6 +315,43 @@ the file is read only when `MEMFUN_TRUST_PROJECT_VERIFY=1` is set in memfun's en
 (`evals/swarm/run_smoke.py` sets it for its episodes, whose file it wrote itself). Failing
 output goes through the solver's verify-and-fix loop.
 
+`.memfun/` is never gathered into the model's context (it can hold credentials), and neither
+are data or config files named like secrets (`.env*`, `credentials.json`, `secrets.yaml`,
+`*.pem`, `*.key`, ...).
+
+#### Fix-loop and look-step options
+
+All keys are optional. An invalid value is **not** applied silently: it logs a warning that
+names the key and the allowed range, and the setting stays off or at its default.
+
+| key | values | default | what it does |
+|---|---|---|---|
+| `max_fix_attempts` | integer 1..50 | 2 (4 for the benchmark bundles) | base number of verify-and-fix rounds; past it the loop continues only while rounds improve (up to `fix_hard_cap`) |
+| `fix_detail` | `true` / `false` | `false` | after **every** failed round that has failing pytest tests, re-run them with `-vv` and show the fix step their untruncated assertion output (not only on a stall) |
+| `probe_rounds` | integer 0..20 | 0 (off) | on a round that did not improve, up to this many times per solve, the model writes short scripts (up to `fix_probe_iterations`, default 3, per stall) that run in the project and print where the code and the tests' data disagree; the real output goes into the next fix call |
+| `probe_guard` | `"project"` / `"strict"` / `"off"` | `"project"` | how probe scripts are guarded (see below). `"strict"` is `python -I -S -B` (standard library and the project only; the benchmark runner sets it so an installed copy of the library under repair cannot be used). `"off"` removes the audit hook: **only for disposable sandboxes** (a throwaway task container) where a reproduction needs temp files, child processes, local sockets or import-time caches |
+
+The loop itself is the same with or without probes: `probe_rounds` changes only whether the look
+step runs, not when the loop stops.
+
+**Probe safety.** A probe runs as a separate process in its own process group (killed whole on
+timeout, so no child outlives it) with a 30 s timeout and a 3 KB output cap, in the interpreter the project's own verify command uses (never memfun's own interpreter;
+with none found, the probes report that they cannot run). Project packages import from the
+project (`src/` and the root come first), and reading an installed copy of a package the project
+defines is denied. An audit hook denies file writes, child processes, network access, `ctypes`,
+and reads outside the project and the interpreter's own directories. This is **defence in
+depth, not a sandbox**: native code or a determined script can get around an audit hook, so run
+untrusted repositories in a container or VM. In `project` mode the probe sees `PATH` and only
+`LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `VIRTUAL_ENV`, `CONDA_PREFIX`, `CONDA_DEFAULT_ENV` and
+`LD_LIBRARY_PATH` from memfun's environment (no keys or tokens); `strict` sees `PATH` only; `off`
+inherits everything. The interpreter comes from the verify command (a bare `pytest` or `python` is
+resolved through `PATH`, never to memfun's own interpreter), else `.venv`, else `python3`/`python`
+on `PATH`.
+
+Names that look like secrets hide only data and config files (`credentials.json`, `.env`,
+`secrets.yaml`, `*.pem`); source modules such as `credentials.py` are still gathered. Every probe and its output is appended to
+`.memfun/probes.jsonl`.
+
 ## Dashboard Environment Variables
 
 The live dashboard (`memfun dashboard`, or embedded in `memfun chat`) reads these at request time:

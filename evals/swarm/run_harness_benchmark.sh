@@ -109,6 +109,13 @@ T="$OUT/isotest"; mkdir -p "$T/repo" "$T/home"
   for pkg in wcwidth cachetools $LIBS; do
     "$SANDBOX" "$PY" -c "import $pkg" >/dev/null 2>&1 && { echo "  FAIL: $pkg is installed for the agent"; fail=1; } || echo "  ok: no installed copy of $pkg"
   done
+  # The look step's probe interpreter: project copy only, read-only (memfun's own interpreter).
+  MEMFUN_PY="$(dirname "$(echo "$MEMFUN" | awk '{print $1}')")/python"
+  if [ -x "$MEMFUN_PY" ]; then
+    env SANDBOX_READ_PATHS="$(reads_for memfun)" "$SANDBOX" "$MEMFUN_PY" "$REPO/evals/swarm/probe_selftest.py" wcwidth cachetools $LIBS || fail=1
+  else
+    echo "  FAIL: no memfun interpreter next to $MEMFUN for the probe self-test"; fail=1
+  fi
   # The way run_smoke launches a harness: cleaned environment, read paths passed via env(1).
   for arm in $ARMS; do
     bin=$PY; [ "$arm" = memfun ] && bin=$MEMFUN

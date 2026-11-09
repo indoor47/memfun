@@ -206,3 +206,107 @@ def test_a_tagged_run_name_still_selects_the_arm_parser(tmp_path: Path) -> None:
     assert res["arm"] == "mini-swe-agent"
     d = res["details"][0]
     assert d["commands"] == 2 and "find-root" in d["probes"] and d["leaks"]
+
+
+def test_the_audit_reads_the_look_steps_probe_log_and_the_arm_from_episode_json(
+    tmp_path: Path,
+) -> None:
+    """memfun's probe scripts (.memfun/probes.jsonl) are audited like any command; a run named
+    look-P (no arm in results.json) is recognised from the arm recorded in episode.json."""
+    _bundle(tmp_path)
+    run = tmp_path / "look-P"
+    ep = run / "c0s-lib-target" / "1"
+    repo = ep / "c0s-lib-target-t1"
+    (repo / ".memfun").mkdir(parents=True)
+    (ep / "collected" / "lib").mkdir(parents=True)
+    (ep / "collected" / "lib" / "m.py").write_text(REF)
+    (ep / "swarm-result.json").write_text(json.dumps({"sub_tasks": {}}))
+    (repo / ".memfun" / "probes.jsonl").write_text(
+        json.dumps(
+            {"scripts": ["import glob; print(glob.glob('/Users/x/.cache/*'))"], "output": "[]"}
+        )
+        + "\n"
+    )
+    (ep / "episode.json").write_text(
+        json.dumps(
+            {"episode": "c0s-lib-target-t1", "outcome": "pass", "repo": str(repo), "arm": "memfun"}
+        )
+    )
+    (run / "results.json").write_text(json.dumps({"meta": {}}))
+    res = ac.audit_run(run, tmp_path / "bundles")
+    assert res["arm"] == "memfun"
+    d = res["details"][0]
+    assert d["commands"] == 1 and d["probes"]  # the probe script was seen and flagged
+
+
+def _memfun_run(
+    tmp: Path, *, log: str | None, probe_rounds: int = 2, look: bool = True, name: str = "look-P"
+) -> Path:
+    _bundle(tmp)
+    run = tmp / name
+    ep = run / "c0s-lib-target" / "1"
+    repo = ep / "c0s-lib-target-t1"
+    (repo / ".memfun").mkdir(parents=True)
+    (ep / "collected" / "lib").mkdir(parents=True)
+    (ep / "collected" / "lib" / "m.py").write_text(REF)
+    (ep / "swarm-result.json").write_text(json.dumps({"sub_tasks": {}}))
+    if log is not None:
+        (repo / ".memfun" / "probes.jsonl").write_text(log)
+    rec = {"episode": "c0s-lib-target-t1", "outcome": "pass", "repo": str(repo), "arm": "memfun"}
+    if look:
+        rec["look_step"] = {"probe_rounds": probe_rounds, "fix_detail": False}
+    (ep / "episode.json").write_text(json.dumps(rec))
+    (run / "results.json").write_text(json.dumps({"meta": {}}))
+    return run
+
+
+def test_memfun_probe_output_is_leak_checked_like_a_mini_command(tmp_path: Path) -> None:
+    """A probe that prints the reference solution (read from the answer cache) is a leak for
+    memfun too, not only for the mini arm."""
+    log = (
+        json.dumps(
+            {
+                "scripts": ["print(open('/x/bundles/c0s-lib-target/solution/lib/m.py').read())"],
+                "output": REF,
+            }
+        )
+        + "\n"
+    )
+    run = _memfun_run(tmp_path, log=log)
+    res = ac.audit_run(run, tmp_path / "bundles")
+    d = res["details"][0]
+    assert d["leaks"] and d["reference_path_touches"]
+    assert res["episodes_with_leak"] == 1 and res["audit_errors"] == []
+
+
+def test_probes_enabled_but_no_log_is_an_audit_error(tmp_path: Path) -> None:
+    res = ac.audit_run(_memfun_run(tmp_path, log=None), tmp_path / "bundles")
+    assert any("probes.jsonl is missing" in e for e in res["audit_errors"])
+    # an empty log is fine: probes were on, none was needed
+    ok = ac.audit_run(
+        _memfun_run(tmp_path / "ok", log="", name="look-P2"), tmp_path / "ok" / "bundles"
+    )
+    assert ok["audit_errors"] == []
+
+
+def test_a_malformed_probe_log_is_an_audit_error(tmp_path: Path) -> None:
+    res = ac.audit_run(_memfun_run(tmp_path, log="not json\n"), tmp_path / "bundles")
+    assert any("malformed probe log" in e for e in res["audit_errors"])
+
+
+def test_an_episode_that_does_not_record_its_look_step_is_an_audit_error(tmp_path: Path) -> None:
+    res = ac.audit_run(_memfun_run(tmp_path, log="", look=False), tmp_path / "bundles")
+    assert any("look-step settings" in e for e in res["audit_errors"])
+
+
+def test_the_audit_exits_nonzero_on_errors_and_on_an_unknown_arm(tmp_path: Path) -> None:
+    run = _memfun_run(tmp_path, log=None)
+    assert ac.main(["--run", str(run), "--bundles", str(tmp_path / "bundles")]) == 2
+    good = _memfun_run(tmp_path / "g", log="", name="look-P3")
+    assert ac.main(["--run", str(good), "--bundles", str(tmp_path / "g" / "bundles")]) == 0
+    (tmp_path / "w" / "bundles").mkdir(parents=True)
+    unk = _memfun_run(tmp_path / "w", log="", name="look-Q")
+    ep = unk / "c0s-lib-target" / "1" / "episode.json"
+    ep.write_text(json.dumps({**json.loads(ep.read_text()), "arm": "mystery"}))
+    res = ac.audit_run(unk, tmp_path / "w" / "bundles")
+    assert any("no audit parser" in e for e in res["audit_errors"])

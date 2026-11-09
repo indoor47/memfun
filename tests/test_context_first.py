@@ -1729,3 +1729,43 @@ async def test_web_category_forces_planner(tmp_path: Path):
     assert planner_called is True
     assert result.success is True
     assert result.method == "context_first_planned"
+
+
+def test_manifest_never_includes_memfun_state_or_secret_files(tmp_path: Path) -> None:
+    """.memfun/ (credentials, verify.json, probe logs) and secret-looking files must never reach
+    a prompt, whatever their extension."""
+    from memfun_agent.context_first import build_file_manifest
+
+    (tmp_path / ".memfun").mkdir()
+    (tmp_path / ".memfun" / "credentials.json").write_text('{"key": "x"}')
+    (tmp_path / ".memfun" / "verify.json").write_text("{}")
+    (tmp_path / "prod.env").write_text("K=v")
+    (tmp_path / "credentials.json").write_text("{}")
+    (tmp_path / "server.pem").write_text("-")
+    (tmp_path / "app.py").write_text("x = 1\n")
+    (tmp_path / "environment.md").write_text("docs\n")
+    assert [p for p, _ in build_file_manifest(tmp_path)] == ["app.py", "environment.md"]
+
+
+def test_source_modules_with_secret_looking_names_stay_visible(tmp_path: Path) -> None:
+    """botocore/credentials.py and a secrets.py are source code an agent may have to fix; only
+    data/config files with secret-looking names are hidden."""
+    from memfun_agent.context_first import build_file_manifest
+
+    for rel in (
+        "auth/credentials.py",
+        "pkg/secrets.py",
+        "web/credentials.ts",
+        ".memfun/credentials.json",
+        "credentials.json",
+        "secrets.yaml",
+        ".env",
+        "prod.env",
+        "config/credentials",
+        "keys/server.key",
+    ):
+        f = tmp_path / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("x = 1\n")
+    got = [p for p, _ in build_file_manifest(tmp_path)]
+    assert got == ["auth/credentials.py", "pkg/secrets.py", "web/credentials.ts"]

@@ -1477,3 +1477,46 @@ def test_arm_step_limit_reaches_mini_and_arms_use_the_episode_url() -> None:
         ["mini-swe-agent", "--spec-file", "t", "--base-url", "u", "--model", "m"]
     )
     assert not any("step_limit" in c for c in arms.mini_command(ns0, "T", Path("x")))
+
+
+def test_look_step_flags_land_in_verify_json(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "b"
+    bundle_dir.mkdir()
+    (bundle_dir / "task.toml").write_text('[verify]\ncommands = ["pytest -q"]\n', "utf-8")
+    repo = tmp_path / "repo"
+    (repo / ".memfun").mkdir(parents=True)
+    bundle = rs.Bundle(id="b", path=bundle_dir)
+    rs.write_project_verify(bundle, repo)
+    doc = json.loads((repo / ".memfun" / "verify.json").read_text())
+    # off values are written explicitly, never left to a default
+    assert (
+        doc["fix_detail"] is False and doc["probe_rounds"] == 0 and doc["probe_guard"] == "strict"
+    )
+    assert rs.effective_look_step(repo)["probe_rounds"] == 0
+    rs.write_project_verify(bundle, repo, None, True, 3)
+    doc = json.loads((repo / ".memfun" / "verify.json").read_text())
+    assert doc["fix_detail"] is True and doc["probe_rounds"] == 3
+
+
+def test_look_step_flags_are_validated_loudly() -> None:
+    rs.validate_look_step(None, 0)
+    rs.validate_look_step(50, 20)
+    for fa, pr in ((0, 0), (51, 0), (None, 21), (None, -1)):
+        with pytest.raises(ValueError):
+            rs.validate_look_step(fa, pr)
+    with pytest.raises(SystemExit):
+        rs.parse_args(["--probe-rounds", "21", "--run-id", "x"])
+
+
+def test_the_look_step_that_ran_is_recorded_per_episode(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".memfun").mkdir(parents=True)
+    assert rs.effective_look_step(repo) == {"verify_json": "missing or unreadable"}
+    (repo / ".memfun" / "verify.json").write_text(
+        json.dumps({"commands": ["x"], "probe_rounds": 2, "fix_detail": True})
+    )
+    eff = rs.effective_look_step(repo)
+    assert eff["probe_rounds"] == 2 and eff["fix_detail"] is True
+    assert rs.probe_runs(repo) is None  # probes enabled but no log: the audit must say so
+    (repo / ".memfun" / "probes.jsonl").write_text('{"a": 1}\n{"a": 2}\n')
+    assert rs.probe_runs(repo) == 2
