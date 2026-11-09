@@ -1,5 +1,6 @@
 ;; Read-isolation for ONE benchmark episode (macOS sandbox-exec).  Parameters (-D):
 ;;   REPO     the episode repo (cwd of the agent)           HOME_EP  the episode's throwaway HOME
+;;   RESULT   the one result file memfun may create (MEMFUN_SWARM_RESULT_JSON or /nonexistent)
 ;;   P0..P5   extra read-only paths (the agent's own venv / interpreter prefixes); unused = /nonexistent
 ;; The agent may READ only: the system (/usr, /bin, /System, /Library, /private/var, /dev ...),
 ;; REPO, HOME_EP and P0..P5.  It may NOT read the rest of /Users, /private/tmp, /tmp, /Volumes: no
@@ -17,6 +18,9 @@
 (deny file-write*)
 (allow file-write* (subpath (param "REPO")) (subpath (param "HOME_EP"))
   (subpath "/private/var/folders") (subpath "/dev"))
+;; The runner's result file (MEMFUN_SWARM_RESULT_JSON, created O_EXCL outside the episode) is the one
+;; other thing memfun writes; without it the runner never sees the result and waits out the timeout.
+(allow file-write* (literal (param "RESULT")))
 (deny network*)
 (allow network-outbound (remote ip "localhost:*") (remote unix-socket))
 (allow network-bind (local ip "localhost:*"))
