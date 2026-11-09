@@ -1007,6 +1007,9 @@ def merge_check(
 ) -> dict[str, Any]:
     """Merge the best trial per function into one tree and run the full suite once.
 
+    The tree is the reference library with each task's function replaced by the best trial's
+    version, so a function without a task (nothing executes it) is the reference's.
+
     Only the target function plus the agent's new top-level imports / helpers / constants are
     carried over (see :func:`splice_function`); a nested addition elsewhere is not.  The
     visible-test command of each task is run with ``shell=True`` from the (operator-owned)
@@ -1039,7 +1042,11 @@ def merge_check(
         texts: dict[str, str] = {}
         picks: list[dict[str, Any]] = []
         for (rel, qual), c in sorted(best.items()):
-            base = texts.get(rel) or (full / "repo" / rel).read_text("utf-8")
+            # Start from the REFERENCE file, not the stubbed one: functions no task covers (no test
+            # executes them, e.g. tinydb's FrozenDict._immutable) stay as the reference,
+            # as they were in every single task; only the 43 tasks' functions come from the agents.
+            # (A stubbed base can fail to import at all, which made the whole suite read 0/0.)
+            base = texts.get(rel) or (full / "solution" / rel).read_text("utf-8")
             agent_file = c.repo / rel
             try:
                 texts[rel] = splice_function(base, agent_file.read_text("utf-8"), qual)

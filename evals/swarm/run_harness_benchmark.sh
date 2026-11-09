@@ -132,7 +132,8 @@ run_arm() {
     --temperature 0.7 --repetition-penalty 1.05 --max-tokens "$MAX_TOKENS" \
     --context-window "$CONTEXT_WINDOW" --no-dashboard \
     --out-dir "$OUT" --run-id "bench-$arm${RUN_TAG:+-$RUN_TAG}" \
-    --progress-file "$REPO/.memfun/bench-$arm${RUN_TAG:+-$RUN_TAG}-progress.md" "$@" || echo "arm $arm exited $?"
+    --progress-file "$REPO/.memfun/bench-$arm${RUN_TAG:+-$RUN_TAG}-progress.md" "$@" ${EXTRA_ARGS:-} \
+    || echo "arm $arm exited $?"
   echo "-- contamination audit: $arm"
   "$PY" "$REPO/evals/swarm/audit_contamination.py" --run "$OUT/bench-$arm${RUN_TAG:+-$RUN_TAG}" \
     --bundles "$CACHE/bundles" --json "$OUT/bench-$arm${RUN_TAG:+-$RUN_TAG}/audit.json" \
