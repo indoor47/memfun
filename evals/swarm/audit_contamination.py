@@ -195,6 +195,22 @@ def mini_steps(ep: Path) -> list[tuple[str, str]]:
     return steps
 
 
+def probe_steps(ep: Path) -> list[tuple[str, str]]:
+    """The look step's probe scripts (``.memfun/probes.jsonl`` in the episode repo): each is a
+    command that ran inside the episode, with its output."""
+    steps: list[tuple[str, str]] = []
+    for log in ep.glob("*/.memfun/probes.jsonl"):
+        try:
+            for line in log.read_text("utf-8").splitlines():
+                rec = json.loads(line)
+                out = str(rec.get("output", ""))
+                for script in rec.get("scripts", []):
+                    steps.append((f"python -c {script}", out))
+        except (OSError, ValueError):
+            continue
+    return steps
+
+
 def memfun_steps(ep: Path) -> list[tuple[str, str]]:
     f = ep / "swarm-result.json"
     try:
@@ -205,7 +221,7 @@ def memfun_steps(ep: Path) -> list[tuple[str, str]]:
     for st in (doc.get("sub_tasks") or {}).values():
         for op in st.get("ops") or []:
             steps.append((f"{op.get('type')} {op.get('target')} {op.get('detail')}", ""))
-    return steps
+    return steps + probe_steps(ep)
 
 
 def aider_steps(ep: Path) -> list[tuple[str, str]]:
@@ -300,7 +316,16 @@ def audit_episode(ep: Path, arm: str, ref: Reference | None) -> dict[str, Any]:
 
 def audit_run(run: Path, bundles: Path) -> dict[str, Any]:
     meta = json.loads((run / "results.json").read_text("utf-8")).get("meta", {})
-    arm = meta.get("arm") or run.name.removeprefix("bench-")
+    arm = meta.get("arm") or ""
+    if not arm:  # run_smoke records the arm in every episode.json
+        for f in sorted(run.glob("*/*/episode.json")):
+            try:
+                arm = str(json.loads(f.read_text("utf-8")).get("arm") or "")
+            except (OSError, ValueError):
+                arm = ""
+            if arm:
+                break
+    arm = arm or run.name.removeprefix("bench-")
     for known in ("mini-swe-agent", "single-shot", "claude-code", "memfun", "aider"):
         if arm == known or arm.startswith(known + "-"):  # e.g. a tagged run: mini-swe-agent-hardD
             arm = known

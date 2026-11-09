@@ -154,10 +154,10 @@ def test_pytest_detail_command_replaces_selectors_and_quietness() -> None:
     out = fl.pytest_detail_command([cmd], ["tests/test_a.py::test_x"])
     assert out is not None
     assert out[:3] == ["python", "-m", "pytest"] and "-vv" in out and "-q" not in out
-    assert (
-        "--tb=short" in out
-        and out[out.index("-p") : out.index("-p") + 2] == ["-p", "no:cacheprovider"]
-    )
+    assert "--tb=short" in out and out[out.index("-p") : out.index("-p") + 2] == [
+        "-p",
+        "no:cacheprovider",
+    ]
     assert out[-1] == "tests/test_a.py::test_x" and "tests/test_b.py::TestC::test_y" not in out
     assert fl.pytest_detail_command(["ruff check ."], ["x"]) is None
     assert fl.pytest_detail_command(["pytest tests"], ["t.py::a"])[-2:] == [
@@ -206,8 +206,8 @@ def test_run_detail_runs_the_failing_test_with_full_assertion_output(tmp_path: P
     cmd = f"{sys.executable} -m pytest -q --tb=short -p no:cacheprovider tests/test_x.py"
     detail = asyncio.run(fl.run_detail(tmp_path, [cmd], ["tests/test_x.py::test_a"]))
     assert (
-        ("test_a" in detail and "'v': 58" in detail) or "'v': 0" in detail
-    )  # the differing item shows
+        "test_a" in detail and "'v': 58" in detail
+    ) or "'v': 0" in detail  # the differing item shows
     assert (
         asyncio.run(fl.run_detail(tmp_path, ["ruff check ."], ["tests/test_x.py::test_a"])) == ""
     )
@@ -226,3 +226,14 @@ def test_probe_fingerprint_ignores_refusals_and_empty_output_and_matches_repeats
     assert fl.probe_fingerprint(b) != fl.probe_fingerprint(
         "--- experiment 1 ---\nz\n=> 0 mismatches"
     )
+
+
+def test_log_probe_appends_a_record_for_audits(tmp_path: Path) -> None:
+    import json
+
+    fl.log_probe(tmp_path, ["print(1)"], "--- experiment 1 ---\nprint(1)\n=> 1")
+    fl.log_probe(tmp_path, ["print(2)"], "out2")
+    lines = (tmp_path / fl.PROBE_LOG).read_text().splitlines()
+    rec = json.loads(lines[0])
+    assert len(lines) == 2 and rec["scripts"] == ["print(1)"] and "=> 1" in rec["output"]
+    fl.log_probe(tmp_path / "missing" / "deeper", ["x"], "y")  # best effort: never raises

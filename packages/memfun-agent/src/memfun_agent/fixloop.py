@@ -29,6 +29,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -438,3 +439,21 @@ def probe_fingerprint(output: str) -> str:
     if not useful:
         return ""
     return hashlib.sha256("\n".join(useful).encode()).hexdigest()[:16]
+
+
+PROBE_LOG = ".memfun/probes.jsonl"
+
+
+def log_probe(project_root: Path, snippets: list[str], output: str) -> None:
+    """Append one probe run (the scripts and their output) to ``.memfun/probes.jsonl``.
+
+    A record of what the model ran, for audits (e.g. did a script look outside the project).
+    Best effort: a logging failure never affects the fix loop.
+    """
+    try:
+        path = project_root / PROBE_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.time(), "scripts": snippets, "output": output}) + "\n")
+    except OSError:
+        pass

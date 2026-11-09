@@ -206,3 +206,34 @@ def test_a_tagged_run_name_still_selects_the_arm_parser(tmp_path: Path) -> None:
     assert res["arm"] == "mini-swe-agent"
     d = res["details"][0]
     assert d["commands"] == 2 and "find-root" in d["probes"] and d["leaks"]
+
+
+def test_the_audit_reads_the_look_steps_probe_log_and_the_arm_from_episode_json(
+    tmp_path: Path,
+) -> None:
+    """memfun's probe scripts (.memfun/probes.jsonl) are audited like any command; a run named
+    look-P (no arm in results.json) is recognised from the arm recorded in episode.json."""
+    _bundle(tmp_path)
+    run = tmp_path / "look-P"
+    ep = run / "c0s-lib-target" / "1"
+    repo = ep / "c0s-lib-target-t1"
+    (repo / ".memfun").mkdir(parents=True)
+    (ep / "collected" / "lib").mkdir(parents=True)
+    (ep / "collected" / "lib" / "m.py").write_text(REF)
+    (ep / "swarm-result.json").write_text(json.dumps({"sub_tasks": {}}))
+    (repo / ".memfun" / "probes.jsonl").write_text(
+        json.dumps(
+            {"scripts": ["import glob; print(glob.glob('/Users/x/.cache/*'))"], "output": "[]"}
+        )
+        + "\n"
+    )
+    (ep / "episode.json").write_text(
+        json.dumps(
+            {"episode": "c0s-lib-target-t1", "outcome": "pass", "repo": str(repo), "arm": "memfun"}
+        )
+    )
+    (run / "results.json").write_text(json.dumps({"meta": {}}))
+    res = ac.audit_run(run, tmp_path / "bundles")
+    assert res["arm"] == "memfun"
+    d = res["details"][0]
+    assert d["commands"] == 1 and d["probes"]  # the probe script was seen and flagged

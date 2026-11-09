@@ -2203,6 +2203,7 @@ class ContextFirstSolver:
             if not snippets:
                 break
             out = await fixloop.run_probes(self.project_root, snippets)
+            fixloop.log_probe(self.project_root, snippets, out)
             key = fixloop.probe_fingerprint(out)
             if not key or key in seen:
                 if out:
