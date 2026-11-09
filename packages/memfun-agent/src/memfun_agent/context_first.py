@@ -33,9 +33,11 @@ import dspy
 from memfun_core.config import LLMConfig
 from memfun_core.logging import get_logger
 
+from memfun_agent import fixloop
 from memfun_agent.signatures import (
     ConsistencyReview,
     ContextPlanning,
+    ExperimentProposal,
     SingleShotSolving,
     VerificationFix,
 )
@@ -218,6 +220,17 @@ class ContextFirstConfig:
     enable_planner: bool = True
     verify_commands: tuple[str, ...] = ()
     max_fix_attempts: int = 2
+    #: Past ``max_fix_attempts`` the loop keeps going only while a round improves the score
+    #: (fewer failing tests), up to this many verify rounds in total.
+    fix_hard_cap: int = 10
+    #: Stop (or restart) after this many verify rounds in a row without a new best score.
+    fix_patience: int = 3
+    #: Clean-slate rewrites from the best state when the patches stall (the second loop).
+    fix_restarts: int = 1
+    #: Probe rounds: when a round makes no progress the model proposes up to 3 small python
+    #: experiments, they run, and their real output goes into the next fix.  Off (0) by default:
+    #: round 2 of the Cerebras A/B showed no gain, so it is opt-in.
+    fix_probe_rounds: int = 0
     enable_edit_retry: bool = True
     enable_consistency_review: bool = True
 
@@ -790,6 +803,25 @@ def _rollout_config(attempt: int) -> dict[str, Any]:
     return {"rollout_id": rollout_id} if rollout_id else {}
 
 
+#: Appended to the task on the retry after a reply was cut off before its operations.
+TRUNCATION_NUDGE = (
+    "\n\nIMPORTANT: your previous reply was cut off before the operations. Keep the reasoning "
+    "to at most 8 short lines, then write the operations JSON immediately. Do not think aloud "
+    "at length."
+)
+#: Appended on the retry after a reply held only commands and no edit.
+NO_EDIT_NUDGE = (
+    "\n\nIMPORTANT: your previous reply contained no edit_file or write_file operation, so no "
+    "file changed and the task is not done. Reply with the edit_file operation(s) that "
+    "implement the task in the file(s) named above. Commands alone do not count."
+)
+
+
+def _has_file_change(operations: list[dict[str, Any]]) -> bool:
+    """False only when every operation is a pure command or read (nothing would change)."""
+    return any(str(o.get("op")) not in ("run_cmd", "read_file") for o in operations)
+
+
 class SingleShotSolver(dspy.Module):
     """Solve a coding task in one LLM call given full context."""
 
@@ -808,11 +840,12 @@ class SingleShotSolver(dspy.Module):
         sample before it is reported as truncated: at temperature > 0 the second attempt
         usually parses, and with no planner there is nothing to escalate to.
         """
+        ask = query
         for attempt in range(1, UNPARSEABLE_RETRIES + 2):
             cfg = _rollout_config(attempt)
             result = await asyncio.to_thread(
                 self.predictor,
-                query=query,
+                query=ask,
                 full_context=full_context,
                 **({"config": cfg} if cfg else {}),
             )
@@ -826,9 +859,20 @@ class SingleShotSolver(dspy.Module):
             # Detect truncation: if the raw operations string doesn't
             # close the JSON array, the LLM response was likely cut off.
             truncated = _detect_truncation(raw_ops, operations)
-            if not truncated or operations or attempt > UNPARSEABLE_RETRIES:
+            if attempt > UNPARSEABLE_RETRIES:
                 break
-            logger.warning("Solver reply had no parseable operations; retrying once")
+            if truncated and not operations:
+                # Cut off before the operations (the reasoning ate the budget): a plain
+                # re-sample tends to ramble again, so say what to do differently.
+                logger.warning("Solver reply was cut off before its operations; retrying once")
+                ask = query + TRUNCATION_NUDGE
+                continue
+            if operations and not _has_file_change(operations):
+                # Only commands, no edit: nothing would change.  Ask for the edit.
+                logger.warning("Solver reply had no edit/write operation; retrying once")
+                ask = query + NO_EDIT_NUDGE
+                continue
+            break
 
         return SolveResult(
             reasoning=reasoning,
@@ -1316,9 +1360,10 @@ class Verifier:
                 if result.returncode != 0:
                     output = ""
                     if result.stdout:
-                        output += result.stdout[:3000]
+                        # head + tail: pytest prints its failure summary LAST
+                        output += fixloop.clip(result.stdout, 12_000)
                     if result.stderr:
-                        output += "\n" + result.stderr[:3000]
+                        output += "\n" + fixloop.clip(result.stderr, 4_000)
                     errors.append(f"$ {cmd} (exit {result.returncode})\n{output.strip()}")
             except subprocess.TimeoutExpired:
                 errors.append(f"$ {cmd} (timed out after 120s)")
@@ -1355,6 +1400,30 @@ class FixSolver(dspy.Module):
 
         raw_ops = str(getattr(result, "operations", "[]"))
         return _parse_operations(raw_ops)
+
+
+class ProbeSolver(dspy.Module):
+    """Propose small python experiments when patching has stalled (one LLM call)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.predictor = dspy.Predict(ExperimentProposal)
+
+    async def apropose(
+        self,
+        query: str,
+        full_context: str,
+        verification_errors: str,
+        history: str,
+    ) -> list[str]:
+        result = await asyncio.to_thread(
+            self.predictor,
+            query=query,
+            full_context=full_context,
+            verification_errors=verification_errors,
+            history=history,
+        )
+        return fixloop.parse_probes(str(getattr(result, "probes", "[]")))
 
 
 class ConsistencyReviewer(dspy.Module):
@@ -1435,6 +1504,7 @@ class ContextFirstSolver:
         )
         self.solver = SingleShotSolver()
         self.fix_solver = FixSolver()
+        self.probe_solver = ProbeSolver()
         self.consistency_reviewer = ConsistencyReviewer()
         self.verifier = Verifier(self.project_root)
 
@@ -1891,56 +1961,139 @@ class ContextFirstSolver:
         executor: OperationExecutor,
         verify_cmds: list[str],
     ) -> None:
-        """Run verification and attempt fixes if it fails.
+        """Verify, then patch while it helps; never finish worse than the best state seen.
+
+        Each round runs the verifier and scores it (:func:`fixloop.score`).  The owned files
+        are snapshotted whenever a round beats the best score and restored at the end, so a
+        late bad edit cannot leave the module broken.  The fix step is shown compact failures,
+        the failing tests' source and what earlier rounds tried.  Past ``max_fix_attempts`` the
+        loop continues only while rounds improve (up to ``fix_hard_cap``); after
+        ``fix_patience`` rounds without a new best it either restarts from the best state with
+        a clean-slate rewrite (``fix_restarts``, the second loop) or stops.
 
         Mutates *executor* by appending fix operations and files.
         """
-        max_fix = self._max_fix_attempts()
-        for attempt in range(1, max_fix + 1):
-            self._status(f"Verifying (attempt {attempt}/{max_fix})...")
+        base = self._max_fix_attempts()
+        cap = max(base, self.config.fix_hard_cap)
+        patience = max(1, self.config.fix_patience)
+        restarts_left = max(0, self.config.fix_restarts)
+        probes_left = max(0, self.config.fix_probe_rounds)
+        experiments: list[str] = []  # real outputs of probe snippets, newest last
+        paths = [Path(f) for f in dict.fromkeys(executor.files_created)]
+        best = fixloop.BestSoFar(paths)
+        history: list[str] = []
+        seen_states: dict[str, tuple[int, tuple[int, int, int]]] = {}  # state -> (round, score)
+        stagnant = 0
+        sc: tuple[int, int, int] = (1, 1, 0)
+        for attempt in range(1, cap + 1):
+            self._status(f"Verifying (round {attempt}, base {base}, cap {cap})...")
             vr = await self.verifier.averify(verify_cmds)
-
             if vr.passed:
                 self._status("Verification passed")
                 return
-
-            logger.info(
-                "Verification failed (attempt %d): %s",
-                attempt,
-                vr.errors[:200],
-            )
-
-            if attempt >= max_fix:
-                self._status("Verification failed, max fix attempts reached")
-                logger.warning(
-                    "Verification still failing after %d fix attempts",
-                    max_fix,
+            sc = fixloop.score(vr.errors, False)
+            state = fixloop.state_key(fixloop.read_texts(paths))
+            revisit = seen_states.get(state)
+            seen_states.setdefault(state, (attempt, sc))
+            if revisit is not None and attempt > 1:
+                history.append(
+                    f"round {attempt}: the code is IDENTICAL to round {revisit[0]} (same failures "
+                    "again). That change was undone or repeated: it is a dead end, try something "
+                    "structurally different."
                 )
-                return
+            improved = best.observe(attempt, sc)
+            stagnant = 0 if improved else stagnant + 1
+            summary = fixloop.summarize(vr.errors)
+            logger.info(
+                "Verification round %d: score %s (%d failed, %d passed%s)",
+                attempt,
+                sc,
+                summary.failed,
+                summary.passed,
+                ", BROKEN" if summary.broken else "",
+            )
+            if attempt >= cap:
+                self._status("Verification failed, round cap reached")
+                break
+            if stagnant >= patience:
+                if restarts_left <= 0:
+                    self._status("Verification failed, patching has stalled")
+                    break
+                restarts_left -= 1
+                self._status("Patches stalled: rewriting from the best state...")
+                best.restore()
+                if await self._restart_from_best(
+                    query, paths, executor, vr.errors, summary, history, experiments
+                ):
+                    stagnant = 0
+                    history.append(
+                        f"round {attempt}: stalled, rewrote the solution from the best state"
+                    )
+                    continue
+                break
 
-            # Re-read affected files to get current state.
+            if attempt >= base and not improved:
+                self._status("Verification failed, no progress past the base budget")
+                break
+
             self._status("Fixing verification errors...")
             current_context = await self._read_affected_files(executor.files_created)
             if not current_context:
                 current_context = full_context
-
+            tests_src = fixloop.failing_tests_source(self.project_root, summary.failed_ids)
+            if tests_src:
+                current_context += (
+                    "\n\n=== FAILING TESTS (read-only; do not edit) ===\n" + tests_src
+                )
+            if probes_left > 0 and not improved:
+                # A round without progress: stop guessing, look at real behaviour.
+                probes_left -= 1
+                self._status("No progress: running experiments...")
+                try:
+                    snippets = await self.probe_solver.apropose(
+                        query=query,
+                        full_context=current_context,
+                        verification_errors=fixloop.compact_errors(vr.errors),
+                        history="\n".join(history[-6:]),
+                    )
+                    logger.info("Probe round: %d experiments proposed", len(snippets))
+                    if snippets:
+                        experiments.append(await fixloop.run_probes(self.project_root, snippets))
+                        history.append(
+                            f"round {attempt}: ran {len(snippets)} experiments (results below)"
+                        )
+                except Exception as exc:
+                    logger.warning("Probe step failed: %s", exc)
+            if experiments:
+                current_context += (
+                    "\n\n=== EXPERIMENT RESULTS (real output of snippets run here) ===\n"
+                    + "\n\n".join(experiments[-2:])
+                )
+            fix_query = query
+            if history:
+                fix_query += (
+                    "\n\nPREVIOUS FIX ATTEMPTS (do not repeat what did not work):\n"
+                    + "\n".join(history[-6:])
+                )
             try:
                 fix_ops = await self.fix_solver.afix(
-                    query=query,
+                    query=fix_query,
                     full_context=current_context,
-                    verification_errors=vr.errors,
+                    verification_errors=fixloop.compact_errors(vr.errors),
                 )
             except Exception as exc:
                 logger.warning("Fix solver failed: %s", exc)
-                return
+                break
 
             if not fix_ops:
                 logger.info("Fix solver produced no operations")
-                return
+                history.append(f"round {attempt}: the fix step proposed nothing")
+                stagnant += 1
+                continue
 
             self._status(f"Applying {len(fix_ops)} fix operations...")
-            # Use edit_only executor: lint fixes should be
-            # targeted edits, never full file rewrites.
+            before_texts = fixloop.read_texts(paths)
+            # Use edit_only executor: fixes should be targeted edits, never full rewrites.
             fix_executor = OperationExecutor(
                 self.project_root,
                 on_status=self._on_status,
@@ -1951,6 +2104,79 @@ class ContextFirstSolver:
             executor.files_created.extend(fix_executor.files_created)
             executor.attempted += fix_executor.attempted
             executor.failed += fix_executor.failed
+            for f in fix_executor.files_created:
+                if Path(f) not in paths:
+                    paths.append(Path(f))  # BestSoFar shares this list
+            ids = ", ".join(summary.failed_ids[:4]) or "lint/other errors"
+            change = fixloop.short_diff(before_texts, fixloop.read_texts(paths))
+            history.append(
+                f"round {attempt}: {summary.failed} failing ({ids}); applied "
+                f"{fix_executor.attempted - fix_executor.failed}/{fix_executor.attempted} edits"
+                + (", some edits did not match the file" if fix_executor.failed else "")
+                + (f"; the change was:\n{change}" if change else "; the file did not change")
+            )
+
+        # Never finish worse than the best state this loop saw.
+        if best.best_score is not None and sc > best.best_score:
+            changed = best.restore()
+            if changed:
+                logger.info(
+                    "Restored the best verified state (round %d, score %s) over the final %s",
+                    best.best_round,
+                    best.best_score,
+                    sc,
+                )
+                self._status(f"Restored the best state (round {best.best_round})")
+
+    async def _restart_from_best(
+        self,
+        query: str,
+        paths: list[Path],
+        executor: OperationExecutor,
+        errors: str,
+        summary: fixloop.TestSummary,
+        history: list[str],
+        experiments: list[str] | None = None,
+    ) -> bool:
+        """The second loop: ask the one-shot solver for a corrected solution given the failures.
+
+        The files are already back at the best state.  Returns True when new operations
+        were applied (the caller verifies them next; a worse result is rolled back).
+        """
+        current = await self._read_affected_files([str(p) for p in paths])
+        tests_src = fixloop.failing_tests_source(self.project_root, summary.failed_ids)
+        rewrite_query = (
+            query
+            + "\n\nA first solution was applied and patched several times but still fails the "
+            "tests below. Study the failing tests and the errors, work out what the code must "
+            "do, and produce a corrected implementation (rewrite what is wrong; you may replace "
+            "the whole function).\n"
+            + ("\nTRIED SO FAR:\n" + "\n".join(history[-6:]) if history else "")
+            + "\n\nFAILURES:\n"
+            + fixloop.compact_errors(errors)
+        )
+        ctx = current + (
+            "\n\n=== FAILING TESTS (read-only; do not edit) ===\n" + tests_src if tests_src else ""
+        )
+        if experiments:
+            ctx += "\n\n=== EXPERIMENT RESULTS (real output) ===\n" + "\n\n".join(experiments[-2:])
+        try:
+            result = await self.solver.asolve(query=rewrite_query, full_context=ctx)
+        except Exception as exc:
+            logger.warning("Restart solve failed: %s", exc)
+            return False
+        if not result.operations:
+            return False
+        rerun = OperationExecutor(self.project_root, on_status=self._on_status)
+        await rerun.execute(result.operations)
+        executor.ops.extend(rerun.ops)
+        executor.files_created.extend(rerun.files_created)
+        executor.attempted += rerun.attempted
+        executor.failed += rerun.failed
+        for f in rerun.files_created:
+            if Path(f) not in paths:
+                paths.append(Path(f))
+        return rerun.attempted > rerun.failed
 
     async def _read_affected_files(self, files: list[str]) -> str:
         """Re-read files that were created/modified for fix context."""
