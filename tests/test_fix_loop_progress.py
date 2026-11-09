@@ -132,3 +132,42 @@ def test_no_proposal_does_not_loop_forever(tmp_path: Path, fixes: list[str]) -> 
     rig = Rig(tmp_path, {"start": _out(2, 1)}, fixes, max_fix_attempts=2, fix_restarts=0)
     rig.run()
     assert rig.verify_calls <= 10 and rig.file.read_text() == "start"
+
+
+def test_a_stalled_round_runs_experiments_and_feeds_their_output_to_the_fix(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "m.py").write_text("start")  # replaced by Rig; the probe runs in tmp_path
+    outs = {"start": _out(3, 1), "a": _out(3, 1), "b": "PASS"}
+    rig = Rig(tmp_path, outs, ["a", "b"], max_fix_attempts=5, fix_restarts=0, fix_probe_rounds=1)
+    proposals: list[str] = []
+
+    async def apropose(query: str, full_context: str, verification_errors: str, history: str):
+        proposals.append(history)
+        return ["print('probe-says', 6 * 7)"]
+
+    rig.solver.probe_solver.apropose = apropose  # type: ignore[method-assign]
+    seen: list[str] = []
+    orig = rig.solver.fix_solver.afix
+
+    async def spy(query: str, full_context: str, verification_errors: str):
+        seen.append(full_context)
+        return await orig(query, full_context, verification_errors)
+
+    rig.solver.fix_solver.afix = spy  # type: ignore[method-assign]
+    rig.run()
+    assert len(proposals) == 1  # one probe round: round 1 is a first score, round 2 stalls
+    assert "probe-says 42" in seen[-1] and "EXPERIMENT RESULTS" in seen[-1]
+    assert "EXPERIMENT RESULTS" not in seen[0]
+
+
+def test_probes_can_be_switched_off(tmp_path: Path) -> None:
+    outs = {"start": _out(3, 1), "a": _out(3, 1), "b": "PASS"}
+    rig = Rig(tmp_path, outs, ["a", "b"], max_fix_attempts=5, fix_restarts=0, fix_probe_rounds=0)
+
+    async def boom(*_a: Any, **_k: Any):
+        raise AssertionError("probe solver must not run")
+
+    rig.solver.probe_solver.apropose = boom  # type: ignore[method-assign]
+    rig.run()
+    assert rig.file.read_text() == "b"

@@ -646,6 +646,33 @@ class VerificationFix(dspy.Signature):
     )
 
 
+class ExperimentProposal(dspy.Signature):
+    """Design small experiments to learn what the failing code must do.
+
+    A fix has not made progress.  Do not guess again: propose at most three short,
+    self-contained Python snippets (each printing its results) that probe the exact
+    behaviour the failing tests expect, for example calling the function with the
+    failing inputs and printing the values, or printing a table entry or a helper's output.
+    The snippets run from the project root with the project's own Python; they must not
+    modify files or use the network.  Their real output is shown to you next round.
+    """
+
+    query: str = dspy.InputField(desc="The original task")
+    full_context: str = dspy.InputField(
+        desc="Current source of the affected files plus the failing tests' source"
+    )
+    verification_errors: str = dspy.InputField(desc="The compact failures of the last verify run")
+    history: str = dspy.InputField(desc="What earlier fix rounds tried (may be empty)")
+
+    reasoning: str = dspy.OutputField(desc="What is still unknown and what each experiment tests")
+    probes: str = dspy.OutputField(
+        desc=(
+            "JSON array of at most 3 strings, each a complete Python snippet that prints its "
+            'result, e.g. ["from pkg.mod import f\\nprint(f(1), f(2))"]'
+        )
+    )
+
+
 class ConsistencyReview(dspy.Signature):
     """Review whether executed code changes are complete and internally consistent.
 

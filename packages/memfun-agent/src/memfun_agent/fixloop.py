@@ -19,7 +19,13 @@ Pure functions and small classes: no LLM, no network, hermetic tests.
 from __future__ import annotations
 
 import ast
+import asyncio
+import json
+import os
 import re
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -207,3 +213,71 @@ class BestSoFar:
             except (OSError, UnicodeDecodeError):
                 continue
         return changed
+
+
+# ── Probes: let the model look at real behaviour when patching stalls ─────────
+
+MAX_PROBES = 3
+MAX_PROBE_CHARS = 2_000
+PROBE_TIMEOUT_S = 20.0
+PROBE_OUTPUT_CHARS = 1_500
+#: Snippets touching these are refused (probes observe; they never change or fetch anything).
+_PROBE_FORBIDDEN = re.compile(
+    r"\b(os\.(remove|unlink|rmdir|system|popen|rename|replace)|shutil\.|subprocess|socket|"
+    r"urllib|requests|httpx|http\.client|open\([^)]*['\"][wax+]|write_text|write_bytes|"
+    r"__import__|eval\(|exec\()"
+)
+
+
+def parse_probes(raw: str) -> list[str]:
+    """The snippets of a model's ``probes`` answer: a JSON array of strings, tolerant of fences
+    and of a single bare snippet.  At most :data:`MAX_PROBES`, each at most
+    :data:`MAX_PROBE_CHARS`."""
+    text = raw.strip()
+    text = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", text)
+    items: list[object]
+    try:
+        data = json.loads(text)
+        items = data if isinstance(data, list) else [data]
+    except ValueError:
+        items = [text] if text and "print" in text else []
+    out = [
+        x.strip() for x in items if isinstance(x, str) and x.strip() and len(x) <= MAX_PROBE_CHARS
+    ]
+    return out[:MAX_PROBES]
+
+
+def probe_refusal(snippet: str) -> str:
+    """Why *snippet* may not run ("" when it may)."""
+    m = _PROBE_FORBIDDEN.search(snippet)
+    return f"refused (uses {m.group(0)!r})" if m else ""
+
+
+async def run_probes(project_root: Path, snippets: list[str]) -> str:
+    """Run each snippet with ``python -c`` from *project_root* (timeout, clipped output) and
+    return a text block of snippet + real output for the next fix round."""
+    blocks: list[str] = []
+    for i, snippet in enumerate(snippets[:MAX_PROBES], 1):
+        why = probe_refusal(snippet)
+        if why:
+            blocks.append(f"--- experiment {i} ---\n{snippet}\n=> {why}")
+            continue
+        try:
+            res = await asyncio.to_thread(
+                subprocess.run,
+                [shutil.which("python") or sys.executable, "-c", snippet],
+                cwd=str(project_root),
+                capture_output=True,
+                text=True,
+                timeout=PROBE_TIMEOUT_S,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                check=False,
+            )
+            out = (res.stdout + (("\n" + res.stderr) if res.stderr else "")).strip()
+            body = clip(out or "(no output)", PROBE_OUTPUT_CHARS)
+        except subprocess.TimeoutExpired:
+            body = f"(timed out after {PROBE_TIMEOUT_S:.0f}s)"
+        except OSError as exc:
+            body = f"(could not run: {exc})"
+        blocks.append(f"--- experiment {i} ---\n{snippet}\n=> {body}")
+    return "\n\n".join(blocks)

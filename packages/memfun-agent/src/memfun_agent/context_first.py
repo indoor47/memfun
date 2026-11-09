@@ -37,6 +37,7 @@ from memfun_agent import fixloop
 from memfun_agent.signatures import (
     ConsistencyReview,
     ContextPlanning,
+    ExperimentProposal,
     SingleShotSolving,
     VerificationFix,
 )
@@ -226,6 +227,9 @@ class ContextFirstConfig:
     fix_patience: int = 3
     #: Clean-slate rewrites from the best state when the patches stall (the second loop).
     fix_restarts: int = 1
+    #: Probe rounds: when a round makes no progress the model proposes up to 3 small python
+    #: experiments, they run, and their real output goes into the next fix (0 = off).
+    fix_probe_rounds: int = 2
     enable_edit_retry: bool = True
     enable_consistency_review: bool = True
 
@@ -1366,6 +1370,30 @@ class FixSolver(dspy.Module):
         return _parse_operations(raw_ops)
 
 
+class ProbeSolver(dspy.Module):
+    """Propose small python experiments when patching has stalled (one LLM call)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.predictor = dspy.Predict(ExperimentProposal)
+
+    async def apropose(
+        self,
+        query: str,
+        full_context: str,
+        verification_errors: str,
+        history: str,
+    ) -> list[str]:
+        result = await asyncio.to_thread(
+            self.predictor,
+            query=query,
+            full_context=full_context,
+            verification_errors=verification_errors,
+            history=history,
+        )
+        return fixloop.parse_probes(str(getattr(result, "probes", "[]")))
+
+
 class ConsistencyReviewer(dspy.Module):
     """Check whether executed operations actually fulfil the user request.
 
@@ -1444,6 +1472,7 @@ class ContextFirstSolver:
         )
         self.solver = SingleShotSolver()
         self.fix_solver = FixSolver()
+        self.probe_solver = ProbeSolver()
         self.consistency_reviewer = ConsistencyReviewer()
         self.verifier = Verifier(self.project_root)
 
@@ -1916,6 +1945,8 @@ class ContextFirstSolver:
         cap = max(base, self.config.fix_hard_cap)
         patience = max(1, self.config.fix_patience)
         restarts_left = max(0, self.config.fix_restarts)
+        probes_left = max(0, self.config.fix_probe_rounds)
+        experiments: list[str] = []  # real outputs of probe snippets, newest last
         paths = [Path(f) for f in dict.fromkeys(executor.files_created)]
         best = fixloop.BestSoFar(paths)
         history: list[str] = []
@@ -1950,7 +1981,7 @@ class ContextFirstSolver:
                 self._status("Patches stalled: rewriting from the best state...")
                 best.restore()
                 if await self._restart_from_best(
-                    query, paths, executor, vr.errors, summary, history
+                    query, paths, executor, vr.errors, summary, history, experiments
                 ):
                     stagnant = 0
                     history.append(
@@ -1971,6 +2002,29 @@ class ContextFirstSolver:
             if tests_src:
                 current_context += (
                     "\n\n=== FAILING TESTS (read-only; do not edit) ===\n" + tests_src
+                )
+            if probes_left > 0 and not improved:
+                # A round without progress: stop guessing, look at real behaviour.
+                probes_left -= 1
+                self._status("No progress: running experiments...")
+                try:
+                    snippets = await self.probe_solver.apropose(
+                        query=query,
+                        full_context=current_context,
+                        verification_errors=fixloop.compact_errors(vr.errors),
+                        history="\n".join(history[-6:]),
+                    )
+                    if snippets:
+                        experiments.append(await fixloop.run_probes(self.project_root, snippets))
+                        history.append(
+                            f"round {attempt}: ran {len(snippets)} experiments (results below)"
+                        )
+                except Exception as exc:
+                    logger.warning("Probe step failed: %s", exc)
+            if experiments:
+                current_context += (
+                    "\n\n=== EXPERIMENT RESULTS (real output of snippets run here) ===\n"
+                    + "\n\n".join(experiments[-2:])
                 )
             fix_query = query
             if history:
@@ -2036,6 +2090,7 @@ class ContextFirstSolver:
         errors: str,
         summary: fixloop.TestSummary,
         history: list[str],
+        experiments: list[str] | None = None,
     ) -> bool:
         """The second loop: ask the one-shot solver for a corrected solution given the failures.
 
@@ -2057,6 +2112,8 @@ class ContextFirstSolver:
         ctx = current + (
             "\n\n=== FAILING TESTS (read-only; do not edit) ===\n" + tests_src if tests_src else ""
         )
+        if experiments:
+            ctx += "\n\n=== EXPERIMENT RESULTS (real output) ===\n" + "\n\n".join(experiments[-2:])
         try:
             result = await self.solver.asolve(query=rewrite_query, full_context=ctx)
         except Exception as exc:

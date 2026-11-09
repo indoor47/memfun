@@ -95,3 +95,37 @@ def test_best_so_far_restores_the_best_state(tmp_path: Path) -> None:
     assert not best.observe(3, (1, 9, 0))  # worse: no snapshot
     assert best.restore() == 1 and f.read_text() == "v1" and best.best_round == 2
     assert best.restore() == 0  # already the best state
+
+
+def test_parse_probes_accepts_json_fences_and_a_bare_snippet() -> None:
+    assert fl.parse_probes('["print(1)", "print(2)"]') == ["print(1)", "print(2)"]
+    assert fl.parse_probes('```json\n["print(1)"]\n```') == ["print(1)"]
+    assert fl.parse_probes("print(wc('x'))") == ["print(wc('x'))"]
+    assert fl.parse_probes("no code here") == []
+    assert len(fl.parse_probes(str([f"print({i})" for i in range(9)]).replace("'", '"'))) == 3
+
+
+def test_probes_that_change_things_or_reach_out_are_refused() -> None:
+    assert fl.probe_refusal("print(1)") == ""
+    for bad in (
+        "import os; os.remove('x')",
+        "import subprocess; subprocess.run(['ls'])",
+        "open('f','w').write('x')",
+        "import urllib.request; urllib.request.urlopen('http://x')",
+        "exec('1')",
+    ):
+        assert fl.probe_refusal(bad), bad
+
+
+def test_run_probes_shows_real_output_and_refusals(tmp_path: Path) -> None:
+    import asyncio
+
+    (tmp_path / "m.py").write_text("def f(x):\n    return x * 2\n")
+    out = asyncio.run(
+        fl.run_probes(
+            tmp_path,
+            ["from m import f\nprint(f(21))", "import os; os.remove('m.py')", "print(1/0)"],
+        )
+    )
+    assert "=> 42" in out and "refused" in out and "ZeroDivisionError" in out
+    assert (tmp_path / "m.py").exists()
