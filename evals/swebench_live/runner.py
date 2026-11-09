@@ -64,6 +64,9 @@ PROMPT_TEMPLATE = (
 HOME_IN = "/tmp/mfl-home"
 REPO_ROOT_IN = "/testbed"
 DUMMY_KEY_ENV, DUMMY_KEY_VALUE = "MEMFUN_SGLANG_DUMMY_KEY", "dummy-not-a-secret"
+#: The agent reads ``.memfun/verify.json`` only when this is set (the runner wrote the file).
+TRUST_VERIFY_ENV = "MEMFUN_TRUST_PROJECT_VERIFY"
+WRITE_OPTIONS = 'mkdir -p "$1/.memfun" && printf %s "$2" > "$1/.memfun/verify.json"'
 MAX_ARG_BYTES = 120_000  # Linux refuses a single argv string over 128 KiB
 #: Never part of a patch: the agent's own state and scratch.
 PATCH_EXCLUDES = (".memfun", "memfun.toml")
@@ -143,6 +146,10 @@ class Settings:
     prompt_template: str
     agent_version: str
     runner_commit: str
+    #: Switches of the agent's own verification, written to ``.memfun/verify.json`` in the
+    #: repository (never part of a patch): e.g. ``discover_tests``, ``reproduce``,
+    #: ``probe_guard`` (``"off"`` is right here: the container is disposable).
+    agent_options: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -494,9 +501,22 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
             ["sh", "-c", f"mkdir -p {HOME_IN}/.memfun && cat > {HOME_IN}/.memfun/config.toml"],
             stdin=memfun_config(base_url, s).encode(),
         )
+        if s.agent_options:
+            box.must(
+                "agentopts",
+                [
+                    "sh",
+                    "-c",
+                    WRITE_OPTIONS,
+                    "sh",
+                    repo,
+                    json.dumps(s.agent_options, sort_keys=True),
+                ],
+            )
         env = {
             "HOME": HOME_IN,
             DUMMY_KEY_ENV: DUMMY_KEY_VALUE,
+            **({TRUST_VERIFY_ENV: "1"} if s.agent_options else {}),
             "MEMFUN_NO_DASHBOARD_AUTOSTART": "1",
             "MEMFUN_SWARM_RESULT_JSON": f"{HOME_IN}/swarm-result.json",
             "PYTHONUNBUFFERED": "1",
@@ -626,8 +646,10 @@ def open_run(run_dir: Path, settings: Settings, ids: list[str]) -> None:
         return
     if meta.get("finalized"):
         raise SystemExit("this run is finalized: no further rollouts (rule: single rollout)")
-    if meta.get("settings") != mine:
-        diff = sorted(k for k in mine if meta.get("settings", {}).get(k) != mine[k])
+    saved = dict(meta.get("settings") or {})
+    saved.setdefault("agent_options", {})  # runs created before the option existed
+    if saved != mine:
+        diff = sorted(k for k in mine if saved.get(k) != mine[k])
         raise SystemExit(f"settings differ from the frozen run.json in {diff}: start a new run")
     if meta.get("instance_ids") != ids:
         raise SystemExit("the instance list differs from the frozen run.json: start a new run")
@@ -776,6 +798,7 @@ def cmd_run(a: argparse.Namespace) -> int:
         prompt_template=PROMPT_TEMPLATE,
         agent_version=bundle_version(bundle),
         runner_commit=git_commit(),
+        agent_options=parse_force(a.agent_option),
     )
     run_dir = a.run_dir.resolve()
     open_run(run_dir, settings, [str(r["instance_id"]) for r in rows])
@@ -864,6 +887,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--context-window", type=int, default=131072)
     r.add_argument("--reasoning-effort", default="none")
     r.add_argument("--force-field", action="append", default=[], metavar="KEY=JSON")
+    r.add_argument(
+        "--agent-option", action="append", default=[], metavar="KEY=JSON",
+        help="a switch of the agent's own verification (.memfun/verify.json), e.g. "
+        "discover_tests=true reproduce=true probe_guard=off; part of the frozen settings",
+    )  # fmt: skip
     r.add_argument("--instance-timeout", type=int, default=2400)
     r.add_argument("--max-tokens-per-instance", type=int, default=4_000_000)
     r.add_argument("--workers", type=int, default=1)

@@ -21,6 +21,7 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 EVALUATOR_REPO = "https://github.com/microsoft/SWE-bench-Live"
@@ -65,8 +66,35 @@ def evaluate(
         *(["--instance_ids", *ids] if ids else []),
         *(["--remove-image"] if remove else []),
     ]  # fmt: skip
-    run(cmd, cwd=clone)
+    started = time.time()
+    try:
+        run(cmd, cwd=clone)
+    except subprocess.CalledProcessError as exc:
+        # A defect of the evaluator at the pinned commit: in gold mode it crashes AFTER the
+        # results are written whenever a gold patch passes (it dumps the dataset row, which
+        # holds a datetime, as JSON).  Complete, fresh results are valid; anything else is not.
+        if not (patch == "gold" and results_complete(out / "results.json", ids, started)):
+            raise
+        print(
+            f"note: the evaluator exited with {exc.returncode} after writing complete results "
+            "(known gold-mode defect at the pinned commit); the results are used",
+            flush=True,
+        )
     return out / "results.json"
+
+
+def results_complete(path: Path, ids: list[str], not_before: float) -> bool:
+    """Whether *path* was written by this run and gives a verdict for every one of *ids*."""
+    try:
+        if path.stat().st_mtime < not_before - 2:
+            return False
+        doc = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return False
+    judged: set[str] = set()
+    for key in ("success_ids", "failure_ids", "empty_patch_ids", "error_ids", "incomplete_ids"):
+        judged.update(doc.get(key) or [])
+    return bool(ids) and set(ids) <= judged
 
 
 def main(argv: list[str] | None = None) -> int:
