@@ -204,8 +204,10 @@ def test_mini_and_aider_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
             "whole",
         ]
     )
-    acmd = arms.aider_command(ns, repo, tmp_path / "task.txt")
+    acmd = arms.aider_command(ns, repo, "TASK TEXT")
     assert acmd[acmd.index("--edit-format") + 1] == "whole"
+    # the task travels on the command line: a file outside the episode is unreadable when isolated
+    assert acmd[acmd.index("--message") + 1] == "TASK TEXT" and "--message-file" not in acmd
     assert "--auto-test" in acmd and acmd[acmd.index("--test-cmd") + 1].startswith(
         "python -m pytest"
     )

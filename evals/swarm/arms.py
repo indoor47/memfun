@@ -377,7 +377,7 @@ def aider_files(repo: Path, a: argparse.Namespace) -> tuple[Path, Path]:
     return settings, meta
 
 
-def aider_command(a: argparse.Namespace, repo: Path, spec_file: Path) -> list[str]:
+def aider_command(a: argparse.Namespace, repo: Path, spec: str) -> list[str]:
     settings, meta = aider_files(repo, a)
     cmd = [
         *shlex.split(a.bin or "aider"),
@@ -409,8 +409,10 @@ def aider_command(a: argparse.Namespace, repo: Path, spec_file: Path) -> list[st
         str(Path(os.environ["HOME"]) / "aider.chat.history.md"),
         "--input-history-file",
         str(Path(os.environ["HOME"]) / "aider.input.history"),
-        "--message-file",
-        str(spec_file),
+        # The task goes on the command line, not as a file: under the read-isolated sandbox the
+        # runner's task.txt (outside the episode) is unreadable, and aider then got an empty task.
+        "--message",
+        spec,
     ]
     vcmd = visible_command(repo)
     if vcmd:  # the way Commit0's aider agent iterates: auto-test on the visible tests
@@ -421,7 +423,7 @@ def aider_command(a: argparse.Namespace, repo: Path, spec_file: Path) -> list[st
 def run_aider(a: argparse.Namespace, repo: Path, spec: str, res: dict[str, Any]) -> None:
     env = {**os.environ, "OPENAI_API_KEY": "dummy", "AIDER_ANALYTICS": "false"}
     log = Path(a.log)
-    rc, timed_out = run_group(aider_command(a, repo, Path(a.spec_file)), env, a.timeout, log)
+    rc, timed_out = run_group(aider_command(a, repo, spec), env, a.timeout, log)
     text = log.read_text("utf-8", "replace") if log.is_file() else ""
     sent = recv = 0
     for m in AIDER_TOKENS_RE.finditer(text):
