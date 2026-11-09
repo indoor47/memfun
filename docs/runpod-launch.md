@@ -150,6 +150,13 @@ the Hub client's own integrity checks. In the pod the download uses, in order: `
 resort `pip install huggingface_hub` then the Python API; 3 resumable attempts, a progress
 line every 20 s, and a clear reason plus the tail of `pull.log` if all fail.)
 
+**SGLang arguments for the agent benchmarks.** Qwen3.8 thinks by default. The benchmark runs use thinking
+off, so launch with
+`--sglang-args "--default-chat-template-kwargs {\"enable_thinking\":false} --max-mamba-cache-size 400"`.
+Without it the model thinks before every answer (runs to the output limit, results not comparable with earlier
+runs). If a pod is already up without it, `evals/swarm/thinking_off_proxy.py` adds the setting to every request:
+run it on a local port in front of the tunnel and point `--base-url` at the proxy.
+
 ### 3. Dry run (default, read-only)
 
 ```bash

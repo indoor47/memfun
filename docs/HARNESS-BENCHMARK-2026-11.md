@@ -3,6 +3,9 @@
 Run on 2026-11-08 (evening, CET). The same model served by SGLang on one B300 (Qwen3.8-27B FP8,
 `qwen3.8-27b-fp8`, thinking off), the same tasks, the same hidden-test grader. Only the agent harness differs.
 
+**A clean, read-isolated rerun with the new memfun loop is in the last section ("Rerun on 2026-11-09").
+Use that one for current numbers; the first run below is kept as the record of what went wrong.**
+
 **Read the contamination section before quoting any number.** The agents ran on the Mac as the user with
 write-only isolation. Reads were not restricted, and in one mini-swe-agent episode the agent read the reference
 solution. The effect on the tallies is small (one episode) but the run was not clean, so a read-isolated rerun
@@ -224,3 +227,113 @@ independent of the sandbox: keep the bundle cache and clones on a path the agent
 - The agentic arms ran on the Mac with bash against the model on the B300, with the isolation flaw described above.
 - claude-code was not run.
 - The model may remember these public libraries from training; nothing here separates recall from reasoning.
+
+## Rerun on 2026-11-09: read-isolated, new memfun loop
+
+One B300 pod (Qwen3.8-27B FP8, SGLang), the same grader, 14 tasks instead of 15 (cachetools `methodkey`
+dropped: its tests pass on the untouched stub), 3 trials each, so 42 episodes per arm. Every agent ran under the
+read-isolation profile (`evals/swarm/sandbox/`): it could read only its own episode, no reference solutions,
+hidden tests, clones or other episodes, and had no network except the model. The contamination audit ran after each
+arm. memfun was the version with the new fix loop (PR #81). Thinking was off, sent with every request (see "What went
+wrong during the run" for why it is not a server default). The arms ran one after another.
+
+### Per arm
+
+The grader-side tallies were cross-checked independently (the research session's aggregation and mine agree on all
+four arms: memfun 683/693 hidden tests and 37/42 episodes, mini-swe-agent 654/693 and 38/42, single-shot 610/671 and
+31/42, aider 514/693 and 29/42).
+
+| arm | all hidden tests pass (of 42) | same 14 tasks, first run | hidden tests passed | input / output tokens | wall | failures | contamination audit |
+|---|---|---|---|---|---|---|---|
+| single-shot | 31 (74%) | 25 | 610/671 | 0.29M / 0.08M | 955 s | 9 partial, 2 failed | no tools: none |
+| memfun | 37 (88%) | 36 | 683/693 | 1.39M / 0.25M | 593 s | 5 partial | no outside reads, no leaks |
+| aider | 29 (69%) | 32 | 514/693 | 5.83M / 0.06M | 954 s | 3 partial, 10 failed (7 no file change, 3 context length) | no outside reads, no leaks |
+| mini-swe-agent | 38 (90%) | 40 | 654/693 | 30.7M / 0.21M | 1,505 s (episode cap) | 3 partial, 1 failed (no file change) | no reference, hidden-test, clones or bundle paths touched; no leaks |
+
+Token numbers are the server's counters for each arm's run window (the arms ran sequentially; a few test
+requests of mine are included). The harnesses' own counts are lower where episodes were killed (mini, at its
+25-minute cap, loses the usage of unfinished episodes). "Wall" for single-shot and aider includes one episode whose code
+hung the grader until its timeout (900 s for single-shot, 240 s for the others); the model calls themselves took
+under 90 s. Whole-library merge-check (best trial per function, full test suite): memfun 36/37 wcwidth, 207/215
+cachetools; mini 37/37 and 207/215; aider 1/37 (its best-trial merge breaks the import) and 208/215.
+
+### Per function (episodes fully passing, out of 3)
+
+| function | single-shot | aider | memfun | mini-swe-agent |
+|---|---|---|---|---|
+| wcwidth `_bisearch` | 2 | 1 | 3 | 3 |
+| wcwidth `_wcmatch_version` | 2 | 0 | 3 | 2 |
+| wcwidth `_wcversion_value` | 3 | 3 | 3 | 3 |
+| wcwidth `list_versions` | 2 | 1 | 3 | 2 |
+| wcwidth `wcswidth` | 0 | 0 | 0 | 1 |
+| wcwidth `wcwidth` | 2 | 1 | 3 | 3 |
+| cachetools `fifo_cache` | 3 | 2 | 3 | 3 |
+| cachetools `lfu_cache` | 3 | 3 | 3 | 3 |
+| cachetools `lru_cache` | 3 | 3 | 3 | 3 |
+| cachetools `mru_cache` | 2 | 3 | 2 | 3 |
+| cachetools `rr_cache` | 3 | 3 | 3 | 3 |
+| cachetools `ttl_cache` | 3 | 3 | 3 | 3 |
+| cachetools `hashkey` | 2 | 3 | 2 | 3 |
+| cachetools `typedkey` | 1 | 3 | 3 | 3 |
+
+### What it says
+
+- **memfun and mini-swe-agent are level on pass rate here (37 and 38 of 42).** One episode apart is well inside
+  the noise of a 42-episode arm. memfun got there with about a twentieth of mini's input tokens (1.4M against 30.7M)
+  and, with no episode running to a cap, in less than half the wall time.
+- **The gain from the new loop is small on the B300.** On the same 14 tasks memfun went from 36 to 37 fully passing
+  episodes. It gained on `mru_cache` and `list_versions` and lost one on `hashkey`. The large gain seen on Cerebras
+  (10 to 17 of 20 on the five weakest functions) does not show up here, because the old loop already solved most of
+  these tasks on the B300. Read it as "no regression and a possible small improvement", not as a measured win.
+- **`wcswidth` is still the unsolved function.** memfun 0 of 3 (19 to 22 of 23 tests), mini 1 of 3, the others 0.
+  In the first run mini solved it 3 of 3, but one of those trials had read the reference solution; this clean rerun
+  gives 1 of 3. With 3 trials the two results cannot be told apart, so the first run's "mini wins on wcswidth" is not
+  confirmed.
+- **The isolation worked.** mini looked around outside its episode in 28 of 42 episodes (directory listings, `find`,
+  `pip show`), as in the first run, but touched none of the answer locations and no reference code appeared in any
+  output. By kind (episodes): path-style probes outside the repo 22, directory listings of the home directory 16,
+  `git show/log/...` 15, `find /` or `find ~` 13, `inspect.getsource`/`__file__` 10, `pip show` 9, cache directories 4,
+  site-packages 4; up to 207 commands in one episode. The audit (`evals/swarm/audit_contamination.py`) was run on all
+  four arms of this run in one pass: 0 function leaks, 0 original-file exposures and 0 touches of the reference,
+  hidden-test, bundle or clones paths, for every arm. That is the difference from the first run, where one episode read the reference solution.
+- **aider was weaker than in the first run (29 against 32), and the sandbox is not the cause.** I compared the
+  two runs' aider logs. The failure mix is the same: context length exceeded 3 then 4, a reply with no edit 5 then 7,
+  an edit that did not fix the tests 2 then 2. No aider log in this run contains a permission error ("Operation not
+  permitted"). The "no edit" episodes are the model answering with pseudo tool calls (a made-up `<tool_call>` /
+  `Read` / `Bash` syntax) instead of the SEARCH/REPLACE blocks aider needs, so aider ends the turn with nothing to
+  apply; that behaviour is in both runs. A three-episode difference on 42 is within the noise, and the one change to
+  aider (the task now arrives with `--message` instead of `--message-file`) delivers the same text. The one real
+  sandbox side effect was the first attempt, below.
+
+### What went wrong during the run (process, so the numbers are read correctly)
+
+1. **Thinking was on at first.** The pod was launched without the SGLang flag the earlier runs used
+   (`--default-chat-template-kwargs '{"enable_thinking":false}'`), so the first single-shot attempt ran with the model
+   thinking out loud and was discarded (9 episodes ran to the output limit). The pod was not restarted (B300 stock was
+   scarce); a small local proxy (`evals/swarm/thinking_off_proxy.py`) adds `enable_thinking=false` to every request, and the
+   whole benchmark was rerun through it. The first attempt's partial results are not used. The launch kit's docs now state
+   the flag.
+2. **aider failed its first attempt.** The runner gave aider its task as a file outside the episode, which the
+   read-isolation blocks, so aider got an empty task and did nothing in all 42 episodes (13 s). The task is now passed
+   on aider's command line (`--message`), and aider was rerun alone after mini. memfun, mini and single-shot were not
+   affected.
+3. **One hanging episode can stall an arm until the grader timeout.** The grader timeout was lowered from 900 s to 240 s
+   for memfun, mini and aider (single-shot ran with 900 s). A hanging candidate still counts as a failure.
+4. A first memfun start was stopped after a minute and restarted when the timeout change was made.
+
+### Cost
+
+About $13.2 for the B300 pod (88 minutes at $8.99/h, of which roughly 8 minutes boot and download and about 10
+minutes lost to the thinking-on attempt), taken from the account balance before and after. The earlier Cerebras
+experiments that led to the new loop cost about $7.8.
+
+### Caveats
+
+- One run per arm, 14 tasks, 3 trials: differences of a few episodes are noise. The ranking memfun 37, mini 38,
+  single-shot 31, aider 29 should be read as "memfun and mini close together, aider and single-shot behind".
+- The rerun differs from the first run in more than memfun's loop: read-isolation, thinking switched off per request
+  rather than as a server default, the lower grader timeout, and 14 instead of 15 tasks.
+- The model may remember these public libraries from training.
+- The agents ran on the Mac against the B300 through a tunnel, under a macOS sandbox profile; a stronger setup
+  would be per-episode containers.
+- claude-code was not run.
