@@ -373,6 +373,26 @@ def _write_swarm_result_json(payload: dict[str, Any]) -> None:
 
 async def _run_swarm(
     spec: str,
+    **kwargs: Any,
+) -> int:
+    """Run the swarm, then release the runtime's database connections.
+
+    Their worker threads are not daemons: left open they keep the process alive after the result
+    is printed and written.
+    """
+    try:
+        return await _run_swarm_impl(spec, **kwargs)
+    finally:
+        try:
+            from memfun_runtime.backends.sqlite._db import close_all_connections
+
+            await close_all_connections()
+        except Exception:
+            logger.debug("closing runtime connections failed", exc_info=True)
+
+
+async def _run_swarm_impl(
+    spec: str,
     *,
     max_pool: int,
     use_worktrees: bool,
