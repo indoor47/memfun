@@ -446,29 +446,6 @@ timeout_seconds = 30
 search_backend = "duckduckgo"         # duckduckgo | brave | tavily | searxng
 ```
 
-## Benchmarks
-
-Beyond SWE-bench Lite (70% on the first 30 instances) and Terminal-Bench (Opus 4.6: 57.5%),
-the repo has a **harness benchmark** that asks one question: on the *same* model, tasks and
-hidden-test grader, does memfun's scaffolding beat other coding agents? The arms are a
-single model call, aider, mini-swe-agent and memfun (`evals/swarm/run_smoke.py --arm ...`,
-`evals/swarm/run_harness_benchmark.sh`). Tasks are 15 function-level tasks from two
-Commit0 libraries (wcwidth, cachetools), 3 trials each.
-
-First run (Qwen3.8-27B on one B300, episodes where every hidden test passes, out of 45):
-mini-swe-agent 43, memfun 39, aider 35, single call 28. mini wins by iterating far longer
-(about 105 commands on the hardest function against memfun's one edit and a short fix
-loop) at about 14 times the input tokens. **That run was not clean:** the agents could read
-the machine, and in one mini episode the agent read the reference solution (so mini is 42
-without it). The write-up, the audit script (`evals/swarm/audit_contamination.py`) and a
-read-isolated rerun setup (`evals/swarm/sandbox/`) are described in
-[docs/HARNESS-BENCHMARK-2026-11.md](docs/HARNESS-BENCHMARK-2026-11.md).
-
-The fix loop above was built from that run's failures. In an A/B on the hardest five
-functions (Cerebras, same model, 20 episodes), it raised the fully-passing count from
-10 to 17 and passed 18 of 18 on the easy functions. A clean B300 rerun with the new loop
-is the confirmation still to come; treat the numbers above as a first measurement.
-
 ## Packages
 
 ```
@@ -484,8 +461,7 @@ memfun/
 │   └── memfun-cli/         Interactive chat, setup wizard, live dashboard, CLI
 ├── skills/                 8 built-in Agent Skills (SKILL.md format)
 ├── agents/                 Built-in agent definitions (AGENT.md format)
-├── evals/                  SWE-bench, Terminal-Bench and the swarm / Commit0 harness
-│                           benchmark (arms, graders, contamination audit, sandbox)
+├── evals/                  SWE-bench + Terminal-Bench evaluation harnesses
 └── tests/                  854 tests (88 skipped for Redis/NATS without servers)
 ```
 
