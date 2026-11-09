@@ -285,6 +285,58 @@ class Box:
             raise InfraError(f"{step} failed (exit {res.returncode}): {tail}")
         return text(res.stdout)
 
+    def rollout(
+        self,
+        argv: list[str],
+        *,
+        workdir: str,
+        env: dict[str, str],
+        log: Path,
+        timeout: float,
+        done_file: str,
+        grace: float = 20.0,
+        poll: float = 5.0,
+    ) -> tuple[str, int | None, float]:
+        """Run the agent, its output streamed to *log*.  Returns ``(how, exit_code, work_s)``:
+        ``exited`` on its own; ``reaped`` when it wrote *done_file* (its result) but was still
+        alive *grace* seconds later (a finished agent that does not exit must not burn the
+        whole timeout); ``timeout``.  In the last two cases the container is restarted, which
+        ends every process in it and keeps its files."""
+        cmd = [self.ctx.docker, "exec", "-e", "MFL_STEP=rollout"]
+        for k, v in env.items():
+            cmd += ["-e", f"{k}={v}"]
+        cmd += ["-w", workdir, self.name, *argv]
+        t0 = time.time()
+        done_at: float | None = None
+        with log.open("wb") as fh:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=fh)
+            try:
+                while True:
+                    try:
+                        code = proc.wait(timeout=poll)
+                        return "exited", code, (done_at or time.time()) - t0
+                    except subprocess.TimeoutExpired:
+                        pass
+                    now = time.time()
+                    if done_at is None:
+                        seen = self.exec("done", ["test", "-f", done_file], timeout=60)
+                        if seen.returncode == 0:
+                            done_at = now
+                    how = (
+                        "reaped"
+                        if done_at is not None and now - done_at >= grace
+                        else "timeout"
+                        if now - t0 >= timeout or self.ctx.stop.is_set()
+                        else ""
+                    )
+                    if how:
+                        self.restart()
+                        return how, None, (done_at or now) - t0
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=30)
+
     def restart(self) -> None:
         """Kill everything running in the container; its filesystem stays."""
         sh([self.ctx.docker, "restart", "-t", "0", self.name], timeout=120)
@@ -451,25 +503,20 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
             "COLUMNS": "160",
         }
         t0 = time.time()
-        timed_out = False
-        try:
-            res = box.exec(
-                "rollout",
-                rollout_argv(ctx, prompt),
-                workdir=repo,
-                env=env,
-                timeout=s.instance_timeout,
-            )
-            rec["agent_exit"] = res.returncode
-            (idir / "agent.log").write_bytes(res.stdout + b"\n--- stderr ---\n" + res.stderr)
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            (idir / "agent.log").write_bytes(
-                (exc.stdout or b"") + b"\n--- stderr ---\n" + (exc.stderr or b"")
-            )
-            box.restart()  # nothing may keep editing while the patch is collected
-            rec["flags"].append("agent_timed_out")
-        rec["rollout_s"] = round(time.time() - t0, 1)
+        how, exit_code, work_s = box.rollout(
+            rollout_argv(ctx, prompt),
+            workdir=repo,
+            env=env,
+            log=idir / "agent.log",
+            timeout=s.instance_timeout,
+            done_file=f"{HOME_IN}/swarm-result.json",
+        )
+        rec["agent_exit"] = exit_code
+        timed_out = how == "timeout"
+        if how != "exited":  # nothing may keep editing while the patch is collected
+            rec["flags"].append("agent_timed_out" if timed_out else "reaped_after_result")
+        rec["rollout_s"] = round(time.time() - t0, 1)  # wall time including any wait to reap
+        rec["work_s"] = round(work_s, 1)  # until the agent wrote its result (or stopped)
         rec["timed_out"] = timed_out
         usage = ctx.proxy.close(token)
         rec["usage"] = dataclasses.asdict(usage)

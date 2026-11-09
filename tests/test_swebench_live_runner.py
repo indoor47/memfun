@@ -64,7 +64,12 @@ if args[0] == "exec":
             req = urllib.request.Request(base + "/chat/completions", data=json.dumps({"messages": [{"role": "user", "content": "p"}]}).encode(), headers={"Content-Type": "application/json"})
             try: urllib.request.urlopen(req, timeout=20).read()
             except Exception as e: print("llm error", e)
-        print("agent ran")
+        print("agent ran", flush=True)
+        if scen.get("writes_result"): mark("result")
+        if scen.get("hangs"):
+            import time
+            time.sleep(scen["hangs"])
+    elif step == "done": sys.exit(0 if has("result") else 1)
     elif step == "result": sys.exit(1)
     elif step == "collect": sys.stdout.write(scen.get("patch", ""))
     elif step == "patchcheck": sys.exit(0 if scen.get("applies", True) else 1)
@@ -268,6 +273,38 @@ def test_the_patch_is_the_change_from_the_images_initial_tree(tmp_path: Path) ->
     chk = tmp_path.parent / "chk"
     chk.mkdir()
     sh(f"git archive {base} | tar -x -C {chk} && cd {chk} && git apply --check {home}/patch.diff")
+
+
+def test_an_agent_that_wrote_its_result_but_does_not_exit_is_reaped(env, monkeypatch) -> None:
+    orig = rn.Box.rollout
+    monkeypatch.setattr(
+        rn.Box,
+        "rollout",
+        lambda self, argv, **kw: orig(self, argv, **{**kw, "grace": 1.0, "poll": 0.3}),
+    )
+    e = env(writes_result=True, hangs=30)
+    assert rn.main(e.argv()) == 0
+    rec = e.record()
+    assert rec["status"] == "done" and rec["flags"] == ["reaped_after_result"]
+    assert rec["rollout_s"] < 20 and rec["work_s"] <= rec["rollout_s"] and not rec["timed_out"]
+    assert rec["patch_bytes"] == len(PATCH)  # the patch is still collected after the reap
+    assert any(c[0] == "restart" for c in e.calls())
+    idir = e.run_dir / "instances" / SENTINELS["instance_id"]
+    assert b"agent ran" in (idir / "agent.log").read_bytes()  # streamed while running
+
+
+def test_a_timed_out_agent_still_gets_its_patch_collected(env, monkeypatch) -> None:
+    orig = rn.Box.rollout
+    monkeypatch.setattr(
+        rn.Box,
+        "rollout",
+        lambda self, argv, **kw: orig(self, argv, **{**kw, "timeout": 1.5, "poll": 0.3}),
+    )
+    e = env(hangs=30)
+    assert rn.main(e.argv()) == 0
+    rec = e.record()
+    assert rec["flags"] == ["agent_timed_out"] and rec["timed_out"] is True
+    assert rec["status"] == "done" and rec["patch_bytes"] == len(PATCH)
 
 
 def test_single_rollout_resume_and_documented_infra_retry(env) -> None:
