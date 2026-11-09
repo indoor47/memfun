@@ -182,6 +182,22 @@ def compact_errors(output: str, per_failure: int = 900, max_failures: int = 12) 
     return ("\n".join(head) + "\n\n" + body).strip()
 
 
+def compact_blocks(blocks: list[str], other_limit: int = 3_000) -> str:
+    """:func:`compact_errors` per failing command: a pytest run is compacted as usual, the
+    output of any other command (a syntax or import check, a reproduction script) is kept,
+    clipped.  Compacting the joined text would keep only the pytest part."""
+    return "\n\n".join(
+        compact_errors(b) if summarize(b).found else clip(b, other_limit) for b in blocks
+    )
+
+
+def other_failures(blocks: list[str]) -> int:
+    """How many failing commands are not test runs (they count as failures of their own when
+    rounds are compared, next to the failing tests)."""
+    kinds = [summarize(b).found for b in blocks]
+    return kinds.count(False) if any(kinds) else 0
+
+
 @dataclass
 class BestSoFar:
     """Snapshot the owned files whenever a round beats the best score; restore at the end."""

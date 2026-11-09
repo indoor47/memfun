@@ -396,6 +396,83 @@ def compile_command(python: str, files: list[str]) -> list[str]:
     return [python, "-c", code, *files]
 
 
+_IMPORT_PROBE = (
+    "import importlib, json, os, sys\n"
+    "root = os.getcwd()\n"
+    "sys.path[:0] = [root, os.path.join(root, 'src')]\n"
+    "out = []\n"
+    "for rel, names in json.loads(sys.argv[1]):\n"
+    "    want = os.path.realpath(os.path.join(root, rel))\n"
+    "    for name in names:\n"
+    "        try:\n"
+    "            mod = importlib.import_module(name)\n"
+    "        except BaseException:\n"
+    "            continue\n"
+    "        if os.path.realpath(getattr(mod, '__file__', None) or '') == want:\n"
+    "            out.append(name)\n"
+    "            break\n"
+    "print('IMPORTABLE ' + json.dumps(out))\n"
+)
+_IMPORT_CHECK = (
+    "import importlib, os, sys\n"
+    "sys.path[:0] = [os.getcwd(), os.path.join(os.getcwd(), 'src')]\n"
+    "for name in sys.argv[1:]:\n"
+    "    importlib.import_module(name)\n"
+)
+
+
+def python_version(python: str, cwd: str | Path) -> str:
+    """``"3.10.4"`` for *python*, or ``""`` when it cannot be asked."""
+    code, out = run([python, "-c", "import sys; print(sys.version.split()[0])"], cwd, 30.0)
+    return out.strip().splitlines()[-1] if code == 0 and out.strip() else ""
+
+
+def importable_modules(
+    python: str, project_root: str | Path, rel_paths: list[str], timeout: float = 120.0
+) -> list[str]:
+    """The dotted names under which *python* imports each of *rel_paths* right now.
+
+    Only modules inside a package (a directory with ``__init__.py``) and not test or setup
+    files are tried, so nothing with top-level side effects is imported; a file that does not
+    import (already broken, optional dependency missing) is left out.  Call it with the
+    ORIGINAL files in place: what imported before a change must still import after it.
+    """
+    import json
+
+    root = Path(project_root)
+    wanted: list[tuple[str, list[str]]] = []
+    for rel in dict.fromkeys(rel_paths):
+        path = Path(rel)
+        if path.suffix != ".py" or path.name in ("setup.py", "conftest.py", "__main__.py"):
+            continue
+        if any(fnmatch.fnmatch(path.name, pat) for pat in DEFAULT_PATTERNS):
+            continue
+        if not (root / path.parent / "__init__.py").is_file():
+            continue
+        names = [n for n in module_names(rel) if "." in n or path.name == "__init__.py"]
+        if names:
+            wanted.append((rel, names))
+    if not wanted:
+        return []
+    code, out = run([python, "-c", _IMPORT_PROBE, json.dumps(wanted)], root, timeout)
+    if code != 0:
+        return []
+    for line in reversed(out.splitlines()):
+        if line.startswith("IMPORTABLE "):
+            try:
+                found = json.loads(line[len("IMPORTABLE ") :])
+            except ValueError:
+                return []
+            return [str(n) for n in found] if isinstance(found, list) else []
+    return []
+
+
+def import_command(python: str, modules: list[str]) -> list[str]:
+    """The argv that imports *modules* with the project's interpreter (fails on the first
+    one that does not import, with its traceback)."""
+    return [python, "-c", _IMPORT_CHECK, *modules]
+
+
 def run(argv: list[str], cwd: str | Path, timeout: float) -> tuple[int | None, str]:
     """Run *argv* in its own process group; ``(exit code, output)``, or ``(None, note)`` when
     it timed out (the whole group is killed) or could not start."""
