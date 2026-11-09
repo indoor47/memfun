@@ -48,7 +48,8 @@ if args[0] == "run": print("cid"); sys.exit(0)
 if args[0] in ("rm", "rmi", "restart"): sys.exit(0)
 if args[0] == "exec":
     step = next(a.split("=", 1)[1] for a in args if a.startswith("MFL_STEP="))
-    if step == "findrepo": print("/testbed\n%s\n0" % scen.get("head", "a" * 40))
+    if step == "findrepo": print("/testbed\n%s" % scen.get("head", "a" * 40))
+    elif step == "baseline": print("c" * 40 + "".join("\n" + x for x in scen.get("dirty", [])))
     elif step == "lockdown":
         sys.stdin.read()
         if scen.get("lockdown_fails"): print("lockdown check FAILED: refs beyond HEAD"); sys.exit(1)
@@ -63,7 +64,12 @@ if args[0] == "exec":
             req = urllib.request.Request(base + "/chat/completions", data=json.dumps({"messages": [{"role": "user", "content": "p"}]}).encode(), headers={"Content-Type": "application/json"})
             try: urllib.request.urlopen(req, timeout=20).read()
             except Exception as e: print("llm error", e)
-        print("agent ran")
+        print("agent ran", flush=True)
+        if scen.get("writes_result"): mark("result")
+        if scen.get("hangs"):
+            import time
+            time.sleep(scen["hangs"])
+    elif step == "done": sys.exit(0 if has("result") else 1)
     elif step == "result": sys.exit(1)
     elif step == "collect": sys.stdout.write(scen.get("patch", ""))
     elif step == "patchcheck": sys.exit(0 if scen.get("applies", True) else 1)
@@ -145,6 +151,9 @@ def test_a_rollout_end_to_end_records_patch_trajectory_and_usage(env) -> None:
     assert rec["status"] == "done" and rec["head"] == HEAD and rec["flags"] == []
     assert rec["usage"]["calls"] == 1 and rec["usage"]["prompt_tokens"] == 100
     assert rec["cost_usd"] == pytest.approx(140 / 1e6) and rec["patch_applies"] is True
+    assert rec["patch_files"] == 1 and rec["patch_new_files"] == 0
+    collect = next(c for c in e.calls() if "MFL_STEP=collect" in c)[-1]
+    assert "':(exclude).memfun'" in collect and "':(exclude,glob)**/__pycache__/**'" in collect
     idir = e.run_dir / "instances" / SENTINELS["instance_id"]
     assert (idir / "patch.diff").read_text() == PATCH
     assert len((idir / "llm.jsonl").read_text().splitlines()) == 1  # the raw trajectory
@@ -153,7 +162,7 @@ def test_a_rollout_end_to_end_records_patch_trajectory_and_usage(env) -> None:
     steps = [a.split("=", 1)[1] for c in e.calls() for a in c if a.startswith("MFL_STEP=")]
     # the order is the contract: history lock-down and the network self-test BEFORE the rollout
     assert steps == [
-        "findrepo", "lockdown", "nettest", "config", "rollout", "result", "collect", "patchcheck"
+        "findrepo", "lockdown", "baseline", "nettest", "config", "rollout", "result", "collect", "patchcheck"
     ]  # fmt: skip
     kinds = [c[0] for c in e.calls()]
     assert kinds[-3:] == ["rm", "rmi", "network"]  # pull-run-delete, nothing left behind
@@ -221,9 +230,81 @@ def test_no_model_answer_is_an_infrastructure_failure_not_an_empty_patch(env) ->
 
 
 def test_flags_empty_and_non_applying_patches_and_a_moved_head(env) -> None:
-    e = env(patch=PATCH, applies=False, head="b" * 40)
+    e = env(patch=PATCH, applies=False, head="b" * 40, dirty=[" M setup.py", "?? gen.py"])
     assert rn.main(e.argv()) == 0
-    assert set(e.record()["flags"]) == {"patch_does_not_apply", "head_is_not_base_commit"}
+    rec = e.record()
+    assert set(rec["flags"]) == {
+        "patch_does_not_apply", "head_is_not_base_commit", "image_tree_dirty"
+    }  # fmt: skip
+    assert rec["initial_dirty"] == [" M setup.py", "?? gen.py"] and rec["base_tree"] == "c" * 40
+    collect = next(c for c in e.calls() if "MFL_STEP=collect" in c)[-1]
+    assert "diff --text --no-color " + "c" * 40 in collect  # against the initial tree, not HEAD
+
+
+def test_the_patch_is_the_change_from_the_images_initial_tree(tmp_path: Path) -> None:
+    """Real git: an image whose tree is already dirty; the agent's patch must hold only the
+    agent's change, apply on top of that dirty tree, and leave the index as it was found."""
+
+    def sh(script: str) -> str:
+        res = subprocess.run(
+            ["sh", "-c", script], cwd=tmp_path, capture_output=True, text=True, timeout=60
+        )
+        assert res.returncode == 0, res.stderr
+        return res.stdout
+
+    home = tmp_path.parent / "home"
+    snap = lambda n: rn._snapshot(n).replace(rn.HOME_IN, str(home))  # noqa: E731
+    spec = rn._pathspec()
+    sh("git init -q && git config user.email a@b && git config user.name t && "
+       "printf 'a=1\nb=1\n' > m.py && echo keep > k.py && git add . && git commit -qm c")  # fmt: skip
+    sh("printf 'a=1\nb=IMAGE\n' > m.py && echo pre > untracked.py && git add k.py")  # dirty image
+    index_before = sh("git status --porcelain")
+    base = sh(snap("base")).strip()
+    assert sh("git status --porcelain") == index_before  # the real index is untouched
+    sh("printf 'a=AGENT\nb=IMAGE\n' > m.py && echo new > fix.py && mkdir -p __pycache__ && "
+       "touch __pycache__/m.pyc")  # fmt: skip
+    patch = sh(
+        f"t=$({snap('final')}) && git --no-pager diff --text --no-color {base} $t -- . {spec}"
+    )
+    assert "+a=AGENT" in patch and "fix.py" in patch
+    assert "IMAGE" not in patch.replace(" b=IMAGE", "") and "untracked.py" not in patch
+    assert "__pycache__" not in patch
+    (home / "patch.diff").write_text(patch)
+    chk = tmp_path.parent / "chk"
+    chk.mkdir()
+    sh(f"git archive {base} | tar -x -C {chk} && cd {chk} && git apply --check {home}/patch.diff")
+
+
+def test_an_agent_that_wrote_its_result_but_does_not_exit_is_reaped(env, monkeypatch) -> None:
+    orig = rn.Box.rollout
+    monkeypatch.setattr(
+        rn.Box,
+        "rollout",
+        lambda self, argv, **kw: orig(self, argv, **{**kw, "grace": 1.0, "poll": 0.3}),
+    )
+    e = env(writes_result=True, hangs=30)
+    assert rn.main(e.argv()) == 0
+    rec = e.record()
+    assert rec["status"] == "done" and rec["flags"] == ["reaped_after_result"]
+    assert rec["rollout_s"] < 20 and rec["work_s"] <= rec["rollout_s"] and not rec["timed_out"]
+    assert rec["patch_bytes"] == len(PATCH)  # the patch is still collected after the reap
+    assert any(c[0] == "restart" for c in e.calls())
+    idir = e.run_dir / "instances" / SENTINELS["instance_id"]
+    assert b"agent ran" in (idir / "agent.log").read_bytes()  # streamed while running
+
+
+def test_a_timed_out_agent_still_gets_its_patch_collected(env, monkeypatch) -> None:
+    orig = rn.Box.rollout
+    monkeypatch.setattr(
+        rn.Box,
+        "rollout",
+        lambda self, argv, **kw: orig(self, argv, **{**kw, "timeout": 1.5, "poll": 0.3}),
+    )
+    e = env(hangs=30)
+    assert rn.main(e.argv()) == 0
+    rec = e.record()
+    assert rec["flags"] == ["agent_timed_out"] and rec["timed_out"] is True
+    assert rec["status"] == "done" and rec["patch_bytes"] == len(PATCH)
 
 
 def test_single_rollout_resume_and_documented_infra_retry(env) -> None:
