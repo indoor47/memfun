@@ -22,15 +22,19 @@ from tests.test_swebench_live_runner import env as env  # noqa: E402
 TEMPLATE = "Fix the issue.\n<issue>\n{problem_statement}\n</issue>"
 SETTINGS = {"model": "m", "prompt_template": TEMPLATE, "agent_version": "abc", "solver": "cf"}
 TEST_LINE = "    assert widget('') == [], 'an empty input must give an empty list'"
+TEST_LINE_2 = "    assert widget(None) == [], 'and so must no input at all, not an error'"
+FIX = "    return frobnicate(value) if value else []  # the fix"
+FIX_2 = "    raise WidgetError('the value {0!r} cannot be frobnicated'.format(value))"
+HINTS = (
+    "A maintainer says: use the frobnicate helper from widget.util for this case.\n"
+    "Another maintainer adds: and raise WidgetError when the value cannot be handled."
+)
 ROW = {
     "instance_id": "octo__widget-1",
     "problem_statement": "Widget crashes on empty input.",
-    "hints_text": "A maintainer says: use the frobnicate helper from widget.util for this case.",
-    "test_patch": "diff --git a/t.py b/t.py\n+def test_widget_handles_empty_input():\n+"
-    + TEST_LINE
-    + "\n",
-    "patch": "diff --git a/w.py b/w.py\n"
-    "+    return frobnicate(value) if value else []  # the fix\n",
+    "hints_text": HINTS,
+    "test_patch": f"diff --git a/t.py b/t.py\n+def test_empty():\n+{TEST_LINE}\n+{TEST_LINE_2}\n",
+    "patch": f"diff --git a/w.py b/w.py\n+{FIX}\n+{FIX_2}\n",
     "FAIL_TO_PASS": ["t.py::test_widget_handles_empty_input"],
 }
 
@@ -214,16 +218,14 @@ def test_the_audit_finds_what_the_rules_forbid(tmp_path: Path) -> None:
     prompt = TEMPLATE.format(problem_statement=ROW["problem_statement"])
     cases: dict[str, dict[str, Any]] = {
         "the instance id is in a prompt": {"calls": [call(1, prompt + f"\nwork on {iid}", "ok")]},
-        "a line of `hints_text` is in a prompt": {
-            "calls": [call(1, prompt + "\n" + ROW["hints_text"], "ok")]
+        "2 of the 2 distinctive lines of `hints_text` are in a prompt": {
+            "calls": [call(1, prompt + "\n" + HINTS, "ok")]
         },
-        "a line of `test_patch` is in a prompt": {
-            "calls": [call(1, prompt, "ok"), call(2, prompt + "\n" + TEST_LINE, "ok")]
+        "2 of the 2 distinctive lines of `test_patch` are in a prompt": {
+            "calls": [call(1, prompt, "ok"), call(2, f"{prompt}\n{TEST_LINE}\n{TEST_LINE_2}", "")]
         },
-        "a line of `patch` is in a prompt": {
-            "calls": [
-                call(1, prompt + "\n    return frobnicate(value) if value else []  # the fix", "")
-            ]
+        "2 of the 2 distinctive lines of `patch` are in a prompt": {
+            "calls": [call(1, f"{prompt}\n{FIX}\n{FIX_2}", ""), call(2, f"{prompt}\n{FIX}", "")]
         },
         "the first prompt is not the prompt template": {"calls": [call(1, "Solve widget.", "ok")]},
         "attempted network access": {"log": "Web search failed for 'x': DNSError\n"},
@@ -254,9 +256,17 @@ def test_the_repository_as_it_was_is_not_a_leak_of_the_reference_patch(tmp_path:
     shows_file = call(1, f"{prompt}\n=== FILE: w.py ===\n{existing}\n{moved}\n", "ok")
     run = make_run(tmp_path / "run", [iid], calls=[shows_file])
     assert sub.audit(run, {iid: row})["n_violations"] == 0
-    leaked = call(1, f"{prompt}\n    return frobnicate(result) if result else []  # fix", "ok")
-    run2 = make_run(tmp_path / "run2", [iid], calls=[leaked])
-    assert sub.audit(run2, {iid: row})["n_violations"] == 1
+    # one added line of several in a prompt: the repository may hold it elsewhere (seen on the
+    # box: a patch that repeats two existing comment lines).  A note for a person, not a refusal.
+    row["patch"] += f"+{FIX}\n+{FIX_2}\n"
+    one_line = call(1, f"{prompt}\n{FIX}", "ok")
+    report = sub.audit(make_run(tmp_path / "run2", [iid], calls=[one_line, one_line]), {iid: row})
+    assert report["n_violations"] == 0 and report["n_review"] == 1
+    whole = call(1, f"{prompt}\n{FIX}\n{FIX_2}", "ok")
+    assert (
+        sub.audit(make_run(tmp_path / "run3", [iid], calls=[whole]), {iid: row})["n_violations"]
+        == 1
+    )
 
 
 def test_what_the_agent_wrote_itself_is_not_a_leak_when_it_comes_back(tmp_path: Path) -> None:

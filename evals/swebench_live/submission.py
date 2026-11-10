@@ -33,7 +33,9 @@ from evals.swebench_live import grade as gr
 #: Dataset fields the agent must never see (rule 1); checked line by line.
 FORBIDDEN_FIELDS = ("hints_text", "all_hints_text", "test_patch", "patch")
 #: A line this long that is in a forbidden field and not in the problem statement is
-#: distinctive enough that finding it in a prompt is not a coincidence.
+#: distinctive.  One such line in a prompt can still be the repository's own text (a patch
+#: often repeats a line that exists elsewhere), so it is a note for review; half of a
+#: field's distinctive lines (and at least two) in one prompt is a violation.
 MIN_LINE = 40
 KEY_PATTERNS = (
     r"sk-[A-Za-z0-9_-]{20,}", r"csk-[A-Za-z0-9]{20,}", r"ghp_[A-Za-z0-9]{30,}",
@@ -138,6 +140,7 @@ def audit_instance(idir: Path, row: dict[str, Any], prompt_template: str) -> dic
             bad.append("the trajectory (llm.jsonl) is missing or unreadable")
     expected = prompt_template.format(problem_statement=_text(row.get("problem_statement")))
     answered = ""  # everything the model itself has written so far
+    leaked: set[str] = set()
     first_user = ""
     for call in calls:
         messages = (call.get("request") or {}).get("messages") or []
@@ -148,11 +151,23 @@ def audit_instance(idir: Path, row: dict[str, Any], prompt_template: str) -> dic
         if iid in asked:
             bad.append(f"call {seq}: the instance id is in a prompt")
         for field in FORBIDDEN_FIELDS:
-            for line in distinctive_lines(row, field):
-                # the agent's own earlier words coming back in a prompt are not a leak
-                if line in asked and line not in answered:
-                    bad.append(f"call {seq}: a line of `{field}` is in a prompt: {line[:80]}")
-                    break
+            lines = list(dict.fromkeys(distinctive_lines(row, field)))
+            # the agent's own earlier words coming back in a prompt are not a leak
+            hits = [ln for ln in lines if ln in asked and ln not in answered]
+            if not hits or field in leaked:
+                continue
+            if len(hits) >= 2 and len(hits) * 2 >= len(lines):
+                leaked.add(field)
+                bad.append(
+                    f"call {seq}: {len(hits)} of the {len(lines)} distinctive lines of "
+                    f"`{field}` are in a prompt, e.g. {hits[0][:80]}"
+                )
+            else:
+                # one line, or a small part: the repository may hold the same text elsewhere
+                for ln in hits:
+                    note = f"a line that is also in `{field}` is in a prompt: {ln[:80]}"
+                    if note not in review:
+                        review.append(note)
         for name in _text(row.get("FAIL_TO_PASS")).splitlines():
             test = name.rsplit("::", 1)[-1].split("[", 1)[0]
             seen = len(test) >= 12 and test in asked and test not in answered
