@@ -271,6 +271,10 @@ class ContextFirstConfig:
     #: ``.memfun/verify.json`` or this field.  With it on, a solve that edits no file is a
     #: failure (``context_first_no_edits``), never a success.
     read_rounds: int = 0
+    #: With the read step on: tell the solver up front that it may ask to read (and how).
+    #: ``False`` answers read requests all the same but does not invite them, so a solver
+    #: that can edit from what it is shown gets the prompt it always got (``read_offer``).
+    read_offer: bool = True
     #: No web step: the planner is not offered web searches and nothing is fetched.  For runs
     #: that must not touch the network (``offline`` in ``.memfun/verify.json``).
     offline: bool = False
@@ -1758,8 +1762,8 @@ def read_project_verify_options(project_root: Path) -> dict[str, Any]:
     ``reproduce`` (bool: a reproduction script before the change, a check after it),
     ``repo_search`` (bool: plan a large project from a search of every file),
     ``read_rounds`` (int >= 0: rounds in which the solver may ask to read more before it
-    edits), ``offline`` (bool: no web step) and ``test_timeout`` (seconds for one run of the
-    selected tests)."""
+    edits), ``read_offer`` (bool: say so in the prompt), ``offline`` (bool: no web step) and
+    ``test_timeout`` (seconds for one run of the selected tests)."""
     if os.environ.get(TRUST_PROJECT_VERIFY_ENV, "").lower() not in ("1", "true", "yes"):
         return {}
     try:
@@ -1787,7 +1791,7 @@ def read_project_verify_options(project_root: Path) -> dict[str, Any]:
                     PROJECT_VERIFY_FILE,
                     ", ".join(fixloop.PROBE_GUARDS),
                 )
-        for key in ("discover_tests", "reproduce", "repo_search", "offline"):
+        for key in ("discover_tests", "reproduce", "repo_search", "offline", "read_offer"):
             if key in data:
                 if isinstance(data[key], bool):
                     out[key] = data[key]
@@ -2697,9 +2701,11 @@ class ContextFirstSolver:
                 read_requests.ROUND_BYTES,
                 min(read_requests.ROUND_BYTES * read_rounds, (cap or 160_000) // 2),
             )
+            offer = bool(opts.get("read_offer", self.config.read_offer))
             solve_result = await self.solver.asolve(
                 query=solver_query,
-                full_context=full_context + READ_OFFER.format(rounds=read_rounds),
+                full_context=full_context
+                + (READ_OFFER.format(rounds=read_rounds) if offer else ""),
                 reader=self._answer_reads,
                 read_rounds=read_rounds,
             )

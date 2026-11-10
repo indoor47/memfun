@@ -335,6 +335,7 @@ names the key and the allowed range, and the setting stays off or at its default
 | `test_timeout` | integer 10..3600 | 300 | seconds one run of the selected tests may take (the whole process group is killed after that) |
 | `repo_search` | `true` / `false` | `false` | on a project too large to read whole, search every source file for the names in the task: the planner chooses from the files that define or mention them (instead of the code map), its search patterns are searched in every file, and a large file keeps the definitions that match |
 | `read_rounds` | integer 0..6 | 0 (off) | rounds in which the solver may ask to read more before it edits (see below) |
+| `read_offer` | `true` / `false` | `true` | with `read_rounds`: tell the solver in its prompt that it may ask to read and how. `false` answers read requests all the same without inviting them: the first prompt is then the one the solver always got |
 | `offline` | `true` / `false` | `false` | no web step: the planner is not offered web searches at all and nothing is fetched (for runs that must not touch the network) |
 
 The loop itself is the same with or without probes: `probe_rounds` changes only whether the look

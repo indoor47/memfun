@@ -168,11 +168,26 @@ async def test_with_its_own_checks_on_a_run_that_edits_nothing_is_a_failure(
     assert '"kind": "no_edits"' in checks
 
 
+@pytest.mark.asyncio
+async def test_reads_are_answered_without_being_offered(tmp_path: Path) -> None:
+    """`read_offer` off: the first prompt is the one the solver always got; a solver that asks
+    to read on its own account is answered all the same."""
+    root = project(tmp_path)
+    replies = Replies([READ], [EDIT])
+    solver = solver_for(root, replies, read_rounds=2, read_offer=False)
+    result = await solver.asolve(query=ISSUE)
+    first, second = replies.calls
+    assert "READING MORE" not in first["full_context"]
+    assert first["full_context"].rstrip().endswith("return sum(items)")  # just the files
+    assert "--- lines 905-908 of shop/big_rules.py" in second["full_context"]
+    assert result.success
+
+
 def test_the_read_switches_are_read_from_the_project_verify_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / ".memfun").mkdir()
-    doc = {"read_rounds": 3, "offline": True}
+    doc = {"read_rounds": 3, "offline": True, "read_offer": False}
     (tmp_path / cf.PROJECT_VERIFY_FILE).write_text(json.dumps(doc), "utf-8")
     assert cf.read_project_verify_options(tmp_path) == {}  # not trusted: nothing is read
     monkeypatch.setenv(cf.TRUST_PROJECT_VERIFY_ENV, "1")
