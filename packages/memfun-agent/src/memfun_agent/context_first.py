@@ -3197,8 +3197,8 @@ class ContextFirstSolver:
         (*verify_cmds* is updated in place); the others are regressions for the fix step.
         Returns the ids left out by this call."""
         own = self._tests_run
-        if own is None or own.command not in vr.failed_cmds:
-            return []
+        if own is None or own.command not in vr.failed_cmds or self._does_not_import(vr):
+            return []  # code that does not import fails tests for that reason alone
         block = vr.blocks[vr.failed_cmds.index(own.command)]
         summary = fixloop.summarize(block)
         if summary.broken or not summary.failed_ids or own.triage_calls >= TRIAGE_MAX_CALLS:

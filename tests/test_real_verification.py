@@ -387,6 +387,7 @@ async def test_a_state_that_does_not_import_is_never_kept_over_one_that_does(roo
     rounds = [r for r in log if r["event"] == "verify"]
     assert "import check of the changed modules" in rounds[0]["failed"][0]
     assert "reproduction" not in rounds[0]  # not run on code that does not import
+    assert model.triage_asked == []  # nor is any test classified on such code
     assert rounds[1]["failed"] == [] and rounds[1]["reproduction"] == "same"
     assert not any("Restored the best state (round 1)" in s for s in statuses)
 
