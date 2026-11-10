@@ -1000,7 +1000,8 @@ READ_OFFER = (
     "A file that is too large is shown above only as its head, an outline and the definitions "
     "that match the task. If the code you have to change, or have to see to change it "
     "correctly, is not shown, do not guess its text: reply with read operations ONLY (no "
-    "edit_file) and a one-line answer. You are then shown what you asked for and asked again, "
+    "edit_file), in the usual reply format with a one-line answer. You are then shown what "
+    "you asked for and asked again, "
     "at most {rounds} time(s), so ask for everything you need at once. The read operations:\n"
     '{{"op":"read_file","path":"pkg/mod.py","start_line":120,"end_line":260}}  lines of a file '
     "(leave the line numbers out for a whole small file)\n"
@@ -1056,22 +1057,40 @@ class SingleShotSolver(dspy.Module):
         rounds_used = 0
         while True:
             cfg = _rollout_config(attempt)
-            result = await asyncio.to_thread(
-                self.predictor,
-                query=ask,
-                full_context=full_context,
-                **({"config": cfg} if cfg else {}),
-            )
+            try:
+                result = await asyncio.to_thread(
+                    self.predictor,
+                    query=ask,
+                    full_context=full_context,
+                    **({"config": cfg} if cfg else {}),
+                )
+            except Exception as exc:
+                # A reply that could not be split into its fields (a field left out, tool-call
+                # markup around the operations) still says what to do: its operations are
+                # read from the text instead of the whole attempt being thrown away.
+                raw = getattr(exc, "lm_response", None)
+                salvaged = salvage_operations(raw) if isinstance(raw, str) else []
+                if not salvaged:
+                    raise
+                logger.warning(
+                    "Solver reply could not be parsed into its fields; %d operation(s) read "
+                    "from its text",
+                    len(salvaged),
+                )
+                result = None
+            if result is None:
+                reasoning, answer, raw_ops = "", "", json.dumps(salvaged)
+                operations, truncated = salvaged, False
+            else:
+                reasoning = str(getattr(result, "reasoning", ""))
+                answer = str(getattr(result, "answer", ""))
+                raw_ops = str(getattr(result, "operations", "[]"))
 
-            reasoning = str(getattr(result, "reasoning", ""))
-            answer = str(getattr(result, "answer", ""))
-            raw_ops = str(getattr(result, "operations", "[]"))
+                operations = _parse_operations(raw_ops)
 
-            operations = _parse_operations(raw_ops)
-
-            # Detect truncation: if the raw operations string doesn't
-            # close the JSON array, the LLM response was likely cut off.
-            truncated = _detect_truncation(raw_ops, operations)
+                # Detect truncation: if the raw operations string doesn't
+                # close the JSON array, the LLM response was likely cut off.
+                truncated = _detect_truncation(raw_ops, operations)
             only_reads = bool(operations) and not _has_file_change(
                 operations, reads=reader is not None
             )
@@ -1148,6 +1167,38 @@ def _parse_operations(raw: str) -> list[dict[str, Any]]:
                     ops.append(obj)
             except (json.JSONDecodeError, ValueError):
                 continue
+    return ops
+
+
+def salvage_operations(raw: str) -> list[dict[str, Any]]:
+    """The operations in a reply that could not be parsed into its fields: a JSON array
+    anywhere in the text (the last one that holds operations), else operation objects written
+    one after another (for example inside tool-call markup)."""
+    ops = _parse_operations(raw)
+    if ops:
+        return ops
+    decoder = json.JSONDecoder()
+    for m in re.finditer(r"\[\s*\{", raw):
+        try:
+            parsed, _ = decoder.raw_decode(raw, m.start())
+        except ValueError:
+            continue
+        if isinstance(parsed, list):
+            found = [
+                cast("dict[str, Any]", op)
+                for op in cast("list[object]", parsed)
+                if isinstance(op, dict) and "op" in op
+            ]
+            ops = found or ops
+    if ops:
+        return ops
+    for m in re.finditer(r"\{\s*\"op\"", raw):
+        try:
+            obj, _ = decoder.raw_decode(raw, m.start())
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and "op" in obj:
+            ops.append(cast("dict[str, Any]", obj))
     return ops
 
 

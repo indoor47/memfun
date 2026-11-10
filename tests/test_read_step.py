@@ -350,3 +350,57 @@ async def test_offline_the_planner_is_not_offered_the_web_and_nothing_is_fetched
 def test_online_the_planner_keeps_its_web_step() -> None:
     planner = cf.ContextPlanner()
     assert "web_searches" in planner.predictor.signature.output_fields
+
+
+# ── a solver reply that cannot be split into its fields ──────────────────────────────────────
+
+TOOL_CALLS = (
+    "I need to see the code first.\n<tool_call>\n"
+    '{"op": "read_file", "path": "shop/big_rules.py", "start_line": 905, "end_line": 908}\n'
+    '<tool_call>\n{"op": "list_dir", "path": "shop"}'
+)
+
+
+def test_operations_are_found_in_a_reply_that_has_no_fields() -> None:
+    assert [op["op"] for op in cf.salvage_operations(TOOL_CALLS)] == ["read_file", "list_dir"]
+    prose = 'A note [1], then:\n[{"op": "edit_file", "path": "a.py", "old": "x", "new": "y"}] ok'
+    assert cf.salvage_operations(prose) == [
+        {"op": "edit_file", "path": "a.py", "old": "x", "new": "y"}
+    ]
+    spread = 'Change this:\n{\n  "op": "edit_file", "path": "a.py",\n  "old": "x", "new": "y"\n}'
+    assert cf.salvage_operations(spread)[0]["path"] == "a.py"
+    assert cf.salvage_operations("I am not sure what to do.") == []
+
+
+@pytest.mark.asyncio
+async def test_a_solver_reply_without_its_fields_does_not_end_the_attempt(tmp_path: Path) -> None:
+    """Seen on the box: the reply after a read offer came as tool-call markup, the parse error
+    ended the whole attempt and the task was started again from scratch."""
+    root = project(tmp_path)
+    calls: list[dict[str, Any]] = []
+
+    def predictor(**kwargs: Any) -> SimpleNamespace:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise UnparsedError(TOOL_CALLS)
+        return SimpleNamespace(reasoning="r", answer="a", operations=json.dumps([EDIT]))
+
+    solver = solver_for(root, Replies([EDIT]), read_rounds=2)
+    solver.solver.predictor = predictor  # type: ignore[assignment]
+    result = await solver.asolve(query=ISSUE)
+    assert result.success and len(calls) == 2
+    assert "def apply_tax(v):\n    return v * 1.2" in calls[1]["full_context"]
+    assert (root / "shop/big_rules.py").read_text("utf-8").endswith("return v * 1.25\n")
+
+
+@pytest.mark.asyncio
+async def test_a_solver_reply_with_nothing_to_salvage_fails_as_before(tmp_path: Path) -> None:
+    root = project(tmp_path)
+
+    def predictor(**_kwargs: Any) -> SimpleNamespace:
+        raise UnparsedError("I cannot decide.")
+
+    solver = solver_for(root, Replies([EDIT]))
+    solver.solver.predictor = predictor  # type: ignore[assignment]
+    result = await solver.asolve(query=ISSUE)
+    assert result.success is False and result.method == "context_first_error"
