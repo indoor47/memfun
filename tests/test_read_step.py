@@ -370,6 +370,41 @@ def test_operations_are_found_in_a_reply_that_has_no_fields() -> None:
     spread = 'Change this:\n{\n  "op": "edit_file", "path": "a.py",\n  "old": "x", "new": "y"\n}'
     assert cf.salvage_operations(spread)[0]["path"] == "a.py"
     assert cf.salvage_operations("I am not sure what to do.") == []
+    xml = (
+        "Let me look.\n<tool_call>\n<function=search>\n<parameter=pattern>\nparse_enum\n"
+        "</parameter>\n<parameter=path>\nsrc\n</parameter>\n</function>\n</tool_call>\n"
+        "<function=completed>\n</function>"
+    )
+    assert cf.salvage_operations(xml) == [{"op": "search", "pattern": "parse_enum", "path": "src"}]
+    named = '<tool_call>{"name": "read_file", "arguments": {"path": "a.py"}}</tool_call>'
+    assert cf.salvage_operations(named) == [{"op": "read_file", "path": "a.py"}]
+    assert cf.salvage_operations('<tool_call>{"name": "bash", "arguments": {"c": "ls"}}') == []
+
+
+@pytest.mark.asyncio
+async def test_the_whole_reply_is_searched_not_the_piece_the_adapter_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seen on the box: the reply held its fields as one JSON object after some code, the
+    adapter kept only the first braces it found (a code snippet) and reported that; the
+    operations were in the full reply, which the model's call history still has."""
+    root = project(tmp_path)
+    full = (
+        "The resolver does:\n{ k: v(aliases=aliases) for k, v in classes.items() }\n"
+        + json.dumps({"reasoning": "r", "answer": "a", "operations": [EDIT]})
+    )
+    history: list[dict[str, Any]] = [{"outputs": ["an earlier, unrelated call"]}]
+    monkeypatch.setattr(cf, "_lm_history", lambda: history)
+
+    def predictor(**_kwargs: Any) -> SimpleNamespace:
+        history.append({"outputs": [{"text": full}]})
+        raise UnparsedError("{ k: v(aliases=aliases) for k, v in classes.items() }")
+
+    solver = solver_for(root, Replies([EDIT]))
+    solver.solver.predictor = predictor  # type: ignore[assignment]
+    result = await solver.asolve(query=ISSUE)
+    assert result.success
+    assert (root / "shop/big_rules.py").read_text("utf-8").endswith("return v * 1.25\n")
 
 
 @pytest.mark.asyncio
@@ -397,10 +432,15 @@ async def test_a_solver_reply_without_its_fields_does_not_end_the_attempt(tmp_pa
 async def test_a_solver_reply_with_nothing_to_salvage_fails_as_before(tmp_path: Path) -> None:
     root = project(tmp_path)
 
-    def predictor(**_kwargs: Any) -> SimpleNamespace:
-        raise UnparsedError("I cannot decide.")
+    asked: list[str] = []
+
+    def predictor(**kwargs: Any) -> SimpleNamespace:
+        asked.append(kwargs["query"])
+        raise UnparsedError("I cannot decide. " * 10)
 
     solver = solver_for(root, Replies([EDIT]))
     solver.solver.predictor = predictor  # type: ignore[assignment]
     result = await solver.asolve(query=ISSUE)
     assert result.success is False and result.method == "context_first_error"
+    # one retry in place, told what was wrong, before the failure it always was
+    assert asked == [ISSUE, ISSUE + cf.TRUNCATION_NUDGE]

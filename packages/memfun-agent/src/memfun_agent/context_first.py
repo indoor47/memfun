@@ -1057,6 +1057,8 @@ class SingleShotSolver(dspy.Module):
         rounds_used = 0
         while True:
             cfg = _rollout_config(attempt)
+            history = _lm_history()
+            marker = history[-1] if history else None
             try:
                 result = await asyncio.to_thread(
                     self.predictor,
@@ -1065,12 +1067,19 @@ class SingleShotSolver(dspy.Module):
                     **({"config": cfg} if cfg else {}),
                 )
             except Exception as exc:
-                # A reply that could not be split into its fields (a field left out, tool-call
-                # markup around the operations) still says what to do: its operations are
-                # read from the text instead of the whole attempt being thrown away.
-                raw = getattr(exc, "lm_response", None)
-                salvaged = salvage_operations(raw) if isinstance(raw, str) else []
-                if not salvaged:
+                # A reply that could not be split into its fields (a field left out, the
+                # fields written as one JSON object, tool-call markup around the operations)
+                # still says what to do.  Its operations are read from the raw replies of
+                # this call; with none found it is an unparseable reply like any other (one
+                # retry), and only then the failure it always was.
+                error_text = getattr(exc, "lm_response", None)
+                replies = _replies_since(marker)
+                if isinstance(error_text, str) and error_text.strip():
+                    replies.append(error_text)
+                if not replies or attempt > UNPARSEABLE_RETRIES + 1:
+                    raise
+                salvaged = next((o for o in map(salvage_operations, replies) if o), [])
+                if not salvaged and attempt > UNPARSEABLE_RETRIES:
                     raise
                 logger.warning(
                     "Solver reply could not be parsed into its fields; %d operation(s) read "
@@ -1079,8 +1088,9 @@ class SingleShotSolver(dspy.Module):
                 )
                 result = None
             if result is None:
-                reasoning, answer, raw_ops = "", "", json.dumps(salvaged)
-                operations, truncated = salvaged, False
+                reasoning, answer = "", ""
+                raw_ops = json.dumps(salvaged) if salvaged else replies[-1]
+                operations, truncated = salvaged, not salvaged
             else:
                 reasoning = str(getattr(result, "reasoning", ""))
                 answer = str(getattr(result, "answer", ""))
@@ -1170,10 +1180,61 @@ def _parse_operations(raw: str) -> list[dict[str, Any]]:
     return ops
 
 
+def _lm_history() -> list[Any]:
+    """The call history of the active DSPy language model (empty when there is none)."""
+    try:
+        lm = dspy.settings.lm
+        history = getattr(lm, "history", None) if lm is not None else None
+    except Exception:
+        return []
+    return cast("list[Any]", history) if isinstance(history, list) else []
+
+
+def _replies_since(marker: object) -> list[str]:
+    """The raw replies of the model calls made after the history entry *marker* (at most the
+    last four): what the model really wrote, before an adapter cut or rejected it."""
+    out: list[str] = []
+    for entry in reversed(_lm_history()[-4:]):
+        if entry is marker:
+            break
+        outputs = cast("dict[str, Any]", entry).get("outputs") if isinstance(entry, dict) else None
+        first: object = cast("list[object]", outputs)[0] if outputs else ""
+        text = cast("dict[str, Any]", first).get("text") if isinstance(first, dict) else first
+        if isinstance(text, str) and text.strip():
+            out.append(text)
+    return list(reversed(out))
+
+
+_TOOL_FUNCTION = re.compile(r"<function=([\w.-]+)>(.*?)(?:</function>|\Z)", re.DOTALL)
+_TOOL_PARAMETER = re.compile(r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+#: Operation names a tool call written as text may stand for.
+_KNOWN_OPS = READ_ONLY_OPS | {"edit_file", "write_file"}
+
+
+def _operations_from_tool_calls(raw: str) -> list[dict[str, Any]]:
+    """Tool calls written as text (``<function=search><parameter=pattern>x</parameter>``, or
+    ``{"name": "search", "arguments": {...}}``) as operations, when they name one."""
+    ops: list[dict[str, Any]] = []
+    for name, body in _TOOL_FUNCTION.findall(raw):
+        if name in _KNOWN_OPS:
+            ops.append({"op": name, **dict(_TOOL_PARAMETER.findall(body))})
+    decoder = json.JSONDecoder()
+    for m in re.finditer(r"\{\s*\"name\"", raw):
+        try:
+            obj, _ = decoder.raw_decode(raw, m.start())
+        except ValueError:
+            continue
+        call = cast("dict[str, Any]", obj) if isinstance(obj, dict) else {}
+        args = call.get("arguments")
+        if call.get("name") in _KNOWN_OPS and isinstance(args, dict):
+            ops.append({"op": call["name"], **cast("dict[str, Any]", args)})
+    return ops
+
+
 def salvage_operations(raw: str) -> list[dict[str, Any]]:
     """The operations in a reply that could not be parsed into its fields: a JSON array
     anywhere in the text (the last one that holds operations), else operation objects written
-    one after another (for example inside tool-call markup)."""
+    one after another, else tool calls written as text that name an operation."""
     ops = _parse_operations(raw)
     if ops:
         return ops
@@ -1199,7 +1260,7 @@ def salvage_operations(raw: str) -> list[dict[str, Any]]:
             continue
         if isinstance(obj, dict) and "op" in obj:
             ops.append(cast("dict[str, Any]", obj))
-    return ops
+    return ops or _operations_from_tool_calls(raw)
 
 
 def _detect_truncation(
