@@ -80,12 +80,30 @@ def _text(value: Any) -> str:
 
 
 def distinctive_lines(row: dict[str, Any], field: str) -> list[str]:
-    """Lines of a forbidden field that are long and absent from the problem statement."""
+    """Lines of a forbidden field that are long and absent from the problem statement.
+
+    Of a diff (``patch``, ``test_patch``) only the ADDED lines count, and not those the same
+    diff also has as removed or unchanged lines: everything else in a diff is the repository
+    as it already was, which the agent reads legitimately.
+    """
     statement = _text(row.get("problem_statement"))
+    text = _text(row.get(field))
+    is_diff = field in ("patch", "test_patch")
+    old: set[str] = set()
+    if is_diff:
+        for line in text.splitlines():
+            if line.startswith(("+++", "---", "@@", "diff ", "index ")):
+                continue
+            if not line.startswith("+"):
+                old.add(line[1:].strip())
     out: list[str] = []
-    for line in _text(row.get(field)).splitlines():
-        line = line.lstrip("+-").strip()
-        if len(line) >= MIN_LINE and line not in statement:
+    for line in text.splitlines():
+        if is_diff:
+            if not line.startswith("+") or line.startswith("+++"):
+                continue
+            line = line[1:]
+        line = line.strip()
+        if len(line) >= MIN_LINE and line not in statement and line not in old:
             out.append(line)
     return out
 

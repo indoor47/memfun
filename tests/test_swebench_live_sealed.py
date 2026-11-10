@@ -238,6 +238,27 @@ def test_the_audit_finds_what_the_rules_forbid(tmp_path: Path) -> None:
         assert len(found) == 1, (needle, found)
 
 
+def test_the_repository_as_it_was_is_not_a_leak_of_the_reference_patch(tmp_path: Path) -> None:
+    """Found on the first dry test: a diff also holds unchanged and removed lines, which are
+    the repository's own text and are in every prompt that shows the file."""
+    iid = ROW["instance_id"]
+    existing = "    log.debug('widget called with {0!s} and {1!s}'.format(value, mode))"
+    moved = "    result = normalise_the_value(value, strict=True, mode=mode)"
+    row = {
+        **ROW,
+        "patch": "diff --git a/w.py b/w.py\n--- a/w.py\n+++ b/w.py\n@@ -1,3 +1,3 @@\n"
+        f" {existing}\n-{moved}\n+{moved}\n"
+        "+    return frobnicate(result) if result else []  # fix\n",
+    }
+    prompt = TEMPLATE.format(problem_statement=ROW["problem_statement"])
+    shows_file = call(1, f"{prompt}\n=== FILE: w.py ===\n{existing}\n{moved}\n", "ok")
+    run = make_run(tmp_path / "run", [iid], calls=[shows_file])
+    assert sub.audit(run, {iid: row})["n_violations"] == 0
+    leaked = call(1, f"{prompt}\n    return frobnicate(result) if result else []  # fix", "ok")
+    run2 = make_run(tmp_path / "run2", [iid], calls=[leaked])
+    assert sub.audit(run2, {iid: row})["n_violations"] == 1
+
+
 def test_what_the_agent_wrote_itself_is_not_a_leak_when_it_comes_back(tmp_path: Path) -> None:
     """A resolved task: the agent writes the same line as the reference patch, and its own
     edit is in the next prompt.  That is not the dataset leaking."""
