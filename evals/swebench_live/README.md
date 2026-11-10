@@ -68,6 +68,34 @@ installed (`FREEZE.txt`) and its digest (`FREEZE.sha256`) are kept in the bundle
 and `litellm` must be present). A bundle rebuilt later from the same commit is then the same
 bundle.
 
+## A long run on several boxes (streaming, sealed grading)
+
+A 300-instance run cannot keep its images until the end, so an instance is graded and its
+image deleted soon after its rollout, without anyone learning the outcome before every rollout
+is final (plan and numbers: `docs/SWEBENCH-LIVE-LITE-PLAN.md`):
+
+```bash
+# per box: its own shard of ids; grading goes to a directory nothing reads
+python3 evals/swebench_live/runner.py run ... --ids-file shard-1.txt --run-dir runs/lite-1 \
+    --sealed /root/memfun-live/sealed/lite-1 --evaluator /root/memfun-live/eval --split lite --gold-check
+python3 evals/swebench_live/runner.py finalize --run-dir runs/lite-1
+# on one box, after every shard is finalized and copied there (sealed directories merged too)
+python3 evals/swebench_live/submission.py merge --run-dir runs/lite-1 --run-dir runs/lite-2 --out runs/lite
+python3 evals/swebench_live/sealed.py unseal --dir /root/memfun-live/eval --run-dir runs/lite --sealed sealed/lite --split lite
+python3 evals/swebench_live/submission.py audit --run-dir runs/lite --dataset data/lite.jsonl
+python3 evals/swebench_live/submission.py build --run-dir runs/lite --dataset data/lite.jsonl \
+    --out submissions/lite/memfun/MODEL --model-label MODEL
+```
+
+`--sealed` grades an instance only once its record is final (a final instance is never rolled
+out again), writes everything the evaluator says, its exit code included, under the sealed
+directory (mode 0700, outside the run directory) and records in the run directory only that the
+evaluation ran. With `--gold-check` the reference patch is evaluated on the same image before
+it is deleted, sealed the same way. `unseal` refuses a run that is not finalized. `build`
+refuses a run whose self-audit has a violation (a forbidden dataset field or the instance id in
+a prompt, an attempted network access, a credential, an instance that is not final, an attempt
+set aside without a documented infrastructure reason).
+
 ## Gold check first
 
 `grade.py gold` runs the official evaluator with the reference patch. Do it for every instance
