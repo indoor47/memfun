@@ -1065,6 +1065,8 @@ class SingleShotSolver(dspy.Module):
             cfg = _rollout_config(attempt)
             history = _lm_history()
             marker = history[-1] if history else None
+            salvaged: list[dict[str, Any]] = []
+            replies: list[str] = []
             try:
                 result = await asyncio.to_thread(
                     self.predictor,
