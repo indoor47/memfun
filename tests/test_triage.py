@@ -528,6 +528,11 @@ class TestReadAffectedFiles:
 class TestDetectVerifyCommands:
     """Tests for _detect_verify_commands linter auto-detection."""
 
+    @pytest.fixture(autouse=True)
+    def _tools_installed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Detection only asks for a linter that is on PATH.
+        monkeypatch.setattr("shutil.which", lambda tool, *a, **k: f"/usr/bin/{tool}")
+
     def test_detects_python_ruff(self, tmp_path: Path) -> None:
         from memfun_agent.context_first import _detect_verify_commands
 

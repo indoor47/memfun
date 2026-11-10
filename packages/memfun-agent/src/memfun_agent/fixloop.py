@@ -182,6 +182,22 @@ def compact_errors(output: str, per_failure: int = 900, max_failures: int = 12) 
     return ("\n".join(head) + "\n\n" + body).strip()
 
 
+def compact_blocks(blocks: list[str], other_limit: int = 3_000) -> str:
+    """:func:`compact_errors` per failing command: a pytest run is compacted as usual, the
+    output of any other command (a syntax or import check, a reproduction script) is kept,
+    clipped.  Compacting the joined text would keep only the pytest part."""
+    return "\n\n".join(
+        compact_errors(b) if summarize(b).found else clip(b, other_limit) for b in blocks
+    )
+
+
+def other_failures(blocks: list[str]) -> int:
+    """How many failing commands are not test runs (they count as failures of their own when
+    rounds are compared, next to the failing tests)."""
+    kinds = [summarize(b).found for b in blocks]
+    return kinds.count(False) if any(kinds) else 0
+
+
 @dataclass
 class BestSoFar:
     """Snapshot the owned files whenever a round beats the best score; restore at the end."""
@@ -697,6 +713,20 @@ def probe_fingerprint(output: str) -> str:
 
 
 PROBE_LOG = ".memfun/probes.jsonl"
+CHECK_LOG = ".memfun/checks.jsonl"
+
+
+def log_check(project_root: Path, record: dict[str, object]) -> None:
+    """Append one record of what the solver's own checks did (a reproduction attempt, the
+    tests it selected, a verify round) to ``.memfun/checks.jsonl``: the evidence of which real
+    tests ran and what they said.  Best effort: a logging failure never affects the solve."""
+    try:
+        path = project_root / CHECK_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.time(), **record}, default=str) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def init_probe_log(project_root: Path) -> None:

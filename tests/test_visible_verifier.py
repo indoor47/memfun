@@ -79,7 +79,10 @@ def test_the_runner_trusts_its_own_episode_verify_file(tmp_path: Path) -> None:
     assert env[rs.TRUST_PROJECT_VERIFY_ENV] == "1"
 
 
-def test_solver_uses_the_project_verify_file_before_auto_detection(tmp_path: Path) -> None:
+def test_solver_uses_the_project_verify_file_before_auto_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda tool, *a, **k: f"/usr/bin/{tool}")  # installed
     (tmp_path / "pyproject.toml").write_text("[tool.ruff]\n")  # would auto-detect ruff
     solver = cf.ContextFirstSolver.__new__(cf.ContextFirstSolver)
     solver.project_root = tmp_path

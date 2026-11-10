@@ -572,7 +572,25 @@ async def test_verifier_no_commands(tmp_path: Path):
 # ── _detect_verify_commands tests ─────────────────────────────
 
 
-def test_detect_verify_python(tmp_path: Path):
+@pytest.fixture
+def tools_installed(monkeypatch):
+    """Every linter looks installed (detection asks ``shutil.which``)."""
+    monkeypatch.setattr("shutil.which", lambda tool, *a, **k: f"/usr/bin/{tool}")
+
+
+def test_a_linter_that_is_not_installed_is_not_asked_for(tmp_path: Path, monkeypatch):
+    """`ruff: not found` in a fix loop is noise: no tool on PATH, no command."""
+    for name in ("pyproject.toml", "go.mod", "Cargo.toml", "package.json", ".eslintrc.json"):
+        (tmp_path / name).write_text("")
+    monkeypatch.setattr("shutil.which", lambda tool, *a, **k: None)
+    assert _detect_verify_commands(tmp_path) == []
+    monkeypatch.setattr(
+        "shutil.which", lambda tool, *a, **k: "/usr/bin/go" if tool == "go" else None
+    )
+    assert _detect_verify_commands(tmp_path) == ["go vet ./..."]
+
+
+def test_detect_verify_python(tmp_path: Path, tools_installed):
     """Detects ruff for Python projects."""
     (tmp_path / "pyproject.toml").write_text("[tool.ruff]")
     cmds = _detect_verify_commands(tmp_path)
@@ -585,14 +603,14 @@ def test_detect_verify_empty(tmp_path: Path):
     assert cmds == []
 
 
-def test_detect_verify_go(tmp_path: Path):
+def test_detect_verify_go(tmp_path: Path, tools_installed):
     """Detects go vet for Go projects."""
     (tmp_path / "go.mod").write_text("module example.com/foo")
     cmds = _detect_verify_commands(tmp_path)
     assert "go vet ./..." in cmds
 
 
-def test_detect_verify_rust(tmp_path: Path):
+def test_detect_verify_rust(tmp_path: Path, tools_installed):
     """Detects cargo check for Rust projects."""
     (tmp_path / "Cargo.toml").write_text("[package]")
     cmds = _detect_verify_commands(tmp_path)
