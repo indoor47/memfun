@@ -13,6 +13,7 @@ files a leaderboard submission needs (`preds.json`, raw trajectories, the offici
 | `runner.py` | Per instance: pull, start on an internal network, find the repository, lock down history, network self-test, rollout, collect and check the patch, delete the image. Resume, frozen settings, `finalize`. |
 | `grade.py` | The official evaluator at a pinned commit; refuses a run that is not finalized. |
 | `provision.sh` | Builds the read-only agent bundle on a Linux x86_64 Docker box; teardown. |
+| `mini_driver.py` | The baseline arm: mini-swe-agent, unchanged, attached to the runner's container. |
 
 ## Rules and the mechanism behind each
 
@@ -79,6 +80,15 @@ when they are fresh and complete.
 - **A finished agent used to hang** instead of exiting (fixed in memfun since); the runner
   still reaps an agent that wrote its result and does not exit (`reaped_after_result`).
 
-Known limits: the agent arm is memfun only (a baseline arm is planned); a problem statement
+## Baseline arm
+
+`--arm mini --mini-python /path/to/venv/bin/python` runs mini-swe-agent on the same container,
+network and proxy: `uv venv mini/venv && uv pip install --python mini/venv/bin/python
+mini-swe-agent mcp` (litellm imports `mcp`). It runs on the host and drives the prepared
+container with `docker exec`; its patch is what the agent submits. Give it a token budget
+(`--max-tokens-per-instance`): it is the only spend limit, the model's price is unknown to
+litellm.
+
+Known limits: a problem statement
 over 120 KB cannot be passed (reported as an infrastructure error); images whose C library is
 not glibc cannot run the bundle; submodule repositories are flagged, not locked down.

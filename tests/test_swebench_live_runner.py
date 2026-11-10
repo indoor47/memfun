@@ -72,6 +72,7 @@ if args[0] == "exec":
     elif step == "done": sys.exit(0 if has("result") else 1)
     elif step == "result": sys.exit(1)
     elif step == "collect": sys.stdout.write(scen.get("patch", ""))
+    elif step == "agentstate": sys.stdout.write(scen.get("state", {}).get(args[-1], ""))
     elif step == "patchcheck": sys.exit(0 if scen.get("applies", True) else 1)
     sys.exit(0)
 sys.exit(2)
@@ -162,7 +163,8 @@ def test_a_rollout_end_to_end_records_patch_trajectory_and_usage(env) -> None:
     steps = [a.split("=", 1)[1] for c in e.calls() for a in c if a.startswith("MFL_STEP=")]
     # the order is the contract: history lock-down and the network self-test BEFORE the rollout
     assert steps == [
-        "findrepo", "lockdown", "baseline", "nettest", "config", "rollout", "result", "collect", "patchcheck"
+        "findrepo", "lockdown", "baseline", "nettest", "config", "rollout", "result",
+        "agentstate", "agentstate", "agentstate", "collect", "patchcheck",
     ]  # fmt: skip
     kinds = [c[0] for c in e.calls()]
     assert kinds[-3:] == ["rm", "rmi", "network"]  # pull-run-delete, nothing left behind
@@ -216,6 +218,14 @@ def test_a_run_created_before_agent_options_existed_can_be_resumed(env) -> None:
     del meta["settings"]["agent_options"]
     (e.run_dir / "run.json").write_text(json.dumps(meta))
     assert rn.main(e.argv()) == 0  # same settings: accepted, nothing re-run
+
+
+def test_the_agents_own_check_log_is_kept_with_the_trajectory(env) -> None:
+    e = env(state={".memfun/checks.jsonl": '{"event": "verify"}\n'})
+    assert rn.main(e.argv()) == 0
+    idir = e.run_dir / "instances" / SENTINELS["instance_id"]
+    assert (idir / "checks.jsonl").read_text() == '{"event": "verify"}\n'
+    assert e.record()["agent_state"] == ["checks.jsonl"] and not (idir / "probes.jsonl").exists()
 
 
 def test_the_container_is_isolated_and_limited(env) -> None:
@@ -458,3 +468,83 @@ def test_dataset_selection_and_dev_sample(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError):
         ds.task_of({"instance_id": "../etc"})
+
+
+# ── the baseline arm (mini-swe-agent on the host, driving the prepared container) ────────────
+
+SUBMISSION = "diff --git a/s.py b/s.py\n--- a/s.py\n+++ b/s.py\n@@ -1 +1 @@\n-a = 1\n+a = 2\n"
+FAKE_MINI_DRIVER = r"""
+import json, os, sys, time, urllib.request
+from pathlib import Path
+args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
+task = sys.stdin.read()
+seen = {"argv": sys.argv[1:], "task": task, "env": dict(os.environ)}
+Path(__file__).with_name("driver-seen.json").write_text(json.dumps(seen))
+if "SLEEP" in task:
+    time.sleep(600)
+req = urllib.request.Request(args["--base-url"] + "/chat/completions",
+    data=json.dumps({"messages": [{"role": "user", "content": task}]}).encode(),
+    headers={"Content-Type": "application/json"})
+urllib.request.urlopen(req, timeout=20).read()
+out = Path(args["--out"])
+(out / "submission.diff").write_text(SUBMISSION)
+(out / "mini.traj.json").write_text("{}")
+(out / "result.json").write_text(json.dumps({"exit_status": "Submitted", "steps": 1}))
+print("driver done")
+"""
+
+
+def mini_argv(e: Env, monkeypatch: pytest.MonkeyPatch, *extra: str) -> list[str]:
+    driver = e.tmp / "fake_mini_driver.py"
+    driver.write_text(FAKE_MINI_DRIVER.replace("SUBMISSION)", repr(SUBMISSION) + ")"))
+    monkeypatch.setattr(rn, "MINI_DRIVER", driver)
+    return e.argv("--arm", "mini", "--mini-python", sys.executable, *extra)
+
+
+def test_the_baseline_arm_sees_only_the_problem_statement_and_its_submission_is_the_patch(
+    env, monkeypatch
+) -> None:
+    e = env()
+    assert rn.main(mini_argv(e, monkeypatch)) == 0
+    rec = e.record()
+    idir = e.run_dir / "instances" / SENTINELS["instance_id"]
+    assert rec["status"] == "done" and rec["usage"]["calls"] == 1 and rec["flags"] == []
+    assert (idir / "patch.diff").read_text() == SUBMISSION  # what the agent submitted...
+    assert (idir / "worktree.diff").read_text() == PATCH  # ...not whatever it left behind
+    assert rec["mini"] == {"exit_status": "Submitted", "steps": 1}
+    assert (idir / "mini.traj.json").exists() and (idir / "mini-result.json").exists()
+    assert "driver done" in (idir / "agent.log").read_text()
+    seen = json.loads((e.tmp / "driver-seen.json").read_text())
+    assert seen["task"] == SENTINELS["problem_statement"]  # rule 1: exactly this, on stdin
+    blob = json.dumps([seen["argv"], seen["env"]])
+    for needle in ("SENTINEL", "4242", "octo__widget"):
+        assert needle not in blob, needle
+    args = dict(zip(seen["argv"][0::2], seen["argv"][1::2], strict=True))
+    assert args["--container"].startswith("mfl-") and args["--cwd"] == "/testbed"
+    assert args["--config"] == "swebench.yaml" and "/i/" in args["--base-url"]
+    assert not (e.run_dir / "tmp" / args["--container"]).exists()  # scratch removed
+    assert set(seen["env"]) <= {"PATH", "HOME", "MSWEA_GLOBAL_CONFIG_DIR", "MSWEA_CONFIGURED",
+                                "PYTHONUNBUFFERED", "NO_PROXY", "LC_CTYPE", "__CF_USER_TEXT_ENCODING"}  # fmt: skip
+    settings = json.loads((e.run_dir / "run.json").read_text())["settings"]
+    assert settings["arm"] == "mini" and settings["mini_config"] == "swebench.yaml"
+    assert not any("MFL_STEP=rollout" in c for c in e.calls())  # nothing ran IN the container
+    assert any("MFL_STEP=putpatch" in c for c in e.calls())  # the submission was checked
+
+
+def test_a_baseline_run_over_its_time_is_killed_and_has_no_patch(env, monkeypatch) -> None:
+    rows = dict(SENTINELS, problem_statement="SLEEP forever")
+    e = env()
+    e.data.write_text(json.dumps(rows) + "\n")
+    argv = mini_argv(e, monkeypatch)
+    argv[argv.index("--instance-timeout") + 1] = "1"
+    rn.main(argv)
+    rec = e.record()
+    # no model answer at all is an infrastructure failure, exactly as for the memfun arm
+    assert rec["status"] == "infra_error" and "no answer from the model" in rec["error"]
+    assert any(c[0] == "restart" for c in e.calls())  # nothing keeps editing
+
+
+def test_the_baseline_arm_needs_its_interpreter(env) -> None:
+    e = env()
+    with pytest.raises(SystemExit, match="--mini-python"):
+        rn.main(e.argv("--arm", "mini"))

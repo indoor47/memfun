@@ -36,6 +36,7 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import json
+import os
 import secrets
 import shutil
 import signal
@@ -52,6 +53,7 @@ from evals.swebench_live import proxy as px
 
 HERE = Path(__file__).resolve().parent
 LOCKDOWN = HERE / "lockdown.sh"
+MINI_DRIVER = HERE / "mini_driver.py"
 #: The whole task text given to the agent besides the issue itself: general, never specific to
 #: an instance or a repository (a test checks this file for instance-specific text).
 PROMPT_TEMPLATE = (
@@ -150,6 +152,10 @@ class Settings:
     #: repository (never part of a patch): e.g. ``discover_tests``, ``reproduce``,
     #: ``probe_guard`` (``"off"`` is right here: the container is disposable).
     agent_options: dict[str, Any] = dataclasses.field(default_factory=dict)
+    #: Baseline arm (``arm = "mini"``): the shipped mini-swe-agent config and its step limit
+    #: (0 = the config's own).  Empty / 0 for the memfun arm.
+    mini_config: str = ""
+    mini_step_limit: int = 0
 
 
 @dataclasses.dataclass
@@ -162,6 +168,7 @@ class Context:
     gateway: str
     bundle: Path
     keep_images: bool
+    mini_python: str = ""
     stop: threading.Event = dataclasses.field(default_factory=threading.Event)
     live: set[str] = dataclasses.field(default_factory=set)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
@@ -448,6 +455,92 @@ def collect_patch(box: Box, repo: str, base_tree: str) -> tuple[str, bool]:
     return patch, ok
 
 
+def host_rollout(
+    ctx: Context, box: Box, repo: str, base_url: str, task_text: str, log: Path, out: Path
+) -> tuple[str, int | None, float]:
+    """The baseline arm: mini-swe-agent runs on the host (its own virtualenv) and drives the
+    prepared container with ``docker exec``.  It is given the problem statement on stdin and
+    an opaque container name and output directory: no instance id anywhere it can see.
+    Returns ``(how, exit_code, work_s)`` like :meth:`Box.rollout`; on a timeout the driver's
+    process group is killed and the container restarted, so nothing keeps editing."""
+    s = ctx.settings
+    argv = [
+        ctx.mini_python, str(MINI_DRIVER), "--container", box.name, "--cwd", repo,
+        "--base-url", base_url, "--model", s.model, "--out", str(out),
+        "--config", s.mini_config, "--step-limit", str(s.mini_step_limit),
+        "--wall-limit", str(max(60, s.instance_timeout - 120)), "--docker", ctx.docker,
+    ]  # fmt: skip
+    env = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": str(out),
+        "MSWEA_GLOBAL_CONFIG_DIR": str(out / "config"),
+        "MSWEA_CONFIGURED": "true",
+        "PYTHONUNBUFFERED": "1",
+        "NO_PROXY": "*",
+    }
+    out.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    with log.open("wb") as fh:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=fh, stderr=fh, env=env, start_new_session=True
+        )
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(task_text.encode())
+            proc.stdin.close()
+            while True:
+                try:
+                    return "exited", proc.wait(timeout=5.0), time.time() - t0
+                except subprocess.TimeoutExpired:
+                    if time.time() - t0 >= s.instance_timeout or ctx.stop.is_set():
+                        break
+        finally:
+            if proc.poll() is None:
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=30)
+    box.restart()
+    return "timeout", None, time.time() - t0
+
+
+def submitted_patch(box: Box, repo: str, base_tree: str, patch: str) -> bool:
+    """Whether a patch the agent SUBMITTED applies to a copy of the image's initial tree."""
+    if not patch.strip():
+        return True
+    box.must(
+        "putpatch",
+        ["sh", "-c", f"mkdir -p {HOME_IN} && cat > {HOME_IN}/patch.diff"],
+        stdin=patch.encode(),
+    )
+    check = (
+        "rm -rf /tmp/mfl-check && mkdir /tmp/mfl-check && "
+        f"git archive {base_tree} | tar -x -C /tmp/mfl-check && cd /tmp/mfl-check && "
+        f"git apply --check --whitespace=nowarn {HOME_IN}/patch.diff"
+    )
+    return box.exec("patchcheck", ["sh", "-c", check], workdir=repo, timeout=900).returncode == 0
+
+
+#: The agent's own record of what it checked (which tests it ran and what they said, its
+#: reproduction script, its experiments): kept with the trajectory, never part of a patch.
+AGENT_STATE = (
+    (".memfun/checks.jsonl", "checks.jsonl"),
+    (".memfun/probes.jsonl", "probes.jsonl"),
+    (".memfun/repro/issue_repro.py", "issue_repro.py"),
+)
+
+
+def collect_agent_state(box: Box, repo: str, idir: Path) -> list[str]:
+    """Copy the files of :data:`AGENT_STATE` that exist out of the container."""
+    got: list[str] = []
+    for rel, dest in AGENT_STATE:
+        script = 'f="$1/$2"; [ -f "$f" ] && head -c 5000000 "$f"'
+        res = box.exec("agentstate", ["sh", "-c", script, "sh", repo, rel], timeout=120)
+        if res.returncode == 0 and res.stdout:
+            (idir / dest).write_bytes(res.stdout)
+            got.append(dest)
+    return got
+
+
 def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str, Any]:
     """One rollout.  Returns the instance record (also written to ``instance.json``)."""
     s = ctx.settings
@@ -523,14 +616,20 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
             "COLUMNS": "160",
         }
         t0 = time.time()
-        how, exit_code, work_s = box.rollout(
-            rollout_argv(ctx, prompt),
-            workdir=repo,
-            env=env,
-            log=idir / "agent.log",
-            timeout=s.instance_timeout,
-            done_file=f"{HOME_IN}/swarm-result.json",
-        )
+        mini_out = ctx.run_dir / "tmp" / box.name  # opaque: the driver never sees the id
+        if s.arm == "mini":
+            how, exit_code, work_s = host_rollout(
+                ctx, box, repo, base_url, inp.problem_statement, idir / "agent.log", mini_out
+            )
+        else:
+            how, exit_code, work_s = box.rollout(
+                rollout_argv(ctx, prompt),
+                workdir=repo,
+                env=env,
+                log=idir / "agent.log",
+                timeout=s.instance_timeout,
+                done_file=f"{HOME_IN}/swarm-result.json",
+            )
         rec["agent_exit"] = exit_code
         timed_out = how == "timeout"
         if how != "exited":  # nothing may keep editing while the patch is collected
@@ -549,7 +648,21 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
                 f"the agent got no answer from the model ({usage.calls} calls, "
                 f"{usage.errors} errors): see agent.log"
             )
+        rec["agent_state"] = collect_agent_state(box, repo, idir)
         patch, applies = collect_patch(box, repo, base_tree)
+        if s.arm == "mini":
+            # The standard result of mini-swe-agent is the patch the agent SUBMITS; what else
+            # it left in the working tree (scratch files, its patch file) is kept for reference.
+            (idir / "worktree.diff").write_text(patch, "utf-8")
+            kept = {"mini.traj.json": "mini.traj.json", "result.json": "mini-result.json"}
+            for name, dest in kept.items():
+                if (mini_out / name).is_file():
+                    shutil.copyfile(mini_out / name, idir / dest)
+            sub = mini_out / "submission.diff"
+            patch = sub.read_text("utf-8") if sub.is_file() else ""
+            applies = submitted_patch(box, repo, base_tree, patch)
+            rec["mini"] = read_json(mini_out / "result.json") or {}
+            shutil.rmtree(mini_out, ignore_errors=True)
         (idir / "patch.diff").write_text(patch, "utf-8")
         rec["patch_bytes"] = len(patch.encode())
         rec["patch_applies"] = applies
@@ -647,7 +760,8 @@ def open_run(run_dir: Path, settings: Settings, ids: list[str]) -> None:
     if meta.get("finalized"):
         raise SystemExit("this run is finalized: no further rollouts (rule: single rollout)")
     saved = dict(meta.get("settings") or {})
-    saved.setdefault("agent_options", {})  # runs created before the option existed
+    for key, default in (("agent_options", {}), ("mini_config", ""), ("mini_step_limit", 0)):
+        saved.setdefault(key, default)  # runs created before the setting existed
     if saved != mine:
         diff = sorted(k for k in mine if saved.get(k) != mine[k])
         raise SystemExit(f"settings differ from the frozen run.json in {diff}: start a new run")
@@ -799,7 +913,11 @@ def cmd_run(a: argparse.Namespace) -> int:
         agent_version=bundle_version(bundle),
         runner_commit=git_commit(),
         agent_options=parse_force(a.agent_option),
+        mini_config=a.mini_config if a.arm == "mini" else "",
+        mini_step_limit=a.mini_step_limit if a.arm == "mini" else 0,
     )
+    if a.arm == "mini" and not (a.mini_python and Path(a.mini_python).is_file()):
+        raise SystemExit("--arm mini needs --mini-python (a virtualenv with mini-swe-agent)")
     run_dir = a.run_dir.resolve()
     open_run(run_dir, settings, [str(r["instance_id"]) for r in rows])
     key = a.key_file.read_text("utf-8").strip() if a.key_file else ""
@@ -824,6 +942,7 @@ def cmd_run(a: argparse.Namespace) -> int:
         gateway=gateway,
         bundle=bundle,
         keep_images=a.keep_images,
+        mini_python=a.mini_python,
     )
 
     def on_signal(_sig: int, _frm: Any) -> None:
@@ -880,7 +999,10 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--key-file", type=Path, default=None, help="upstream API key (never printed)")
     r.add_argument("--model", required=True)
     r.add_argument("--bundle", type=Path, required=True)
-    r.add_argument("--arm", default="memfun", choices=("memfun",))
+    r.add_argument("--arm", default="memfun", choices=("memfun", "mini"))
+    r.add_argument("--mini-python", default="", help="python of a venv with mini-swe-agent")
+    r.add_argument("--mini-config", default="swebench.yaml", help="a shipped benchmark config")
+    r.add_argument("--mini-step-limit", type=int, default=0, help="0 = the config's own limit")
     r.add_argument("--solver", default="context-first", choices=("context-first", "rlm"))
     r.add_argument("--temperature", type=float, default=0.7)
     r.add_argument("--llm-max-tokens", type=int, default=32768)
