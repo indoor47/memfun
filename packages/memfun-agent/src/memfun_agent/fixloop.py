@@ -191,13 +191,6 @@ def compact_blocks(blocks: list[str], other_limit: int = 3_000) -> str:
     )
 
 
-def other_failures(blocks: list[str]) -> int:
-    """How many failing commands are not test runs (they count as failures of their own when
-    rounds are compared, next to the failing tests)."""
-    kinds = [summarize(b).found for b in blocks]
-    return kinds.count(False) if any(kinds) else 0
-
-
 @dataclass
 class BestSoFar:
     """Snapshot the owned files whenever a round beats the best score; restore at the end."""

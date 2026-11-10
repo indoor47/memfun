@@ -360,6 +360,10 @@ def select_tests(
 # ── running ──────────────────────────────────────────────────────────────────────────────────
 
 
+#: pytest's exit code when it collected no test to run (here: every selected test is left out).
+PYTEST_NO_TESTS_RAN = 5
+
+
 def test_command(
     setup: TestSetup, test_files: list[str], deselect: list[str] | tuple[str, ...] = ()
 ) -> list[str]:

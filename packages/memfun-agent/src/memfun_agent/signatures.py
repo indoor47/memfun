@@ -721,6 +721,45 @@ class IssueReproduction(dspy.Signature):
     )
 
 
+class TestFailureTriage(dspy.Signature):
+    """Decide, for each existing test that fails after a change, whether it is out of date.
+
+    A change was made to the project to carry out the task.  Some of the project's existing
+    tests, which passed before the change, fail now.  For EACH failing test decide:
+
+    - ``old_behaviour``: the test asserts exactly the behaviour the task asks to change (the
+      output, format, default, message or signature that the task says is wrong or must become
+      different), AND the result the change now produces is what the task asks for.  The
+      failure is the expected consequence of doing the task; the test is out of date.
+    - ``regression``: everything else.  The test checks behaviour the task does not ask to
+      change, or the change produces something the task does not describe (a crash, a value
+      that is neither the old one nor the one the task wants).  The code has to be corrected.
+
+    Be strict.  ``old_behaviour`` needs a concrete statement in the task that contradicts what
+    the test asserts; a test that merely exercises the changed code is not out of date.  When
+    in doubt answer ``regression``.
+    """
+
+    __test__ = False  # not a pytest test class
+
+    query: str = dspy.InputField(desc="The task (an issue report or a change request)")
+    change: str = dspy.InputField(desc="The change that was made, as a diff")
+    failing_tests: str = dspy.InputField(
+        desc="The failing tests, numbered: id, source and failure output of each"
+    )
+
+    reasoning: str = dspy.OutputField(
+        desc="Per test: what it asserts, what the task says about that, what the code now does"
+    )
+    verdicts: str = dspy.OutputField(
+        desc=(
+            "JSON array with one object per test: "
+            '{"test": <its number>, "verdict": "old_behaviour" or "regression", '
+            '"why": "<one sentence>"}'
+        )
+    )
+
+
 class ConsistencyReview(dspy.Signature):
     """Review whether executed code changes are complete and internally consistent.
 

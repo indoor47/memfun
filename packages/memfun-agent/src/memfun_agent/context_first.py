@@ -40,6 +40,7 @@ from memfun_agent.signatures import (
     ExperimentProposal,
     IssueReproduction,
     SingleShotSolving,
+    TestFailureTriage,
     VerificationFix,
 )
 
@@ -1558,6 +1559,8 @@ class VerifyResult:
     skipped: list[str] = field(default_factory=lambda: [])
     #: The error text of each failing command, in order (``errors`` is these joined).
     blocks: list[str] = field(default_factory=lambda: [])
+    #: The failing commands themselves, parallel to ``blocks``.
+    failed_cmds: list[str] = field(default_factory=lambda: [])
 
 
 #: Seconds one verification command may run (the whole process group is killed after that).
@@ -1573,6 +1576,9 @@ class Verifier:
         self.timeout = timeout
         #: Shown instead of the command line in the error text (for long generated commands).
         self.labels: dict[str, str] = {}
+        #: Exit codes other than 0 that are not a failure, per command (pytest ends with 5
+        #: when every selected test was left out: nothing ran, nothing failed).
+        self.ok_exits: dict[str, tuple[int, ...]] = {}
 
     async def averify(
         self,
@@ -1589,12 +1595,14 @@ class Verifier:
         import subprocess
 
         errors: list[str] = []
+        failed_cmds: list[str] = []
         commands_run: list[str] = []
         skipped: list[str] = []
         env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
         for cmd in commands:
             commands_run.append(cmd)
+            before = len(errors)
             try:
                 result = await asyncio.to_thread(
                     fixloop._run_in_group,  # pyright: ignore[reportPrivateUsage]
@@ -1609,7 +1617,7 @@ class Verifier:
                     )
                     skipped.append(cmd)
                     continue
-                if result.returncode != 0:
+                if result.returncode != 0 and result.returncode not in self.ok_exits.get(cmd, ()):
                     output = ""
                     if result.stdout:
                         # head + tail: pytest prints its failure summary LAST
@@ -1623,6 +1631,8 @@ class Verifier:
                 errors.append(f"$ {shown} (timed out after {self.timeout:.0f}s)")
             except Exception as exc:
                 errors.append(f"$ {self.labels.get(cmd, cmd)} (error: {exc})")
+            if len(errors) > before:
+                failed_cmds.append(cmd)
 
         return VerifyResult(
             passed=len(errors) == 0,
@@ -1630,6 +1640,7 @@ class Verifier:
             commands_run=commands_run,
             skipped=skipped,
             blocks=errors,
+            failed_cmds=failed_cmds,
         )
 
 
@@ -1707,9 +1718,13 @@ class ProbeSolver(dspy.Module):
 
 # ── Reproduction: show the problem before the change, check it after ──────────────────────
 
+#: Where the script is while it runs (guard ``off``).  It is written right before each run and
+#: removed right after: memfun's scratch is never there for the project's linters or tests to
+#: pick up, and a script that deletes its own directory cannot break a later run.  The text is
+#: kept in memory and in ``.memfun/checks.jsonl``.
 REPRO_FILE = ".memfun/repro/issue_repro.py"
 REPRO_TIMEOUT_S = 90.0
-REPRO_LABEL = "reproduction script (must print REPRO: PASS)"
+REPRO_LABEL = "reproduction script"
 #: Runs the script like a test: from the project root, the project's own packages first.
 _REPRO_LAUNCH = (
     "import os, runpy, sys; r = sys.argv[1]; s = sys.argv[2]; "
@@ -1726,6 +1741,8 @@ class Reproduction:
     script: str
     argv: list[str]
     output: str  # what it printed on the unchanged code
+    #: What it reported on the unchanged code, comparable between runs (:func:`repro_signature`).
+    signature: str = ""
 
 
 def repro_argv(python: str, project_root: Path, script: str, guard: str) -> list[str]:
@@ -1755,6 +1772,56 @@ def classify_repro(code: int | None, output: str) -> str:
     if code == 0 and passed and not failed:
         return "passes"
     return "broken"
+
+
+def repro_report(output: str) -> str:
+    """The script's own report of the problem: its ``REPRO: FAIL`` line and what follows."""
+    m = re.search(r"^REPRO: FAIL.*", output, re.M | re.S)
+    return m.group(0).strip() if m else ""
+
+
+def repro_signature(output: str) -> str:
+    """What a failing reproduction reported, comparable between two runs: its first
+    ``REPRO: FAIL`` line without the values that differ from run to run (quoted text, numbers,
+    bracketed lists).  Empty when there is no such line."""
+    m = re.search(r"^REPRO: FAIL.*$", output, re.M)
+    if not m:
+        return ""
+    line = m.group(0).lower()
+    line = re.sub(r"'[^']*'|\"[^\"]*\"|`[^`]*`", "''", line)
+    line = re.sub(r"0x[0-9a-f]+|\d+(?:\.\d+)?", "0", line)
+    line = re.sub(r"\[.*?\]|\(.*?\)|\{.*?\}", "..", line)
+    return " ".join(line.split())
+
+
+#: Words with which a report says the script ran into an ERROR, as opposed to observing a wrong
+#: result.  Such a report is the task's problem only when the task itself speaks of that error.
+_ERROR_WORDS = re.compile(
+    r"\b[A-Z]\w*(?:Error|Exception)\b|\b(?:unexpected|exception|traceback)\b|is not callable|"
+    r"has no attribute|no module named|is not defined|cannot import|unexpected keyword|"
+    r"positional argument",
+    re.I,
+)
+_ERROR_CLASS = re.compile(r"\b[A-Z]\w*(?:Error|Exception)\b")
+
+
+def repro_shows_the_task(task: str, output: str) -> bool:
+    """Whether a failing reproduction plausibly shows the problem *task* describes, and not a
+    mistake of its own (a wrong attribute, toy objects that do not fit together, a missing
+    optional dependency: all seen on real repositories, each reported as ``REPRO: FAIL``).
+
+    A report of a wrong RESULT is taken as it is.  A report of an ERROR (an exception class,
+    "unexpected", "has no attribute", "No module named", ...) counts only when the task speaks
+    of that error: it names the exception class, or shares four consecutive words with the
+    report."""
+    report = repro_report(output)
+    if not _ERROR_WORDS.search(report):
+        return True
+    task_words = " ".join(re.findall(r"[a-z0-9_]+", task.lower()))
+    if any(name.lower() in task_words for name in _ERROR_CLASS.findall(report)):
+        return True
+    words = re.findall(r"[a-z0-9_]+", report.lower())[2:]  # after "repro fail"
+    return any(" ".join(words[i : i + 4]) in task_words for i in range(len(words) - 3))
 
 
 def traceback_context(output: str, project_root: Path, have: str, *, radius: int = 40) -> str:
@@ -1802,6 +1869,78 @@ class ReproSolver(dspy.Module):
         script = str(getattr(result, "script", "") or "").strip()
         script = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", script).strip()
         return script if "REPRO:" in script else ""
+
+
+@dataclass
+class OwnTests:
+    """The project's tests selected for one solve, and how to run them."""
+
+    setup: repo_tests.TestSetup
+    files: list[str]
+    #: Failures that were already there before the change: never counted.
+    failing_before: list[str]
+    #: The current command (rebuilt when a test is left out).
+    command: str = ""
+    #: Tests that fail because they assert the behaviour the task changes: left out.
+    old_behaviour: list[str] = field(default_factory=lambda: [])
+    #: Test id -> the failure it was last classified with (a test is asked about again only
+    #: when it fails differently).
+    asked: dict[str, str] = field(default_factory=lambda: {})
+    triage_calls: int = 0
+
+
+#: At most this many failing tests are classified in one call, and this many calls per solve.
+TRIAGE_MAX_TESTS = 8
+TRIAGE_MAX_CALLS = 3
+#: Said to the fix step whenever the solver's own checks are on.
+FIX_NOTE_OLD_TESTS = (
+    "\n\nNOTE: an existing test can assert behaviour that the task asks to change. Never undo "
+    "the task's change to make such a test pass: correct the change if it is wrong, and leave "
+    "a test that only checks the old behaviour failing."
+)
+
+
+def failure_sections(block: str) -> dict[str, str]:
+    """pytest's failure sections of *block* by title (``Class.test[param]``)."""
+    parts = re.split(r"\n_{3,}\s+(.+?)\s+_{3,}\n", fixloop.strip_ansi(block))
+    out: dict[str, str] = {}
+    for i in range(1, len(parts) - 1, 2):
+        body = re.split(r"\n=+ [^\n]*=+\n", parts[i + 1])[0]
+        out.setdefault(parts[i], body.strip())
+    return out
+
+
+class TestTriage(dspy.Module):
+    """Classify failing existing tests against the task (one LLM call)."""
+
+    __test__ = False  # not a pytest test class
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.predictor = dspy.Predict(TestFailureTriage)
+
+    async def aclassify(self, query: str, change: str, failing_tests: str) -> dict[int, str]:
+        """``{test number: "old_behaviour" | "regression"}``; a test the answer does not name,
+        or names with anything else, is a regression."""
+        result = await asyncio.to_thread(
+            self.predictor, query=query, change=change, failing_tests=failing_tests
+        )
+        raw = str(getattr(result, "verdicts", "") or "")
+        m = re.search(r"\[.*\]", raw, re.S)
+        try:
+            items = json.loads(m.group(0)) if m else []
+        except ValueError:
+            items = []
+        out: dict[int, str] = {}
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            number, verdict = item.get("test"), str(item.get("verdict", "")).strip().lower()
+            if isinstance(number, str) and number.strip().lstrip("Tt").isdigit():
+                number = int(number.strip().lstrip("Tt"))
+            if isinstance(number, int) and not isinstance(number, bool):
+                out[number] = "old_behaviour" if verdict == "old_behaviour" else "regression"
+        return out
 
 
 class ConsistencyReviewer(dspy.Module):
@@ -1867,6 +2006,11 @@ class ContextFirstSolver:
     #: the first solution).
     _log_checks: bool = False
     _first_on_tie: bool = False
+    #: The kept reproduction (run after every change as EVIDENCE, see :meth:`_run_repro`).
+    _repro: Reproduction | None = None
+    #: The project's own tests as selected for this solve (to leave out, later, a test that
+    #: asserts the behaviour the task changes).
+    _tests_run: OwnTests | None = None
 
     def __init__(
         self,
@@ -1891,6 +2035,9 @@ class ContextFirstSolver:
         self.fix_solver = FixSolver()
         self.probe_solver = ProbeSolver()
         self.repro_solver = ReproSolver()
+        self.test_triage = TestTriage()
+        #: Per solve: what each of the solver's own check commands is (syntax, import, tests).
+        self._check_kinds: dict[str, str] = {}
         self.consistency_reviewer = ConsistencyReviewer()
         self.verifier = Verifier(self.project_root)
 
@@ -2170,6 +2317,7 @@ class ContextFirstSolver:
 
         # 2b. Reproduction (opt-in): show the problem on the unchanged code first.
         repro: Reproduction | None = None
+        self._repro, self._tests_run, self._check_kinds = None, None, {}
         wants_repro = bool(opts.get("reproduce", self.config.reproduce))
         self._log_checks = wants_repro or bool(
             opts.get("discover_tests", self.config.verify_tests)
@@ -2194,11 +2342,14 @@ class ContextFirstSolver:
             except Exception as exc:  # the reproduction must never end the solve
                 logger.warning("Reproduction step failed: %s", exc)
             if repro is not None:
+                self._repro = repro
                 self._first_on_tie = True
                 full_context += (
-                    "\n\n=== REPRODUCTION (this script was run on the current code and shows the "
-                    "problem; it is run again after your change and must then print "
-                    '"REPRO: PASS". Change the project\'s code, not the script) ===\n'
+                    "\n\n=== REPRODUCTION (this script was run on the current code and reports "
+                    "the problem; it is run again after your change. It was written from the "
+                    "task text and is evidence, not the specification: where it and the task "
+                    "disagree, the task is right. Change the project's code, not the script) "
+                    "===\n"
                     + repro.script
                     + "\n--- its output on the current code ---\n"
                     + fixloop.clip(repro.output, 3_000)
@@ -2339,12 +2490,13 @@ class ContextFirstSolver:
         verify_cmds = self._get_verify_commands()
         if executor.files_created:
             try:
-                verify_cmds = (
-                    await self._own_checks(executor, repro, opts, raw_query or query) + verify_cmds
-                )
+                own_cmds = await self._own_checks(executor, opts, raw_query or query)
+                if self._log_checks and verify_cmds and self._verify_commands_are_detected():
+                    verify_cmds = await self._failing_only_after_the_change(verify_cmds, executor)
+                verify_cmds = own_cmds + verify_cmds
             except Exception as exc:  # no check is better than a crash after the edits
                 logger.warning("Could not set up the project's own tests: %s", exc)
-        if verify_cmds and executor.files_created:
+        if (verify_cmds or self._repro is not None) and executor.files_created:
             verify_id = f"verify-{workflow_id}"
             t_verify = time.monotonic()
             self._dashboard(
@@ -2455,8 +2607,9 @@ class ContextFirstSolver:
         self, query: str, full_context: str, opts: dict[str, Any]
     ) -> Reproduction | None:
         """Have the model write a script that shows the problem and keep it only if, run on
-        the unchanged code, it really reports the problem.  One retry with the script's own
-        output when it does not."""
+        the unchanged code, it reports the problem the task describes (not an error of its
+        own, see :func:`repro_shows_the_task`).  One rewrite with the script's own output when
+        it does not; after that there is no reproduction."""
         guard = str(opts.get("probe_guard", self.config.fix_probe_guard))
         if guard not in fixloop.PROBE_GUARDS:
             guard = "project"
@@ -2465,7 +2618,6 @@ class ContextFirstSolver:
             logger.info("Reproduction skipped: no project interpreter found")
             return None
         python = candidates[0]
-        path = self.project_root / REPRO_FILE
         feedback = ""
         for attempt in (1, 2):
             script = await self.repro_solver.awrite(query, full_context, feedback)
@@ -2473,13 +2625,11 @@ class ContextFirstSolver:
                 logger.info("Reproduction: the model gave no script (attempt %d)", attempt)
                 self._check_log({"event": "reproduction", "attempt": attempt, "verdict": "none"})
                 break
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(script + "\n", "utf-8")
             argv = repro_argv(python, self.project_root, script, guard)
-            code, out = await asyncio.to_thread(
-                repo_tests.run, argv, self.project_root, REPRO_TIMEOUT_S
-            )
+            code, out = await asyncio.to_thread(self._run_script, script, argv)
             verdict = classify_repro(code, out)
+            if verdict == "reproduced" and not repro_shows_the_task(query, out):
+                verdict = "own_error"
             logger.info("Reproduction attempt %d: %s (exit %s)", attempt, verdict, code)
             self._check_log(
                 {
@@ -2488,49 +2638,84 @@ class ContextFirstSolver:
                     "verdict": verdict,
                     "exit": code,
                     "output": fixloop.clip(out, 1_500),
+                    "script": fixloop.clip(script, 12_000),
                 }
             )
             if verdict == "reproduced":
                 self._status("The problem is reproduced")
-                return Reproduction(script=script, argv=argv, output=out)
-            why = (
-                "it printed REPRO: PASS on the UNCHANGED code, so it does not detect the problem"
-                if verdict == "passes"
-                else "it did not finish with a REPRO: FAIL or REPRO: PASS line (it crashed, "
-                "timed out or let an exception escape)"
+                return Reproduction(
+                    script=script, argv=argv, output=out, signature=repro_signature(out)
+                )
+            why = {
+                "passes": "it printed REPRO: PASS on the UNCHANGED code, so it does not detect "
+                "the problem",
+                "own_error": "it reported an error the task does not speak of. That is most "
+                "likely a mistake in the script itself (a wrong name or call, objects that do "
+                "not fit together, something that is not installed), not the problem of the "
+                "task: use the project's API the way its own tests do, and report only what "
+                "the task describes",
+            }.get(
+                verdict,
+                "it did not finish with a REPRO: FAIL or REPRO: PASS line (it crashed, timed "
+                "out or let an exception escape)",
             )
             feedback = (
                 f"Your previous script was run on the unchanged code and {why}.\n"
                 f"--- the script ---\n{script}\n--- its output (exit {code}) ---\n"
                 + fixloop.clip(out, 3_000)
             )
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
         self._status("No reproduction of the problem")
         return None
+
+    def _run_script(self, script: str, argv: list[str]) -> tuple[int | None, str]:
+        """Run a reproduction *script*.  Its file exists only for the run: it is (re)written
+        right before and removed right after."""
+        path = self.project_root / REPRO_FILE
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(script + "\n", "utf-8")
+            return repo_tests.run(argv, self.project_root, REPRO_TIMEOUT_S)
+        except OSError as exc:
+            return None, f"(could not run: {exc})"
+        finally:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                path.parent.rmdir()
+
+    async def _run_repro(self) -> tuple[str, str]:
+        """Run the kept reproduction on the current code.  ``("passes", out)``: it now reports
+        the wanted behaviour.  ``("same", out)``: it reports what it reported on the unchanged
+        code, so the change did not touch the problem it shows.  ``("other", out)``: anything
+        else (a different report, a crash, a timeout), which is no evidence either way: the
+        script checks its own idea of the task, and a change can make that idea fail."""
+        repro = self._repro
+        if repro is None:
+            return "", ""
+        code, out = await asyncio.to_thread(self._run_script, repro.script, repro.argv)
+        verdict = classify_repro(code, out)
+        if verdict == "passes":
+            return "passes", out
+        if verdict == "reproduced" and repro.signature and repro_signature(out) == repro.signature:
+            return "same", out
+        return "other", out
 
     async def _own_checks(
         self,
         executor: OperationExecutor,
-        repro: Reproduction | None,
         opts: dict[str, Any],
         task: str = "",
     ) -> list[str]:
-        """Verify commands from the project itself: a syntax check of the changed Python files,
-        the reproduction script, and the project's tests relevant to the changed files with
-        the failures that were already there left out.  Empty unless opted in."""
+        """Verify commands from the project itself: a syntax check and an import check of the
+        changed Python files, and the project's tests relevant to the changed files with the
+        failures that were already there left out.  Empty unless opted in.  (The reproduction
+        script is not one of them: it is run next to them, as evidence.)"""
         use_tests = bool(opts.get("discover_tests", self.config.verify_tests))
-        if not use_tests and repro is None:
+        if not use_tests:
             return []
         timeout = float(opts.get("test_timeout", self.config.test_timeout))
         self.verifier.timeout = max(self.verifier.timeout, timeout)
         cmds: list[str] = []
-        if repro is not None:
-            cmd = repo_tests.shell(repro.argv)
-            self.verifier.labels[cmd] = REPRO_LABEL
-            cmds.append(cmd)
-        if not use_tests:
-            return cmds
         changed: list[str] = []
         for f in dict.fromkeys(executor.files_created):
             with contextlib.suppress(ValueError):
@@ -2544,6 +2729,7 @@ class ContextFirstSolver:
         if py_files:
             cmd = repo_tests.shell(repo_tests.compile_command(setup.python, py_files))
             self.verifier.labels[cmd] = "syntax check of the changed files"
+            self._check_kinds[cmd] = "syntax"
             cmds.insert(0, cmd)
             # What imported before the change must still import after it (a name that does
             # not exist, a circular import: no syntax check sees those).
@@ -2559,6 +2745,7 @@ class ContextFirstSolver:
                 self.verifier.labels[cmd] = "import check of the changed modules: " + ", ".join(
                     modules
                 )
+                self._check_kinds[cmd] = "import"
                 cmds.insert(1, cmd)
         if not setup.usable:
             self._status("No tests found in the project")
@@ -2626,7 +2813,14 @@ class ContextFirstSolver:
             len(failing),
         )
         self._status(f"Verifying with {len(files)} related test files")
-        return [*cmds, repo_tests.shell(argv)]
+        tests_cmd = repo_tests.shell(argv)
+        self._check_kinds[tests_cmd] = "tests"
+        if setup.runner == "pytest":
+            self.verifier.ok_exits[tests_cmd] = (repo_tests.PYTEST_NO_TESTS_RAN,)
+        self._tests_run = OwnTests(
+            setup=setup, files=files, failing_before=failing, command=tests_cmd
+        )
+        return [*cmds, tests_cmd]
 
     def _check_log(self, record: dict[str, Any]) -> None:
         if self._log_checks:
@@ -2640,6 +2834,29 @@ class ContextFirstSolver:
         if project_cmds:
             return project_cmds  # the project's own checks (e.g. its visible tests)
         return _detect_verify_commands(self.project_root)
+
+    def _verify_commands_are_detected(self) -> bool:
+        """Whether :meth:`_get_verify_commands` returns auto-detected linters (nobody
+        configured a command)."""
+        return not self.config.verify_commands and not read_project_verify(self.project_root)[0]
+
+    async def _failing_only_after_the_change(
+        self, cmds: list[str], executor: OperationExecutor
+    ) -> list[str]:
+        """*cmds* without those that already fail on the unchanged code.  A detected linter
+        that reports problems before the change says nothing about the change (the same rule
+        as for the tests that failed before): asking the fix step to clean them up sends it
+        into files the task never touched."""
+        if not executor.originals:
+            return cmds
+
+        with repo_tests.original_files(executor.originals):
+            vr = await self.verifier.averify(cmds)
+        for cmd in vr.failed_cmds:
+            logger.info("Left out, it already fails on the unchanged code: %s", cmd)
+        if vr.failed_cmds:
+            self._check_log({"event": "checks_failing_before", "left_out": vr.failed_cmds})
+        return [c for c in cmds if c not in vr.failed_cmds]
 
     def _max_fix_attempts(self) -> int:
         _, fixes = read_project_verify(self.project_root)
@@ -2675,7 +2892,9 @@ class ContextFirstSolver:
             sc = last[0]
             worse = sc is not None and best.best_score is not None and sc > best.best_score
             tie = sc is not None and sc == best.best_score and self._first_on_tie
-            if worse or tie:
+            # Nor on the starting tree when a candidate existed: an undone change is no answer.
+            undone = self._log_checks and bool(best.best_files) and self._unchanged(executor)
+            if worse or tie or undone:
                 changed = best.restore()
                 if changed:
                     logger.info(
@@ -2714,29 +2933,56 @@ class ContextFirstSolver:
         history: list[str] = []
         seen_states: dict[str, tuple[int, tuple[int, int, int]]] = {}  # state -> (round, score)
         stagnant = 0
+        repro_only_rounds = 0  # fix rounds spent on nothing but the reproduction
         for attempt in range(1, cap + 1):
             self._status(f"Verifying (round {attempt}, base {base}, cap {cap})...")
             vr = await self.verifier.averify(verify_cmds)
+            left_out: list[str] = []
+            if self._log_checks and not vr.passed:
+                # An existing test that asserts the behaviour the task changes is not a
+                # regression: it is left out, and the round is judged without it.
+                left_out = await self._leave_out_old_behaviour(query, executor, verify_cmds, vr)
+                if left_out:
+                    vr = await self.verifier.averify(verify_cmds)
+            # The reproduction is evidence next to the checks, never a check of its own: it
+            # counts only while it reports exactly what it reported on the unchanged code.
+            repro_state, repro_out = "", ""
+            if self._repro is not None and not self._does_not_import(vr):
+                repro_state, repro_out = await self._run_repro()
+            repro_same = repro_state == "same"
             self._check_log(
                 {
                     "event": "verify",
                     "round": attempt,
-                    "passed": vr.passed,
+                    "passed": vr.passed and not repro_same,
                     "commands": [self.verifier.labels.get(c, c)[:300] for c in verify_cmds],
                     "skipped": [self.verifier.labels.get(c, c)[:300] for c in vr.skipped],
                     "failed": [b[:1_500] for b in vr.blocks],
+                    **(
+                        {"reproduction": repro_state, "reproduction_output": repro_out[-1_500:]}
+                        if repro_state
+                        else {}
+                    ),
+                    **({"left_out_old_behaviour": left_out} if left_out else {}),
                 }
             )
-            if vr.passed:
+            undone = self._log_checks and self._unchanged(executor)
+            if vr.passed and not repro_same:
+                if undone and best.best_files:
+                    # The edits were taken back until the checks passed: the starting tree is
+                    # not a solution.  The best candidate is put back and the loop ends.
+                    logger.info("The change was undone; keeping the best candidate instead")
+                    self._status("The change was undone: keeping the best candidate")
+                    best.restore()
+                    last[0] = best.best_score
+                    return
                 last[0] = None
                 self._status("Verification passed")
                 return
-            sc = fixloop.score(vr.errors, False)
-            # With the solver's own checks on, several commands can fail in one round: a
-            # failing check next to failing tests is a failure too, and each is shown.
+            sc = self._round_score(vr, repro_same)
+            # With the solver's own checks on, several commands can fail in one round: each
+            # is shown to the fix step.
             by_command = self._log_checks and len(vr.blocks) > 1
-            if by_command:
-                sc = (sc[0], sc[1] + fixloop.other_failures(vr.blocks), sc[2])
             last[0] = sc
             state = fixloop.state_key(fixloop.read_texts(paths))
             revisit = seen_states.get(state)
@@ -2747,7 +2993,8 @@ class ContextFirstSolver:
                     "again). That change was undone or repeated: it is a dead end, try something "
                     "structurally different."
                 )
-            improved = best.observe(attempt, sc)
+            # The starting tree is never the best state (it is what the task wants changed).
+            improved = False if undone else best.observe(attempt, sc)
             stagnant = 0 if improved else stagnant + 1
             summary = fixloop.summarize(vr.errors)
             logger.info(
@@ -2761,6 +3008,11 @@ class ContextFirstSolver:
             if attempt >= cap:
                 self._status("Verification failed, round cap reached")
                 break
+            if vr.passed:  # only the reproduction still reports the problem
+                if repro_only_rounds >= 1:
+                    self._status("Only the reproduction still fails: no further fix round")
+                    break
+                repro_only_rounds += 1
             if stagnant >= patience:
                 if restarts_left <= 0:
                     self._status("Verification failed, patching has stalled")
@@ -2796,6 +3048,16 @@ class ContextFirstSolver:
                 if by_command
                 else fixloop.compact_errors(vr.errors)
             )
+            if repro_same:
+                errors_for_fix = (
+                    errors_for_fix
+                    + f"\n\n$ {REPRO_LABEL}\n"
+                    + fixloop.clip(repro_out, 3_000)
+                    + "\n(The reproduction script still reports what it reported before your "
+                    "change. It was written from the task text and can itself be wrong: fix the "
+                    "project's code where the report is right, and change nothing only to "
+                    "silence the script.)"
+                ).strip()
             if fix_detail and summary.failed_ids:
                 try:
                     detail = await fixloop.run_detail(
@@ -2832,6 +3094,8 @@ class ContextFirstSolver:
                     + "\n\n".join(experiments[-3:])
                 )
             fix_query = query
+            if self._log_checks and summary.failed_ids:
+                fix_query += FIX_NOTE_OLD_TESTS
             if history:
                 fix_query += (
                     "\n\nPREVIOUS FIX ATTEMPTS (do not repeat what did not work):\n"
@@ -2860,6 +3124,7 @@ class ContextFirstSolver:
                 self.project_root,
                 on_status=self._on_status,
                 edit_only=True,
+                originals=executor.originals,
             )
             await fix_executor.execute(fix_ops)
             executor.ops.extend(fix_executor.ops)
@@ -2877,6 +3142,123 @@ class ContextFirstSolver:
                 + (", some edits did not match the file" if fix_executor.failed else "")
                 + (f"; the change was:\n{change}" if change else "; the file did not change")
             )
+
+    def _round_score(self, vr: VerifyResult, repro_same: bool) -> tuple[int, int, int]:
+        """A failing round's score, lower is better: ``(broken, failing, -passing)``.
+
+        Without the solver's own checks this is :func:`fixloop.score` of the joined output,
+        as it always was.  With them each failing command is scored for what it is: a state
+        whose changed files do not compile or import, or whose tests do not collect or run, is
+        BROKEN and always worse than one that is not, whatever else fails; then failing tests
+        count most, any other failing command (a linter) less, and a reproduction that still
+        reports the original problem least."""
+        if not self._log_checks:
+            return fixloop.score(vr.errors, False)
+        broken, tests, other, passing = False, 0, 0, 0
+        for cmd, block in zip(vr.failed_cmds, vr.blocks, strict=False):
+            kind = self._check_kinds.get(cmd, "other")
+            s = fixloop.summarize(block)
+            if kind in ("syntax", "import"):
+                broken = True
+            elif s.found:
+                broken = broken or s.broken
+                tests += s.failed + s.errors
+                passing += s.passed
+            elif kind == "tests":  # they did not run at all (time limit, crash at start)
+                broken = True
+            else:
+                other += 1
+        return (1 if broken else 0, 4 * tests + 2 * other + (1 if repro_same else 0), -passing)
+
+    def _does_not_import(self, vr: VerifyResult) -> bool:
+        """Whether the syntax or import check of the changed files failed this round."""
+        return any(self._check_kinds.get(c) in ("syntax", "import") for c in vr.failed_cmds)
+
+    @staticmethod
+    def _unchanged(executor: OperationExecutor) -> bool:
+        """Whether every file the solve has touched is back at its original content: the tree
+        is the starting tree.  False when nothing was touched."""
+        if not executor.originals:
+            return False
+        for path, before in executor.originals.items():
+            try:
+                now = path.read_text("utf-8") if path.is_file() else None
+            except (OSError, UnicodeDecodeError):
+                return False
+            if now != before:
+                return False
+        return True
+
+    async def _leave_out_old_behaviour(
+        self, query: str, executor: OperationExecutor, verify_cmds: list[str], vr: VerifyResult
+    ) -> list[str]:
+        """Ask the model, once per new failure, whether each failing existing test asserts the
+        behaviour the task changes.  Those tests are left out of the run from now on
+        (*verify_cmds* is updated in place); the others are regressions for the fix step.
+        Returns the ids left out by this call."""
+        own = self._tests_run
+        if own is None or own.command not in vr.failed_cmds or self._does_not_import(vr):
+            return []  # code that does not import fails tests for that reason alone
+        block = vr.blocks[vr.failed_cmds.index(own.command)]
+        summary = fixloop.summarize(block)
+        if summary.broken or not summary.failed_ids or own.triage_calls >= TRIAGE_MAX_CALLS:
+            return []
+        sections = failure_sections(block)
+        ask: list[tuple[str, str]] = []
+        for tid in summary.failed_ids:
+            detail = sections.get(".".join(tid.split("::")[1:]), "")
+            if own.asked.get(tid) != detail:  # not asked yet, or it fails differently now
+                ask.append((tid, detail))
+        ask = ask[:TRIAGE_MAX_TESTS]
+        if not ask:
+            return []
+        own.triage_calls += 1
+        parts: list[str] = []
+        for n, (tid, detail) in enumerate(ask, 1):
+            src = fixloop.failing_tests_source(self.project_root, [tid], max_chars=2_500)
+            parts.append(
+                f"TEST {n}: {tid}\n--- source ---\n{src or '(not found)'}\n--- failure ---\n"
+                + fixloop.clip(detail or "(no detail)", 1_500)
+            )
+        before = {p: (t or "") for p, t in executor.originals.items()}
+        change = fixloop.short_diff(before, fixloop.read_texts(list(before)), limit=4_000)
+        try:
+            verdicts = await self.test_triage.aclassify(
+                query=query, change=change, failing_tests="\n\n".join(parts)
+            )
+        except Exception as exc:  # no classification: every failure stays a regression
+            logger.warning("Classifying the failing tests failed: %s", exc)
+            verdicts = {}
+        left_out: list[str] = []
+        for n, (tid, detail) in enumerate(ask, 1):
+            own.asked[tid] = detail
+            if verdicts.get(n) == "old_behaviour":
+                left_out.append(tid)
+        self._check_log(
+            {
+                "event": "failing_tests_classified",
+                "asked": [tid for tid, _ in ask],
+                "old_behaviour": left_out,
+            }
+        )
+        if not left_out:
+            return []
+        logger.info(
+            "Tests that assert the behaviour the task changes, left out: %s", ", ".join(left_out)
+        )
+        self._status(f"{len(left_out)} existing tests assert the old behaviour: left out")
+        own.old_behaviour += left_out
+        cmd = repo_tests.shell(
+            repo_tests.test_command(
+                own.setup, own.files, [*own.failing_before, *own.old_behaviour]
+            )
+        )
+        self._check_kinds[cmd] = "tests"
+        if own.command in self.verifier.ok_exits:
+            self.verifier.ok_exits[cmd] = self.verifier.ok_exits[own.command]
+        verify_cmds[verify_cmds.index(own.command)] = cmd
+        own.command = cmd
+        return left_out
 
     async def _look(
         self,
@@ -2977,7 +3359,9 @@ class ContextFirstSolver:
             return False
         if not result.operations:
             return False
-        rerun = OperationExecutor(self.project_root, on_status=self._on_status)
+        rerun = OperationExecutor(
+            self.project_root, on_status=self._on_status, originals=executor.originals
+        )
         await rerun.execute(result.operations)
         executor.ops.extend(rerun.ops)
         executor.files_created.extend(rerun.files_created)
