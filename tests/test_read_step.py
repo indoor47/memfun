@@ -459,3 +459,26 @@ async def test_a_solver_reply_with_nothing_to_salvage_fails_as_before(tmp_path: 
     assert result.success is False and result.method == "context_first_error"
     # one retry in place, told what was wrong, before the failure it always was
     assert asked == [ISSUE, ISSUE + cf.TRUNCATION_NUDGE]
+
+
+@pytest.mark.asyncio
+async def test_in_read_mode_a_reply_without_an_edit_runs_nothing_whatever_it_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command next to an operation memfun does not know used to reach the executor,
+    which runs commands through a shell."""
+    root = project(tmp_path)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("a command was run"))
+    for extra in ({"op": "noop"}, {"op": "Read_File", "path": "x"}, {"op": 7}):
+        mixed = [{"op": "run_cmd", "cmd": "touch made-by-cmd"}, extra]
+        solver = solver_for(root, Replies(mixed), read_rounds=1, verify_commands=())
+        result = await solver.asolve(query=ISSUE)
+        assert result.method == cf.NO_EDITS_METHOD and result.ops == []
+        assert not (root / "made-by-cmd").exists()
+
+
+def test_tool_call_text_padded_with_blanks_is_read_at_once() -> None:
+    padded = "<function=run_cmd><parameter=cmd>" + " " * 20_000
+    assert cf.salvage_operations(padded) == [{"op": "run_cmd"}]
+    closed = "<function=search><parameter=pattern>  x  </parameter></function>"
+    assert cf.salvage_operations(closed) == [{"op": "search", "pattern": "x"}]

@@ -993,9 +993,11 @@ READ_ONLY_OPS = frozenset(
 
 def _has_file_change(operations: list[dict[str, Any]], *, reads: bool = False) -> bool:
     """False only when every operation is a pure command or read (nothing would change).
-    With *reads* (the read step is on) its read operations count as reads too."""
-    quiet = READ_ONLY_OPS if reads else ("run_cmd", "read_file")
-    return any(str(o.get("op")) not in quiet for o in operations)
+    With *reads* (the read step is on) only an edit or a write is a change: a reply without
+    one is answered as reads, whatever else it holds, and nothing in it is ever run."""
+    if reads:
+        return any(str(o.get("op")) in ("edit_file", "write_file") for o in operations)
+    return any(str(o.get("op")) not in ("run_cmd", "read_file") for o in operations)
 
 
 #: Shown once at the end of the context when the read step is on.
@@ -1210,7 +1212,9 @@ def _replies_since(marker: object) -> list[str]:
 
 
 _TOOL_FUNCTION = re.compile(r"<function=([\w.-]+)>(.*?)(?:</function>|\Z)", re.DOTALL)
-_TOOL_PARAMETER = re.compile(r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+_TOOL_PARAMETER = re.compile(r"<parameter=(\w+)>(.*?)</parameter>", re.DOTALL)
+#: Characters of a reply that are searched for operations.
+_SALVAGE_CHARS = 200_000
 #: Operation names a tool call written as text may stand for.
 _KNOWN_OPS = READ_ONLY_OPS | {"edit_file", "write_file"}
 
@@ -1221,7 +1225,8 @@ def _operations_from_tool_calls(raw: str) -> list[dict[str, Any]]:
     ops: list[dict[str, Any]] = []
     for name, body in _TOOL_FUNCTION.findall(raw):
         if name in _KNOWN_OPS:
-            ops.append({"op": name, **dict(_TOOL_PARAMETER.findall(body))})
+            params = {k: v.strip() for k, v in _TOOL_PARAMETER.findall(body)}
+            ops.append({"op": name, **params})
     decoder = json.JSONDecoder()
     for m in re.finditer(r"\{\s*\"name\"", raw):
         try:
@@ -1239,6 +1244,7 @@ def salvage_operations(raw: str) -> list[dict[str, Any]]:
     """The operations in a reply that could not be parsed into its fields: a JSON array
     anywhere in the text (the last one that holds operations), else operation objects written
     one after another, else tool calls written as text that name an operation."""
+    raw = raw[:_SALVAGE_CHARS]
     ops = _parse_operations(raw)
     if ops:
         return ops

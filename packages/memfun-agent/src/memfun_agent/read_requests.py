@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -51,7 +52,13 @@ READ_LOG = ".memfun/reads.jsonl"
 
 #: Never readable: version-control data (history is not the task's input) and memfun's own
 #: state (settings, logs, the reproduction script).
-FORBIDDEN_PARTS = frozenset({".git", ".memfun", ".hg", ".svn"})
+FORBIDDEN_PARTS = frozenset({".git", ".memfun", ".hg", ".svn", ".ssh", ".aws", ".gnupg"})
+#: Longest pattern that is compiled; seconds one match may take before the search is stopped.
+MAX_PATTERN = 1_000
+MATCH_SECONDS = 0.25
+#: Requests of one reply that are looked at at all.
+MAX_PARSED = 60
+_MAX_NUMBER = 10**9
 #: Not searched or listed by a walk (they can still be named explicitly, except the
 #: forbidden ones).
 _SKIP_WALK = FORBIDDEN_PARTS | frozenset(
@@ -61,8 +68,10 @@ _SKIP_WALK = FORBIDDEN_PARTS | frozenset(
     }
 )  # fmt: skip
 _SECRET_NAME = re.compile(
-    r"(^\.env(\..*)?$|\.env$|^credentials?(\..*)?$|^secrets?(\..*)?$|\.pem$|\.key$|"
-    r"^id_(rsa|dsa|ecdsa|ed25519)|^\.netrc$|^\.npmrc$|^\.pypirc$)",
+    r"(^\.env(\..*)?$|\.env$|^\.env[-_].*|^\.envrc$|^env\.local$|^credentials?(\..*)?$|"
+    r"^secrets?(\..*)?$|\.pem$|\.key$|\.p12$|\.pfx$|\.jks$|\.keystore$|"
+    r"^id_(rsa|dsa|ecdsa|ed25519)|^\.netrc$|^\.npmrc$|^\.pypirc$|^\.git-credentials$|"
+    r"^\.htpasswd$|^\.pgpass$|^\.dockercfg$|^kubeconfig$|^service[-_]account.*\.json$)",
     re.IGNORECASE,
 )
 _CODE_SUFFIX = re.compile(
@@ -163,12 +172,12 @@ def confine(root: Path, path_str: str, base: str = ".") -> Path | str:
     candidate = raw if raw.is_absolute() else root / base / raw
     try:
         resolved = candidate.resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return "cannot be resolved"
     if not resolved.is_relative_to(root):
         return "is outside the project (paths are relative to the project root)"
     parts = resolved.relative_to(root).parts
-    if any(p in FORBIDDEN_PARTS for p in parts):
+    if any(p.casefold() in FORBIDDEN_PARTS for p in parts):  # .Git on a case-blind disk
         return "is version-control data or memfun's own state, which is not readable"
     if parts and is_secret_name(parts[-1]):
         return "looks like a file of secrets, which is never read"
@@ -193,25 +202,26 @@ def _walk(root: Path, base: Path, deadline: float) -> Iterator[tuple[Path, list[
         dirnames[:] = sorted(
             d
             for d in dirnames
-            if d not in _SKIP_WALK and not d.endswith(".egg-info") and not (here / d).is_symlink()
+            if d.casefold() not in _SKIP_WALK
+            and not d.endswith(".egg-info")
+            and not (here / d).is_symlink()
         )
         yield here, dirnames, sorted(filenames)
 
 
 def _inside(root: Path, path: Path) -> bool:
-    """Whether *path* (possibly a symbolic link) still points into the project."""
-    if not path.is_symlink():
-        return True
-    try:
-        return path.resolve().is_relative_to(root)
-    except (OSError, RuntimeError):
-        return False
+    """Whether a file met in a walk or a listing may be read.  A symbolic link is judged by
+    where it points: inside the project, and not at version-control data, memfun's own
+    state or a file of secrets (a link ``notes.txt -> ../.env`` is not readable)."""
+    return not path.is_symlink() or isinstance(confine(root, str(path)), Path)
 
 
 def _read_text(path: Path) -> str | None:
     """The text of *path*, or ``None`` for a binary, unreadable or oversized file."""
     try:
-        if path.stat().st_size > MAX_FILE_BYTES:
+        st = path.stat()
+        # regular files only: a named pipe or a device would block the read for ever
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE_BYTES:
             return None
         data = path.read_bytes()
     except OSError:
@@ -225,9 +235,10 @@ def _read_text(path: Path) -> str | None:
 
 
 def _int(value: Any) -> int:
+    """A count or line number from model text: never negative, never absurd, never raising."""
     try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
+        return max(0, min(int(value), _MAX_NUMBER))
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -251,7 +262,7 @@ def parse_operation(op: dict[str, Any]) -> list[Read | Refusal]:
         end = _int(op.get("end_line") or op.get("end") or op.get("line_end"))
         lines: object = op.get("lines")
         if isinstance(lines, str) and (m := re.fullmatch(r"\s*(\d+)\s*[-,:]\s*(\d+)\s*", lines)):
-            start, end = int(m.group(1)), int(m.group(2))
+            start, end = _int(m.group(1)), _int(m.group(2))
         elif isinstance(lines, list | tuple):
             pair = cast("Sequence[object]", lines)
             if len(pair) == 2:
@@ -366,7 +377,7 @@ def _bre(pattern: str) -> str:
 
 
 def _number(text: str) -> int | None:
-    return int(text) if text.isdigit() else None
+    return int(text) if text.isdecimal() and len(text) <= 9 else None
 
 
 def _parse_grep(
@@ -537,9 +548,9 @@ def _parse_lines_tool(name: str, args: list[str], asked: str, base: str) -> list
         elif name in ("head", "tail") and a.startswith("--lines="):
             count = _number(a.partition("=")[2])
         elif name in ("head", "tail") and re.fullmatch(r"-n?\d+", a):
-            count = int(a.lstrip("-n"))
+            count = _int(a.lstrip("-n"))
         elif name == "tail" and re.fullmatch(r"-n\+\d+", a):
-            from_line = int(a[3:])
+            from_line = _int(a[3:])
         elif a.startswith("-") and len(a) > 1:
             if name in ("head", "tail") and a in ("-c", "--bytes", "-f", "--follow"):
                 return [Refusal(asked, f"option {a} is not supported; {READ_OPS_HINT}")]
@@ -551,16 +562,16 @@ def _parse_lines_tool(name: str, args: list[str], asked: str, base: str) -> list
         quiet = "-n" in args or "--quiet" in args or "--silent" in args
         if not m or not quiet:
             return [Refusal(asked, f"only sed -n 'A,Bp' FILE is served; {READ_OPS_HINT}")]
-        start = int(m.group(1))
+        start = _int(m.group(1))
         second = m.group(2)
         if second is None:
             end = start
         elif second == "$":
             end = 0
         elif second.startswith("+"):
-            end = start + int(second[1:])
+            end = start + _int(second[1:])
         else:
-            end = int(second)
+            end = _int(second)
     elif name == "head":
         start, end = 1, count if count is not None else 10
     elif name == "tail":
@@ -678,10 +689,10 @@ def _parse_post(stage: list[str], asked: str) -> Post | Refusal:
         n = 10
         for i, a in enumerate(args):
             if re.fullmatch(r"-n?\d+", a):
-                n = int(a.lstrip("-n"))
-            elif a in ("-n", "--lines") and i + 1 < len(args) and args[i + 1].isdigit():
-                n = int(args[i + 1])
-            elif not a.isdigit():
+                n = _int(a.lstrip("-n"))
+            elif a in ("-n", "--lines") and i + 1 < len(args) and args[i + 1].isdecimal():
+                n = _int(args[i + 1])
+            elif not a.isdecimal():
                 return Refusal(asked, f"{name} {a} after | is not supported; {READ_OPS_HINT}")
         return Post(name, n=n)
     if name in ("grep", "egrep", "fgrep", "rg"):
@@ -706,7 +717,7 @@ def _parse_post(stage: list[str], asked: str) -> Post | Refusal:
     if name == "sed" and len(args) == 2 and args[0] == "-n":
         m = _SED_RANGE.match(args[1].replace(" ", ""))
         if m and (m.group(2) or "").isdigit():
-            return Post("slice", n=int(m.group(1)), m=int(m.group(2)))
+            return Post("slice", n=_int(m.group(1)), m=_int(m.group(2)))
     if name == "xargs":
         rest = [a for a in args if a not in ("-r", "-0", "--no-run-if-empty", "-d", "\\n")]
         if rest and os.path.basename(rest[0]) in ("grep", "egrep", "rg"):
@@ -799,12 +810,46 @@ def _clip_lines(lines: list[str], limit: int) -> tuple[list[str], int]:
     return lines, len(lines)
 
 
-def _compile(pattern: str, ignore_case: bool) -> re.Pattern[str]:
-    flags = re.IGNORECASE if ignore_case else 0
-    try:
-        return re.compile(pattern, flags)
-    except re.error:
-        return re.compile(re.escape(pattern), flags)
+class PatternTooSlowError(Exception):
+    """A match did not finish in time: the pattern backtracks without end on this text."""
+
+
+class _Matcher:
+    """A pattern from model text that cannot run away.
+
+    It is compiled by the ``regex`` engine, whose every search takes a time limit (the
+    standard ``re`` has none, and ``(a+)+$`` on thirty characters would hold the whole
+    process).  A pattern that does not compile, is too long, or meets an installation
+    without ``regex`` is searched as fixed text.
+    """
+
+    def __init__(self, pattern: str, ignore_case: bool) -> None:
+        self._rx: Any = None
+        self._fold = ignore_case
+        self._needle = pattern.casefold() if ignore_case else pattern
+        if len(pattern) > MAX_PATTERN:
+            return
+        try:
+            import regex
+
+            self._rx = regex.compile(pattern, regex.IGNORECASE if ignore_case else 0)
+        except Exception:  # not installed, not a pattern, too deeply nested, too large a count
+            self._rx = None
+
+    def search(self, text: str, deadline: float) -> bool:
+        if self._rx is None:
+            return self._needle in (text.casefold() if self._fold else text)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise PatternTooSlowError
+        try:
+            return self._rx.search(text, timeout=min(MATCH_SECONDS, left)) is not None
+        except TimeoutError:
+            raise PatternTooSlowError from None
+
+
+def _compile(pattern: str, ignore_case: bool) -> _Matcher:
+    return _Matcher(pattern, ignore_case)
 
 
 def _glob(name: str, glob: str) -> bool:
@@ -848,11 +893,17 @@ def _serve_lines(root: Path, r: Read, limit: int) -> Served:
 
 
 def _search_file(
-    rel: str, text: str, rx: re.Pattern[str], around: tuple[int, int], hits: list[str], room: int
+    rel: str,
+    text: str,
+    rx: _Matcher,
+    around: tuple[int, int],
+    hits: list[str],
+    room: int,
+    deadline: float,
 ) -> int:
     """Append the matches of one file (``path:line: text``; context lines with ``-``)."""
     lines = text.splitlines()
-    matched = [i for i, line in enumerate(lines) if rx.search(line[:2_000])]
+    matched = [i for i, line in enumerate(lines) if rx.search(line[:2_000], deadline)]
     shown: set[int] = set()
     for i in matched[:room]:
         for j in range(max(0, i - around[0]), min(len(lines), i + around[1] + 1)):
@@ -886,7 +937,7 @@ def _serve_search(root: Path, r: Read, files: list[Path] | None = None) -> Serve
             ]
     hits: list[str] = []
     total = n_files = 0
-    cut = False
+    cut = slow = False
     for path in files:
         if time.monotonic() > deadline or len(hits) >= MAX_HITS:
             cut = True
@@ -895,14 +946,18 @@ def _serve_search(root: Path, r: Read, files: list[Path] | None = None) -> Serve
         if text is None:
             continue
         rel = _rel(root, path)
-        if r.files_only:
-            if rx.search(text):
-                n_files += 1
-                total += 1
-                hits.append(rel)
-            continue
-        room = MAX_HITS - len(hits)
-        found = _search_file(rel, text, rx, (r.before, r.after), hits, room)
+        try:
+            if r.files_only:
+                if any(rx.search(line[:2_000], deadline) for line in text.splitlines()):
+                    n_files += 1
+                    total += 1
+                    hits.append(rel)
+                continue
+            room = MAX_HITS - len(hits)
+            found = _search_file(rel, text, rx, (r.before, r.after), hits, room, deadline)
+        except PatternTooSlowError:
+            slow = True
+            break
         if found:
             n_files += 1
             total += found
@@ -910,10 +965,12 @@ def _serve_search(root: Path, r: Read, files: list[Path] | None = None) -> Serve
     where = (
         _rel(root, files[0]) if len(files) == 1 else (r.path if r.path != "." else "the project")
     )
-    heading = f'search "{r.pattern}" in {where}: ' + (
+    heading = f'search "{r.pattern[:200]}" in {where}: ' + (
         f"{n_files} files" if r.files_only else f"{total} matches in {n_files} files"
     )
-    if cut:
+    if slow:
+        heading += " (stopped: the pattern takes too long to match here, use a simpler one)"
+    elif cut:
         heading += f" (stopped at {MAX_HITS} lines: narrow the pattern or the path)"
     return Served(r.asked, "search", heading, "\n".join(hits) or "(no match)", True)
 
@@ -949,7 +1006,7 @@ def _serve_find(root: Path, r: Read) -> Served:
             dirs[:] = []
         if len(found) > MAX_HITS * 5:
             break
-    what = " or ".join(r.include + r.path_globs) or "everything"
+    what = (" or ".join(r.include + r.path_globs) or "everything")[:200]
     heading = f"files named {what} under {_rel(root, base)}: {len(found)}"
     return Served(r.asked, "find", heading, "\n".join(sorted(found)) or "(none)", True)
 
@@ -971,7 +1028,7 @@ def _serve_list(root: Path, r: Read) -> Served:
     except OSError:
         return _refused(r.asked, f"{rel} cannot be listed")
     for entry in entries:
-        if entry.name in FORBIDDEN_PARTS or is_secret_name(entry.name):
+        if entry.name.casefold() in FORBIDDEN_PARTS or is_secret_name(entry.name):
             continue
         if entry.is_dir() and not entry.is_symlink():
             rows.append(entry.name + "/")
@@ -994,7 +1051,7 @@ def _serve_count(root: Path, r: Read) -> Served:
 
 
 def _refused(asked: str, why: str) -> Served:
-    return Served(asked, "refused", f"not served: {asked}", why, False)
+    return Served(asked, "refused", f"not served: {asked[:300]}", why, False)
 
 
 def _apply_post(root: Path, served: Served, posts: tuple[Post, ...]) -> Served:
@@ -1008,7 +1065,8 @@ def _apply_post(root: Path, served: Served, posts: tuple[Post, ...]) -> Served:
             lines = lines[max(0, p.n - 1) : p.m]
         elif p.kind == "grep":
             rx = _compile(p.pattern, p.ignore_case)
-            lines = [ln for ln in lines if bool(rx.search(ln)) != p.invert]
+            until = time.monotonic() + SEARCH_SECONDS
+            lines = [ln for ln in lines if rx.search(ln[:2_000], until) != p.invert]
         elif p.kind == "sort":
             lines = sorted(set(lines) if p.invert else lines, reverse=p.reverse)
         elif p.kind == "uniq":
@@ -1018,9 +1076,12 @@ def _apply_post(root: Path, served: Served, posts: tuple[Post, ...]) -> Served:
         elif p.kind == "xargs" and p.search is not None:
             files: list[Path] = []
             for ln in lines:
-                got = confine(root, ln.split(":", 1)[0].strip().rstrip("/"))
+                name = ln.split(":", 1)[0].strip().rstrip("/")
+                got = confine(root, name) if 0 < len(name) < 1_000 else ""
                 if isinstance(got, Path) and got.is_file() and got not in files:
                     files.append(got)
+                if len(files) >= 2_000:
+                    break
             if not files:
                 return replace(served, output="(no file to search)")
             again = _serve_search(root, replace(p.search, asked=served.asked), files)
@@ -1047,11 +1108,13 @@ def serve_one(root: Path, item: Read | Refusal, limit: int = PER_REQUEST_BYTES) 
             served = _serve_count(root, item)
         else:
             return _refused(item.asked, f"unknown read; {READ_OPS_HINT}")
-    except OSError as exc:
+        if served.ok and item.post:
+            served = _apply_post(root, served, item.post)
+    except PatternTooSlowError:
+        return _refused(item.asked, "the pattern takes too long to match: use a simpler one")
+    except Exception as exc:  # whatever model text can provoke is a refusal, never a crash
         return _refused(item.asked, f"could not be read ({type(exc).__name__})")
-    if served.ok and item.post:
-        served = _apply_post(root, served, item.post)
-    if served.ok and item.kind != "lines":
+    if served.ok and (item.kind != "lines" or item.post):
         lines, kept = _clip_lines(served.output.splitlines(), limit)
         if kept < len(served.output.splitlines()):
             lines.append(f"... (cut at {kept} lines to keep the reply small: narrow the request)")
@@ -1076,13 +1139,14 @@ def serve(
             continue
         seen.add(key)
         if n >= MAX_REQUESTS or left < 400:
+            # one line for all the rest: the refusals must not outgrow the budget themselves
             out.append(
                 _refused(
-                    item.asked,
+                    f"{len(items) - n} more request(s), starting with {item.asked[:120]}",
                     "this round's reading budget is used up: ask again for what you still need",
                 )
             )
-            continue
+            break
         served = serve_one(root, item, min(per_request, left))
         left -= len(served.output.encode("utf-8", "replace")) + len(served.heading) + 16
         out.append(served)
@@ -1090,15 +1154,33 @@ def serve(
 
 
 def requests_of(operations: list[dict[str, Any]]) -> list[Read | Refusal]:
-    """Every read the *operations* of one reply ask for."""
-    return [item for op in operations for item in parse_operation(op)]
+    """Every read the *operations* of one reply ask for (the first :data:`MAX_PARSED`).
+    Model text that cannot be read as a request is a refusal, never an exception."""
+    out: list[Read | Refusal] = []
+    for op in operations:
+        try:
+            out.extend(parse_operation(op))
+        except Exception as exc:
+            out.append(Refusal(str(op)[:200], f"is not a readable request ({type(exc).__name__})"))
+        if len(out) >= MAX_PARSED:
+            return out[:MAX_PARSED]
+    return out
+
+
+def _printable(text: str) -> str:
+    """*text* without what cannot be encoded (a lone surrogate would break the next call)."""
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def format_served(served: list[Served]) -> str:
     """The answers as prompt text: one headed block per request."""
-    return "\n\n".join(
-        f"--- {s.heading} ---\n{s.output}" if s.ok else f"--- {s.heading} ---\nREFUSED: {s.output}"
-        for s in served
+    return _printable(
+        "\n\n".join(
+            f"--- {s.heading[:400]} ---\n{s.output}"
+            if s.ok
+            else f"--- {s.heading[:400]} ---\nREFUSED: {s.output}"
+            for s in served
+        )
     )
 
 
@@ -1107,23 +1189,25 @@ def log_reads(project_root: Path, round_no: int, served: list[Served]) -> None:
     read of the step, with the refusals).  Best effort: logging never affects the solve."""
     try:
         path = project_root / READ_LOG
+        if path.parent.is_symlink() or path.is_symlink():
+            return  # a log that would be written through a link somebody put there: not written
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
+        with path.open("a", encoding="utf-8", errors="backslashreplace") as fh:
             for s in served:
                 fh.write(
                     json.dumps(
                         {
                             "ts": time.time(),
                             "round": round_no,
-                            "asked": s.asked,
+                            "asked": s.asked[:400],
                             "kind": s.kind,
                             "served": s.ok,
-                            "answer": s.heading if s.ok else s.output,
+                            "answer": (s.heading if s.ok else s.output)[:400],
                             "bytes": len(s.output.encode("utf-8", "replace")) if s.ok else 0,
                         },
                         ensure_ascii=False,
                     )
                     + "\n"
                 )
-    except OSError:
-        pass
+    except Exception:  # best effort: whatever goes wrong here must not reach the solve
+        return

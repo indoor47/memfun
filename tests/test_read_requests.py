@@ -262,8 +262,10 @@ def test_one_round_has_a_budget_and_a_request_limit(root: Path) -> None:
     refused = [g for g in got if not g.ok]
     assert sum(len(g.output) for g in served) <= 3_500
     assert refused and all("budget is used up" in g.output for g in refused)
-    assert len(rr.serve(root, many, budget=10**9)) == len(many)
-    assert sum(g.ok for g in rr.serve(root, many, budget=10**9)) == rr.MAX_REQUESTS
+    unlimited = rr.serve(root, many, budget=10**9)
+    assert sum(g.ok for g in unlimited) == rr.MAX_REQUESTS
+    assert len(unlimited) == rr.MAX_REQUESTS + 1  # one line for all the rest
+    assert unlimited[-1].heading.startswith(f"not served: {len(many) - rr.MAX_REQUESTS} more")
     twice = rr.serve(root, rr.parse_command("cat pkg/mod.py") * 2)
     assert len(twice) == 1  # the same request asked twice is answered once
 
@@ -287,3 +289,126 @@ def test_what_was_asked_and_served_is_logged(root: Path) -> None:
     text = rr.format_served(served)
     assert text.startswith("--- lines 1-2 of pkg/mod.py (40 lines in the file) ---\nline 1\n")
     assert "REFUSED: nothing is executed before the edit" in text
+
+
+# ── what an independent audit broke, and must stay fixed ─────────────────────────────────────
+
+
+def test_a_pattern_that_backtracks_without_end_cannot_hold_the_process(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``re`` has no time limit: under it each of these patterns held the whole process on a
+    short line.  (No clock is asserted; a regression shows as a test that does not come back.)"""
+    (root / "pkg/code.py").write_text("result = compute_total(items, tax_rate) + shipping\n")
+    (root / "pkg/aaa.txt").write_text("a" * 60 + "!\n" + "x" * 60 + "\n")
+    for pattern in ("(\\w+\\W*)+\\x01", "(a+)+$", "(x+x+)+y", "^(([a-z])+.)+[A-Z]([a-z])+$"):
+        got = rr.serve(root, rr.requests_of([{"op": "search", "pattern": pattern, "path": "pkg"}]))
+        assert got[0].ok and got[0].output == "(no match)", pattern
+    # what cannot be compiled at all is searched as plain text instead of raising
+    for pattern in ("(" * 3000 + ")" * 3000, "a{99999999999}", "x" * 5000, "(unclosed"):
+        assert rr.serve(root, rr.requests_of([{"op": "search", "pattern": pattern}]))[0].ok
+
+    class OutOfTime:
+        def search(self, text: str, timeout: float) -> None:
+            assert 0 < timeout <= rr.MATCH_SECONDS  # every match is given a limit
+            raise TimeoutError
+
+    real = rr._compile
+
+    def slow(pattern: str, ignore_case: bool) -> Any:
+        matcher = real(pattern, ignore_case)
+        matcher._rx = OutOfTime()
+        return matcher
+
+    # the backstop behind the engine: a match that does run out of time ends the search
+    monkeypatch.setattr(rr, "_compile", slow)
+    assert "takes too long" in one(root, "grep -n a pkg/aaa.txt").heading
+    assert "takes too long" in one(root, "grep -rl a pkg").heading
+    piped = one(root, "cat pkg/aaa.txt | grep a")
+    assert not piped.ok and "takes too long" in piped.output
+
+
+def test_a_named_pipe_in_the_project_does_not_block_a_search(root: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("no named pipes here")
+    os.mkfifo(root / "pkg" / "fifo")
+    (root / "pkg" / "fifo_link").symlink_to(root / "pkg" / "fifo")
+    assert "pkg/mod.py:1: line 1" in one(root, "grep -rn 'line 1$' pkg").output
+    assert not one(root, "cat pkg/fifo").ok and not one(root, "wc -l pkg/fifo").ok
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        {"op": "read_file", "path": "pkg/mod.py", "start_line": 1e999},
+        {"op": "read_file", "path": "pkg/mod.py", "end_line": float("inf"), "offset": 1e999},
+        {"op": "read_file", "path": "pkg/mod.py", "lines": "1-" + "9" * 5000},
+        {"op": "read_file", "path": "pkg/mod.py", "lines": [1e999, 2]},
+        {"op": "search", "pattern": "line", "path": "pkg/mod.py", "context": 1e999},
+        {"op": "read_file", "path": "pkg/\ud800.py"},
+        {"op": "search", "pattern": "\udcff", "path": "pkg"},
+        {"op": "find_files", "name": "\ud800*", "path": "."},
+        {"op": "run_cmd", "cmd": "head -n \u00b2 pkg/mod.py"},
+        {"op": "run_cmd", "cmd": "head -n " + "9" * 5000 + " pkg/mod.py"},
+        {"op": "run_cmd", "cmd": "sed -n '" + "9" * 5000 + "p' pkg/mod.py"},
+        {"op": "run_cmd", "cmd": "find . -maxdepth \u00b2 -name '*.py'"},
+        {"op": "run_cmd", "cmd": "grep -A \u00b2 line pkg/mod.py"},
+        {"op": "run_cmd", "cmd": "cat pkg/mod.py | head -n \u00b2"},
+        {"op": "run_cmd", "cmd": "cat pkg/long.txt | xargs grep tax"},
+        {"op": "run_cmd", "cmd": 12345},
+        {"op": "search", "pattern": ["a", "b"], "path": {"x": 1}},
+        {"op": "read_file", "path": None, "start_line": "abc"},
+    ],
+)
+def test_no_request_however_malformed_raises(root: Path, op: dict[str, Any]) -> None:
+    """Each of these ended the solve with an uncaught exception; a request is answered or
+    refused, and the answer and the log survive text that cannot be encoded."""
+    (root / "pkg/long.txt").write_text("word " * 80 + "\n")  # one line: a 400-byte "file name"
+    served = rr.serve(root, rr.requests_of([op]))
+    rr.format_served(served).encode("utf-8")
+    rr.log_reads(root, 1, served)
+    assert (root / "pkg/mod.py").read_text("utf-8") == MOD
+
+
+def test_off_limits_names_in_another_case_are_not_served(root: Path) -> None:
+    """On a disk that ignores case ``.Git/config`` is ``.git/config``."""
+    for path in (".Git/HEAD", ".GIT/packed-refs", ".MEMFUN/verify.json", ".Env", ".ENV"):
+        for cmd in (f"cat {path}", f"grep -rn . {path}", f"cd {path.split('/')[0]} && ls"):
+            for got in answer(root, cmd):
+                text = got.heading + got.output
+                assert "future-ref" not in text and "in-project-secret" not in text, (cmd, got)
+                assert "refs/heads" not in text and "reproduce" not in text, (cmd, got)
+
+
+def test_a_link_inside_the_project_to_an_off_limits_file_is_not_read(root: Path) -> None:
+    (root / "pkg/env_alias.txt").symlink_to("../.env")
+    (root / "pkg/git_alias.txt").symlink_to("../.git/packed-refs")
+    (root / "pkg/state_alias.txt").symlink_to("../.memfun/verify.json")
+    everything = one(root, "grep -rn . pkg").output + one(root, "ls -la pkg").output
+    everything += one(root, "find pkg -type f | xargs grep -n .").output
+    for leaked in ("in-project-secret", "future-ref", "reproduce", "_alias.txt ("):
+        assert leaked not in everything
+    assert not one(root, "cat pkg/env_alias.txt").ok
+    for name in (".envrc", ".env-local", ".git-credentials", ".pgpass", "kubeconfig", "k.p12"):
+        (root / name).write_text("NEW-SECRET\n")
+    assert "NEW-SECRET" not in one(root, "grep -rn SECRET .").output
+
+
+def test_the_answers_of_a_round_cannot_outgrow_its_budget(root: Path) -> None:
+    flood = {"op": "run_cmd", "cmd": ";".join(f"a{i}" for i in range(5000))}
+    served = rr.serve(root, rr.requests_of([flood]))
+    assert len(served) <= rr.MAX_REQUESTS + 1
+    assert len(rr.format_served(served)) < 20_000
+    (root / "pkg/SOURCES.txt").write_text("pkg/big.py\n" * 50)
+    wide = one(root, "cat pkg/SOURCES.txt | xargs grep -n -C 20 'X = 1'")
+    assert len(wide.output) <= rr.PER_REQUEST_BYTES + 200
+    long_name = rr.serve(root, rr.requests_of([{"op": "search", "pattern": "x" * 900}]))
+    assert len(long_name[0].heading) < 400
+
+
+def test_the_read_log_is_not_written_through_a_link(root: Path, tmp_path: Path) -> None:
+    victim = tmp_path / "outside" / "victim.txt"
+    victim.write_text("ORIGINAL\n")
+    (root / rr.READ_LOG).symlink_to(victim)
+    rr.log_reads(root, 1, answer(root, "cat pkg/nope.py"))
+    assert victim.read_text() == "ORIGINAL\n"
