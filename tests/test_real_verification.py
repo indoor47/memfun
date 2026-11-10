@@ -271,7 +271,9 @@ async def test_a_large_project_is_planned_from_a_search_of_every_file(root: Path
     )
     (root / "shop/big_rules.py").write_text(big, "utf-8")
     statuses: list[str] = []
-    solver = make_solver(root, statuses, max_context_bytes=1_000, max_file_bytes=2_000)
+    solver = make_solver(
+        root, statuses, max_context_bytes=1_000, max_file_bytes=2_000, repo_search=True
+    )
     seen: dict[str, str] = {}
 
     async def aplan(query: str, file_manifest: str, project_summary: str) -> cf.PlanResult:
@@ -302,11 +304,117 @@ def test_the_new_switches_are_read_from_the_project_verify_file(
     tmp_path: Path, monkeypatch
 ) -> None:
     (tmp_path / ".memfun").mkdir()
-    doc = {"discover_tests": True, "reproduce": True, "test_timeout": 600, "probe_guard": "off"}
+    doc = {
+        "discover_tests": True,
+        "reproduce": True,
+        "repo_search": True,
+        "test_timeout": 600,
+        "probe_guard": "off",
+    }
     (tmp_path / cf.PROJECT_VERIFY_FILE).write_text(json.dumps(doc), "utf-8")
     assert cf.read_project_verify_options(tmp_path) == {}  # not trusted: nothing is read
     monkeypatch.setenv(cf.TRUST_PROJECT_VERIFY_ENV, "1")
     assert cf.read_project_verify_options(tmp_path) == doc
-    bad = {"discover_tests": "yes", "reproduce": 1, "test_timeout": 5}
+    bad = {"discover_tests": "yes", "reproduce": 1, "repo_search": "on", "test_timeout": 5}
     (tmp_path / cf.PROJECT_VERIFY_FILE).write_text(json.dumps(bad), "utf-8")
     assert cf.read_project_verify_options(tmp_path) == {}
+
+
+# ── Everything above is opt-in: with every switch off the solver works as it did before ──────
+
+
+def large_project(root: Path) -> None:
+    for i in range(40):
+        (root / f"shop/extra_{i:02d}.py").write_text(f"def helper_{i}():\n    return {i}\n" * 20)
+
+
+def test_every_new_switch_is_off_by_default() -> None:
+    cfg = cf.ContextFirstConfig()
+    assert (cfg.repo_search, cfg.verify_tests, cfg.reproduce) == (False, False, False)
+    assert (cfg.fix_probe_rounds, cfg.fix_detail) == (0, False)
+
+
+@pytest.mark.asyncio
+async def test_with_every_switch_off_the_solver_plans_reads_and_fixes_as_before(
+    root: Path, monkeypatch
+) -> None:
+    """The default configuration on a project too large to read whole: the planner chooses
+    from the plain code map, exactly the files and patterns it names are gathered, the solver
+    is shown exactly the gathered text, the fix step gets the joined errors of the configured
+    commands, and none of the opt-in machinery runs or leaves a file behind."""
+    from memfun_agent import fixloop, repo_search
+    from memfun_agent.code_map import build_code_map, code_map_to_string
+
+    large_project(root)
+    for name in ("issue_terms", "rank_files", "grep"):
+        monkeypatch.setattr(repo_search, name, lambda *_a, **_k: pytest.fail("search is opt-in"))
+    for name in ("discover", "candidate_pythons", "python_version"):
+        monkeypatch.setattr(repo_tests, name, lambda *_a, **_k: pytest.fail("checks are opt-in"))
+    fail_a = f"{sys.executable} -c \"import sys; print('first check'); sys.exit(1)\""
+    fail_b = f"{sys.executable} -c \"import sys; print('second check'); sys.exit(2)\""
+    solver = make_solver(
+        root, [], max_context_bytes=1_000, verify_commands=(fail_a, fail_b), max_fix_attempts=1
+    )
+    expected_manifest = code_map_to_string(
+        build_code_map(root, manifest=cf.build_file_manifest(root)), max_tokens=2000
+    )
+    seen: dict[str, Any] = {}
+    plan = cf.PlanResult(
+        files_to_read=["shop/tax.py", "shop/cart.py"], search_patterns=["RATE"], reasoning=""
+    )
+
+    async def aplan(query: str, file_manifest: str, project_summary: str) -> cf.PlanResult:
+        seen["manifest"] = file_manifest
+        return plan
+
+    gather = solver.gatherer.agather
+
+    async def agather(**kwargs: Any) -> str:
+        seen["gather"] = kwargs
+        seen["gathered"] = await gather(**kwargs)
+        return seen["gathered"]
+
+    solver.planner.aplan = aplan  # type: ignore[method-assign]
+    solver.gatherer.agather = agather  # type: ignore[method-assign]
+    change = edit(root, "return sum(items)", "return sum(list(items))")
+    model = Model(solver, solve=[[change]], fixes=[])
+    solver.repro_solver.awrite = None  # type: ignore[method-assign]  # must never be called
+    await solver.asolve(query=ISSUE)
+
+    assert seen["manifest"] == expected_manifest
+    assert seen["gather"] == {
+        "files": plan.files_to_read,
+        "project_root": solver.project_root,
+        "search_patterns": plan.search_patterns,
+        "web_searches": None,
+    }
+    assert solver.gatherer.focus_terms == []
+    assert model.solve_contexts == [seen["gathered"]]  # nothing added: no search, no environment
+    # two failing commands: the fix step is shown what it was always shown
+    vr = await cf.Verifier(root).averify([fail_a, fail_b])
+    assert model.fix_errors == [fixloop.compact_errors(vr.errors)]
+    assert "first check" in model.fix_errors[0] and "second check" in model.fix_errors[0]
+    assert not (root / ".memfun").exists()  # no check log, no reproduction, no probe log
+
+
+@pytest.mark.asyncio
+async def test_repo_search_is_switched_on_by_the_project_verify_file(
+    root: Path, monkeypatch
+) -> None:
+    """The benchmark runner writes its agent options to ``.memfun/verify.json``."""
+    large_project(root)
+    (root / ".memfun").mkdir()
+    (root / cf.PROJECT_VERIFY_FILE).write_text(json.dumps({"repo_search": True}), "utf-8")
+    monkeypatch.setenv(cf.TRUST_PROJECT_VERIFY_ENV, "1")
+    solver = make_solver(root, [], max_context_bytes=1_000)
+    seen: dict[str, str] = {}
+
+    async def aplan(query: str, file_manifest: str, project_summary: str) -> cf.PlanResult:
+        seen["manifest"] = file_manifest
+        return cf.PlanResult(files_to_read=["shop/tax.py"], search_patterns=[], reasoning="")
+
+    solver.planner.aplan = aplan  # type: ignore[method-assign]
+    model = Model(solver, solve=[[]], fixes=[])
+    await solver.asolve(query=ISSUE)
+    assert seen["manifest"].startswith("FILES THAT DEFINE OR MENTION NAMES FROM THE TASK")
+    assert "=== FILE: shop/cart.py ===" in model.solve_contexts[0]  # found by the search

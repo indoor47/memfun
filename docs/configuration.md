@@ -333,6 +333,7 @@ names the key and the allowed range, and the setting stays off or at its default
 | `discover_tests` | `true` / `false` | `false` | verify with the project's **own** tests (see below) |
 | `reproduce` | `true` / `false` | `false` | before solving, the model writes a script that shows the problem; it is kept only if it reports the problem on the unchanged code, is shown to the solver with its real output, and is run again after the change |
 | `test_timeout` | integer 10..3600 | 300 | seconds one run of the selected tests may take (the whole process group is killed after that) |
+| `repo_search` | `true` / `false` | `false` | on a project too large to read whole, search every source file for the names in the task: the planner chooses from the files that define or mention them (instead of the code map), its search patterns are searched in every file, and a large file keeps the definitions that match |
 
 The loop itself is the same with or without probes: `probe_rounds` changes only whether the look
 step runs, not when the loop stops.

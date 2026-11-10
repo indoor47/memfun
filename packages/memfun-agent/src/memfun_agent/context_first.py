@@ -245,7 +245,9 @@ class ContextFirstConfig:
     #: Search the whole repository for the names in the task when the project is too large
     #: to read whole (the planner path): the planner sees the files that define or mention
     #: them, and its own search patterns are searched in every file, not only the ones read.
-    repo_search: bool = True
+    #: Opt-in (it changes which files the planner is offered and what is read):
+    #: ``repo_search`` in ``.memfun/verify.json`` or this field.
+    repo_search: bool = False
     #: Verify with the project's OWN tests: find how it runs them, select the tests relevant
     #: to the changed files, leave out failures that were already there, feed the rest to the
     #: fix loop (see ``repo_tests``).  Opt-in (it runs parts of the project's test suite):
@@ -1479,7 +1481,8 @@ def read_project_verify_options(project_root: Path) -> dict[str, Any]:
     ``fix_detail`` (bool: re-run failing pytest tests with full assertion output),
     ``probe_rounds`` (int >= 0: stalled rounds on which to run differential probes),
     ``probe_guard``, ``discover_tests`` (bool: verify with the project's own relevant tests),
-    ``reproduce`` (bool: a reproduction script before the change, a check after it) and
+    ``reproduce`` (bool: a reproduction script before the change, a check after it),
+    ``repo_search`` (bool: plan a large project from a search of every file) and
     ``test_timeout`` (seconds for one run of the selected tests)."""
     if os.environ.get(TRUST_PROJECT_VERIFY_ENV, "").lower() not in ("1", "true", "yes"):
         return {}
@@ -1508,7 +1511,7 @@ def read_project_verify_options(project_root: Path) -> dict[str, Any]:
                     PROJECT_VERIFY_FILE,
                     ", ".join(fixloop.PROBE_GUARDS),
                 )
-        for key in ("discover_tests", "reproduce"):
+        for key in ("discover_tests", "reproduce", "repo_search"):
             if key in data:
                 if isinstance(data[key], bool):
                     out[key] = data[key]
@@ -2064,6 +2067,9 @@ class ContextFirstSolver:
         #    are planned and executed.
         gather_id = f"gather-{workflow_id}"
         t_gather = time.monotonic()
+        opts = read_project_verify_options(self.project_root)
+        use_search = bool(opts.get("repo_search", self.config.repo_search))
+        self.gatherer.focus_terms = []
         self._dashboard(
             "task.published",
             task_id=gather_id,
@@ -2098,7 +2104,7 @@ class ContextFirstSolver:
             all_files = [path for path, _ in manifest]
             terms: list[str] = []
             ranked: list[repo_search.FileHit] = []
-            if self.config.repo_search:
+            if use_search:
                 terms = repo_search.issue_terms(raw_query or query)
                 if terms:
                     self._status(f"Searching {len(all_files)} files for {len(terms)} names...")
@@ -2113,7 +2119,7 @@ class ContextFirstSolver:
             )
             files_to_read = list(plan.files_to_read)
             grep_block = ""
-            if self.config.repo_search:
+            if use_search:
                 hits, counts = await asyncio.to_thread(
                     repo_search.grep, self.project_root, all_files, plan.search_patterns
                 )
@@ -2130,7 +2136,7 @@ class ContextFirstSolver:
             full_context = await self.gatherer.agather(
                 files=files_to_read,
                 project_root=self.project_root,
-                search_patterns=None if self.config.repo_search else plan.search_patterns or None,
+                search_patterns=None if use_search else plan.search_patterns or None,
                 web_searches=plan.web_searches or None,
             )
             full_context += grep_block + extra_context
@@ -2163,7 +2169,6 @@ class ContextFirstSolver:
             )
 
         # 2b. Reproduction (opt-in): show the problem on the unchanged code first.
-        opts = read_project_verify_options(self.project_root)
         repro: Reproduction | None = None
         wants_repro = bool(opts.get("reproduce", self.config.reproduce))
         self._log_checks = wants_repro or bool(
@@ -2727,7 +2732,10 @@ class ContextFirstSolver:
                 self._status("Verification passed")
                 return
             sc = fixloop.score(vr.errors, False)
-            if len(vr.blocks) > 1:  # a failing check next to failing tests is a failure too
+            # With the solver's own checks on, several commands can fail in one round: a
+            # failing check next to failing tests is a failure too, and each is shown.
+            by_command = self._log_checks and len(vr.blocks) > 1
+            if by_command:
                 sc = (sc[0], sc[1] + fixloop.other_failures(vr.blocks), sc[2])
             last[0] = sc
             state = fixloop.state_key(fixloop.read_texts(paths))
@@ -2785,7 +2793,7 @@ class ContextFirstSolver:
                 )
             errors_for_fix = (
                 fixloop.compact_blocks(vr.blocks)
-                if len(vr.blocks) > 1
+                if by_command
                 else fixloop.compact_errors(vr.errors)
             )
             if fix_detail and summary.failed_ids:
