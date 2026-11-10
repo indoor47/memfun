@@ -1583,6 +1583,26 @@ class OperationExecutor:
             )
             return
 
+        if new_content == content:
+            # An edit whose result is the text that was already there changes nothing: it is
+            # a failed edit (the model is told and may send a real one), not a file "edited"
+            # that then yields an empty patch reported as a success.
+            logger.warning("edit_file: the edit changes nothing in %s", path)
+            self._status(f"Edit failed: it changes nothing in {path}")
+            self.failed += 1
+            self.edit_diagnostics.append(
+                EditDiagnostic(
+                    path=str(path),
+                    old_text=old_text[:500],
+                    new_text=new_text[:500],
+                    best_match_ratio=ratio,
+                    best_match_snippet=snippet,
+                    strategy_tried="no-op (the new text is the same as the old text)",
+                    file_excerpt=content[:2000],
+                )
+            )
+            return
+
         if strategy != "exact":
             logger.info(
                 "edit_file: fuzzy match in %s (ratio=%.2f, strategy=%s)",
