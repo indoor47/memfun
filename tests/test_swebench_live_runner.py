@@ -58,6 +58,13 @@ if args[0] == "exec":
     elif step == "config":
         open(os.path.join(state, "config.toml"), "w").write(sys.stdin.read())
     elif step == "rollout":
+        with open(os.path.join(state, "rollout_env.jsonl"), "a") as fh:
+            fh.write(json.dumps([a for a in args if "=" in a and not a.startswith("MFL_")]) + "\n")
+        n = len(open(os.path.join(state, "rollout_env.jsonl")).read().splitlines())
+        crashes = scen.get("crashes", [])
+        if n <= len(crashes):
+            print("Traceback (most recent call last)\n" + crashes[n - 1], flush=True)
+            sys.exit(1)
         cfg = open(os.path.join(state, "config.toml")).read()
         base = cfg.split('base_url = "')[1].split('"')[0]
         for _ in range(scen.get("llm_calls", 1)):
@@ -70,7 +77,9 @@ if args[0] == "exec":
             import time
             time.sleep(scen["hangs"])
     elif step == "done": sys.exit(0 if has("result") else 1)
-    elif step == "result": sys.exit(1)
+    elif step == "result":
+        if "result_json" not in scen: sys.exit(1)
+        sys.stdout.write(json.dumps(scen["result_json"]))
     elif step == "collect": sys.stdout.write(scen.get("patch", ""))
     elif step == "agentstate": sys.stdout.write(scen.get("state", {}).get(args[-1], ""))
     elif step == "patchcheck": sys.exit(0 if scen.get("applies", True) else 1)
@@ -164,8 +173,11 @@ def test_a_rollout_end_to_end_records_patch_trajectory_and_usage(env) -> None:
     # the order is the contract: history lock-down and the network self-test BEFORE the rollout
     assert steps == [
         "findrepo", "lockdown", "baseline", "nettest", "config", "rollout", "result",
-        "agentstate", "agentstate", "agentstate", "collect", "patchcheck",
+        "agentstate", "agentstate", "agentstate", "agentstate", "collect", "patchcheck",
     ]  # fmt: skip
+    # the model library must not refresh its price table from the internet at start-up
+    rollout = next(c for c in e.calls() if "MFL_STEP=rollout" in c)
+    assert "LITELLM_LOCAL_MODEL_COST_MAP=true" in rollout
     kinds = [c[0] for c in e.calls()]
     assert kinds[-3:] == ["rm", "rmi", "network"]  # pull-run-delete, nothing left behind
 
@@ -586,3 +598,87 @@ def test_the_baseline_arm_needs_its_interpreter(env) -> None:
     e = env()
     with pytest.raises(SystemExit, match="--mini-python"):
         rn.main(e.argv("--arm", "mini"))
+
+
+# ── an agent that dies before its first model call ───────────────────────────────────────────
+
+CRASH = "MarkupError: closing tag '[/content/x.py]' at position 1949 doesn't match any open tag"
+
+
+def attempts(e: Env) -> list[dict[str, Any]]:
+    return [json.loads(x) for x in (e.run_dir / "attempts.jsonl").read_text().splitlines()]
+
+
+def test_the_same_crash_three_times_closes_the_instance_instead_of_retrying_for_ever(env) -> None:
+    """Zero model calls is not an attempt: the instance runs again from scratch.  But an
+    agent that dies the same way three times in a row is failing on this task: it is closed
+    with an empty patch and its own class (one pilot instance was retried 39 times)."""
+    e = env(crashes=[CRASH] * 9)
+    assert rn.main(e.argv()) == 0
+    rec = e.record()
+    assert rec["status"] == "done" and rec["failure_class"] == "agent_crash"
+    assert rec["crash"] == CRASH and rec["identical_crashes"] == 3
+    assert {"agent_crash", "empty_patch"} <= set(rec["flags"]) and rec["patch_bytes"] == 0
+    assert rec["usage"]["calls"] == 0 and "no answer from the model" in rec["error"]
+    log = attempts(e)
+    assert [(a["attempt"], a["status"], a["crash"]) for a in log] == [
+        (1, "infra_error", CRASH),
+        (2, "infra_error", CRASH),
+        (3, "agent_crash", CRASH),
+    ]
+    assert log[2]["final"] is True and "not retried" in log[2]["note"]
+    assert len((e.state / "rollout_env.jsonl").read_text().splitlines()) == 3  # and no more
+    iid = SENTINELS["instance_id"]
+    assert (e.run_dir / "attempts" / f"{iid}.1" / "agent.log").read_text().strip().endswith(CRASH)
+    preds = json.loads((e.run_dir / "preds.json").read_text())
+    assert preds[iid]["model_patch"] == ""
+    assert rn.main(e.argv("--retry-infra")) == 0  # final: never rolled out again
+    assert len((e.state / "rollout_env.jsonl").read_text().splitlines()) == 3
+
+
+def test_a_crash_that_does_not_repeat_is_retried_and_the_rollout_counts(env) -> None:
+    e = env(crashes=[CRASH, "OSError: [Errno 28] No space left on device"])
+    assert rn.main(e.argv()) == 0
+    rec = e.record()
+    assert rec["status"] == "done" and "failure_class" not in rec and rec["patch_bytes"] > 0
+    assert [a["status"] for a in attempts(e)] == ["infra_error", "infra_error"]
+
+
+def test_crashes_that_keep_differing_stay_an_infrastructure_error(env) -> None:
+    e = env(crashes=[f"RuntimeError: temporary failure {i}" for i in range(9)])
+    assert rn.main(e.argv()) == 1
+    assert e.record()["status"] == "infra_error"
+    assert len((e.state / "rollout_env.jsonl").read_text().splitlines()) == rn.CRASH_REPEATS
+
+
+def test_the_crash_signature_is_the_last_line_of_text_not_the_drawn_frame(tmp_path: Path) -> None:
+    log = tmp_path / "agent.log"
+    log.write_text(
+        "\u256d\u2500 Traceback (most recent call last) \u2500\u256e\n"
+        "\u2502 /x/markup.py:167 in render             \u2502\n"
+        "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n"
+        f"{CRASH}\n\n",
+        "utf-8",
+    )
+    assert rn.crash_signature(log) == CRASH
+    assert rn.crash_signature(tmp_path / "missing.log") == ""
+
+
+def test_an_empty_patch_is_never_silent(env) -> None:
+    """The agent's own outcome is kept: a rollout that changed nothing says so."""
+    why = "no file changes produced (context-first escalated, RLM did not run)"
+    e = env(patch="", result_json={"success": False, "no_edits": True, "error": why})
+    assert rn.main(e.argv()) == 0
+    rec = e.record()
+    assert rec["status"] == "done" and "empty_patch" in rec["flags"]
+    assert rec["failure_class"] == "no_edits" and rec["agent_no_edits"] is True
+    assert rec["agent_error"] == why and rec["agent_success"] is False
+
+
+def test_the_served_reads_are_kept_with_the_trajectory(env) -> None:
+    line = json.dumps({"round": 1, "asked": "sed -n '1,5p' m.py", "served": True})
+    e = env(state={".memfun/reads.jsonl": line + "\n"})
+    assert rn.main(e.argv()) == 0
+    idir = e.run_dir / "instances" / SENTINELS["instance_id"]
+    assert (idir / "reads.jsonl").read_text() == line + "\n"
+    assert "reads.jsonl" in e.record()["agent_state"]

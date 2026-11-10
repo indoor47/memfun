@@ -37,6 +37,7 @@ import contextlib
 import dataclasses
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -93,6 +94,11 @@ PATCH_JUNK = (
 PATCH_LARGE_BYTES = 1_000_000
 FINAL = "done"
 INFRA = "infra_error"
+#: An agent that exits with an error before its first model call, the same way this many
+#: times in a row, is not an infrastructure failure: the instance is closed with an empty
+#: patch and this failure class instead of being retried for ever.
+CRASH_REPEATS = 3
+AGENT_CRASH = "agent_crash"
 
 FIND_REPO = (
     f"cd {REPO_ROOT_IN} && "
@@ -534,6 +540,7 @@ def submitted_patch(box: Box, repo: str, base_tree: str, patch: str) -> bool:
 AGENT_STATE = (
     (".memfun/checks.jsonl", "checks.jsonl"),
     (".memfun/probes.jsonl", "probes.jsonl"),
+    (".memfun/reads.jsonl", "reads.jsonl"),
     (".memfun/repro/issue_repro.py", "issue_repro.py"),
 )
 
@@ -621,6 +628,9 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
             **({TRUST_VERIFY_ENV: "1"} if s.agent_options else {}),
             "MEMFUN_NO_DASHBOARD_AUTOSTART": "1",
             "MEMFUN_SWARM_RESULT_JSON": f"{HOME_IN}/swarm-result.json",
+            # The model library refreshes a price table from the internet at start-up unless
+            # told to use its bundled copy: no network attempt may appear in a rollout.
+            "LITELLM_LOCAL_MODEL_COST_MAP": "true",
             "PYTHONUNBUFFERED": "1",
             "COLUMNS": "160",
         }
@@ -652,8 +662,11 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
         result = box.exec("result", ["cat", f"{HOME_IN}/swarm-result.json"], timeout=60)
         if result.returncode == 0 and result.stdout.strip():
             (idir / "swarm-result.json").write_bytes(result.stdout)
+            rec.update(agent_outcome(result.stdout))
         if usage.calls - usage.errors <= 0:
             rec["model_path_failed"] = True
+            if usage.calls == 0 and exit_code not in (0, None):
+                rec["crash"] = crash_signature(idir / "agent.log")
             raise InfraError(
                 f"the agent got no answer from the model ({usage.calls} calls, "
                 f"{usage.errors} errors): see agent.log"
@@ -690,7 +703,11 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
         if len(patch.encode()) > PATCH_LARGE_BYTES:
             rec["flags"].append("patch_large")
         if not patch.strip():
+            # Never silent: an empty patch carries the agent's own failure class.
             rec["flags"].append("empty_patch")
+            rec["failure_class"] = (
+                "no_edits" if rec.get("agent_no_edits") else rec.get("agent_error") or "no_patch"
+            )[:300]
         elif not applies:
             rec["flags"].append("patch_does_not_apply")
         rec["status"] = FINAL
@@ -718,6 +735,98 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
 # ── the run ──────────────────────────────────────────────────────────────────────────────────
 
 
+_BOX_DRAWING = re.compile(r"^[\s\u2500-\u257f]+|[\s\u2500-\u257f]+$")
+
+
+def crash_signature(log: Path) -> str:
+    """The last line of text in an agent log (frames of a drawn traceback left out): what an
+    agent that died before its first model call died of, e.g. ``MarkupError: closing tag...``."""
+    try:
+        tail = log.read_bytes()[-8_000:].decode("utf-8", "replace")
+    except OSError:
+        return ""
+    for line in reversed(tail.splitlines()):
+        line = _BOX_DRAWING.sub("", line)
+        if line:
+            return line[:300]
+    return ""
+
+
+def agent_outcome(result_json: bytes) -> dict[str, Any]:
+    """What the agent itself reported (its ``swarm-result.json``): kept in the instance
+    record so that a rollout without a patch says why."""
+    try:
+        doc = json.loads(result_json)
+    except ValueError:
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    out: dict[str, Any] = {"agent_success": bool(doc.get("success"))}
+    if doc.get("no_edits"):
+        out["agent_no_edits"] = True
+    if doc.get("error"):
+        out["agent_error"] = str(doc["error"])[:500]
+    return out
+
+
+def identical_crashes_before(run_dir: Path, iid: str, signature: str) -> int:
+    """How many attempts of *iid* in a row, up to now, ended in this same crash."""
+    try:
+        lines = (run_dir / "attempts.jsonl").read_text("utf-8").splitlines()
+    except OSError:
+        return 0
+    n = 0
+    for line in reversed(lines):
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        if doc.get("instance_id") != iid:
+            continue
+        if not signature or doc.get("crash") != signature:
+            break
+        n += 1
+    return n
+
+
+def close_as_crash(run_dir: Path, rec: dict[str, Any], repeats: int) -> dict[str, Any]:
+    """Close an instance whose agent keeps crashing before its first model call: final, with
+    an empty patch and the failure class ``agent_crash`` (documented in ``attempts.jsonl``)."""
+    iid = str(rec["instance_id"])
+    idir = run_dir / "instances" / iid
+    rec = {
+        **rec,
+        "status": FINAL,
+        "failure_class": AGENT_CRASH,
+        "identical_crashes": repeats,
+        "patch_bytes": 0,
+        "patch_applies": False,
+        "patch_files": 0,
+        "flags": [*rec.get("flags", []), AGENT_CRASH, "empty_patch"],
+    }
+    (idir / "patch.diff").write_text("", "utf-8")
+    write_json(idir / "instance.json", rec)
+    with (run_dir / "attempts.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "instance_id": iid,
+                    "attempt": repeats,
+                    "status": AGENT_CRASH,
+                    "final": True,
+                    "error": rec.get("error", ""),
+                    "crash": rec.get("crash", ""),
+                    "llm_calls": 0,
+                    "closed_at": time.time(),
+                    "note": f"{repeats} identical crashes before the first model call: "
+                    "closed with an empty patch, not retried",
+                }
+            )
+            + "\n"
+        )
+    return rec
+
+
 def instance_status(run_dir: Path, iid: str) -> str:
     """``""`` (never started), ``done``, or anything else = an attempt that did not finish."""
     idir = run_dir / "instances" / iid
@@ -743,6 +852,7 @@ def set_aside(run_dir: Path, iid: str, status: str) -> None:
                     "attempt": n,
                     "status": status,
                     "error": old.get("error", ""),
+                    "crash": old.get("crash", ""),
                     "llm_calls": (old.get("usage") or {}).get("calls", 0),
                     "set_aside_at": time.time(),
                     "kept_at": str(dest.relative_to(run_dir)),
@@ -838,6 +948,7 @@ def run_all(
     def one(item: tuple[ds.Task, ds.EpisodeInput]) -> None:
         iid = item[0].instance_id
         restarts = 0
+        crashes = 0
         while True:
             if ctx.stop.is_set():
                 return
@@ -848,6 +959,24 @@ def run_all(
                         counts["skipped_unfinished"] += 1
                 return
             rec = run_instance(item[0], item[1], ctx)
+            crash = str(rec.get("crash") or "")
+            if crash:
+                # The agent died before its first model call.  From scratch again (no model
+                # call was made, so it is not an attempt), but the same death CRASH_REPEATS
+                # times in a row is the agent's failure on this task: closed, not retried.
+                with ctx.lock:
+                    seen = identical_crashes_before(ctx.run_dir, iid, crash) + 1
+                    if seen >= CRASH_REPEATS:
+                        rec = close_as_crash(ctx.run_dir, rec, seen)
+                        break
+                    crashes += 1
+                    if ctx.stop.is_set() or crashes >= CRASH_REPEATS:
+                        break  # crashes that differ: left as an infrastructure error
+                    print(
+                        f"{iid}: agent crashed before its first call ({crash}); again", flush=True
+                    )
+                    set_aside(ctx.run_dir, iid, str(rec["status"]))
+                continue
             # An outage during the rollout: wait for the model path and restart this instance
             # from scratch within the same run (the attempt is kept and logged, as with
             # --retry-infra).  Only with the wait switched on, and a bounded number of times.

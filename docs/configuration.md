@@ -334,9 +334,41 @@ names the key and the allowed range, and the setting stays off or at its default
 | `reproduce` | `true` / `false` | `false` | before solving, the model writes a script that shows the problem; it is kept only if it reports the task's problem on the unchanged code, is shown to the solver with its real output, and is run again after the change as evidence (see below) |
 | `test_timeout` | integer 10..3600 | 300 | seconds one run of the selected tests may take (the whole process group is killed after that) |
 | `repo_search` | `true` / `false` | `false` | on a project too large to read whole, search every source file for the names in the task: the planner chooses from the files that define or mention them (instead of the code map), its search patterns are searched in every file, and a large file keeps the definitions that match |
+| `read_rounds` | integer 0..6 | 0 (off) | rounds in which the solver may ask to read more before it edits (see below) |
+| `offline` | `true` / `false` | `false` | no web step: the planner is not offered web searches at all and nothing is fetched (for runs that must not touch the network) |
 
 The loop itself is the same with or without probes: `probe_rounds` changes only whether the look
 step runs, not when the loop stops.
+
+#### Reading more before the edit (`read_rounds`)
+
+A file over `max_file_bytes` is shown to the solver as its head, an outline and the definitions
+that match the task. When the code that has to change is not among them, a careful model does
+not guess its text: it answers with a request to read (`sed -n '760,770p' pkg/mod.py`,
+`grep -rn "name" pkg`, a `read_file` operation). Without `read_rounds` such a reply gets one
+reminder and the run ends with nothing edited. With `read_rounds` (1 to 6):
+
+- A reply that holds **only** read requests is answered and the solver is asked again, at most
+  `read_rounds` times; then the edit is demanded once. The task text stays the same and the
+  answers are added at the end of the context.
+- The reads are served by memfun's own code (`memfun_agent.read_requests`). **Nothing is passed
+  to a shell.** A request is one of: lines of a file, a regular-expression search under a path,
+  a search for file names, a directory listing, a line count. Commands are only parsed: `cat`,
+  `head`, `tail`, `sed -n 'A,Bp'`, `grep`/`rg`/`git grep`, `find -name`, `ls`, `wc -l`, with
+  `&&`/`;` between requests and `| grep`, `| head`, `| sort`, `| wc -l`, `| xargs grep` after
+  one. Everything else is refused with the reason (running code, writing or redirecting to a
+  file, `sed -i`, `find -exec`/`-delete`, command substitution, `git log`/`show`, the network).
+- Every path is confined to the project: no absolute path outside it, no `..`, no symbolic link
+  that leaves it, nothing under `.git` or `.memfun`, no file named like a file of secrets.
+- One answer is capped at 16 KB (cut at a line, with the range to ask for next), one round at
+  40 KB and 12 requests, a search at 200 lines.
+- Every request, served or refused, is recorded in `.memfun/reads.jsonl`.
+
+With `read_rounds`, or with the solver's own checks (`discover_tests`, `reproduce`), the run is
+there to change code: if it ends without an edited file it is reported as the failure
+`context_first_no_edits`, whatever commands it ran, and a reply of reads alone is never
+executed. Without these switches a reply that only runs a command is still an ordinary request
+to run it.
 
 #### Verifying with the project's own tests (`discover_tests`)
 

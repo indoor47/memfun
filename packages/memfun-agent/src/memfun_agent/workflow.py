@@ -304,12 +304,16 @@ def _op_kind(op: Any) -> str:
 
 
 def _git_has_changes(root: Path | None) -> bool | None:
-    """``git status --porcelain`` non-empty?  ``None`` when it cannot be judged."""
+    """``git status --porcelain`` non-empty?  ``None`` when it cannot be judged.
+
+    memfun's own state directory (``.memfun``: settings, logs, the reproduction script) is
+    left out: a run that only wrote its own log there has changed nothing of the project.
+    """
     if root is None:
         return None
     try:
         proc = subprocess.run(
-            ("git", "status", "--porcelain"),
+            ("git", "status", "--porcelain", "--", ".", ":(exclude).memfun"),
             cwd=root,
             capture_output=True,
             text=True,

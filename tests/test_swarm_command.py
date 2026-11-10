@@ -14,6 +14,7 @@ These tests do **not** spin up an LLM or a real runtime — they mock
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -349,3 +350,55 @@ def test_swarm_rejects_use_worktrees_outside_git_repo(
     assert "requires a git repository" in result.output.lower()
     # The engine was never constructed.
     assert engine_cls.call_count == 0
+
+
+# ── Text that looks like terminal markup ───────────────────────────
+
+
+def test_a_task_text_with_bracket_tags_does_not_crash_the_command(
+    git_project: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A task that quotes a path such as ``[/content/pkg/mod.py]`` used to crash the command
+    while it printed its banner (the text was read as terminal markup), before any model
+    call.  The task, the answer and an error are now shown as they are, and the
+    machine-readable result is written before anything is displayed."""
+    from memfun_agent.workflow import WorkflowResult
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    out = git_project / "result.json"
+    monkeypatch.setenv("MEMFUN_SWARM_RESULT_JSON", str(out))
+    spec = "Traceback in [/content/pkg/mod.py] line 3: got [bold]x[/bold] and [/red]"
+    engine_cls = _make_engine_mock()
+    engine_cls.return_value.execute_workflow = AsyncMock(
+        return_value=WorkflowResult(
+            workflow_id="wf-markup",
+            success=False,
+            answer="Changed [/content/pkg/mod.py] as asked [/nope]",
+            sub_task_results={},
+            total_duration_ms=1.0,
+            error="no file changes produced ([/content/pkg/mod.py])",
+        )
+    )
+    builder = MagicMock()
+    builder.return_value.build = AsyncMock(return_value=MagicMock())
+    manager = MagicMock()
+    manager.is_running.return_value = True
+    manager.stop_all = AsyncMock()
+    with (
+        patch("memfun_agent.workflow.WorkflowEngine", engine_cls),
+        patch("memfun_runtime.builder.RuntimeBuilder", builder),
+        patch("memfun_runtime.lifecycle.AgentManager", return_value=manager),
+        patch("memfun_runtime.orchestrator.AgentOrchestrator", return_value=MagicMock()),
+        patch("memfun_cli.commands.agent_commands._configure_dspy", lambda _cfg: None),
+    ):
+        result = CliRunner().invoke(_build_app(), [spec, "--no-use-worktrees"])
+
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.output
+    assert result.exit_code == 1  # the run itself failed; the command did not crash
+    assert engine_cls.return_value.execute_workflow.await_count == 1
+    flat = " ".join(result.output.split())
+    assert "[/content/pkg/mod.py]" in flat and "[bold]x[/bold]" in flat and "[/nope]" in flat
+    assert "MarkupError" not in result.output
+    assert json.loads(out.read_text("utf-8"))["success"] is False
