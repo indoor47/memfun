@@ -33,11 +33,12 @@ import dspy
 from memfun_core.config import LLMConfig
 from memfun_core.logging import get_logger
 
-from memfun_agent import fixloop
+from memfun_agent import fixloop, repo_search, repo_tests
 from memfun_agent.signatures import (
     ConsistencyReview,
     ContextPlanning,
     ExperimentProposal,
+    IssueReproduction,
     SingleShotSolving,
     VerificationFix,
 )
@@ -241,6 +242,23 @@ class ContextFirstConfig:
     #: where an installed copy of the library is a leak) or ``"off"`` (no hook, for disposable
     #: sandboxes only).
     fix_probe_guard: str = "project"
+    #: Search the whole repository for the names in the task when the project is too large
+    #: to read whole (the planner path): the planner sees the files that define or mention
+    #: them, and its own search patterns are searched in every file, not only the ones read.
+    #: Opt-in (it changes which files the planner is offered and what is read):
+    #: ``repo_search`` in ``.memfun/verify.json`` or this field.
+    repo_search: bool = False
+    #: Verify with the project's OWN tests: find how it runs them, select the tests relevant
+    #: to the changed files, leave out failures that were already there, feed the rest to the
+    #: fix loop (see ``repo_tests``).  Opt-in (it runs parts of the project's test suite):
+    #: ``discover_tests`` in ``.memfun/verify.json`` or this field.
+    verify_tests: bool = False
+    #: Seconds one run of the selected tests may take.
+    test_timeout: float = 300.0
+    #: Before solving, have the model write a script that shows the problem, run it on the
+    #: unchanged code and, when it does show the problem, use it as a check after the change
+    #: (``reproduce`` in ``.memfun/verify.json``).  Guarded like a probe (``fix_probe_guard``).
+    reproduce: bool = False
     enable_edit_retry: bool = True
     enable_consistency_review: bool = True
 
@@ -616,12 +634,16 @@ def _python_outline(content: str) -> str:
     return "\n".join(lines)
 
 
-def trim_large_file(content: str, rel_path: str, max_file_bytes: int) -> str:
+def trim_large_file(
+    content: str, rel_path: str, max_file_bytes: int, focus: list[str] | None = None
+) -> str:
     """Replace a huge or generated file by a short outline; small files pass unchanged.
 
     A file is trimmed when it is over *max_file_bytes*, or when it is over a quarter of
     that and looks like generated data (unicode tables, ``# generated`` headers).  The
     outline keeps the head and the Python symbol list, and says how to read the rest.
+    With *focus* (names the task is about) the full source of the functions and classes
+    that define or mention them is added, so the part that matters is not lost.
     """
     if max_file_bytes <= 0:
         return content
@@ -641,6 +663,15 @@ def trim_large_file(content: str, rel_path: str, max_file_bytes: int) -> str:
     parts = [head.rstrip(), note]
     if outline:
         parts.append("OUTLINE (line: symbol):\n" + outline)
+    if focus and rel_path.endswith(".py") and not generated:
+        excerpt = repo_search.focused_excerpt(
+            content, focus, budget=max(4_000, max_file_bytes // 2)
+        )
+        if excerpt:
+            parts.append(
+                "DEFINITIONS THAT MATCH THE TASK (complete source; edit them with edit_file "
+                "using this exact text):\n" + excerpt
+            )
     return "\n".join(parts)
 
 
@@ -658,6 +689,8 @@ class ContextGatherer:
         self.max_files = max_files
         self.max_file_bytes = max_file_bytes
         self._on_status = on_status
+        #: Names the task is about: a file too large to show whole keeps their definitions.
+        self.focus_terms: list[str] = []
 
     def _status(self, msg: str) -> None:
         """Emit a per-file status update."""
@@ -700,7 +733,7 @@ class ContextGatherer:
                 content = await asyncio.to_thread(fpath.read_text, "utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            content = trim_large_file(content, rel_path, self.max_file_bytes)
+            content = trim_large_file(content, rel_path, self.max_file_bytes, self.focus_terms)
 
             # Budget check.
             if total + len(content) > self.max_bytes:
@@ -894,6 +927,11 @@ class SingleShotSolver(dspy.Module):
             truncated = _detect_truncation(raw_ops, operations)
             if attempt > UNPARSEABLE_RETRIES:
                 break
+            if not operations and looks_like_tool_call(raw_ops, answer, reasoning):
+                # Tool calls written as text: this step has no tools, so nothing happened.
+                logger.warning("Solver reply was written as tool calls; retrying once")
+                ask = query + TOOL_CALL_NUDGE
+                continue
             if truncated and not operations:
                 # Cut off before the operations (the reasoning ate the budget): a plain
                 # re-sample tends to ramble again, so say what to do differently.
@@ -999,6 +1037,45 @@ def _detect_truncation(
 # ── Operation Executor ────────────────────────────────────────
 
 
+def repair_foreign_path(path_str: str, project_root: Path, *, for_write: bool) -> Path | None:
+    """Map an absolute path that does not exist onto the project, or return ``None``.
+
+    A model sometimes answers with paths of a place it imagines (``/workspace/pkg/mod.py``)
+    instead of the project it was shown.  An absolute path that exists (or, for a new file,
+    whose directory exists) is taken as given.  Otherwise the longest tail of the path that
+    names an existing project file (for a new file: an existing project directory) is used,
+    and when there is none the operation is refused: memfun never creates directories outside
+    the project for a path nobody has.
+    """
+    path = Path(path_str)
+    if path.is_file() or (for_write and path.parent.is_dir()):
+        return Path(os.path.abspath(path_str))
+    parts = path.parts[1:]
+    for i in range(1, len(parts)):
+        candidate = project_root.joinpath(*parts[i:])
+        if candidate.is_file() or (for_write and candidate.parent.is_dir() and i < len(parts) - 1):
+            return candidate
+    return None
+
+
+_CD_ABSOLUTE = re.compile(r"^\s*cd\s+(/[^\s;&|]*)")
+#: Markup of a tool call written as text: the solver steps have no tools, so such a reply is
+#: not an answer (seen with chat models that fall into their tool-calling habit).
+_TOOL_CALL_TEXT = re.compile(
+    r"<tool_call>|</tool_call>|<function=|<parameter=|<function_calls>|<invoke\s|\[TOOL_CALLS\]"
+)
+TOOL_CALL_NUDGE = (
+    "\n\nIMPORTANT: your previous reply was written as tool calls. You have NO tools in this "
+    "step and nothing will run them. Work only from the files shown above; their paths are "
+    "relative to the project root. Reply with the operations JSON and nothing else after it."
+)
+
+
+def looks_like_tool_call(*texts: str) -> bool:
+    """Whether any of *texts* is written as a tool call instead of an answer."""
+    return any(_TOOL_CALL_TEXT.search(t or "") for t in texts)
+
+
 class OperationExecutor:
     """Execute file operations produced by the SingleShotSolver.
 
@@ -1013,6 +1090,7 @@ class OperationExecutor:
         *,
         edit_only: bool = False,
         base_dir: str | Path | None = None,
+        originals: dict[Path, str | None] | None = None,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self._on_status = on_status
@@ -1027,18 +1105,30 @@ class OperationExecutor:
         self.attempted: int = 0  # total operations attempted
         self.failed: int = 0  # operations that silently failed
         self.edit_diagnostics: list[EditDiagnostic] = []
+        #: The content of every file as it was before this executor (or one sharing the dict)
+        #: first changed it; ``None`` = the file did not exist.
+        self.originals: dict[Path, str | None] = {} if originals is None else originals
 
-    def _resolve_path(self, path_str: str) -> Path | None:
+    def _resolve_path(self, path_str: str, *, for_write: bool = False) -> Path | None:
         """Resolve *path_str* and (when ``base_dir`` is set) confine it.
 
         Returns ``None`` if the path would escape ``base_dir``; the
         caller should treat that as a soft failure (increment
-        ``self.failed`` and continue).  When ``base_dir`` is unset
-        the legacy behaviour — ``Path(os.path.abspath(path_str))`` —
-        is preserved so existing tests / callers see no change.
+        ``self.failed`` and continue).  When ``base_dir`` is unset a
+        relative path resolves against the working directory as before;
+        an absolute path that does not exist is mapped onto the project
+        or refused (:func:`repair_foreign_path`).
         """
         if self.base_dir is None:
-            return Path(os.path.abspath(path_str))
+            if os.path.isabs(path_str):
+                fixed = repair_foreign_path(path_str, self.project_root, for_write=for_write)
+                if fixed is None:
+                    logger.warning("Refusing a path that is not in the project: %s", path_str)
+                    self._status(f"Blocked path outside the project: {path_str}")
+                elif str(fixed) != os.path.abspath(path_str):
+                    logger.info("Mapped %s onto the project as %s", path_str, fixed)
+                return self._not_own_state(fixed, path_str)
+            return self._not_own_state(Path(os.path.abspath(path_str)), path_str)
 
         candidate = Path(path_str)
         if not candidate.is_absolute():
@@ -1053,6 +1143,15 @@ class OperationExecutor:
             self._status(f"Blocked path outside worktree: {path_str}")
             return None
         return resolved
+
+    def _not_own_state(self, path: Path | None, path_str: str) -> Path | None:
+        """*path*, unless it is inside the project's ``.memfun`` directory: memfun's own state
+        (settings, the reproduction script, logs) is never something a task edits."""
+        if path is not None and path.is_relative_to(self.project_root / ".memfun"):
+            logger.warning("Refusing to change memfun's own state: %s", path_str)
+            self._status(f"Blocked change to memfun's own files: {path_str}")
+            return None
+        return path
 
     def _status(self, msg: str) -> None:
         """Emit a per-operation status update."""
@@ -1089,7 +1188,7 @@ class OperationExecutor:
             self.failed += 1
             return
 
-        path = self._resolve_path(path_str)
+        path = self._resolve_path(path_str, for_write=True)
         if path is None:
             self.failed += 1
             return
@@ -1146,6 +1245,9 @@ class OperationExecutor:
 
         path.parent.mkdir(parents=True, exist_ok=True)
 
+        if path not in self.originals:
+            with contextlib.suppress(OSError, UnicodeDecodeError):
+                self.originals[path] = path.read_text("utf-8") if path.is_file() else None
         await asyncio.to_thread(path.write_text, content, "utf-8")
 
         self.ops.append(("write", str(path), len(content)))
@@ -1205,6 +1307,7 @@ class OperationExecutor:
                 strategy,
             )
 
+        self.originals.setdefault(path, content)
         await asyncio.to_thread(path.write_text, new_content, "utf-8")
 
         self.ops.append(("edit", str(path), len(new_content)))
@@ -1220,6 +1323,13 @@ class OperationExecutor:
 
         cmd = op.get("cmd", "")
         if not cmd:
+            return
+        m = _CD_ABSOLUTE.match(cmd)
+        if m and not Path(m.group(1)).is_dir():
+            # A command for a place that does not exist (an imagined /workspace): not run.
+            logger.warning("Skipped a command for a directory that does not exist: %s", cmd[:200])
+            self._status(f"Skipped command (no such directory {m.group(1)})")
+            self.ops.append(("cmd", cmd, "skipped: no such directory"))
             return
 
         result = await asyncio.to_thread(
@@ -1286,13 +1396,19 @@ def _detect_verify_commands(
     commands.  Returns an empty list if nothing is detected.
     """
     cmds: list[str] = []
+    import shutil
+
+    def installed(tool: str) -> bool:
+        # A linter that is not installed reports nothing about the code: asking for it only
+        # sends "command not found" into the fix loop.
+        return shutil.which(tool) is not None
 
     # Python: ruff (fast, preferred)
     has_python = (project_root / "pyproject.toml").is_file() or any(project_root.glob("*.py"))
     has_ruff_config = (project_root / ".ruff.toml").is_file() or (
         project_root / "pyproject.toml"
     ).is_file()
-    if has_python and has_ruff_config:
+    if has_python and has_ruff_config and installed("ruff"):
         cmds.append("ruff check .")
 
     # JavaScript/TypeScript: eslint
@@ -1301,15 +1417,15 @@ def _detect_verify_commands(
         or (project_root / ".eslintrc.js").is_file()
         or (project_root / "eslint.config.js").is_file()
     )
-    if (project_root / "package.json").is_file() and has_eslint:
+    if (project_root / "package.json").is_file() and has_eslint and installed("npx"):
         cmds.append("npx eslint .")
 
     # Go
-    if (project_root / "go.mod").is_file():
+    if (project_root / "go.mod").is_file() and installed("go"):
         cmds.append("go vet ./...")
 
     # Rust
-    if (project_root / "Cargo.toml").is_file():
+    if (project_root / "Cargo.toml").is_file() and installed("cargo"):
         cmds.append("cargo check")
 
     return cmds
@@ -1361,9 +1477,13 @@ def read_project_verify(project_root: Path) -> tuple[list[str], int | None]:
 
 
 def read_project_verify_options(project_root: Path) -> dict[str, Any]:
-    """The look-step switches of ``.memfun/verify.json`` (same trust rule as the commands):
-    ``fix_detail`` (bool: re-run failing pytest tests with full assertion output) and
-    ``probe_rounds`` (int >= 0: stalled rounds on which to run differential probes)."""
+    """The switches of ``.memfun/verify.json`` (same trust rule as the commands):
+    ``fix_detail`` (bool: re-run failing pytest tests with full assertion output),
+    ``probe_rounds`` (int >= 0: stalled rounds on which to run differential probes),
+    ``probe_guard``, ``discover_tests`` (bool: verify with the project's own relevant tests),
+    ``reproduce`` (bool: a reproduction script before the change, a check after it),
+    ``repo_search`` (bool: plan a large project from a search of every file) and
+    ``test_timeout`` (seconds for one run of the selected tests)."""
     if os.environ.get(TRUST_PROJECT_VERIFY_ENV, "").lower() not in ("1", "true", "yes"):
         return {}
     try:
@@ -1391,6 +1511,27 @@ def read_project_verify_options(project_root: Path) -> dict[str, Any]:
                     PROJECT_VERIFY_FILE,
                     ", ".join(fixloop.PROBE_GUARDS),
                 )
+        for key in ("discover_tests", "reproduce", "repo_search"):
+            if key in data:
+                if isinstance(data[key], bool):
+                    out[key] = data[key]
+                else:
+                    logger.warning(
+                        "ignoring %s=%r in %s (must be true or false)",
+                        key,
+                        data[key],
+                        PROJECT_VERIFY_FILE,
+                    )
+        if "test_timeout" in data:
+            tt = data["test_timeout"]
+            if isinstance(tt, int) and not isinstance(tt, bool) and 10 <= tt <= 3600:
+                out["test_timeout"] = tt
+            else:
+                logger.warning(
+                    "ignoring test_timeout=%r in %s (must be an integer 10..3600 seconds)",
+                    tt,
+                    PROJECT_VERIFY_FILE,
+                )
         if "probe_rounds" in data:
             pr = data["probe_rounds"]
             if isinstance(pr, int) and not isinstance(pr, bool) and 0 <= pr <= MAX_PROBE_ROUNDS:
@@ -1412,13 +1553,26 @@ class VerifyResult:
     passed: bool
     errors: str  # Combined stderr/stdout from failing commands
     commands_run: list[str]
+    #: Commands that could not start at all (the program is not installed): no evidence
+    #: about the code either way, so they are neither a pass nor a failure.
+    skipped: list[str] = field(default_factory=lambda: [])
+    #: The error text of each failing command, in order (``errors`` is these joined).
+    blocks: list[str] = field(default_factory=lambda: [])
+
+
+#: Seconds one verification command may run (the whole process group is killed after that).
+VERIFY_TIMEOUT_S = 120.0
+_NOT_FOUND = re.compile(r"not found|No such file or directory", re.I)
 
 
 class Verifier:
     """Run verification commands (lint, type check, tests) on a project."""
 
-    def __init__(self, project_root: str | Path) -> None:
+    def __init__(self, project_root: str | Path, timeout: float = VERIFY_TIMEOUT_S) -> None:
         self.project_root = Path(project_root).resolve()
+        self.timeout = timeout
+        #: Shown instead of the command line in the error text (for long generated commands).
+        self.labels: dict[str, str] = {}
 
     async def averify(
         self,
@@ -1426,27 +1580,35 @@ class Verifier:
     ) -> VerifyResult:
         """Run *commands* and collect any errors.
 
-        Returns a :class:`VerifyResult` with ``passed=True`` if all
-        commands succeed (exit code 0), or ``passed=False`` with the
-        combined error output.
+        Returns a :class:`VerifyResult` with ``passed=True`` if no command failed, or
+        ``passed=False`` with the combined error output.  Each command runs in its own
+        process group with a time limit, so a hung test run cannot outlive it.  A command
+        whose program is not installed (exit 127, "not found") says nothing about the code:
+        it is listed in ``skipped`` and is not an error.
         """
         import subprocess
 
         errors: list[str] = []
         commands_run: list[str] = []
+        skipped: list[str] = []
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
         for cmd in commands:
             commands_run.append(cmd)
             try:
                 result = await asyncio.to_thread(
-                    subprocess.run,
-                    cmd,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    cwd=str(self.project_root),
+                    fixloop._run_in_group,  # pyright: ignore[reportPrivateUsage]
+                    ["/bin/sh", "-c", cmd],
+                    str(self.project_root),
+                    env,
+                    self.timeout,
                 )
+                if result.returncode == 127 and _NOT_FOUND.search(result.stderr or ""):
+                    logger.warning(
+                        "Verification command could not start (not installed), skipped: %s", cmd
+                    )
+                    skipped.append(cmd)
+                    continue
                 if result.returncode != 0:
                     output = ""
                     if result.stdout:
@@ -1454,16 +1616,20 @@ class Verifier:
                         output += fixloop.clip(result.stdout, 12_000)
                     if result.stderr:
                         output += "\n" + fixloop.clip(result.stderr, 4_000)
-                    errors.append(f"$ {cmd} (exit {result.returncode})\n{output.strip()}")
+                    shown = self.labels.get(cmd, cmd)
+                    errors.append(f"$ {shown} (exit {result.returncode})\n{output.strip()}")
             except subprocess.TimeoutExpired:
-                errors.append(f"$ {cmd} (timed out after 120s)")
+                shown = self.labels.get(cmd, cmd)
+                errors.append(f"$ {shown} (timed out after {self.timeout:.0f}s)")
             except Exception as exc:
-                errors.append(f"$ {cmd} (error: {exc})")
+                errors.append(f"$ {self.labels.get(cmd, cmd)} (error: {exc})")
 
         return VerifyResult(
             passed=len(errors) == 0,
             errors="\n\n".join(errors),
             commands_run=commands_run,
+            skipped=skipped,
+            blocks=errors,
         )
 
 
@@ -1480,16 +1646,39 @@ class FixSolver(dspy.Module):
         full_context: str,
         verification_errors: str,
     ) -> list[dict[str, Any]]:
-        """Produce fix operations for the given verification errors."""
-        result = await asyncio.to_thread(
-            self.predictor,
-            query=query,
-            full_context=full_context,
-            verification_errors=verification_errors,
-        )
+        """Produce fix operations for the given verification errors.
 
-        raw_ops = str(getattr(result, "operations", "[]"))
-        return _parse_operations(raw_ops)
+        A reply written as tool calls (the step has no tools), or one the adapter cannot
+        parse at all, is not an answer: the model is asked once more, told so.
+        """
+        ask = query
+        for attempt in (1, 2):
+            try:
+                result = await asyncio.to_thread(
+                    self.predictor,
+                    query=ask,
+                    full_context=full_context,
+                    verification_errors=verification_errors,
+                )
+            except Exception as exc:
+                unparseable = any(
+                    c.__name__ in ("AdapterParseError", "JSONDecodeError")
+                    for c in type(exc).__mro__
+                )
+                if attempt == 1 and unparseable:
+                    logger.warning("Fix reply could not be parsed (%s); asking once more", exc)
+                    ask = query + TOOL_CALL_NUDGE
+                    continue
+                raise
+            raw_ops = str(getattr(result, "operations", "[]"))
+            ops = _parse_operations(raw_ops)
+            if ops or attempt == 2:
+                return ops
+            if not looks_like_tool_call(raw_ops, str(getattr(result, "reasoning", ""))):
+                return ops
+            logger.warning("Fix reply was written as tool calls; asking once more")
+            ask = query + TOOL_CALL_NUDGE
+        return []
 
 
 class ProbeSolver(dspy.Module):
@@ -1514,6 +1703,105 @@ class ProbeSolver(dspy.Module):
             history=history,
         )
         return fixloop.parse_probes(str(getattr(result, "probes", "[]")))
+
+
+# ── Reproduction: show the problem before the change, check it after ──────────────────────
+
+REPRO_FILE = ".memfun/repro/issue_repro.py"
+REPRO_TIMEOUT_S = 90.0
+REPRO_LABEL = "reproduction script (must print REPRO: PASS)"
+#: Runs the script like a test: from the project root, the project's own packages first.
+_REPRO_LAUNCH = (
+    "import os, runpy, sys; r = sys.argv[1]; s = sys.argv[2]; "
+    "sys.path[:0] = [r, os.path.join(r, 'src')]; os.chdir(r); sys.argv = [s]; "
+    "runpy.run_path(s, run_name='__main__')"
+)
+_FRAME_RE = re.compile(r'File "([^"\n]+)", line (\d+)')
+
+
+@dataclass
+class Reproduction:
+    """A script that showed the problem on the unchanged code."""
+
+    script: str
+    argv: list[str]
+    output: str  # what it printed on the unchanged code
+
+
+def repro_argv(python: str, project_root: Path, script: str, guard: str) -> list[str]:
+    """The command that runs the reproduction *script*.  ``off`` (a disposable sandbox) runs
+    the saved file plainly; the guarded modes run it under the probe's read-only audit hook."""
+    if guard == "off":
+        return [
+            python,
+            "-B",
+            "-c",
+            _REPRO_LAUNCH,
+            str(project_root),
+            str(project_root / REPRO_FILE),
+        ]
+    flags = ["-I", "-S", "-B"] if guard == "strict" else ["-I", "-B"]
+    owned = ",".join(fixloop.owned_packages(project_root))
+    return [python, *flags, "-c", fixloop.PROBE_PREAMBLE, str(project_root), script, guard, owned]
+
+
+def classify_repro(code: int | None, output: str) -> str:
+    """``reproduced`` (the script reports the problem), ``passes`` (it reports the wanted
+    behaviour) or ``broken`` (it crashed, timed out or did not follow its own protocol)."""
+    failed = re.search(r"^REPRO: FAIL", output, re.M) is not None
+    passed = re.search(r"^REPRO: PASS", output, re.M) is not None
+    if code not in (0, None) and failed:
+        return "reproduced"
+    if code == 0 and passed and not failed:
+        return "passes"
+    return "broken"
+
+
+def traceback_context(output: str, project_root: Path, have: str, *, radius: int = 40) -> str:
+    """The code around each project line named in a traceback of *output*, for files that are
+    not in the context *have* yet: where a reproduction fails is where to look."""
+    parts: list[str] = []
+    seen: set[tuple[str, int]] = set()
+    for raw, line_s in _FRAME_RE.findall(output):
+        path = Path(raw)
+        try:
+            rel = str(path.resolve().relative_to(project_root))
+        except (OSError, ValueError):
+            continue
+        if rel.startswith(".memfun") or f"=== FILE: {rel} ===" in have or not path.is_file():
+            continue
+        line = int(line_s)
+        if any(r == rel and abs(line - n) <= radius for r, n in seen):
+            continue
+        seen.add((rel, line))
+        try:
+            lines = path.read_text("utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        lo, hi = max(1, line - radius), min(len(lines), line + radius)
+        body = "\n".join(lines[lo - 1 : hi])
+        parts.append(
+            f"=== FILE: {rel} (lines {lo}-{hi}, from the reproduction traceback) ===\n{body}"
+        )
+        if len(parts) >= 5:
+            break
+    return "\n\n".join(parts)
+
+
+class ReproSolver(dspy.Module):
+    """Write the reproduction script (one LLM call)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.predictor = dspy.Predict(IssueReproduction)
+
+    async def awrite(self, query: str, full_context: str, feedback: str) -> str:
+        result = await asyncio.to_thread(
+            self.predictor, query=query, full_context=full_context, feedback=feedback
+        )
+        script = str(getattr(result, "script", "") or "").strip()
+        script = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", script).strip()
+        return script if "REPRO:" in script else ""
 
 
 class ConsistencyReviewer(dspy.Module):
@@ -1573,6 +1861,13 @@ class ContextFirstSolver:
             print(result.answer)
     """
 
+    #: Set per solve.  ``_log_checks``: write ``.memfun/checks.jsonl`` (own checks are on).
+    #: ``_first_on_tie``: on a tie between verify rounds keep the EARLIEST best state (a
+    #: model-written check is in play, so later edits made to satisfy it are not trusted over
+    #: the first solution).
+    _log_checks: bool = False
+    _first_on_tie: bool = False
+
     def __init__(
         self,
         project_root: str | Path = ".",
@@ -1595,6 +1890,7 @@ class ContextFirstSolver:
         self.solver = SingleShotSolver()
         self.fix_solver = FixSolver()
         self.probe_solver = ProbeSolver()
+        self.repro_solver = ReproSolver()
         self.consistency_reviewer = ConsistencyReviewer()
         self.verifier = Verifier(self.project_root)
 
@@ -1771,6 +2067,9 @@ class ContextFirstSolver:
         #    are planned and executed.
         gather_id = f"gather-{workflow_id}"
         t_gather = time.monotonic()
+        opts = read_project_verify_options(self.project_root)
+        use_search = bool(opts.get("repo_search", self.config.repo_search))
+        self.gatherer.focus_terms = []
         self._dashboard(
             "task.published",
             task_id=gather_id,
@@ -1802,19 +2101,45 @@ class ContextFirstSolver:
                 f"{len(manifest)} source files, "
                 f"{total_size // 1024} KB total"
             )
+            all_files = [path for path, _ in manifest]
+            terms: list[str] = []
+            ranked: list[repo_search.FileHit] = []
+            if use_search:
+                terms = repo_search.issue_terms(raw_query or query)
+                if terms:
+                    self._status(f"Searching {len(all_files)} files for {len(terms)} names...")
+                    ranked = await asyncio.to_thread(
+                        repo_search.rank_files, self.project_root, all_files, terms
+                    )
+                    manifest_str = self._planner_manifest(file_maps, all_files, ranked)
             plan = await self.planner.aplan(
                 query=query,
                 file_manifest=manifest_str,
                 project_summary=project_summary,
             )
-            self._status(f"Reading {len(plan.files_to_read)} selected files...")
+            files_to_read = list(plan.files_to_read)
+            grep_block = ""
+            if use_search:
+                hits, counts = await asyncio.to_thread(
+                    repo_search.grep, self.project_root, all_files, plan.search_patterns
+                )
+                files_to_read = self._files_to_read(files_to_read, ranked, counts)
+                if hits:
+                    grep_block = (
+                        "\n\n=== SEARCH RESULTS (whole repository, path:line: text) ===\n"
+                        + repo_search.format_grep(hits)
+                    )
+                self.gatherer.focus_terms = terms + [
+                    p for p in plan.search_patterns if re.fullmatch(r"\w{3,}", p)
+                ]
+            self._status(f"Reading {len(files_to_read)} selected files...")
             full_context = await self.gatherer.agather(
-                files=plan.files_to_read,
+                files=files_to_read,
                 project_root=self.project_root,
-                search_patterns=plan.search_patterns or None,
+                search_patterns=None if use_search else plan.search_patterns or None,
                 web_searches=plan.web_searches or None,
             )
-            full_context += extra_context
+            full_context += grep_block + extra_context
             method = "context_first_planned"
         self._dashboard(
             "task.completed",
@@ -1842,6 +2167,45 @@ class ContextFirstSolver:
                 success=False,
                 method=method,
             )
+
+        # 2b. Reproduction (opt-in): show the problem on the unchanged code first.
+        repro: Reproduction | None = None
+        wants_repro = bool(opts.get("reproduce", self.config.reproduce))
+        self._log_checks = wants_repro or bool(
+            opts.get("discover_tests", self.config.verify_tests)
+        )
+        self._first_on_tie = False
+        if self._log_checks:
+            pythons = repo_tests.candidate_pythons(self.project_root)
+            version = (
+                await asyncio.to_thread(repo_tests.python_version, pythons[0], self.project_root)
+                if pythons
+                else ""
+            )
+            if version:
+                full_context += (
+                    f"\n\n=== ENVIRONMENT ===\nThe project runs on Python {version}: "
+                    "everything you write must work on that version."
+                )
+        if wants_repro:
+            self._status("Writing a reproduction of the problem...")
+            try:
+                repro = await self._reproduce(raw_query or query, full_context, opts)
+            except Exception as exc:  # the reproduction must never end the solve
+                logger.warning("Reproduction step failed: %s", exc)
+            if repro is not None:
+                self._first_on_tie = True
+                full_context += (
+                    "\n\n=== REPRODUCTION (this script was run on the current code and shows the "
+                    "problem; it is run again after your change and must then print "
+                    '"REPRO: PASS". Change the project\'s code, not the script) ===\n'
+                    + repro.script
+                    + "\n--- its output on the current code ---\n"
+                    + fixloop.clip(repro.output, 3_000)
+                )
+                where = traceback_context(repro.output, self.project_root, full_context)
+                if where:
+                    full_context += "\n\n" + where
 
         # 3. Single-shot solve.
         solve_id = f"solve-{workflow_id}"
@@ -1973,6 +2337,13 @@ class ContextFirstSolver:
 
         # 5. Verify & fix loop.
         verify_cmds = self._get_verify_commands()
+        if executor.files_created:
+            try:
+                verify_cmds = (
+                    await self._own_checks(executor, repro, opts, raw_query or query) + verify_cmds
+                )
+            except Exception as exc:  # no check is better than a crash after the edits
+                logger.warning("Could not set up the project's own tests: %s", exc)
         if verify_cmds and executor.files_created:
             verify_id = f"verify-{workflow_id}"
             t_verify = time.monotonic()
@@ -2031,6 +2402,236 @@ class ContextFirstSolver:
             total_tokens=total_tokens,
         )
 
+    def _planner_manifest(
+        self, file_maps: list[Any], all_files: list[str], ranked: list[repo_search.FileHit]
+    ) -> str:
+        """What the planner chooses from on a large project: the files that define or mention
+        the names in the task (found by searching every file), the definitions of the best of
+        them, and the directory layout."""
+        from memfun_agent.code_map import code_map_to_string
+
+        sources = [h for h in ranked if not h.is_test]
+        tests = [h for h in ranked if h.is_test]
+        if not sources and not tests:
+            return code_map_to_string(file_maps, max_tokens=2000)
+        parts = [
+            f"FILES THAT DEFINE OR MENTION NAMES FROM THE TASK (all {len(all_files)} source "
+            "files were searched; most relevant first):\n"
+            + repo_search.format_ranked(sources, max_files=20, max_chars=6_000)
+        ]
+        if tests:
+            parts.append(
+                "TESTS THAT MENTION THE SAME NAMES:\n"
+                + repo_search.format_ranked(tests, max_files=6, max_chars=1_500)
+            )
+        top = {h.path for h in sources[:15]}
+        maps = [fm for fm in file_maps if fm.path in top]
+        if maps:
+            parts.append(
+                "DEFINITIONS IN THE MOST RELEVANT FILES:\n"
+                + code_map_to_string(maps, max_tokens=2500)
+            )
+        parts.append(
+            "DIRECTORIES OF THE PROJECT (any file may be named, not only the ones above):\n"
+            + repo_search.directory_overview(all_files)
+        )
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _files_to_read(
+        planned: list[str], ranked: list[repo_search.FileHit], grep_counts: dict[str, int]
+    ) -> list[str]:
+        """The planner's files first, then a safety net it may have missed: the two best
+        search-ranked source files, the two source files its own patterns hit most, and the
+        best-ranked test file (to see how the project tests this code)."""
+        files = list(dict.fromkeys(f.strip() for f in planned if f.strip()))
+        extra = [h.path for h in ranked if not h.is_test][:2]
+        by_hits = sorted(grep_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        extra += [f for f, _ in by_hits if not repo_search.is_test_path(f)][:2]
+        extra += [h.path for h in ranked if h.is_test][:1]
+        return files + [f for f in dict.fromkeys(extra) if f not in files]
+
+    async def _reproduce(
+        self, query: str, full_context: str, opts: dict[str, Any]
+    ) -> Reproduction | None:
+        """Have the model write a script that shows the problem and keep it only if, run on
+        the unchanged code, it really reports the problem.  One retry with the script's own
+        output when it does not."""
+        guard = str(opts.get("probe_guard", self.config.fix_probe_guard))
+        if guard not in fixloop.PROBE_GUARDS:
+            guard = "project"
+        candidates = repo_tests.candidate_pythons(self.project_root)
+        if not candidates:
+            logger.info("Reproduction skipped: no project interpreter found")
+            return None
+        python = candidates[0]
+        path = self.project_root / REPRO_FILE
+        feedback = ""
+        for attempt in (1, 2):
+            script = await self.repro_solver.awrite(query, full_context, feedback)
+            if not script:
+                logger.info("Reproduction: the model gave no script (attempt %d)", attempt)
+                self._check_log({"event": "reproduction", "attempt": attempt, "verdict": "none"})
+                break
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(script + "\n", "utf-8")
+            argv = repro_argv(python, self.project_root, script, guard)
+            code, out = await asyncio.to_thread(
+                repo_tests.run, argv, self.project_root, REPRO_TIMEOUT_S
+            )
+            verdict = classify_repro(code, out)
+            logger.info("Reproduction attempt %d: %s (exit %s)", attempt, verdict, code)
+            self._check_log(
+                {
+                    "event": "reproduction",
+                    "attempt": attempt,
+                    "verdict": verdict,
+                    "exit": code,
+                    "output": fixloop.clip(out, 1_500),
+                }
+            )
+            if verdict == "reproduced":
+                self._status("The problem is reproduced")
+                return Reproduction(script=script, argv=argv, output=out)
+            why = (
+                "it printed REPRO: PASS on the UNCHANGED code, so it does not detect the problem"
+                if verdict == "passes"
+                else "it did not finish with a REPRO: FAIL or REPRO: PASS line (it crashed, "
+                "timed out or let an exception escape)"
+            )
+            feedback = (
+                f"Your previous script was run on the unchanged code and {why}.\n"
+                f"--- the script ---\n{script}\n--- its output (exit {code}) ---\n"
+                + fixloop.clip(out, 3_000)
+            )
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        self._status("No reproduction of the problem")
+        return None
+
+    async def _own_checks(
+        self,
+        executor: OperationExecutor,
+        repro: Reproduction | None,
+        opts: dict[str, Any],
+        task: str = "",
+    ) -> list[str]:
+        """Verify commands from the project itself: a syntax check of the changed Python files,
+        the reproduction script, and the project's tests relevant to the changed files with
+        the failures that were already there left out.  Empty unless opted in."""
+        use_tests = bool(opts.get("discover_tests", self.config.verify_tests))
+        if not use_tests and repro is None:
+            return []
+        timeout = float(opts.get("test_timeout", self.config.test_timeout))
+        self.verifier.timeout = max(self.verifier.timeout, timeout)
+        cmds: list[str] = []
+        if repro is not None:
+            cmd = repo_tests.shell(repro.argv)
+            self.verifier.labels[cmd] = REPRO_LABEL
+            cmds.append(cmd)
+        if not use_tests:
+            return cmds
+        changed: list[str] = []
+        for f in dict.fromkeys(executor.files_created):
+            with contextlib.suppress(ValueError):
+                changed.append(str(Path(f).resolve().relative_to(self.project_root)))
+        setup = await asyncio.to_thread(repo_tests.discover, self.project_root)
+        if not setup.python:
+            self._status("No project interpreter found: the project's tests are not run")
+            return cmds
+        py_files = [f for f in changed if f.endswith(".py") and (self.project_root / f).is_file()]
+        originals = dict(executor.originals)
+        if py_files:
+            cmd = repo_tests.shell(repo_tests.compile_command(setup.python, py_files))
+            self.verifier.labels[cmd] = "syntax check of the changed files"
+            cmds.insert(0, cmd)
+            # What imported before the change must still import after it (a name that does
+            # not exist, a circular import: no syntax check sees those).
+
+            def importable() -> list[str]:
+                with repo_tests.original_files(originals):
+                    return repo_tests.importable_modules(setup.python or "", root, py_files)
+
+            root = self.project_root
+            modules = await asyncio.to_thread(importable)
+            if modules:
+                cmd = repo_tests.shell(repo_tests.import_command(setup.python, modules))
+                self.verifier.labels[cmd] = "import check of the changed modules: " + ", ".join(
+                    modules
+                )
+                cmds.insert(1, cmd)
+        if not setup.usable:
+            self._status("No tests found in the project")
+            return cmds
+        symbols: list[str] = []
+        for path, before in originals.items():
+            if path.suffix == ".py" and path.is_file():
+                with contextlib.suppress(OSError, UnicodeDecodeError):
+                    symbols += repo_tests.changed_symbols(before or "", path.read_text("utf-8"))
+        selected = repo_tests.select_tests(self.project_root, changed, setup, symbols=symbols)
+        files = [s.path for s in selected]
+        if len(files) < 2 and task:
+            # Few or no tests are tied to the changed files by name or import (common when a
+            # project tests through its public interface): add the tests that mention the
+            # names the task itself uses.
+            terms = repo_search.issue_terms(task)
+            by_task = await asyncio.to_thread(
+                repo_search.rank_files, self.project_root, list(setup.test_files), terms
+            )
+            files += [h.path for h in by_task if h.path not in files][: 2 - len(files)]
+        if not files:
+            self._status("No existing test is related to the changed files")
+            self._check_log({"event": "tests_selected", "files": [], "changed": changed})
+            return cmds
+        new_files = {
+            str(p.relative_to(self.project_root))
+            for p, text in originals.items()
+            if text is None and p.is_relative_to(self.project_root)
+        }
+        old_files = [f for f in files if f not in new_files]
+        failing: list[str] = []
+        if old_files:
+            self._status(f"Running {len(old_files)} related test files on the original code...")
+            failing, broken, note = await asyncio.to_thread(
+                repo_tests.baseline_failures,
+                self.project_root,
+                setup,
+                old_files,
+                originals,
+                timeout,
+            )
+            noisy = {f for f in old_files if sum(i.startswith(f + "::") for i in failing) > 20}
+            files = [f for f in files if f not in set(broken) | noisy]
+            failing = [i for i in failing if i.split("::")[0] in files]
+            if note:
+                logger.info("Related tests on the original code: %s", note)
+        if not files:
+            self._status("The related tests do not run on the original code: not used")
+            return cmds
+        argv = repo_tests.test_command(setup, files, failing)
+        self._check_log(
+            {
+                "event": "tests_selected",
+                "files": files,
+                "by_file": {s.path: list(s.reasons) for s in selected},
+                "left_out_failing_before": failing,
+                "python": setup.python,
+                "runner": setup.runner,
+            }
+        )
+        logger.info(
+            "Verifying with %d test files (%s); %d failures that were already there left out",
+            len(files),
+            ", ".join(files),
+            len(failing),
+        )
+        self._status(f"Verifying with {len(files)} related test files")
+        return [*cmds, repo_tests.shell(argv)]
+
+    def _check_log(self, record: dict[str, Any]) -> None:
+        if self._log_checks:
+            fixloop.log_check(self.project_root, record)
+
     def _get_verify_commands(self) -> list[str]:
         """Get verification commands: explicit config or auto-detected."""
         if self.config.verify_commands:
@@ -2072,7 +2673,9 @@ class ContextFirstSolver:
             # Never finish worse than the best state this loop saw, whatever ended the loop
             # (a cap, a stall, an exception, a cancellation).
             sc = last[0]
-            if sc is not None and best.best_score is not None and sc > best.best_score:
+            worse = sc is not None and best.best_score is not None and sc > best.best_score
+            tie = sc is not None and sc == best.best_score and self._first_on_tie
+            if worse or tie:
                 changed = best.restore()
                 if changed:
                     logger.info(
@@ -2114,11 +2717,26 @@ class ContextFirstSolver:
         for attempt in range(1, cap + 1):
             self._status(f"Verifying (round {attempt}, base {base}, cap {cap})...")
             vr = await self.verifier.averify(verify_cmds)
+            self._check_log(
+                {
+                    "event": "verify",
+                    "round": attempt,
+                    "passed": vr.passed,
+                    "commands": [self.verifier.labels.get(c, c)[:300] for c in verify_cmds],
+                    "skipped": [self.verifier.labels.get(c, c)[:300] for c in vr.skipped],
+                    "failed": [b[:1_500] for b in vr.blocks],
+                }
+            )
             if vr.passed:
                 last[0] = None
                 self._status("Verification passed")
                 return
             sc = fixloop.score(vr.errors, False)
+            # With the solver's own checks on, several commands can fail in one round: a
+            # failing check next to failing tests is a failure too, and each is shown.
+            by_command = self._log_checks and len(vr.blocks) > 1
+            if by_command:
+                sc = (sc[0], sc[1] + fixloop.other_failures(vr.blocks), sc[2])
             last[0] = sc
             state = fixloop.state_key(fixloop.read_texts(paths))
             revisit = seen_states.get(state)
@@ -2173,7 +2791,11 @@ class ContextFirstSolver:
                 current_context += (
                     "\n\n=== FAILING TESTS (read-only; do not edit) ===\n" + tests_src
                 )
-            errors_for_fix = fixloop.compact_errors(vr.errors)
+            errors_for_fix = (
+                fixloop.compact_blocks(vr.blocks)
+                if by_command
+                else fixloop.compact_errors(vr.errors)
+            )
             if fix_detail and summary.failed_ids:
                 try:
                     detail = await fixloop.run_detail(
@@ -2539,6 +3161,7 @@ class ContextFirstSolver:
                     self.project_root,
                     on_status=self._on_status,
                     edit_only=True,
+                    originals=executor.originals,
                 )
                 await polish_executor.execute(polish_ops)
                 # Merge results back into the main executor.

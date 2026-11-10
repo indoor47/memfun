@@ -45,8 +45,10 @@ Never develop on `lite` or `verified` instances: use `dataset.py dev-sample`.
 
 The agent's own verification is off unless switched on, per run and recorded in the frozen
 settings: `--agent-option discover_tests=true --agent-option reproduce=true --agent-option
-probe_guard=off` (the runner writes them to `.memfun/verify.json` in the repository, which is
-never part of a patch; `probe_guard=off` is right here because the container is disposable).
+repo_search=true --agent-option probe_guard=off` (the runner writes them to
+`.memfun/verify.json` in the repository, which is never part of a patch; `probe_guard=off` is
+right here because the container is disposable; `repo_search` plans a large repository from
+a search of every file and is off unless asked for, like the others).
 
 ## Gold check first
 

@@ -303,8 +303,8 @@ temperature 0.7, repetition penalty 1.05 and the guard on (`--temperature`,
 
 ### Project verify file (`.memfun/verify.json`)
 
-The single-task solver verifies its edit with a linter it auto-detects. A project can name its
-own checks, for example the unit tests of the function being implemented:
+The single-task solver verifies its edit with a linter it auto-detects (when one is installed).
+A project can name its own checks, for example the unit tests of the function being implemented:
 
 ```json
 {"commands": ["python -m pytest -q tests/test_core.py::test_x"], "max_fix_attempts": 4}
@@ -330,9 +330,42 @@ names the key and the allowed range, and the setting stays off or at its default
 | `fix_detail` | `true` / `false` | `false` | after **every** failed round that has failing pytest tests, re-run them with `-vv` and show the fix step their untruncated assertion output (not only on a stall) |
 | `probe_rounds` | integer 0..20 | 0 (off) | on a round that did not improve, up to this many times per solve, the model writes short scripts (up to `fix_probe_iterations`, default 3, per stall) that run in the project and print where the code and the tests' data disagree; the real output goes into the next fix call |
 | `probe_guard` | `"project"` / `"strict"` / `"off"` | `"project"` | how probe scripts are guarded (see below). `"strict"` is `python -I -S -B` (standard library and the project only; the benchmark runner sets it so an installed copy of the library under repair cannot be used). `"off"` removes the audit hook: **only for disposable sandboxes** (a throwaway task container) where a reproduction needs temp files, child processes, local sockets or import-time caches |
+| `discover_tests` | `true` / `false` | `false` | verify with the project's **own** tests (see below) |
+| `reproduce` | `true` / `false` | `false` | before solving, the model writes a script that shows the problem; it is kept only if it reports the problem on the unchanged code, is shown to the solver with its real output, and is run again after the change |
+| `test_timeout` | integer 10..3600 | 300 | seconds one run of the selected tests may take (the whole process group is killed after that) |
+| `repo_search` | `true` / `false` | `false` | on a project too large to read whole, search every source file for the names in the task: the planner chooses from the files that define or mention them (instead of the code map), its search patterns are searched in every file, and a large file keeps the definitions that match |
 
 The loop itself is the same with or without probes: `probe_rounds` changes only whether the look
 step runs, not when the loop stops.
+
+#### Verifying with the project's own tests (`discover_tests`)
+
+On a real repository nobody hands the solver a test command. With `discover_tests` it finds
+one, by general rules only (no knowledge of any particular project):
+
+1. **How the project runs its tests.** The interpreter is the project's (`.venv` or the
+   `python` on `PATH`, never the one memfun runs in); pytest is used when that interpreter can
+   import it; test files come from the project's pytest configuration (`pyproject.toml`,
+   `pytest.ini`, `tox.ini`, `setup.cfg`) and pytest's naming rules.
+2. **Which tests matter for this change.** Test files named after a changed module, importing
+   it, or mentioning a changed function or class; when fewer than two are found, the tests that
+   mention the names the task itself uses. At most 6 files.
+3. **What was already broken.** The selected tests are run once on the original files. Tests
+   that fail there are left out, a file that does not even collect is dropped: the fix loop
+   only ever sees failures the change caused.
+4. **Two cheap checks first.** The changed Python files must compile, and every changed module
+   that could be imported before the change must still import (a name that does not exist or
+   a circular import breaks every test, and no linter in the task's environment may be there
+   to say so).
+
+What ran and what it said is appended to `.memfun/checks.jsonl`. A linter is only ever asked
+for when it is installed, and a verification command whose program is missing (exit 127) is
+skipped instead of being fed to the fix loop as an error.
+
+With `reproduce`, a reproduction script is a check written by the model, so it is trusted less
+than the project's tests: when no edit makes it pass, the first solution is kept rather than
+the last attempt. `probe_guard` applies to it as to probes (`"off"` only in a disposable
+sandbox).
 
 **Probe safety.** A probe runs as a separate process in its own process group (killed whole on
 timeout, so no child outlives it) with a 30 s timeout and a 3 KB output cap, in the interpreter the project's own verify command uses (never memfun's own interpreter;
