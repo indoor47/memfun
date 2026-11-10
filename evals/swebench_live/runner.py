@@ -119,7 +119,7 @@ out = {"proxy": tcp(gw, port)}
 out["internet"] = [h for h, p in (("1.1.1.1", 443), ("8.8.8.8", 53), ("140.82.112.3", 443),
                                    ("151.101.0.223", 443)) if tcp(h, p)]
 out["dns"] = [n for n in ("github.com", "pypi.org", "huggingface.co") if dns(n)]
-ports = (22, 80, 443, 2375, 5432, 6379, 8000, 8080)
+ports = (22, 80, 443, 2375, 5432, 6379, 8000, 8080) + tuple(int(a) for a in sys.argv[3:])
 out["host_ports"] = [p for p in ports if p != port and tcp(gw, p)]
 print(json.dumps(out))
 """
@@ -169,6 +169,9 @@ class Context:
     bundle: Path
     keep_images: bool
     mini_python: str = ""
+    outage_wait: float = 0.0  # seconds to wait for a model path that is not serving; 0 = off
+    outage_poll: float = 60.0
+    outage_restarts: int = 3  # restarts of one instance after an outage, within one run
     stop: threading.Event = dataclasses.field(default_factory=threading.Event)
     live: set[str] = dataclasses.field(default_factory=set)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
@@ -379,7 +382,13 @@ def pull(ctx: Context, image: str, attempts: int = 5) -> float:
 
 def network_selftest(box: Box, ctx: Context) -> dict[str, Any]:
     py = str(ctx.bundle / "venv" / "bin" / "python")
-    out = box.must("nettest", [py, "-c", NETTEST, ctx.gateway, str(ctx.proxy.port)], timeout=120)
+    # A model server (or key-holding proxy) on this host must be out of reach as well: only
+    # the recording proxy may be between the agent and the model.
+    host, up_port = ctx.proxy.upstream_address
+    extra = [str(up_port)] if host in ("127.0.0.1", "localhost", "::1", ctx.gateway) else []
+    out = box.must(
+        "nettest", [py, "-c", NETTEST, ctx.gateway, str(ctx.proxy.port), *extra], timeout=120
+    )
     try:
         doc = json.loads(out.strip().splitlines()[-1])
     except (ValueError, IndexError) as exc:
@@ -644,9 +653,19 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
         if result.returncode == 0 and result.stdout.strip():
             (idir / "swarm-result.json").write_bytes(result.stdout)
         if usage.calls - usage.errors <= 0:
+            rec["model_path_failed"] = True
             raise InfraError(
                 f"the agent got no answer from the model ({usage.calls} calls, "
                 f"{usage.errors} errors): see agent.log"
+            )
+        if usage.unserved:
+            # An outage in the middle of a rollout: what the agent did afterwards is not its
+            # own doing.  A documented infrastructure failure, restarted from scratch.
+            rec["model_path_failed"] = True
+            raise InfraError(
+                f"the model path did not serve {usage.unserved} of {usage.calls} calls "
+                "(no answer, credentials or credit refused, or errors that outlasted the "
+                "retries): see llm.jsonl"
             )
         rec["agent_state"] = collect_agent_state(box, repo, idir)
         patch, applies = collect_patch(box, repo, base_tree)
@@ -769,6 +788,32 @@ def open_run(run_dir: Path, settings: Settings, ids: list[str]) -> None:
         raise SystemExit("the instance list differs from the frozen run.json: start a new run")
 
 
+def wait_for_model(ctx: Context) -> bool:
+    """Block until the model path serves a call (see :meth:`proxy.RecordingProxy.probe`), at
+    most ``ctx.outage_wait`` seconds; ``True`` at once when the wait is switched off.  A model
+    server that is down, unreachable or out of credit pauses the run instead of failing every
+    remaining instance."""
+    if ctx.outage_wait <= 0:
+        return True
+    deadline = time.time() + ctx.outage_wait
+    told = False
+    while not ctx.stop.is_set():
+        if ctx.proxy.probe(ctx.settings.model):
+            if told:
+                print("the model path answers again", flush=True)
+            return True
+        if time.time() >= deadline:
+            return False
+        if not told:
+            print(
+                f"the model path is not serving calls: waiting up to {ctx.outage_wait:.0f}s",
+                flush=True,
+            )
+            told = True
+        ctx.stop.wait(ctx.outage_poll)
+    return False
+
+
 def run_all(
     rows: list[dict[str, Any]], ctx: Context, workers: int, retry_infra: bool
 ) -> dict[str, int]:
@@ -791,9 +836,28 @@ def run_all(
         todo.append((task, inp))
 
     def one(item: tuple[ds.Task, ds.EpisodeInput]) -> None:
-        if ctx.stop.is_set():
-            return
-        rec = run_instance(item[0], item[1], ctx)
+        iid = item[0].instance_id
+        restarts = 0
+        while True:
+            if ctx.stop.is_set():
+                return
+            if not wait_for_model(ctx):
+                if not ctx.stop.is_set():
+                    print(f"{iid}: not started, the model path did not come back", flush=True)
+                    with ctx.lock:
+                        counts["skipped_unfinished"] += 1
+                return
+            rec = run_instance(item[0], item[1], ctx)
+            # An outage during the rollout: wait for the model path and restart this instance
+            # from scratch within the same run (the attempt is kept and logged, as with
+            # --retry-infra).  Only with the wait switched on, and a bounded number of times.
+            again = rec.get("model_path_failed") and ctx.outage_wait > 0
+            if not again or restarts >= ctx.outage_restarts or ctx.stop.is_set():
+                break
+            restarts += 1
+            print(f"{iid}: {rec.get('error', '')}; restart {restarts} from scratch", flush=True)
+            with ctx.lock:
+                set_aside(ctx.run_dir, iid, str(rec["status"]))
         with ctx.lock:
             counts[rec["status"]] = counts.get(rec["status"], 0) + 1
             write_preds(ctx.run_dir, ctx.settings.model)
@@ -943,6 +1007,9 @@ def cmd_run(a: argparse.Namespace) -> int:
         bundle=bundle,
         keep_images=a.keep_images,
         mini_python=a.mini_python,
+        outage_wait=max(0.0, a.outage_wait),
+        outage_restarts=max(0, a.outage_restarts),
+        outage_poll=max(0.01, a.outage_poll),
     )
 
     def on_signal(_sig: int, _frm: Any) -> None:
@@ -1030,6 +1097,14 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--keep-images", action="store_true")
     r.add_argument("--keep-network", action="store_true")
     r.add_argument("--retry-infra", action="store_true")
+    r.add_argument(
+        "--outage-wait", type=float, default=0.0, metavar="SECONDS",
+        help="before each instance, and after a rollout the model path did not serve, wait up "
+        "to this long for the model to answer a one-token call, then restart that instance "
+        "from scratch (0 = off: such a rollout is an infrastructure error for --retry-infra)",
+    )  # fmt: skip
+    r.add_argument("--outage-restarts", type=int, default=3)
+    r.add_argument("--outage-poll", type=float, default=60.0, help="seconds between checks")
     r.set_defaults(fn=cmd_run)
     f = sub.add_parser("finalize")
     f.add_argument("--run-dir", type=Path, required=True)

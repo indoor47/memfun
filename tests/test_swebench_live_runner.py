@@ -270,6 +270,44 @@ def test_no_model_answer_is_an_infrastructure_failure_not_an_empty_patch(env) ->
     assert e.record()["status"] == "infra_error"
 
 
+def test_a_rollout_the_model_path_did_not_serve_is_an_infrastructure_failure(env) -> None:
+    e = env(llm_calls=2)
+    e.up.statuses = [200, 402]  # the account ran out of credit in the middle of the rollout
+    assert rn.main(e.argv()) == 1
+    rec = e.record()
+    assert rec["status"] == "infra_error" and "did not serve 1 of 2 calls" in rec["error"]
+    assert rec["usage"]["unserved"] == 1 and "patch_bytes" not in rec  # no patch is taken from it
+    assert json.loads((e.run_dir / "preds.json").read_text()) == {}
+
+
+def test_an_outage_pauses_the_run_and_restarts_the_instance_from_scratch(env) -> None:
+    e = env()
+    # probe ok, the rollout's call is refused (no credit), probe refused, probe ok, call ok
+    e.up.statuses = [200, 402, 402, 200, 200]
+    assert rn.main(e.argv("--outage-wait", "30", "--outage-poll", "0.01")) == 0
+    assert e.record()["status"] == "done" and e.record()["patch_bytes"] == len(PATCH.encode())
+    (log,) = [json.loads(x) for x in (e.run_dir / "attempts.jsonl").read_text().splitlines()]
+    assert log["status"] == "infra_error" and "no answer from the model" in log["error"]
+    assert (e.run_dir / log["kept_at"] / "llm.jsonl").exists()  # the failed attempt is kept
+    assert len(e.up.seen) == 5 and e.up.statuses == []
+    assert sum(c[0] == "run" for c in e.calls()) == 2  # a fresh container for the restart
+
+
+def test_a_model_path_that_does_not_come_back_starts_nothing(env) -> None:
+    e = env()
+    e.up.statuses = [402] * 200
+    assert rn.main(e.argv("--outage-wait", "0.2", "--outage-poll", "0.01")) == 1
+    assert not (e.run_dir / "instances").exists()  # no attempt was used up
+    assert not (e.state / "calls.jsonl").exists() or not any(c[0] == "run" for c in e.calls())
+
+
+def test_the_self_test_covers_a_model_server_on_this_host(env) -> None:
+    e = env()
+    assert rn.main(e.argv()) == 0
+    (nettest,) = [c for c in e.calls() if "MFL_STEP=nettest" in c]
+    assert nettest[-1] == e.up.url.split(":")[2].split("/")[0]  # the upstream's port is probed
+
+
 def test_flags_empty_and_non_applying_patches_and_a_moved_head(env) -> None:
     e = env(patch=PATCH, applies=False, head="b" * 40, dirty=[" M setup.py", "?? gen.py"])
     assert rn.main(e.argv()) == 0
