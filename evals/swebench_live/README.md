@@ -22,9 +22,9 @@ files a leaderboard submission needs (`preds.json`, raw trajectories, the offici
 | Only `problem_statement` reaches the agent | `dataset.episode_input`; opaque container name and proxy token; config in a throwaway `HOME` | `test_only_the_problem_statement_reaches_the_container` |
 | Official container | the row's `docker_image`, repository under `/testbed` as the evaluator uses it | `test_a_rollout_end_to_end_...` |
 | No future history | `lockdown.sh` and its self-check before the rollout | `test_lockdown_removes_everything_newer_than_head` |
-| No internet | `--internal` Docker network; self-test from inside the container (internet, DNS, host services); optional host firewall rule on the runner's bridge only | `test_a_failed_self_test_stops_before_the_rollout` |
+| No internet | `--internal` Docker network; self-test from inside the container (internet, DNS, host services, a model server on the same host); optional host firewall rule on the runner's bridge only | `test_a_failed_self_test_stops_before_the_rollout` |
 | No ground-truth feedback | `grade.py` needs a finalized run; a finalized run cannot roll out | `test_settings_are_frozen_and_a_finalized_run_cannot_roll_out` |
-| Single rollout, frozen settings | `run.json`; finished instances never re-run; infrastructure failures re-run only with `--retry-infra`, logged in `attempts.jsonl`, earlier attempt kept | `test_single_rollout_resume_and_documented_infra_retry` |
+| Single rollout, frozen settings | `run.json`; finished instances never re-run; infrastructure failures re-run only with `--retry-infra`, logged in `attempts.jsonl`, earlier attempt kept; a rollout the model path did not serve (no answer, no credit, errors that outlast the retries) is such a failure, and with `--outage-wait` the run waits for the model and restarts that instance from scratch | `test_single_rollout_resume_and_documented_infra_retry`, `test_an_outage_pauses_the_run_and_restarts_the_instance_from_scratch` |
 | Raw trajectories | `proxy.py` records before the agent gets the answer | `tests/test_swebench_live_proxy.py` |
 | General prompts only | one prompt template, filled with the problem statement | `test_prompts_are_general` |
 

@@ -301,3 +301,35 @@ def test_the_end_of_a_stream_is_sent_only_after_the_record(tmp_path: Path) -> No
     finally:
         p.stop()
         up.stop()
+
+
+def test_a_probe_tells_a_serving_model_path_and_is_in_no_trajectory(tmp_path: Path) -> None:
+    up = Upstream(statuses=[200, 402])
+    p = make(up, api_key="sk-secret-value")
+    try:
+        tok = p.register("i", tmp_path / "t")
+        assert p.probe("served") is True  # answered
+        assert p.probe("served") is False  # no credit: a model list would still answer
+        assert up.seen[0]["body"]["model"] == "served" and up.seen[0]["body"]["max_tokens"] == 1
+        assert up.auth == ["Bearer sk-secret-value"] * 2
+        assert lines(tmp_path / "t") == [] and p.usage(tok).calls == 0  # not the agent's calls
+    finally:
+        p.stop()
+        up.stop()
+    assert p.probe("served") is False  # nothing listens any more
+
+
+def test_calls_the_model_path_did_not_serve_are_counted_apart_from_rejected_requests(
+    tmp_path: Path,
+) -> None:
+    up = Upstream(statuses=[402, 400, 200])
+    p = make(up, max_retries=0)
+    try:
+        tok = p.register("i", tmp_path / "t")
+        assert [call(p.port, tok, {"messages": []})[0] for _ in range(3)] == [402, 400, 200]
+        u = p.usage(tok)
+        # no credit = the path did not serve; a request the server rejects is the agent's own
+        assert (u.calls, u.errors, u.unserved) == (3, 2, 1)
+    finally:
+        p.stop()
+        up.stop()

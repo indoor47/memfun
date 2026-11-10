@@ -48,6 +48,10 @@ if TYPE_CHECKING:
 PATH_RE = re.compile(r"^/i/([A-Za-z0-9]{16,64})/v1/(chat/completions|models)/?$")
 MAX_BODY_BYTES = 32 * 1024 * 1024
 RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+#: Answers that mean the model path did not serve the call (as opposed to a request the model
+#: server rejected as wrong): no answer at all, credentials or credit refused, rate limit or
+#: server errors that outlasted the retries.
+UNSERVED_STATUS = frozenset({401, 402, 403, 429, 500, 502, 503, 504})
 HOP_HEADERS = frozenset(
     {"connection", "keep-alive", "transfer-encoding", "upgrade", "te", "trailer", "host"}
 )
@@ -64,6 +68,7 @@ class Usage:
     calls: int = 0
     refused: int = 0
     errors: int = 0
+    unserved: int = 0  # of the errors: the model path did not serve the call (an outage)
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
@@ -185,6 +190,11 @@ class RecordingProxy:
     @property
     def port(self) -> int:
         return int(self._server.server_address[1])
+
+    @property
+    def upstream_address(self) -> tuple[str, int]:
+        """Host and port of the model server this proxy forwards to."""
+        return self._up_host, self._up_port
 
     def start(self) -> int:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -366,6 +376,7 @@ class RecordingProxy:
             "POST", "/v1/chat/completions", out, h, stream_ok=True
         )
         stream = "text/event-stream" in ctype
+        unserved = status == 0 or status in UNSERVED_STATUS
         if status == 0:
             status, ctype = 502, "application/json"
             data = json.dumps(
@@ -378,6 +389,7 @@ class RecordingProxy:
             inst.usage.calls += 1
             if status >= 400:
                 inst.usage.errors += 1
+                inst.usage.unserved += unserved
             elif use is None:
                 inst.usage.calls_without_usage += 1
             if use:
@@ -406,6 +418,31 @@ class RecordingProxy:
             self._send(h, status, data, ctype)
 
     # ── upstream ─────────────────────────────────────────────────────────────────────────────
+
+    def probe(self, model: str, timeout: float = 60.0) -> bool:
+        """Is the model path serving?  One minimal call (one output token) sent straight to
+        the upstream: it belongs to no instance, is recorded in no trajectory and counts
+        against no budget.  A model list is not enough: it also answers when the account has
+        no credit or the model itself is down."""
+        body = json.dumps(
+            {"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
+        ).encode()
+        headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+        if self._key:
+            headers["Authorization"] = f"Bearer {self._key}"
+        conn = self._connect()
+        conn.timeout = timeout
+        try:
+            conn.request(
+                "POST", self._up_prefix + "/v1/chat/completions", body=body, headers=headers
+            )
+            resp = conn.getresponse()
+            resp.read()
+            return resp.status == 200
+        except (OSError, http.client.HTTPException):
+            return False
+        finally:
+            conn.close()
 
     def _connect(self) -> http.client.HTTPConnection:
         if self._tls:
