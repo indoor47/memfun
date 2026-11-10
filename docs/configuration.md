@@ -331,7 +331,7 @@ names the key and the allowed range, and the setting stays off or at its default
 | `probe_rounds` | integer 0..20 | 0 (off) | on a round that did not improve, up to this many times per solve, the model writes short scripts (up to `fix_probe_iterations`, default 3, per stall) that run in the project and print where the code and the tests' data disagree; the real output goes into the next fix call |
 | `probe_guard` | `"project"` / `"strict"` / `"off"` | `"project"` | how probe scripts are guarded (see below). `"strict"` is `python -I -S -B` (standard library and the project only; the benchmark runner sets it so an installed copy of the library under repair cannot be used). `"off"` removes the audit hook: **only for disposable sandboxes** (a throwaway task container) where a reproduction needs temp files, child processes, local sockets or import-time caches |
 | `discover_tests` | `true` / `false` | `false` | verify with the project's **own** tests (see below) |
-| `reproduce` | `true` / `false` | `false` | before solving, the model writes a script that shows the problem; it is kept only if it reports the problem on the unchanged code, is shown to the solver with its real output, and is run again after the change |
+| `reproduce` | `true` / `false` | `false` | before solving, the model writes a script that shows the problem; it is kept only if it reports the task's problem on the unchanged code, is shown to the solver with its real output, and is run again after the change as evidence (see below) |
 | `test_timeout` | integer 10..3600 | 300 | seconds one run of the selected tests may take (the whole process group is killed after that) |
 | `repo_search` | `true` / `false` | `false` | on a project too large to read whole, search every source file for the names in the task: the planner chooses from the files that define or mention them (instead of the code map), its search patterns are searched in every file, and a large file keeps the definitions that match |
 
@@ -358,14 +358,40 @@ one, by general rules only (no knowledge of any particular project):
    a circular import breaks every test, and no linter in the task's environment may be there
    to say so).
 
+5. **A failing existing test is not automatically a regression.** When a selected test that
+   passed before fails after the change, the model is asked once per new failure whether the
+   test asserts the very behaviour the task changes (and the code now does what the task asks)
+   or whether the change broke something. A test of the first kind is left out from then on;
+   the others go to the fix step, which is told never to undo the task's change to make a
+   test pass. A test is asked about again only when it fails differently.
+6. **How rounds are compared.** A state whose changed files do not compile or import, or whose
+   tests do not collect or run, is always worse than one that is not, whatever else fails.
+   Then failing tests count most, any other failing command less. The best state is put back
+   at the end, and the loop never ends on the starting tree when a candidate existed: if the
+   fix step takes the change back until the checks pass, the best candidate is kept instead.
+
 What ran and what it said is appended to `.memfun/checks.jsonl`. A linter is only ever asked
 for when it is installed, and a verification command whose program is missing (exit 127) is
-skipped instead of being fed to the fix loop as an error.
+skipped instead of being fed to the fix loop as an error. With the solver's own checks on, a
+detected linter that already reports problems on the unchanged code is left out too (the same
+rule as for tests that failed before).
 
-With `reproduce`, a reproduction script is a check written by the model, so it is trusted less
-than the project's tests: when no edit makes it pass, the first solution is kept rather than
-the last attempt. `probe_guard` applies to it as to probes (`"off"` only in a disposable
-sandbox).
+With `reproduce`, the reproduction script is **evidence, not a check**. It is written by the
+model from the task text, so it can be wrong in its own ways:
+
+- It is kept only if, on the unchanged code, it reports the problem the task describes. A
+  report of an error the task does not speak of (an exception class the task never names, "has
+  no attribute", "No module named", "unexpected") is a mistake of the script: it is rewritten
+  once, then dropped.
+- After a change it counts as a failure only while it reports exactly what it reported on the
+  unchanged code (values aside). A different report, a crash or a timeout is no evidence
+  either way and is only logged. When nothing but the reproduction fails, at most one fix
+  round is spent on it, and the first solution is kept if that does not help.
+- Its file exists only while it runs (`.memfun/repro/issue_repro.py`, written right before and
+  removed right after), so the project's linters and tests never see it; the text is in
+  `.memfun/checks.jsonl`.
+
+`probe_guard` applies to it as to probes (`"off"` only in a disposable sandbox).
 
 **Probe safety.** A probe runs as a separate process in its own process group (killed whole on
 timeout, so no child outlives it) with a 30 s timeout and a 3 KB output cap, in the interpreter the project's own verify command uses (never memfun's own interpreter;
