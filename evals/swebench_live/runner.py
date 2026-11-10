@@ -162,6 +162,9 @@ class Settings:
     #: (0 = the config's own).  Empty / 0 for the memfun arm.
     mini_config: str = ""
     mini_step_limit: int = 0
+    #: Digest of everything installed in the bundle (``FREEZE.sha256``, written by
+    #: ``provision.sh``): with ``agent_version`` (the commit) the identity of the agent.
+    bundle_digest: str = ""
 
 
 @dataclasses.dataclass
@@ -178,6 +181,12 @@ class Context:
     outage_wait: float = 0.0  # seconds to wait for a model path that is not serving; 0 = off
     outage_poll: float = 60.0
     outage_restarts: int = 3  # restarts of one instance after an outage, within one run
+    #: Streaming runs: grade each instance as soon as it is final, into a directory nobody
+    #: reads before the run is finalized (see ``sealed.py``), then delete its image.
+    sealed: Path | None = None
+    evaluator: Path | None = None
+    split: str = "lite"
+    gold_check: bool = False
     stop: threading.Event = dataclasses.field(default_factory=threading.Event)
     live: set[str] = dataclasses.field(default_factory=set)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
@@ -889,7 +898,12 @@ def open_run(run_dir: Path, settings: Settings, ids: list[str]) -> None:
     if meta.get("finalized"):
         raise SystemExit("this run is finalized: no further rollouts (rule: single rollout)")
     saved = dict(meta.get("settings") or {})
-    for key, default in (("agent_options", {}), ("mini_config", ""), ("mini_step_limit", 0)):
+    for key, default in (
+        ("agent_options", {}),
+        ("mini_config", ""),
+        ("mini_step_limit", 0),
+        ("bundle_digest", ""),
+    ):
         saved.setdefault(key, default)  # runs created before the setting existed
     if saved != mine:
         diff = sorted(k for k in mine if saved.get(k) != mine[k])
@@ -990,6 +1004,14 @@ def run_all(
         with ctx.lock:
             counts[rec["status"]] = counts.get(rec["status"], 0) + 1
             write_preds(ctx.run_dir, ctx.settings.model)
+        if rec["status"] == FINAL and ctx.sealed is not None and ctx.evaluator is not None:
+            # Final means never rolled out again: its evaluation can run now, sealed, and the
+            # image can go.  Nothing of the outcome is printed or returned.
+            from evals.swebench_live import sealed
+
+            sealed.grade_final(
+                ctx.evaluator, ctx.run_dir, ctx.sealed, iid, ctx.split, gold=ctx.gold_check
+            )
         u = rec.get("usage") or {}
         print(
             f"{rec['instance_id']}: {rec['status']}  "
@@ -1064,6 +1086,11 @@ def bundle_version(bundle: Path) -> str:
     return f.read_text("utf-8").strip() if f.is_file() else "unknown"
 
 
+def bundle_digest(bundle: Path) -> str:
+    f = bundle / "FREEZE.sha256"
+    return f.read_text("utf-8").strip() if f.is_file() else ""
+
+
 def parse_force(items: list[str]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for item in items:
@@ -1108,7 +1135,10 @@ def cmd_run(a: argparse.Namespace) -> int:
         agent_options=parse_force(a.agent_option),
         mini_config=a.mini_config if a.arm == "mini" else "",
         mini_step_limit=a.mini_step_limit if a.arm == "mini" else 0,
+        bundle_digest=bundle_digest(bundle),
     )
+    if a.sealed is not None and a.evaluator is None:
+        raise SystemExit("--sealed needs --evaluator (the directory of grade.py setup)")
     if a.arm == "mini" and not (a.mini_python and Path(a.mini_python).is_file()):
         raise SystemExit("--arm mini needs --mini-python (a virtualenv with mini-swe-agent)")
     run_dir = a.run_dir.resolve()
@@ -1134,8 +1164,12 @@ def cmd_run(a: argparse.Namespace) -> int:
         network=a.network,
         gateway=gateway,
         bundle=bundle,
-        keep_images=a.keep_images,
+        keep_images=a.keep_images or a.sealed is not None,  # sealed grading deletes the image
         mini_python=a.mini_python,
+        sealed=a.sealed.resolve() if a.sealed else None,
+        evaluator=a.evaluator.resolve() if a.evaluator else None,
+        split=a.split,
+        gold_check=a.gold_check,
         outage_wait=max(0.0, a.outage_wait),
         outage_restarts=max(0, a.outage_restarts),
         outage_poll=max(0.01, a.outage_poll),
@@ -1232,6 +1266,15 @@ def main(argv: list[str] | None = None) -> int:
         "to this long for the model to answer a one-token call, then restart that instance "
         "from scratch (0 = off: such a rollout is an infrastructure error for --retry-infra)",
     )  # fmt: skip
+    r.add_argument(
+        "--sealed", type=Path, default=None, metavar="DIR",
+        help="grade each instance when it is final into DIR (outside the run directory, read "
+        "by nobody until `sealed.py unseal` after finalize), then delete its image",
+    )  # fmt: skip
+    r.add_argument("--evaluator", type=Path, default=None, help="directory of grade.py setup")
+    r.add_argument("--split", default="lite", choices=("lite", "verified", "full", "test"))
+    r.add_argument("--gold-check", action="store_true",
+                   help="with --sealed: also evaluate the reference patch (sealed)")  # fmt: skip
     r.add_argument("--outage-restarts", type=int, default=3)
     r.add_argument("--outage-poll", type=float, default=60.0, help="seconds between checks")
     r.set_defaults(fn=cmd_run)
