@@ -1576,6 +1576,9 @@ class Verifier:
         self.timeout = timeout
         #: Shown instead of the command line in the error text (for long generated commands).
         self.labels: dict[str, str] = {}
+        #: Exit codes other than 0 that are not a failure, per command (pytest ends with 5
+        #: when every selected test was left out: nothing ran, nothing failed).
+        self.ok_exits: dict[str, tuple[int, ...]] = {}
 
     async def averify(
         self,
@@ -1614,7 +1617,7 @@ class Verifier:
                     )
                     skipped.append(cmd)
                     continue
-                if result.returncode != 0:
+                if result.returncode != 0 and result.returncode not in self.ok_exits.get(cmd, ()):
                     output = ""
                     if result.stdout:
                         # head + tail: pytest prints its failure summary LAST
@@ -2812,6 +2815,8 @@ class ContextFirstSolver:
         self._status(f"Verifying with {len(files)} related test files")
         tests_cmd = repo_tests.shell(argv)
         self._check_kinds[tests_cmd] = "tests"
+        if setup.runner == "pytest":
+            self.verifier.ok_exits[tests_cmd] = (repo_tests.PYTEST_NO_TESTS_RAN,)
         self._tests_run = OwnTests(
             setup=setup, files=files, failing_before=failing, command=tests_cmd
         )
@@ -3249,6 +3254,8 @@ class ContextFirstSolver:
             )
         )
         self._check_kinds[cmd] = "tests"
+        if own.command in self.verifier.ok_exits:
+            self.verifier.ok_exits[cmd] = self.verifier.ok_exits[own.command]
         verify_cmds[verify_cmds.index(own.command)] = cmd
         own.command = cmd
         return left_out
