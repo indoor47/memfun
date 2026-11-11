@@ -80,7 +80,7 @@ if args[0] == "exec":
     elif step == "result":
         if "result_json" not in scen: sys.exit(1)
         sys.stdout.write(json.dumps(scen["result_json"]))
-    elif step == "collect": sys.stdout.write(scen.get("patch", ""))
+    elif step == "collect": sys.stdout.write(scen.get("limited_patch", "") if ":(literal)" in args[-1] else scen.get("patch", ""))
     elif step == "agentstate": sys.stdout.write(scen.get("state", {}).get(args[-1], ""))
     elif step == "patchcheck": sys.exit(0 if scen.get("applies", True) else 1)
     sys.exit(0)
@@ -682,3 +682,131 @@ def test_the_served_reads_are_kept_with_the_trajectory(env) -> None:
     idir = e.run_dir / "instances" / SENTINELS["instance_id"]
     assert (idir / "reads.jsonl").read_text() == line + "\n"
     assert "reads.jsonl" in e.record()["agent_state"]
+
+
+BYPRODUCT = "diff --git a/tests/data/ca/serial b/tests/data/ca/serial\n--- a/tests/data/ca/serial\n+++ b/tests/data/ca/serial\n@@ -1 +1 @@\n-0A\n+0B\n"
+
+
+def test_what_the_projects_tests_wrote_is_not_part_of_the_patch(env) -> None:
+    """The agent ran the project's tests and they changed a data file.  The patch holds the
+    file the agent edited; the whole change of the tree is kept next to it."""
+    result = {"success": True, "files_created": ["/testbed/m.py", "/testbed/m.py", "/tmp/x.py"]}
+    e = env(patch=PATCH + BYPRODUCT, limited_patch=PATCH, result_json=result)
+    assert rn.main(e.argv()) == 0
+    rec = e.record()
+    idir = e.run_dir / "instances" / SENTINELS["instance_id"]
+    assert (idir / "patch.diff").read_text() == PATCH
+    assert (idir / "worktree.diff").read_text() == PATCH + BYPRODUCT
+    assert rec["flags"] == ["patch_limited_to_agent_edits"] and rec["patch_files"] == 1
+    assert rec["left_out_of_patch"] == ["tests/data/ca/serial"]
+    limited = [c[-1] for c in e.calls() if "MFL_STEP=collect" in c][1]
+    assert "-- ':(literal)m.py' ':(exclude).memfun'" in limited  # that file, taken literally
+    preds = json.loads((e.run_dir / "preds.json").read_text())
+    assert preds[SENTINELS["instance_id"]]["model_patch"] == PATCH
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"success": True, "files_created": ["/testbed/m.py"]},  # nothing else changed
+        {"success": True, "files_created": ["/elsewhere/m.py"]},  # lists cannot be matched
+        {"success": True, "files_created": []},  # the agent reported nothing
+        None,  # no result file at all (a timed-out agent)
+    ],
+)
+def test_the_patch_is_left_whole_when_there_is_nothing_to_tell_apart(env, result) -> None:
+    patch = PATCH if result and result["files_created"] == ["/testbed/m.py"] else PATCH + BYPRODUCT
+    e = env(patch=patch, limited_patch="WRONG", **({"result_json": result} if result else {}))
+    assert rn.main(e.argv()) == 0
+    idir = e.run_dir / "instances" / SENTINELS["instance_id"]
+    assert (idir / "patch.diff").read_text() == patch and not (idir / "worktree.diff").exists()
+    assert "patch_limited_to_agent_edits" not in e.record()["flags"]
+
+
+def test_the_agents_own_list_of_files_is_read_relative_to_the_repository() -> None:
+    doc = {
+        "files_created": ["/testbed/a.py", "/testbed/pkg/../pkg/b.py", "/testbed", "/tmp/s.py", 7],
+        "sub_tasks": {"T1": {"files_created": ["/testbed/a.py", "rel/c.py", "../out.py", "x\ny"]}},
+    }
+    assert rn.own_files(json.dumps(doc).encode(), "/testbed") == ["a.py", "pkg/b.py", "rel/c.py"]
+    assert rn.own_files(b"not json", "/testbed") == [] and rn.own_files(b"[]", "/testbed") == []
+    many = {"files_created": [f"/testbed/f{i}.py" for i in range(rn.OWN_FILES_MAX + 1)]}
+    assert rn.own_files(json.dumps(many).encode(), "/testbed") == []  # too many: no limit
+
+
+def test_a_limited_patch_holds_exactly_the_named_files(tmp_path: Path) -> None:
+    """Real git: names are taken literally (brackets and spaces are not patterns), a file that
+    does not exist is no error, and a by-product next to the edited file stays out."""
+
+    def sh(script: str) -> str:
+        res = subprocess.run(
+            ["sh", "-c", script], cwd=tmp_path, capture_output=True, text=True, timeout=60
+        )
+        assert res.returncode == 0, res.stderr
+        return res.stdout
+
+    home = tmp_path.parent / "home2"
+    snap = lambda n: rn._snapshot(n).replace(rn.HOME_IN, str(home))  # noqa: E731
+    sh("git init -q && git config user.email a@b && git config user.name t && mkdir d && "
+       "echo 1 > 'd/a[1].py' && echo 1 > d/a1.py && echo 1 > 'd/b c.py' && echo 1 > d/serial && "
+       "git add . && git commit -qm c")  # fmt: skip
+    base = sh(snap("base")).strip()
+    sh("echo 2 > 'd/a[1].py' && echo 2 > d/a1.py && echo 2 > 'd/b c.py' && echo 2 > d/serial && "
+       "echo new > d/made.pem")  # fmt: skip
+    only = ["d/a[1].py", "d/b c.py", "d/gone.py"]
+    what = " ".join(rn.shlex.quote(f":(literal){p}") for p in only)
+    patch = sh(
+        f"t=$({snap('final')}) && "
+        f"git --no-pager diff --text --no-color {base} $t -- {what} {rn._pathspec()}"
+    )
+    assert rn.patch_paths(patch) == ["d/a[1].py", "d/b c.py"]
+
+
+def test_rollout_slots_bound_the_rollouts_in_flight_not_the_grading(tmp_path, monkeypatch) -> None:
+    """Three workers, one rollout slot: never two rollouts at once, while a finished instance
+    is graded next to the following rollout."""
+    import threading
+    import time
+
+    from evals.swebench_live import sealed as sl
+
+    rows = [{**SENTINELS, "instance_id": f"octo__widget-{n}"} for n in range(4)]
+    state = {"rolling": 0, "most": 0, "overlap": False}
+    lock = threading.Lock()
+
+    def run_instance(task: Any, inp: Any, ctx: Any) -> dict[str, Any]:
+        with lock:
+            state["rolling"] += 1
+            state["most"] = max(state["most"], state["rolling"])
+        time.sleep(0.05)
+        with lock:
+            state["rolling"] -= 1
+        idir = ctx.run_dir / "instances" / task.instance_id
+        idir.mkdir(parents=True)
+        rec = {"instance_id": task.instance_id, "status": "done", "flags": []}
+        (idir / "instance.json").write_text(json.dumps(rec))
+        return rec
+
+    def grade_final(base: Path, run_dir: Path, sealed: Path, iid: str, split: str, **kw: Any):
+        for _ in range(40):  # grading takes longer than a rollout: the next rollout starts
+            with lock:
+                state["overlap"] = state["overlap"] or state["rolling"] > 0
+            time.sleep(0.005)
+        return {"instance_id": iid}
+
+    monkeypatch.setattr(rn, "run_instance", run_instance)
+    monkeypatch.setattr(sl, "grade_final", grade_final)
+    ctx = rn.Context(
+        run_dir=tmp_path, settings=None, proxy=None, docker="docker", network="n",  # type: ignore[arg-type]
+        gateway="g", bundle=tmp_path, keep_images=True, sealed=tmp_path / "s",
+        evaluator=tmp_path / "e", rollout_slots=1,
+    )  # fmt: skip
+    monkeypatch.setattr(rn, "write_preds", lambda run_dir, model: {})
+    ctx.settings = type("S", (), {"model": "m"})()  # type: ignore[assignment]
+    counts = rn.run_all(rows, ctx, workers=3, retry_infra=False)
+    assert counts["done"] == 4 and state["most"] == 1 and state["overlap"] is True
+    ctx.rollout_slots, state["most"] = 0, 0
+    for row in rows:
+        row["instance_id"] += "-b"
+    rn.run_all(rows, ctx, workers=3, retry_infra=False)
+    assert state["most"] > 1  # without the bound the workers roll out side by side

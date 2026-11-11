@@ -13,6 +13,7 @@ files a leaderboard submission needs (`preds.json`, raw trajectories, the offici
 | `runner.py` | Per instance: pull, start on an internal network, find the repository, lock down history, network self-test, rollout, collect and check the patch, delete the image. Resume, frozen settings, `finalize`. |
 | `grade.py` | The official evaluator at a pinned commit; refuses a run that is not finalized. |
 | `provision.sh` | Builds the read-only agent bundle on a Linux x86_64 Docker box; teardown. |
+| `sealed.py`, `submission.py`, `box_run.sh` | A long run on several boxes: sealed grading per instance, one shard per box with the agent settings fixed in the script, merging the shards, the self-audit, the submission folder. |
 | `mini_driver.py` | The baseline arm: mini-swe-agent, unchanged, attached to the runner's container. |
 
 ## Rules and the mechanism behind each
@@ -51,7 +52,8 @@ right here because the container is disposable; `repo_search` plans a large repo
 a search of every file and is off unless asked for, like the others). Two more belong in a
 benchmark run: `read_rounds=3` lets the solver ask to read parts of a large file before it
 edits (served by memfun's own code, never a shell; every request is kept as `reads.jsonl` next
-to the trajectory), and `offline=true` removes the web step, so that the planner is not even
+to the trajectory; with `read_offer=false` such requests are answered but the prompt does not
+invite them), and `offline=true` removes the web step, so that the planner is not even
 offered it. The runner also sets `LITELLM_LOCAL_MODEL_COST_MAP=true` for the agent: the model
 library otherwise tries to refresh a price table from the internet at start-up.
 
@@ -62,11 +64,58 @@ attempt, so the instance runs again from scratch; when it dies the same way thre
 row the instance is closed with an empty patch and `failure_class: agent_crash`, and
 `attempts.jsonl` records each try and the decision.
 
+What the patch holds: the difference between the image's initial tree and the tree after the
+rollout, without the agent's own state and the usual test junk. When that difference also
+touches files the agent never edited (the project's tests wrote them while the agent ran them:
+certificates, databases, snapshots), the patch is limited to the files the agent's own write
+and edit operations touched, as the agent reports them in its result file; the whole
+difference is kept as `worktree.diff`, `instance.json` lists the files left out and carries
+the flag `patch_limited_to_agent_edits`. Seen once in 103 graded dev patches: a 4 KB change of
+one source file had become a 71 KB patch with 15 certificate files of the test suite. When the
+agent reports no files, or none of the reported files is among the changed ones, nothing is
+left out.
+
 The bundle is built from `uv.lock` (`provision.sh up`): a copy of the lock file, what is
 installed (`FREEZE.txt`) and its digest (`FREEZE.sha256`) are kept in the bundle, and
 `bundle_check.py BUNDLE` fails when an installed version differs from the locked one (`dspy`
 and `litellm` must be present). A bundle rebuilt later from the same commit is then the same
 bundle.
+
+## A long run on several boxes (streaming, sealed grading)
+
+A 300-instance run cannot keep its images until the end, so an instance is graded and its
+image deleted soon after its rollout, without anyone learning the outcome before every rollout
+is final (plan and numbers: `docs/SWEBENCH-LIVE-LITE-PLAN.md`):
+
+```bash
+# per box: its own shard of ids; grading goes to a directory nothing reads.  box_run.sh holds
+# the agent settings and runs passes until every instance of the shard is final
+evals/swebench_live/box_run.sh /root/memfun-live lite-1 data/shard-1.txt data/lite.jsonl lite
+python3 evals/swebench_live/runner.py finalize --run-dir runs/lite-1
+# on one box, after every shard is finalized and copied there (sealed directories merged too)
+python3 evals/swebench_live/submission.py merge --run-dir runs/lite-1 --run-dir runs/lite-2 --out runs/lite
+python3 evals/swebench_live/sealed.py unseal --dir /root/memfun-live/eval --run-dir runs/lite --sealed sealed/lite --split lite
+python3 evals/swebench_live/submission.py audit --run-dir runs/lite --dataset data/lite.jsonl
+python3 evals/swebench_live/submission.py repo-text --run-dir runs/lite --dataset data/lite.jsonl
+python3 evals/swebench_live/submission.py build --run-dir runs/lite --dataset data/lite.jsonl \
+    --out submissions/lite/memfun/MODEL --model-label MODEL
+```
+
+`--rollout-slots N` (with `--workers` larger than N) keeps at most N rollouts in flight while
+the other workers grade: the number of rollouts is what a model endpoint with a limit on
+tokens per minute has to carry, and grading needs no model.
+
+`--sealed` grades an instance only once its record is final (a final instance is never rolled
+out again), writes everything the evaluator says, its exit code included, under the sealed
+directory (mode 0700, outside the run directory) and records in the run directory only that the
+evaluation ran. With `--gold-check` the reference patch is evaluated on the same image before
+it is deleted, sealed the same way. `unseal` refuses a run that is not finalized. `repo-text`
+looks up, in the image of each instance the audit flagged, whether the flagged lines of the
+test patch or reference patch were already in the repository, and records them as evidence
+(`in-repo.json`) that the audit then honours. `build`
+refuses a run whose self-audit has a violation (a forbidden dataset field or the instance id in
+a prompt, an attempted network access, a credential, an instance that is not final, an attempt
+set aside without a documented infrastructure reason).
 
 ## Gold check first
 

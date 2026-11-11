@@ -37,8 +37,10 @@ import contextlib
 import dataclasses
 import json
 import os
+import posixpath
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -92,6 +94,9 @@ PATCH_JUNK = (
 )
 #: A patch over this size is flagged (never cut): it probably carries generated files.
 PATCH_LARGE_BYTES = 1_000_000
+#: More files than this in the agent's own list of what it edited: the patch is not limited to
+#: them (the list would not fit a command line), the whole change of the tree is taken.
+OWN_FILES_MAX = 1000
 FINAL = "done"
 INFRA = "infra_error"
 #: An agent that exits with an error before its first model call, the same way this many
@@ -162,6 +167,9 @@ class Settings:
     #: (0 = the config's own).  Empty / 0 for the memfun arm.
     mini_config: str = ""
     mini_step_limit: int = 0
+    #: Digest of everything installed in the bundle (``FREEZE.sha256``, written by
+    #: ``provision.sh``): with ``agent_version`` (the commit) the identity of the agent.
+    bundle_digest: str = ""
 
 
 @dataclasses.dataclass
@@ -178,6 +186,16 @@ class Context:
     outage_wait: float = 0.0  # seconds to wait for a model path that is not serving; 0 = off
     outage_poll: float = 60.0
     outage_restarts: int = 3  # restarts of one instance after an outage, within one run
+    #: Streaming runs: grade each instance as soon as it is final, into a directory nobody
+    #: reads before the run is finalized (see ``sealed.py``), then delete its image.
+    sealed: Path | None = None
+    evaluator: Path | None = None
+    split: str = "lite"
+    gold_check: bool = False
+    #: At most this many rollouts in flight (0 = as many as there are workers).  The other
+    #: workers grade meanwhile: a model path with a limit on tokens per minute sets how many
+    #: rollouts may share it, the box's CPUs set how many evaluations run next to them.
+    rollout_slots: int = 0
     stop: threading.Event = dataclasses.field(default_factory=threading.Event)
     live: set[str] = dataclasses.field(default_factory=set)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
@@ -447,12 +465,16 @@ def baseline(box: Box, repo: str) -> tuple[str, list[str]]:
     return out[0].strip(), [ln for ln in out[1:] if ln.strip()]
 
 
-def collect_patch(box: Box, repo: str, base_tree: str) -> tuple[str, bool]:
+def collect_patch(
+    box: Box, repo: str, base_tree: str, only: list[str] | None = None
+) -> tuple[str, bool]:
     """The agent's change as one diff against the image's initial tree, checked to apply
-    cleanly to a copy of that tree.  ``("", True)`` when nothing changed."""
+    cleanly to a copy of that tree.  ``("", True)`` when nothing changed.  With *only* (paths
+    relative to the repository, taken literally) the diff holds those files and no others."""
+    what = " ".join(shlex.quote(f":(literal){p}") for p in only) if only else "."
     script = (
         f"t=$({_snapshot('final')}) && "
-        f"git --no-pager diff --text --no-color {base_tree} $t -- . {_pathspec()} "
+        f"git --no-pager diff --text --no-color {base_tree} $t -- {what} {_pathspec()} "
         f"> {HOME_IN}/patch.diff && cat {HOME_IN}/patch.diff"
     )
     res = box.exec("collect", ["sh", "-c", script], workdir=repo, timeout=600)
@@ -533,6 +555,42 @@ def submitted_patch(box: Box, repo: str, base_tree: str, patch: str) -> bool:
         f"git apply --check --whitespace=nowarn {HOME_IN}/patch.diff"
     )
     return box.exec("patchcheck", ["sh", "-c", check], workdir=repo, timeout=900).returncode == 0
+
+
+def patch_paths(patch: str) -> list[str]:
+    """The files a diff touches (the ``b/`` side of each header), in order."""
+    return [m.group(1) for m in re.finditer(r"(?m)^diff --git a/.+? b/(.+)$", patch)]
+
+
+def own_files(result_json: bytes, repo: str) -> list[str]:
+    """The files the agent itself reported writing or editing (``files_created`` in its result
+    file, which lists every file one of its write or edit operations touched), relative to the
+    repository.  Empty when it reported none, or too many to pass on a command line."""
+    try:
+        doc = json.loads(result_json)
+    except ValueError:
+        return []
+    if not isinstance(doc, dict):
+        return []
+    names: list[Any] = list(doc.get("files_created") or [])
+    subs = doc.get("sub_tasks")
+    for sub in subs.values() if isinstance(subs, dict) else []:
+        if isinstance(sub, dict):
+            names += list(sub.get("files_created") or [])
+    root = posixpath.normpath(repo)
+    out: dict[str, None] = {}
+    for name in names:
+        if not isinstance(name, str) or not name.strip() or "\n" in name or "\0" in name:
+            continue
+        rel = posixpath.normpath(name)
+        if posixpath.isabs(rel):
+            if not rel.startswith(root.rstrip("/") + "/"):
+                continue  # outside the repository: never part of a patch
+            rel = rel[len(root.rstrip("/")) + 1 :]
+        if rel in (".", "..") or rel.startswith("../"):
+            continue
+        out[rel] = None
+    return list(out) if len(out) <= OWN_FILES_MAX else []
 
 
 #: The agent's own record of what it checked (which tests it ran and what they said, its
@@ -682,6 +740,17 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
             )
         rec["agent_state"] = collect_agent_state(box, repo, idir)
         patch, applies = collect_patch(box, repo, base_tree)
+        own = own_files(result.stdout, repo) if s.arm != "mini" else []
+        if own and set(patch_paths(patch)) & set(own) and set(patch_paths(patch)) - set(own):
+            # The tree also changed in files the agent never edited: what the project's own
+            # tests wrote while the agent ran them (certificates, databases, snapshots).  The
+            # patch is the agent's change, so it holds the files the agent edited; the whole
+            # change of the tree is kept next to it.  (When none of the files it reported is
+            # among the changed ones the lists cannot be matched and nothing is left out.)
+            (idir / "worktree.diff").write_text(patch, "utf-8")
+            rec["left_out_of_patch"] = sorted(set(patch_paths(patch)) - set(own))[:200]
+            rec["flags"].append("patch_limited_to_agent_edits")
+            patch, applies = collect_patch(box, repo, base_tree, only=own)
         if s.arm == "mini":
             # The standard result of mini-swe-agent is the patch the agent SUBMITS; what else
             # it left in the working tree (scratch files, its patch file) is kept for reference.
@@ -889,7 +958,12 @@ def open_run(run_dir: Path, settings: Settings, ids: list[str]) -> None:
     if meta.get("finalized"):
         raise SystemExit("this run is finalized: no further rollouts (rule: single rollout)")
     saved = dict(meta.get("settings") or {})
-    for key, default in (("agent_options", {}), ("mini_config", ""), ("mini_step_limit", 0)):
+    for key, default in (
+        ("agent_options", {}),
+        ("mini_config", ""),
+        ("mini_step_limit", 0),
+        ("bundle_digest", ""),
+    ):
         saved.setdefault(key, default)  # runs created before the setting existed
     if saved != mine:
         diff = sorted(k for k in mine if saved.get(k) != mine[k])
@@ -945,6 +1019,14 @@ def run_all(
             set_aside(ctx.run_dir, task.instance_id, status)
         todo.append((task, inp))
 
+    slots = threading.BoundedSemaphore(ctx.rollout_slots) if ctx.rollout_slots > 0 else None
+
+    def rollout(item: tuple[ds.Task, ds.EpisodeInput]) -> dict[str, Any]:
+        if slots is None:
+            return run_instance(item[0], item[1], ctx)
+        with slots:
+            return run_instance(item[0], item[1], ctx)
+
     def one(item: tuple[ds.Task, ds.EpisodeInput]) -> None:
         iid = item[0].instance_id
         restarts = 0
@@ -958,7 +1040,7 @@ def run_all(
                     with ctx.lock:
                         counts["skipped_unfinished"] += 1
                 return
-            rec = run_instance(item[0], item[1], ctx)
+            rec = rollout(item)
             crash = str(rec.get("crash") or "")
             if crash:
                 # The agent died before its first model call.  From scratch again (no model
@@ -990,6 +1072,14 @@ def run_all(
         with ctx.lock:
             counts[rec["status"]] = counts.get(rec["status"], 0) + 1
             write_preds(ctx.run_dir, ctx.settings.model)
+        if rec["status"] == FINAL and ctx.sealed is not None and ctx.evaluator is not None:
+            # Final means never rolled out again: its evaluation can run now, sealed, and the
+            # image can go.  Nothing of the outcome is printed or returned.
+            from evals.swebench_live import sealed
+
+            sealed.grade_final(
+                ctx.evaluator, ctx.run_dir, ctx.sealed, iid, ctx.split, gold=ctx.gold_check
+            )
         u = rec.get("usage") or {}
         print(
             f"{rec['instance_id']}: {rec['status']}  "
@@ -1064,6 +1154,11 @@ def bundle_version(bundle: Path) -> str:
     return f.read_text("utf-8").strip() if f.is_file() else "unknown"
 
 
+def bundle_digest(bundle: Path) -> str:
+    f = bundle / "FREEZE.sha256"
+    return f.read_text("utf-8").strip() if f.is_file() else ""
+
+
 def parse_force(items: list[str]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for item in items:
@@ -1108,7 +1203,10 @@ def cmd_run(a: argparse.Namespace) -> int:
         agent_options=parse_force(a.agent_option),
         mini_config=a.mini_config if a.arm == "mini" else "",
         mini_step_limit=a.mini_step_limit if a.arm == "mini" else 0,
+        bundle_digest=bundle_digest(bundle),
     )
+    if a.sealed is not None and a.evaluator is None:
+        raise SystemExit("--sealed needs --evaluator (the directory of grade.py setup)")
     if a.arm == "mini" and not (a.mini_python and Path(a.mini_python).is_file()):
         raise SystemExit("--arm mini needs --mini-python (a virtualenv with mini-swe-agent)")
     run_dir = a.run_dir.resolve()
@@ -1134,8 +1232,13 @@ def cmd_run(a: argparse.Namespace) -> int:
         network=a.network,
         gateway=gateway,
         bundle=bundle,
-        keep_images=a.keep_images,
+        keep_images=a.keep_images or a.sealed is not None,  # sealed grading deletes the image
         mini_python=a.mini_python,
+        sealed=a.sealed.resolve() if a.sealed else None,
+        evaluator=a.evaluator.resolve() if a.evaluator else None,
+        split=a.split,
+        gold_check=a.gold_check,
+        rollout_slots=max(0, a.rollout_slots),
         outage_wait=max(0.0, a.outage_wait),
         outage_restarts=max(0, a.outage_restarts),
         outage_poll=max(0.01, a.outage_poll),
@@ -1213,6 +1316,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--instance-timeout", type=int, default=2400)
     r.add_argument("--max-tokens-per-instance", type=int, default=4_000_000)
     r.add_argument("--workers", type=int, default=1)
+    r.add_argument(
+        "--rollout-slots", type=int, default=0, metavar="N",
+        help="at most N rollouts in flight while the other workers grade (with --sealed); "
+        "0 = one per worker.  Size it to the model path's limit on tokens per minute",
+    )  # fmt: skip
     r.add_argument("--cpus", type=float, default=4.0)
     r.add_argument("--memory", default="16g")
     r.add_argument("--docker", default="docker")
@@ -1232,6 +1340,15 @@ def main(argv: list[str] | None = None) -> int:
         "to this long for the model to answer a one-token call, then restart that instance "
         "from scratch (0 = off: such a rollout is an infrastructure error for --retry-infra)",
     )  # fmt: skip
+    r.add_argument(
+        "--sealed", type=Path, default=None, metavar="DIR",
+        help="grade each instance when it is final into DIR (outside the run directory, read "
+        "by nobody until `sealed.py unseal` after finalize), then delete its image",
+    )  # fmt: skip
+    r.add_argument("--evaluator", type=Path, default=None, help="directory of grade.py setup")
+    r.add_argument("--split", default="lite", choices=("lite", "verified", "full", "test"))
+    r.add_argument("--gold-check", action="store_true",
+                   help="with --sealed: also evaluate the reference patch (sealed)")  # fmt: skip
     r.add_argument("--outage-restarts", type=int, default=3)
     r.add_argument("--outage-poll", type=float, default=60.0, help="seconds between checks")
     r.set_defaults(fn=cmd_run)
