@@ -81,8 +81,22 @@ Measured on the pilot (30 dev instances, a 16-CPU box, three instances at a time
 | pull + evaluation of the reference patch | 117 s | 300 s | 809 s | 1372 s |
 | image size | 3 GB | 7 GB | 18 GB | 19 GB |
 
-- **Time**: about 8 to 10 minutes per instance through all seven steps. Three at a time on one
-  box: about 60 instances in 3 hours, 100 in 5 hours.
+- **Time on a box**: about 8 to 10 minutes per instance through all seven steps. Three at a
+  time on one box: about 60 instances in 3 hours, 100 in 5 hours, when the model path keeps
+  up.
+- **The model path sets the pace.** The Cerebras account is limited to 150,000 tokens per
+  minute (read from the live `x-ratelimit-*` headers; the key-holding proxy queues requests
+  to stay at 80% of it and saw one rate-limit refusal, retried, in about 2,200 requests). One
+  rollout that is not waiting uses about 100,000 uncached tokens per minute, and a task uses
+  about 130,000 in total. So
+  300 tasks need at least 5.5 hours of that limit however many boxes there are, and fifteen
+  rollouts at once would each crawl at a fifteenth of their speed towards the 30-minute time
+  limit. The run therefore has ONE rollout in flight per box (`ROLLOUT_SLOTS=1` in
+  `box_run.sh`, five in all) while the box's other two workers grade: a typical rollout then
+  takes 3 to 5 minutes and a task at its token stop about 20. Expected wall time: 6 to 7
+  hours. An endpoint without such a limit (a rented GPU serving the same model) can carry
+  three rollouts per box and finish in about 3 hours; it is a different serving path and has
+  to pass the dev check first.
 - **Disk**: three images at once at up to 19 GB each, plus the evaluator and the bundle (about
   2 GB): 80 GB is enough, 160 GB is comfortable. Images are deleted as the run goes.
 - **Image pulls**: Docker Hub allows about 100 unauthenticated pulls per 6 hours per address.
@@ -137,7 +151,9 @@ setsid nohup $B/repo/evals/swebench_live/box_run.sh $B lite-N $B/data/shard-N.tx
     $B/data/lite.jsonl lite > $B/lite-N.out 2>&1 < /dev/null &
 ```
 
-`box_run.sh` runs passes until every instance of the shard is final and prints `BOXDONE`. What
+`box_run.sh` runs passes until every instance of the shard is final and prints `BOXDONE`. It
+works on three instances at a time, of which one is in its rollout (`WORKERS`, `ROLLOUT_SLOTS`
+in its environment; see "The model path sets the pace"). What
 may be looked at while it runs: the lines it prints (instance, status, time, calls, tokens,
 dollars, patch size, flags), the proxy's spend counter, `df`. Nothing else: the sealed
 directories are not opened.
@@ -171,8 +187,8 @@ That is about $0.16 per task and about $50 for 300. The stop of 520,000 tokens b
 at about $0.52, so the hard ceiling is $156; the proxy's spend cap is set to $65, and when it is
 reached the run waits instead of failing instances.
 
-Boxes: five at about EUR 0.14 per hour for about 3 hours of run plus setup and the final
-steps, and the key-holding box: under EUR 5.
+Boxes: five at about EUR 0.14 per hour for 6 to 7 hours of run plus setup and the final
+steps, and the key-holding box: under EUR 10.
 
 ## What the practice runs say
 

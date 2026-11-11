@@ -14,7 +14,11 @@
 # and the frozen commit names them.  Only where the model is reached and how many instances
 # run at once come from the environment:
 #   UPSTREAM  (default http://127.0.0.1:18431/e/live/v1: the key-holding proxy, on this box or
-#             through an SSH forward)   MODEL (qwen-3.8-27b)   WORKERS (3)
+#             through an SSH forward)   MODEL (qwen-3.8-27b)
+#   WORKERS (3) instances in work at once on this box, of which at most ROLLOUT_SLOTS (1) are
+#             in their rollout; the others are being graded.  ROLLOUT_SLOTS times the number
+#             of boxes is what the model path must carry: an endpoint limited to 150,000
+#             tokens per minute carries about five rollouts with waiting, not fifteen
 #   PRICE_IN, PRICE_OUT  dollars per million tokens, for the cost column only (0.99, 1.49)
 #
 # An instance that ends as an infrastructure error (a failed pull, a step of the runner that
@@ -39,7 +43,8 @@ while :; do
     --instance-timeout 1800 --max-tokens-per-instance 520000 --cpus 2 --memory 8g \
     --price-in "${PRICE_IN:-0.99}" --price-out "${PRICE_OUT:-1.49}" \
     --host-firewall --iptables-record "$BASE/iptables-added-$NAME.txt" --network "mfl-$NAME" \
-    --workers "${WORKERS:-3}" --retry-infra --outage-wait 10800 \
+    --workers "${WORKERS:-3}" --rollout-slots "${ROLLOUT_SLOTS:-1}" \
+    --retry-infra --outage-wait 10800 \
     --sealed "$BASE/sealed/$NAME" --evaluator "$BASE/eval" --split "$SPLIT" --gold-check \
     --agent-option discover_tests=true --agent-option reproduce=true \
     --agent-option repo_search=true --agent-option probe_guard=off \

@@ -760,3 +760,53 @@ def test_a_limited_patch_holds_exactly_the_named_files(tmp_path: Path) -> None:
         f"git --no-pager diff --text --no-color {base} $t -- {what} {rn._pathspec()}"
     )
     assert rn.patch_paths(patch) == ["d/a[1].py", "d/b c.py"]
+
+
+def test_rollout_slots_bound_the_rollouts_in_flight_not_the_grading(tmp_path, monkeypatch) -> None:
+    """Three workers, one rollout slot: never two rollouts at once, while a finished instance
+    is graded next to the following rollout."""
+    import threading
+    import time
+
+    from evals.swebench_live import sealed as sl
+
+    rows = [{**SENTINELS, "instance_id": f"octo__widget-{n}"} for n in range(4)]
+    state = {"rolling": 0, "most": 0, "overlap": False}
+    lock = threading.Lock()
+
+    def run_instance(task: Any, inp: Any, ctx: Any) -> dict[str, Any]:
+        with lock:
+            state["rolling"] += 1
+            state["most"] = max(state["most"], state["rolling"])
+        time.sleep(0.05)
+        with lock:
+            state["rolling"] -= 1
+        idir = ctx.run_dir / "instances" / task.instance_id
+        idir.mkdir(parents=True)
+        rec = {"instance_id": task.instance_id, "status": "done", "flags": []}
+        (idir / "instance.json").write_text(json.dumps(rec))
+        return rec
+
+    def grade_final(base: Path, run_dir: Path, sealed: Path, iid: str, split: str, **kw: Any):
+        for _ in range(40):  # grading takes longer than a rollout: the next rollout starts
+            with lock:
+                state["overlap"] = state["overlap"] or state["rolling"] > 0
+            time.sleep(0.005)
+        return {"instance_id": iid}
+
+    monkeypatch.setattr(rn, "run_instance", run_instance)
+    monkeypatch.setattr(sl, "grade_final", grade_final)
+    ctx = rn.Context(
+        run_dir=tmp_path, settings=None, proxy=None, docker="docker", network="n",  # type: ignore[arg-type]
+        gateway="g", bundle=tmp_path, keep_images=True, sealed=tmp_path / "s",
+        evaluator=tmp_path / "e", rollout_slots=1,
+    )  # fmt: skip
+    monkeypatch.setattr(rn, "write_preds", lambda run_dir, model: {})
+    ctx.settings = type("S", (), {"model": "m"})()  # type: ignore[assignment]
+    counts = rn.run_all(rows, ctx, workers=3, retry_infra=False)
+    assert counts["done"] == 4 and state["most"] == 1 and state["overlap"] is True
+    ctx.rollout_slots, state["most"] = 0, 0
+    for row in rows:
+        row["instance_id"] += "-b"
+    rn.run_all(rows, ctx, workers=3, retry_infra=False)
+    assert state["most"] > 1  # without the bound the workers roll out side by side

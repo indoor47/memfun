@@ -100,6 +100,10 @@ python3 evals/swebench_live/submission.py build --run-dir runs/lite --dataset da
     --out submissions/lite/memfun/MODEL --model-label MODEL
 ```
 
+`--rollout-slots N` (with `--workers` larger than N) keeps at most N rollouts in flight while
+the other workers grade: the number of rollouts is what a model endpoint with a limit on
+tokens per minute has to carry, and grading needs no model.
+
 `--sealed` grades an instance only once its record is final (a final instance is never rolled
 out again), writes everything the evaluator says, its exit code included, under the sealed
 directory (mode 0700, outside the run directory) and records in the run directory only that the

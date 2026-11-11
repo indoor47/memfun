@@ -192,6 +192,10 @@ class Context:
     evaluator: Path | None = None
     split: str = "lite"
     gold_check: bool = False
+    #: At most this many rollouts in flight (0 = as many as there are workers).  The other
+    #: workers grade meanwhile: a model path with a limit on tokens per minute sets how many
+    #: rollouts may share it, the box's CPUs set how many evaluations run next to them.
+    rollout_slots: int = 0
     stop: threading.Event = dataclasses.field(default_factory=threading.Event)
     live: set[str] = dataclasses.field(default_factory=set)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
@@ -1015,6 +1019,14 @@ def run_all(
             set_aside(ctx.run_dir, task.instance_id, status)
         todo.append((task, inp))
 
+    slots = threading.BoundedSemaphore(ctx.rollout_slots) if ctx.rollout_slots > 0 else None
+
+    def rollout(item: tuple[ds.Task, ds.EpisodeInput]) -> dict[str, Any]:
+        if slots is None:
+            return run_instance(item[0], item[1], ctx)
+        with slots:
+            return run_instance(item[0], item[1], ctx)
+
     def one(item: tuple[ds.Task, ds.EpisodeInput]) -> None:
         iid = item[0].instance_id
         restarts = 0
@@ -1028,7 +1040,7 @@ def run_all(
                     with ctx.lock:
                         counts["skipped_unfinished"] += 1
                 return
-            rec = run_instance(item[0], item[1], ctx)
+            rec = rollout(item)
             crash = str(rec.get("crash") or "")
             if crash:
                 # The agent died before its first model call.  From scratch again (no model
@@ -1226,6 +1238,7 @@ def cmd_run(a: argparse.Namespace) -> int:
         evaluator=a.evaluator.resolve() if a.evaluator else None,
         split=a.split,
         gold_check=a.gold_check,
+        rollout_slots=max(0, a.rollout_slots),
         outage_wait=max(0.0, a.outage_wait),
         outage_restarts=max(0, a.outage_restarts),
         outage_poll=max(0.01, a.outage_poll),
@@ -1303,6 +1316,11 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--instance-timeout", type=int, default=2400)
     r.add_argument("--max-tokens-per-instance", type=int, default=4_000_000)
     r.add_argument("--workers", type=int, default=1)
+    r.add_argument(
+        "--rollout-slots", type=int, default=0, metavar="N",
+        help="at most N rollouts in flight while the other workers grade (with --sealed); "
+        "0 = one per worker.  Size it to the model path's limit on tokens per minute",
+    )  # fmt: skip
     r.add_argument("--cpus", type=float, default=4.0)
     r.add_argument("--memory", default="16g")
     r.add_argument("--docker", default="docker")
