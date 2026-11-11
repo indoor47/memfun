@@ -3,6 +3,7 @@
 
     submission.py merge --run-dir A --run-dir B ... --out RUN     # shards of one run, one per box
     submission.py audit --run-dir RUN --dataset lite.jsonl        # every trajectory, every rule
+    submission.py repo-text --run-dir RUN --dataset lite.jsonl    # alarms about repository text
     submission.py build --run-dir RUN --dataset lite.jsonl --out submissions/lite/memfun/MODEL
 
 ``merge`` joins the shards of one run (same frozen settings, disjoint instances, all
@@ -13,6 +14,14 @@ violations.  The folder holds what github.com/SWE-bench-Live/submission asks for
 every model request and response as sent and received, the agent's log, its patch and the
 log of its own checks) and ``README.md`` (the scaffold, the frozen settings, the number of
 rollouts, the audit).
+
+The audit cannot see the repository, so it cannot tell a leaked line of the test patch from a
+line the test patch shares with a test that was already there (the agent reads existing tests
+legitimately; about 4% of dev instances raise this alarm).  ``repo-text`` settles it with
+evidence: for each instance with such an alarm it searches the instance's image, as it was
+before the rollout, for every distinctive line of the forbidden fields and records the ones
+found there in ``in-repo.json``.  The audit does not count those lines and says so in a note.
+It runs on a finalized run only and touches no rollout.
 """
 
 from __future__ import annotations
@@ -22,7 +31,9 @@ import contextlib
 import json
 import re
 import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -115,10 +126,19 @@ def _content(message: dict[str, Any]) -> str:
     return c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
 
 
-def audit_instance(idir: Path, row: dict[str, Any], prompt_template: str) -> dict[str, list[str]]:
-    """Violations and things to review for one instance (both empty = clean)."""
+def audit_instance(
+    idir: Path,
+    row: dict[str, Any],
+    prompt_template: str,
+    in_repo: dict[str, list[str]] | None = None,
+) -> dict[str, list[str]]:
+    """Violations and things to review for one instance (both empty = clean).
+
+    *in_repo*: per forbidden field, the lines found in the instance's image as it was before
+    the rollout (``repo-text``).  They are the repository's own text and are not counted."""
     bad: list[str] = []
     review: list[str] = []
+    known = {f: set(v) for f, v in (in_repo or {}).items()}
     iid = str(row["instance_id"])
     rec = read_json(idir / "instance.json") or {}
     if rec.get("status") != "done":
@@ -151,7 +171,19 @@ def audit_instance(idir: Path, row: dict[str, Any], prompt_template: str) -> dic
         if iid in asked:
             bad.append(f"call {seq}: the instance id is in a prompt")
         for field in FORBIDDEN_FIELDS:
-            lines = list(dict.fromkeys(distinctive_lines(row, field)))
+            every = list(dict.fromkeys(distinctive_lines(row, field)))
+            lines = [ln for ln in every if ln not in known.get(field, ())]
+            aside = [ln for ln in every if ln in known.get(field, ()) and ln in asked]
+            if aside:
+                note = (
+                    f"lines of `{field}` in a prompt are text of the repository as it was "
+                    f"before the rollout (found in the image, in-repo.json): not counted, "
+                    f"e.g. {aside[0][:60]}"
+                )
+                if not any(
+                    r.startswith(f"lines of `{field}` in a prompt are text") for r in review
+                ):
+                    review.append(note)
             # the agent's own earlier words coming back in a prompt are not a leak
             hits = [ln for ln in lines if ln in asked and ln not in answered]
             if not hits or field in leaked:
@@ -207,6 +239,7 @@ def audit(run_dir: Path, rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
     settings = meta.get("settings") or {}
     ids = list(meta.get("instance_ids") or [])
     out: dict[str, Any] = {"instances": {}, "run": []}
+    evidence = read_json(run_dir / IN_REPO) or {}
     if meta.get("finalized") is not True:
         out["run"].append("run.json is not finalized")
     if len(ids) != len(set(ids)):
@@ -216,7 +249,10 @@ def audit(run_dir: Path, rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
             out["run"].append(f"{iid} is not in the dataset file")
             continue
         found = audit_instance(
-            run_dir / "instances" / iid, rows[iid], str(settings.get("prompt_template", ""))
+            run_dir / "instances" / iid,
+            rows[iid],
+            str(settings.get("prompt_template", "")),
+            (evidence.get(iid) or {}).get("lines"),
         )
         if found["violations"] or found["review"]:
             out["instances"][iid] = found
@@ -241,6 +277,82 @@ def audit(run_dir: Path, rows: dict[str, dict[str, Any]]) -> dict[str, Any]:
     out["n_violations"] = len(out["run"]) + sum(len(v["violations"]) for v in per_instance)
     out["n_review"] = sum(len(v["review"]) for v in per_instance)
     return out
+
+
+#: Evidence written by ``repo-text``: per instance, the forbidden-field lines found in its image.
+IN_REPO = "in-repo.json"
+#: Runs in a container of the instance's image without network; the lines arrive on stdin.
+#: Prints each line that some text file of the repository's working tree contains.
+SEARCH_TREE = """
+cd /testbed || exit 3
+[ -d .git ] || { g=$(find . -maxdepth 2 -mindepth 2 -type d -name .git -print -quit); \
+  [ -n "$g" ] && cd "${g%/.git}"; }
+cat > /tmp/mfl-lines
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  if grep -rIqF --exclude-dir=.git -e "$p" . 2>/dev/null; then printf '%s\n' "$p"; fi
+done < /tmp/mfl-lines
+"""
+
+
+def lines_in_image(docker: str, image: str, lines: list[str], keep: bool = False) -> set[str]:
+    """Which of *lines* occur in the repository inside *image* (its initial working tree)."""
+
+    def run(*argv: str, stdin: bytes | None = None, timeout: int = 3600) -> Any:
+        return subprocess.run(
+            [docker, *argv], input=stdin, capture_output=True, check=False, timeout=timeout
+        )
+
+    pulled = False
+    if run("image", "inspect", image, timeout=120).returncode != 0:
+        if run("pull", image).returncode != 0:
+            raise SystemExit(f"cannot pull {image}")
+        pulled = True
+    try:
+        res = run(
+            "run", "--rm", "--network", "none", "-i", "--entrypoint", "sh", image, "-c",
+            SEARCH_TREE, stdin=("\n".join(lines) + "\n").encode(),
+        )  # fmt: skip
+        if res.returncode != 0:
+            raise SystemExit(f"the search in {image} failed: {res.stderr.decode()[-300:]}")
+        return set(res.stdout.decode("utf-8", "replace").splitlines()) & set(lines)
+    finally:
+        if pulled and not keep:
+            run("rmi", image, timeout=600)
+
+
+def repo_text(
+    run_dir: Path, rows: dict[str, dict[str, Any]], docker: str = "docker", keep: bool = False
+) -> dict[str, Any]:
+    """For every instance whose audit says forbidden lines are in a prompt: find out which
+    of those lines the repository already held, and record them as evidence."""
+    meta = read_json(run_dir / "run.json") or {}
+    if meta.get("finalized") is not True:
+        raise SystemExit("this run is not finalized: no forbidden field is handled before that")
+    evidence: dict[str, Any] = read_json(run_dir / IN_REPO) or {}
+    report = audit(run_dir, rows)
+    done: dict[str, int] = {}
+    for iid, found in report["instances"].items():
+        if not any("distinctive lines of" in v for v in found["violations"]):
+            continue
+        row = rows[iid]
+        per_field = {f: list(dict.fromkeys(distinctive_lines(row, f))) for f in FORBIDDEN_FIELDS}
+        wanted = sorted({ln for lines in per_field.values() for ln in lines if "\n" not in ln})
+        present = lines_in_image(docker, str(row["docker_image"]), wanted, keep)
+        evidence[iid] = {
+            "image": row["docker_image"],
+            "searched_at": time.time(),
+            "lines_searched": len(wanted),
+            "lines": {f: [ln for ln in v if ln in present] for f, v in per_field.items()},
+        }
+        done[iid] = len(present)
+        (run_dir / IN_REPO).write_text(json.dumps(evidence, indent=1), "utf-8")
+    after = audit(run_dir, rows)
+    return {
+        "searched": done,
+        "violations_before": report["n_violations"],
+        "violations_after": after["n_violations"],
+    }
 
 
 def merge(shards: list[Path], out: Path) -> dict[str, Any]:
@@ -329,7 +441,10 @@ instance), ${cost:.2f} at the endpoint's list price.
 Every trajectory was scanned for the dataset's forbidden fields (hints, test patch, reference
 patch), the instance id, credentials and attempted network access:
 {report.get("n_violations", 0)} violations, {report.get("n_review", 0)} notes for review
-(`audit.json`).
+(`audit.json`). Where a line of the test patch or the reference patch was in a prompt because
+the repository already held the same line (an existing test, an existing fixture), the line
+was looked up in the instance's image as it was before the rollout; those lines are listed
+per instance in `in-repo.json` when there were any.
 
 ## Files
 `preds.json`, `results.json`, `run.json`, `attempts.jsonl`, `audit.json`, and per instance in
@@ -352,7 +467,7 @@ def build(run_dir: Path, rows: dict[str, dict[str, Any]], out: Path, name: str, 
     if out.exists() and any(out.iterdir()):
         raise SystemExit(f"{out} is not empty")
     (out / "trajs").mkdir(parents=True)
-    for fname in ("preds.json", "results.json", "run.json", "attempts.jsonl"):
+    for fname in ("preds.json", "results.json", "run.json", "attempts.jsonl", IN_REPO):
         if (run_dir / fname).is_file():
             shutil.copyfile(run_dir / fname, out / fname)
     for idir in sorted((run_dir / "instances").glob("*")):
@@ -375,10 +490,13 @@ def main(argv: list[str] | None = None) -> int:
     m = sub.add_parser("merge")
     m.add_argument("--run-dir", type=Path, action="append", required=True)
     m.add_argument("--out", type=Path, required=True)
-    for cmd in ("audit", "build"):
+    for cmd in ("audit", "repo-text", "build"):
         p = sub.add_parser(cmd)
         p.add_argument("--run-dir", type=Path, required=True)
         p.add_argument("--dataset", type=Path, required=True, help="JSONL from dataset.py fetch")
+        if cmd == "repo-text":
+            p.add_argument("--docker", default="docker")
+            p.add_argument("--keep-images", action="store_true")
         if cmd == "build":
             p.add_argument("--out", type=Path, required=True)
             p.add_argument("--name", default="memfun")
@@ -389,6 +507,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"merged {len(doc['instance_ids'])} instances into {a.out}")
         return 0
     rows = load_rows(a.dataset)
+    if a.cmd == "repo-text":
+        print(json.dumps(repo_text(a.run_dir.resolve(), rows, a.docker, a.keep_images)))
+        return 0
     if a.cmd == "audit":
         report = audit(a.run_dir.resolve(), rows)
         print(json.dumps(report, indent=1))

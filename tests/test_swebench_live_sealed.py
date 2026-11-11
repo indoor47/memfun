@@ -356,3 +356,57 @@ def test_what_the_projects_tests_wrote_is_kept_and_a_key_in_it_is_a_note(tmp_pat
     # the same text in the patch itself stays a violation
     (run / "instances" / iid / "patch.diff").write_text("diff --git a/k.pem b/k.pem\n" + pem)
     assert any("patch.diff: text that looks like" in v for v in violations(run))
+
+
+FAKE_DOCKER_SEARCH = """#!/bin/sh
+# image inspect: present.  run: print the lines of stdin that occur in the file $FAKE_TREE.
+echo "$@" >> "$FAKE_CALLS"
+case "$1" in
+  image) exit 0 ;;
+  run)
+    while IFS= read -r p; do grep -qF -e "$p" "$FAKE_TREE" && printf '%s\\n' "$p"; done
+    exit 0 ;;
+esac
+exit 0
+"""
+
+
+def test_a_line_the_repository_already_held_is_settled_with_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two lines of the test patch are in a prompt: a violation, until the image shows that
+    the repository held them before the rollout.  Lines it did not hold stay a violation."""
+    iid = ROW["instance_id"]
+    rows = {iid: {**ROW, "docker_image": "starryzhang/sweb.eval.x86_64.octo_1776_widget-1"}}
+    prompt = TEMPLATE.format(problem_statement=ROW["problem_statement"])
+    leak = [call(1, prompt, "ok"), call(2, f"{prompt}\n{TEST_LINE}\n{TEST_LINE_2}", "")]
+    docker = tmp_path / "docker"
+    docker.write_text(FAKE_DOCKER_SEARCH)
+    docker.chmod(0o755)
+    monkeypatch.setenv("FAKE_CALLS", str(tmp_path / "calls"))
+    monkeypatch.setenv("FAKE_TREE", str(tmp_path / "tree"))
+
+    (tmp_path / "tree").write_text("some other line of the repository that is long enough\n")
+    run = make_run(tmp_path / "leaked", [iid], calls=leak)
+    out = sub.repo_text(run, rows, str(docker))
+    assert out["searched"] == {iid: 0} and out["violations_after"] == 1  # a real leak stays
+
+    (tmp_path / "tree").write_text(f"{TEST_LINE}\n{TEST_LINE_2}\n")
+    run = make_run(tmp_path / "shared", [iid], calls=leak)
+    assert len(violations(run)) == 1
+    out = sub.repo_text(run, rows, str(docker))
+    assert out == {"searched": {iid: 2}, "violations_before": 1, "violations_after": 0}
+    evidence = json.loads((run / "in-repo.json").read_text())[iid]
+    assert evidence["lines"]["test_patch"] == [TEST_LINE.strip(), TEST_LINE_2.strip()]
+    report = sub.audit(run, rows)
+    assert report["n_violations"] == 0
+    assert "not counted" in report["instances"][iid]["review"][0]
+    calls = (tmp_path / "calls").read_text()
+    assert "--network none" in calls and "pull" not in calls  # no network, image was there
+    (run / "results.json").write_text(json.dumps({"submitted": 1, "success": 0}))
+    assert sub.build(run, rows, tmp_path / "out", "memfun", "Model") == 0
+    assert (tmp_path / "out" / "in-repo.json").is_file()
+
+    open_run = make_run(tmp_path / "open", [iid], calls=leak, finalized=False)
+    with pytest.raises(SystemExit, match="not finalized"):
+        sub.repo_text(open_run, rows, str(docker))
