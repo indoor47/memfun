@@ -82,6 +82,21 @@ async def test_a_real_absolute_path_is_taken_as_given(tmp_path: Path) -> None:
     assert (outside / "fresh.txt").exists() and ex.ops[-1][2] == 0
 
 
+@pytest.mark.asyncio
+async def test_an_edit_that_changes_nothing_is_a_failed_edit(tmp_path: Path) -> None:
+    """Seen on a real repository: the solver "replaced" a block by the same block, the file
+    counted as edited, the checks passed and the run ended a success with an empty patch."""
+    root = project(tmp_path)
+    same = {"op": "edit_file", "path": str(root / "pkg/mod.py"), "old": "x = 1", "new": "x = 1"}
+    ex = await run_ops(root, [same])
+    assert ex.attempted == 1 and ex.failed == 1 and ex.files_created == [] and ex.ops == []
+    assert ex.edit_diagnostics[0].strategy_tried.startswith("no-op")
+    assert (root / "pkg/mod.py").read_text("utf-8") == "x = 1\n"
+    real = {"op": "edit_file", "path": str(root / "pkg/mod.py"), "old": "x = 1", "new": "x = 2"}
+    ex = await run_ops(root, [same, real])
+    assert ex.failed == 1 and ex.files_created == [str(root / "pkg/mod.py")]
+
+
 def test_repair_prefers_the_longest_tail_that_exists(tmp_path: Path) -> None:
     root = project(tmp_path)
     (root / "mod.py").write_text("", "utf-8")

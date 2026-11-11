@@ -9,6 +9,8 @@
 #   BASE/bundle/venv     memfun installed non-editable; mounted read-only into task containers
 #                        at this same absolute path, so nothing needs relocating
 #   BASE/bundle/VERSION  the commit the bundle was built from (recorded in every run.json)
+#   BASE/bundle/uv.lock  the lock file the dependencies were installed from; FREEZE.txt and
+#                        FREEZE.sha256 are what is installed and its digest (bundle_check.py)
 # Needs: docker, git, uv.  No API key is ever needed or stored on the box: the model is reached
 # through the recording proxy, whose upstream is a tunnel to a key-holding proxy elsewhere.
 #
@@ -39,11 +41,24 @@ up)
   # into the checkout, which is NOT mounted in a task container.
   (cd "$REPO" && "$UV" build --all-packages --wheel -o "$B/wheels" >/dev/null 2>&1) \
     || { echo "wheel build failed"; exit 3; }
-  "$UV" pip install --python "$B/venv/bin/python" --link-mode copy --no-sources "$B"/wheels/*.whl >/dev/null
+  # Dependencies at the versions of uv.lock, never "the newest today": a bundle built later
+  # from the same commit must be the same bundle (a rebuild that resolved afresh once got a
+  # newer dspy and litellm, and every rollout failed before its first model call).
+  [ -f "$REPO/uv.lock" ] || { echo "no uv.lock in $REPO"; exit 3; }
+  cp "$REPO/uv.lock" "$B/uv.lock"
+  (cd "$REPO" && "$UV" export --frozen --no-dev --all-packages --no-emit-workspace --no-hashes \
+      -o "$B/requirements.lock.txt" >/dev/null 2>"$BASE/.export.err") \
+    || { echo "uv export failed: $(tail -3 "$BASE/.export.err")"; exit 3; }
+  rm -f "$BASE/.export.err"
+  "$UV" pip install --python "$B/venv/bin/python" --link-mode copy -r "$B/requirements.lock.txt" >/dev/null
+  "$UV" pip install --python "$B/venv/bin/python" --link-mode copy --no-sources --no-deps "$B"/wheels/*.whl >/dev/null
   git -C "$REPO" rev-parse HEAD > "$B/VERSION"
   [ -z "$(git -C "$REPO" status --porcelain)" ] || echo "dirty" >> "$B/VERSION"
   echo "== self-tests"
   "$B/venv/bin/memfun" --help >/dev/null && echo "  ok: memfun starts from the bundle"
+  # the installed versions are the locked ones (dspy and litellm named; all compared)
+  "$PYBIN" "$REPO/evals/swebench_live/bundle_check.py" "$B" --write \
+    || { echo "  FAIL: the bundle does not match uv.lock"; exit 3; }
   # everything the venv points at must live inside the bundle (it is the only thing mounted)
   out=$(find "$B/venv" -type l -exec readlink -f {} \; | grep -v "^$B/" | head -3 || true)
   [ -z "$out" ] && echo "  ok: no symlink leaves the bundle" || { echo "  FAIL: links leave the bundle: $out"; exit 3; }

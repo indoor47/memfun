@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, cast
 import typer
 from memfun_core.config import MemfunConfig
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -110,7 +111,10 @@ def _on_sub_task_status_factory(
         }.get(st, "?")
         agent_label = status.agent_name or "?"
         desc = (status.sub_task.description or "")[:80]
-        console.print(f"  {symbol} [cyan]{tid}[/cyan] [dim]({agent_label})[/dim] {st:<10} {desc}")
+        console.print(
+            f"  {symbol} [cyan]{escape(tid)}[/cyan] [dim]({escape(agent_label)})[/dim] "
+            f"{st:<10} {escape(desc)}"
+        )
 
     return on_sub_task_status
 
@@ -132,7 +136,7 @@ def _display_final_summary(
     table.add_row("review_rounds", str(result.review_rounds))
     table.add_row(
         "files_created",
-        ", ".join(result.files_created) or "(none)",
+        escape(", ".join(result.files_created)) or "(none)",
     )
     table.add_row("wall_time", _format_duration(wall_seconds))
     table.add_row(
@@ -150,7 +154,7 @@ def _display_final_summary(
             "[red]a model call was rejected: the prompt exceeded the context window[/red]",
         )
     if result.error:
-        table.add_row("error", f"[red]{result.error}[/red]")
+        table.add_row("error", f"[red]{escape(result.error)}[/red]")
 
     # Auto-commit / auto-push outcome (issue #37).  Always shown
     # when the engine returned a CommitResult so the user knows
@@ -162,7 +166,7 @@ def _display_final_summary(
             table.add_row(
                 "commit",
                 f"[green]{short_sha}[/green] on "
-                f"[cyan]{cr.branch or '?'}[/cyan]"
+                f"[cyan]{escape(cr.branch or '?')}[/cyan]"
                 f" ({len(cr.files_committed)} file(s))",
             )
             if cr.pushed:
@@ -173,17 +177,17 @@ def _display_final_summary(
             elif cr.push_error:
                 table.add_row(
                     "push",
-                    f"[yellow]not pushed: {cr.push_error}[/yellow]",
+                    f"[yellow]not pushed: {escape(cr.push_error)}[/yellow]",
                 )
         elif cr.skipped:
             table.add_row(
                 "commit",
-                f"[dim]skipped ({cr.error or 'unknown reason'})[/dim]",
+                f"[dim]skipped ({escape(cr.error or 'unknown reason')})[/dim]",
             )
         elif cr.error:
             table.add_row(
                 "commit",
-                f"[red]failed: {cr.error}[/red]",
+                f"[red]failed: {escape(cr.error)}[/red]",
             )
 
     truncated = _truncated_responses()
@@ -208,7 +212,7 @@ def _display_final_summary(
         console.print()
         console.print(
             Panel(
-                result.answer[:5000]
+                escape(result.answer[:5000])
                 + ("\n\n[dim]...truncated...[/dim]" if len(result.answer) > 5000 else ""),
                 title="Merged answer",
                 border_style="cyan",
@@ -480,14 +484,16 @@ async def _run_swarm_impl(
             if branch_err:
                 console.print(
                     Panel(
-                        f"[red]Could not create branch '{branch_name}': {branch_err}[/red]",
+                        f"[red]Could not create branch '{escape(branch_name)}': "
+                        f"{escape(branch_err)}[/red]",
                         title="Branch error",
                         border_style="red",
                     )
                 )
                 return 1
             console.print(
-                f"[dim]Branch:[/dim] [green]{branch_name}[/green] [dim](created off HEAD)[/dim]"
+                f"[dim]Branch:[/dim] [green]{escape(branch_name)}[/green] "
+                "[dim](created off HEAD)[/dim]"
             )
 
     # Worktree manager (requires a git repo).
@@ -497,7 +503,7 @@ async def _run_swarm_impl(
             console.print(
                 Panel(
                     f"[red]--use-worktrees requires a git repository, "
-                    f"but {project_root} is not one.[/red]\n\n"
+                    f"but {escape(str(project_root))} is not one.[/red]\n\n"
                     "Re-run with [bold]--no-use-worktrees[/bold] or "
                     "initialise a git repo first (`git init`).",
                     title="Swarm error",
@@ -510,7 +516,7 @@ async def _run_swarm_impl(
             # Stash the override on the manager for later — but since
             # WorktreeManager.make_worktree takes base_sha per-call,
             # we wire it through via a closure-based wrapper below.
-            console.print(f"[dim]Worktrees rooted at HEAD ref:[/dim] {base_sha}")
+            console.print(f"[dim]Worktrees rooted at HEAD ref:[/dim] {escape(base_sha)}")
 
     # Wrap the worktree manager if a custom base_sha was provided so
     # every make_worktree call pulls from that ref.
@@ -596,12 +602,14 @@ async def _run_swarm_impl(
     except Exception as exc:
         logger.debug("Dashboard auto-start skipped: %s", exc)
 
+    # The task text, paths and refs are shown as they are: text such as "[/content/x.py]" is
+    # not terminal markup (unescaped, such a task crashed the command before its first step).
     banner = (
-        f"[bold]Spec:[/bold] {spec}\n"
-        f"[dim]project:[/dim] {project_root}\n"
+        f"[bold]Spec:[/bold] {escape(spec)}\n"
+        f"[dim]project:[/dim] {escape(str(project_root))}\n"
         f"[dim]max_pool:[/dim] {max_pool}  "
         f"[dim]use_worktrees:[/dim] {use_worktrees}  "
-        f"[dim]base_sha:[/dim] {base_sha or 'HEAD'}"
+        f"[dim]base_sha:[/dim] {escape(base_sha or 'HEAD')}"
     )
     if dashboard_port:
         banner += f"\n[dim]Dashboard:[/dim] [cyan]http://localhost:{dashboard_port}[/cyan]"
@@ -631,7 +639,7 @@ async def _run_swarm_impl(
     except Exception as exc:
         console.print(
             Panel(
-                f"[red]{type(exc).__name__}: {exc}[/red]",
+                f"[red]{type(exc).__name__}: {escape(str(exc))}[/red]",
                 title="Swarm error",
                 border_style="red",
             )
@@ -653,8 +661,9 @@ async def _run_swarm_impl(
             logger.debug("manager.stop_all failed", exc_info=True)
 
     wall = time.perf_counter() - start
-    _display_final_summary(result, wall)
+    # The machine-readable result first: nothing in the display may cost a finished run its record.
     _write_swarm_result_json(_swarm_result_payload(result, wall, sub_tasks_seen))
+    _display_final_summary(result, wall)
     return 0 if result.success and not _truncated_responses() else 1
 
 

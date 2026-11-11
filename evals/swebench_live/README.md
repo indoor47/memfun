@@ -48,7 +48,25 @@ settings: `--agent-option discover_tests=true --agent-option reproduce=true --ag
 repo_search=true --agent-option probe_guard=off` (the runner writes them to
 `.memfun/verify.json` in the repository, which is never part of a patch; `probe_guard=off` is
 right here because the container is disposable; `repo_search` plans a large repository from
-a search of every file and is off unless asked for, like the others).
+a search of every file and is off unless asked for, like the others). Two more belong in a
+benchmark run: `read_rounds=3` lets the solver ask to read parts of a large file before it
+edits (served by memfun's own code, never a shell; every request is kept as `reads.jsonl` next
+to the trajectory), and `offline=true` removes the web step, so that the planner is not even
+offered it. The runner also sets `LITELLM_LOCAL_MODEL_COST_MAP=true` for the agent: the model
+library otherwise tries to refresh a price table from the internet at start-up.
+
+What a rollout without a patch says: `instance.json` carries `failure_class` (`no_edits` when
+the agent reported that it edited nothing, else the agent's own error) next to the
+`empty_patch` flag. An agent that exits with an error before its first model call made no
+attempt, so the instance runs again from scratch; when it dies the same way three times in a
+row the instance is closed with an empty patch and `failure_class: agent_crash`, and
+`attempts.jsonl` records each try and the decision.
+
+The bundle is built from `uv.lock` (`provision.sh up`): a copy of the lock file, what is
+installed (`FREEZE.txt`) and its digest (`FREEZE.sha256`) are kept in the bundle, and
+`bundle_check.py BUNDLE` fails when an installed version differs from the locked one (`dspy`
+and `litellm` must be present). A bundle rebuilt later from the same commit is then the same
+bundle.
 
 ## Gold check first
 

@@ -58,6 +58,8 @@ MAX_TEST_FILE_BYTES = 400_000
 IMPORT_CHECK_TIMEOUT_S = 30.0
 #: Never run more than this many test files for one change.
 MAX_SELECTED = 6
+#: Directory names that say nothing about which module a test is for.
+_GENERIC_DIRS = frozenset({"src", "lib", "tests", "test", "testing", "unit", "integration"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,7 +296,8 @@ def select_tests(
     """The test files most relevant to *changed_files* (relative paths), best first.
 
     Three general signals, added up per test file: its **name** matches the changed module
-    (``test_<module>.py``, ``<module>_test.py``); it **imports** the changed module; it
+    (``test_<module>.py``, ``<module>_test.py``; weaker: the name mentions the module, or the
+    file is in a directory named after it); it **imports** the changed module; it
     **mentions** a changed function or class (*symbols*).  A changed file that is itself a
     test file is always selected.  Nothing is selected on a weak signal alone.
     """
@@ -331,6 +334,11 @@ def select_tests(
             elif re.search(rf"(?:^|_){re.escape(stem)}(?:_|$)", base):
                 score += 2
                 reasons.append(f"name mentions {stem}")
+            if stem in Path(test).parent.parts and stem not in _GENERIC_DIRS:
+                # tests/main/<module>/test_main_<module>.py: tests of the module that reach it
+                # through another entry point, so they neither import it nor carry its name alone
+                score += 2
+                reasons.append(f"is in a directory named {stem}")
             shared = set(Path(rel).parent.parts) & set(Path(test).parent.parts)
             score += 0.5 * len(shared - {"src", "lib", "tests", "test"})
         text = ""

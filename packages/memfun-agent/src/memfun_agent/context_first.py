@@ -21,10 +21,14 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
+
+    #: Answers the read requests of one reply: ``(operations, round number, rounds left)``
+    #: to the text that is appended to the context.
+    ReadAnswerer = Callable[[list[dict[str, Any]], int, int], Awaitable[str]]
 
 import time
 import uuid
@@ -33,7 +37,7 @@ import dspy
 from memfun_core.config import LLMConfig
 from memfun_core.logging import get_logger
 
-from memfun_agent import fixloop, repo_search, repo_tests
+from memfun_agent import fixloop, read_requests, repo_search, repo_tests
 from memfun_agent.signatures import (
     ConsistencyReview,
     ContextPlanning,
@@ -260,6 +264,20 @@ class ContextFirstConfig:
     #: unchanged code and, when it does show the problem, use it as a check after the change
     #: (``reproduce`` in ``.memfun/verify.json``).  Guarded like a probe (``fix_probe_guard``).
     reproduce: bool = False
+    #: Rounds in which the solver may ask to read more before it edits (lines of a file, a
+    #: search, a listing): when a reply holds only read requests they are answered by memfun's
+    #: own code (``read_requests``: no shell, confined to the project) and the solver is asked
+    #: again.  Opt-in (it changes the solver's prompt): ``read_rounds`` in
+    #: ``.memfun/verify.json`` or this field.  With it on, a solve that edits no file is a
+    #: failure (``context_first_no_edits``), never a success.
+    read_rounds: int = 0
+    #: With the read step on: tell the solver up front that it may ask to read (and how).
+    #: ``False`` answers read requests all the same but does not invite them, so a solver
+    #: that can edit from what it is shown gets the prompt it always got (``read_offer``).
+    read_offer: bool = True
+    #: No web step: the planner is not offered web searches and nothing is fetched.  For runs
+    #: that must not touch the network (``offline`` in ``.memfun/verify.json``).
+    offline: bool = False
     enable_edit_retry: bool = True
     enable_consistency_review: bool = True
 
@@ -358,6 +376,8 @@ class PlanResult:
     search_patterns: list[str]
     reasoning: str
     web_searches: list[str] = field(default_factory=list)
+    #: The raw answer when it could not be parsed into the fields above (else empty).
+    unparsed: str = ""
 
 
 @dataclass
@@ -368,6 +388,8 @@ class SolveResult:
     answer: str
     operations: list[dict[str, Any]]
     truncated: bool = False
+    #: Rounds of reads that were answered before this reply (the read step).
+    read_rounds: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -567,26 +589,97 @@ def _normalize_list(value: Any) -> list[Any]:
     return []
 
 
+_PATHISH = re.compile(r"[\w./\-]+")
+
+
+def salvage_planned_files(raw: str, known_files: list[str] | None, limit: int = 50) -> list[str]:
+    """The files a planner answer names when the answer itself could not be parsed.
+
+    A model sometimes answers with a bare JSON list of paths, or with prose, instead of the
+    fields it was asked for.  The paths are still there: a JSON list (or an object with
+    ``files_to_read``) is taken as written, and otherwise every project file the text names
+    is taken in the order it appears.  With *known_files* only real project files count.
+    """
+    known = set(known_files) if known_files is not None else None
+    found: list[str] = []
+
+    def add(item: object) -> None:
+        text = item.strip().removeprefix("./") if isinstance(item, str) else ""
+        if known is not None and text not in known:
+            text = text.rstrip(".,;:")  # a path at the end of a sentence
+        if text and text not in found and (known is None or text in known):
+            found.append(text)
+
+    text = raw.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    for candidate in (text, fenced.group(1) if fenced else ""):
+        if not candidate.startswith(("[", "{")):
+            continue
+        try:
+            parsed: object = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            parsed = cast("dict[str, object]", parsed).get("files_to_read")
+        if isinstance(parsed, list):
+            for item in cast("list[object]", parsed):
+                add(item)
+    if not found and known is not None:
+        for m in _PATHISH.finditer(text):
+            add(m.group(0))
+    return found[:limit]
+
+
 class ContextPlanner(dspy.Module):
     """Decide what files need to be read to solve a task (1 LLM call)."""
 
     def __init__(self) -> None:
         super().__init__()
         self.predictor = dspy.Predict(ContextPlanning)
+        self._offline_predictor: dspy.Predict | None = None
 
     async def aplan(
         self,
         query: str,
         file_manifest: str,
         project_summary: str,
+        *,
+        offline: bool = False,
     ) -> PlanResult:
-        """Plan which files to gather."""
-        result = await asyncio.to_thread(
-            self.predictor,
-            query=query,
-            file_manifest=file_manifest,
-            project_summary=project_summary,
-        )
+        """Plan which files to gather.
+
+        With *offline* the planner is not offered the web step at all (the signature has no
+        ``web_searches`` field).  An answer that cannot be parsed does not end the solve: it
+        comes back as ``PlanResult.unparsed`` and the caller takes the files it names
+        (:func:`salvage_planned_files`) or goes on with what its own search found.
+        """
+        predictor = self.predictor
+        if offline:
+            if self._offline_predictor is None:
+                self._offline_predictor = dspy.Predict(ContextPlanning.delete("web_searches"))
+            predictor = self._offline_predictor
+        # Non-empty only on the workflow's retry of the whole task: a fresh sample then,
+        # instead of the cached answer of the attempt that just failed.
+        cfg = _rollout_config(1)
+        try:
+            result = await asyncio.to_thread(
+                predictor,
+                query=query,
+                file_manifest=file_manifest,
+                project_summary=project_summary,
+                **({"config": cfg} if cfg else {}),
+            )
+        except Exception as exc:
+            raw = getattr(exc, "lm_response", None)
+            if not isinstance(raw, str):
+                raise  # not an unparseable answer (no model, a timeout): nothing to salvage
+            return PlanResult(
+                files_to_read=[],
+                search_patterns=[],
+                reasoning="(the planner's answer could not be parsed)",
+                web_searches=[],
+                unparsed=raw or " ",
+            )
 
         files = _normalize_list(getattr(result, "files_to_read", []))
         patterns = _normalize_list(getattr(result, "search_patterns", []))
@@ -852,6 +945,10 @@ class ContextGatherer:
 
 #: Extra attempts when the solver's reply parses to no operations at all.
 UNPARSEABLE_RETRIES = 1
+#: Files read when the planner's answer names none: the best of a search for the task's names.
+PLAN_FALLBACK_FILES = 10
+#: ``ContextFirstResult.method`` of a run that was there to change code and edited no file.
+NO_EDITS_METHOD = "context_first_no_edits"
 
 # A retry must not be answered from DSPy's response cache (it would replay the same bad
 # reply byte for byte).  ``rollout_id`` is part of DSPy's cache key and only matters when
@@ -884,9 +981,54 @@ NO_EDIT_NUDGE = (
 )
 
 
-def _has_file_change(operations: list[dict[str, Any]]) -> bool:
-    """False only when every operation is a pure command or read (nothing would change)."""
+#: Operations that only read (the read step answers them; none of them changes a file).
+READ_ONLY_OPS = frozenset(
+    {
+        "run_cmd", "read_file", "read", "read_lines", "view", "cat", "search", "grep",
+        "search_files", "search_code", "rg", "find_files", "find", "glob", "find_file",
+        "list_dir", "ls", "list_files", "list_directory", "list",
+    }
+)  # fmt: skip
+
+
+def _has_file_change(operations: list[dict[str, Any]], *, reads: bool = False) -> bool:
+    """False only when every operation is a pure command or read (nothing would change).
+    With *reads* (the read step is on) only an edit or a write is a change: a reply without
+    one is answered as reads, whatever else it holds, and nothing in it is ever run."""
+    if reads:
+        return any(str(o.get("op")) in ("edit_file", "write_file") for o in operations)
     return any(str(o.get("op")) not in ("run_cmd", "read_file") for o in operations)
+
+
+#: Shown once at the end of the context when the read step is on.
+READ_OFFER = (
+    "\n\n=== READING MORE BEFORE YOU EDIT ===\n"
+    "A file that is too large is shown above only as its head, an outline and the definitions "
+    "that match the task. If the code you have to change, or have to see to change it "
+    "correctly, is not shown, do not guess its text: reply with read operations ONLY (no "
+    "edit_file), in the usual reply format with a one-line answer. You are then shown what "
+    "you asked for and asked again, "
+    "at most {rounds} time(s), so ask for everything you need at once. The read operations:\n"
+    '{{"op":"read_file","path":"pkg/mod.py","start_line":120,"end_line":260}}  lines of a file '
+    "(leave the line numbers out for a whole small file)\n"
+    '{{"op":"search","pattern":"def name|ClassName","path":"pkg"}}  a regular expression, '
+    "searched in every file under the path\n"
+    '{{"op":"find_files","name":"*part_of_a_name*","path":"."}}  files by name\n'
+    '{{"op":"list_dir","path":"pkg"}}  the entries of a directory\n'
+    "Nothing is executed in this step: a command that is not a read is refused. When the code "
+    'is shown, reply with the edit_file operation(s); the "old" text of an edit must be copied '
+    "exactly from text you were shown."
+)
+#: After a round of reads, while more rounds are possible.
+READ_MORE = (
+    "Now reply with the edit_file operation(s) that resolve the task. Only if something you "
+    "need is still not shown, ask for more reads instead ({left} round(s) left)."
+)
+#: After the last round of reads.
+READ_LAST = (
+    "This was the last round of reads: further read requests are not answered. Reply now with "
+    "the edit_file operation(s) that resolve the task, using the text shown above."
+)
 
 
 class SingleShotSolver(dspy.Module):
@@ -900,57 +1042,113 @@ class SingleShotSolver(dspy.Module):
         self,
         query: str,
         full_context: str,
+        *,
+        reader: ReadAnswerer | None = None,
+        read_rounds: int = 0,
     ) -> SolveResult:
         """Solve the task and return structured operations.
 
         An unparseable reply (substantial text, 0 operations) is retried ONCE with a fresh
         sample before it is reported as truncated: at temperature > 0 the second attempt
         usually parses, and with no planner there is nothing to escalate to.
+
+        With a *reader* and *read_rounds* > 0, a reply that holds only read requests is
+        answered (the reader's text is appended to the context) and the solver is asked
+        again, at most *read_rounds* times; these rounds are not retries.  The task text
+        stays the same and the context only grows at its end.
         """
         ask = query
-        for attempt in range(1, UNPARSEABLE_RETRIES + 2):
+        attempt = 1
+        reads_left = read_rounds if reader is not None else 0
+        rounds_used = 0
+        while True:
             cfg = _rollout_config(attempt)
-            result = await asyncio.to_thread(
-                self.predictor,
-                query=ask,
-                full_context=full_context,
-                **({"config": cfg} if cfg else {}),
+            history = _lm_history()
+            marker = history[-1] if history else None
+            salvaged: list[dict[str, Any]] = []
+            replies: list[str] = []
+            try:
+                result = await asyncio.to_thread(
+                    self.predictor,
+                    query=ask,
+                    full_context=full_context,
+                    **({"config": cfg} if cfg else {}),
+                )
+            except Exception as exc:
+                # A reply that could not be split into its fields (a field left out, the
+                # fields written as one JSON object, tool-call markup around the operations)
+                # still says what to do.  Its operations are read from the raw replies of
+                # this call; with none found it is an unparseable reply like any other (one
+                # retry), and only then the failure it always was.
+                error_text = getattr(exc, "lm_response", None)
+                replies = _replies_since(marker)
+                if isinstance(error_text, str) and error_text.strip():
+                    replies.append(error_text)
+                if not replies or attempt > UNPARSEABLE_RETRIES + 1:
+                    raise
+                salvaged = next((o for o in map(salvage_operations, replies) if o), [])
+                if not salvaged and attempt > UNPARSEABLE_RETRIES:
+                    raise
+                logger.warning(
+                    "Solver reply could not be parsed into its fields; %d operation(s) read "
+                    "from its text",
+                    len(salvaged),
+                )
+                result = None
+            if result is None:
+                reasoning, answer = "", ""
+                raw_ops = json.dumps(salvaged) if salvaged else replies[-1]
+                operations, truncated = salvaged, not salvaged
+            else:
+                reasoning = str(getattr(result, "reasoning", ""))
+                answer = str(getattr(result, "answer", ""))
+                raw_ops = str(getattr(result, "operations", "[]"))
+
+                operations = _parse_operations(raw_ops)
+
+                # Detect truncation: if the raw operations string doesn't
+                # close the JSON array, the LLM response was likely cut off.
+                truncated = _detect_truncation(raw_ops, operations)
+            only_reads = bool(operations) and not _has_file_change(
+                operations, reads=reader is not None
             )
-
-            reasoning = str(getattr(result, "reasoning", ""))
-            answer = str(getattr(result, "answer", ""))
-            raw_ops = str(getattr(result, "operations", "[]"))
-
-            operations = _parse_operations(raw_ops)
-
-            # Detect truncation: if the raw operations string doesn't
-            # close the JSON array, the LLM response was likely cut off.
-            truncated = _detect_truncation(raw_ops, operations)
+            if only_reads and reader is not None and reads_left > 0:
+                rounds_used += 1
+                reads_left -= 1
+                full_context += await reader(operations, rounds_used, reads_left)
+                continue
             if attempt > UNPARSEABLE_RETRIES:
                 break
             if not operations and looks_like_tool_call(raw_ops, answer, reasoning):
                 # Tool calls written as text: this step has no tools, so nothing happened.
                 logger.warning("Solver reply was written as tool calls; retrying once")
                 ask = query + TOOL_CALL_NUDGE
+                attempt += 1
                 continue
             if truncated and not operations:
                 # Cut off before the operations (the reasoning ate the budget): a plain
                 # re-sample tends to ramble again, so say what to do differently.
                 logger.warning("Solver reply was cut off before its operations; retrying once")
                 ask = query + TRUNCATION_NUDGE
+                attempt += 1
                 continue
-            if operations and not _has_file_change(operations):
+            if only_reads:
                 # Only commands, no edit: nothing would change.  Ask for the edit.
                 logger.warning("Solver reply had no edit/write operation; retrying once")
                 ask = query + NO_EDIT_NUDGE
+                attempt += 1
                 continue
             break
 
+        if reader is not None and only_reads:
+            # Reads are answered, never executed: a final reply of reads alone does nothing.
+            operations = []
         return SolveResult(
             reasoning=reasoning,
             answer=answer,
             operations=operations,
             truncated=truncated,
+            read_rounds=rounds_used,
         )
 
 
@@ -988,6 +1186,93 @@ def _parse_operations(raw: str) -> list[dict[str, Any]]:
             except (json.JSONDecodeError, ValueError):
                 continue
     return ops
+
+
+def _lm_history() -> list[Any]:
+    """The call history of the active DSPy language model (empty when there is none)."""
+    try:
+        lm = dspy.settings.lm
+        history = getattr(lm, "history", None) if lm is not None else None
+    except Exception:
+        return []
+    return cast("list[Any]", history) if isinstance(history, list) else []
+
+
+def _replies_since(marker: object) -> list[str]:
+    """The raw replies of the model calls made after the history entry *marker* (at most the
+    last four): what the model really wrote, before an adapter cut or rejected it."""
+    out: list[str] = []
+    for entry in reversed(_lm_history()[-4:]):
+        if entry is marker:
+            break
+        outputs = cast("dict[str, Any]", entry).get("outputs") if isinstance(entry, dict) else None
+        first: object = cast("list[object]", outputs)[0] if outputs else ""
+        text = cast("dict[str, Any]", first).get("text") if isinstance(first, dict) else first
+        if isinstance(text, str) and text.strip():
+            out.append(text)
+    return list(reversed(out))
+
+
+_TOOL_FUNCTION = re.compile(r"<function=([\w.-]+)>(.*?)(?:</function>|\Z)", re.DOTALL)
+_TOOL_PARAMETER = re.compile(r"<parameter=(\w+)>(.*?)</parameter>", re.DOTALL)
+#: Characters of a reply that are searched for operations.
+_SALVAGE_CHARS = 200_000
+#: Operation names a tool call written as text may stand for.
+_KNOWN_OPS = READ_ONLY_OPS | {"edit_file", "write_file"}
+
+
+def _operations_from_tool_calls(raw: str) -> list[dict[str, Any]]:
+    """Tool calls written as text (``<function=search><parameter=pattern>x</parameter>``, or
+    ``{"name": "search", "arguments": {...}}``) as operations, when they name one."""
+    ops: list[dict[str, Any]] = []
+    for name, body in _TOOL_FUNCTION.findall(raw):
+        if name in _KNOWN_OPS:
+            params = {k: v.strip() for k, v in _TOOL_PARAMETER.findall(body)}
+            ops.append({"op": name, **params})
+    decoder = json.JSONDecoder()
+    for m in re.finditer(r"\{\s*\"name\"", raw):
+        try:
+            obj, _ = decoder.raw_decode(raw, m.start())
+        except ValueError:
+            continue
+        call = cast("dict[str, Any]", obj) if isinstance(obj, dict) else {}
+        args = call.get("arguments")
+        if call.get("name") in _KNOWN_OPS and isinstance(args, dict):
+            ops.append({"op": call["name"], **cast("dict[str, Any]", args)})
+    return ops
+
+
+def salvage_operations(raw: str) -> list[dict[str, Any]]:
+    """The operations in a reply that could not be parsed into its fields: a JSON array
+    anywhere in the text (the last one that holds operations), else operation objects written
+    one after another, else tool calls written as text that name an operation."""
+    raw = raw[:_SALVAGE_CHARS]
+    ops = _parse_operations(raw)
+    if ops:
+        return ops
+    decoder = json.JSONDecoder()
+    for m in re.finditer(r"\[\s*\{", raw):
+        try:
+            parsed, _ = decoder.raw_decode(raw, m.start())
+        except ValueError:
+            continue
+        if isinstance(parsed, list):
+            found = [
+                cast("dict[str, Any]", op)
+                for op in cast("list[object]", parsed)
+                if isinstance(op, dict) and "op" in op
+            ]
+            ops = found or ops
+    if ops:
+        return ops
+    for m in re.finditer(r"\{\s*\"op\"", raw):
+        try:
+            obj, _ = decoder.raw_decode(raw, m.start())
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and "op" in obj:
+            ops.append(cast("dict[str, Any]", obj))
+    return ops or _operations_from_tool_calls(raw)
 
 
 def _detect_truncation(
@@ -1300,6 +1585,26 @@ class OperationExecutor:
             )
             return
 
+        if new_content == content:
+            # An edit whose result is the text that was already there changes nothing: it is
+            # a failed edit (the model is told and may send a real one), not a file "edited"
+            # that then yields an empty patch reported as a success.
+            logger.warning("edit_file: the edit changes nothing in %s", path)
+            self._status(f"Edit failed: it changes nothing in {path}")
+            self.failed += 1
+            self.edit_diagnostics.append(
+                EditDiagnostic(
+                    path=str(path),
+                    old_text=old_text[:500],
+                    new_text=new_text[:500],
+                    best_match_ratio=ratio,
+                    best_match_snippet=snippet,
+                    strategy_tried="no-op (the new text is the same as the old text)",
+                    file_excerpt=content[:2000],
+                )
+            )
+            return
+
         if strategy != "exact":
             logger.info(
                 "edit_file: fuzzy match in %s (ratio=%.2f, strategy=%s)",
@@ -1483,7 +1788,9 @@ def read_project_verify_options(project_root: Path) -> dict[str, Any]:
     ``probe_rounds`` (int >= 0: stalled rounds on which to run differential probes),
     ``probe_guard``, ``discover_tests`` (bool: verify with the project's own relevant tests),
     ``reproduce`` (bool: a reproduction script before the change, a check after it),
-    ``repo_search`` (bool: plan a large project from a search of every file) and
+    ``repo_search`` (bool: plan a large project from a search of every file),
+    ``read_rounds`` (int >= 0: rounds in which the solver may ask to read more before it
+    edits), ``read_offer`` (bool: say so in the prompt), ``offline`` (bool: no web step) and
     ``test_timeout`` (seconds for one run of the selected tests)."""
     if os.environ.get(TRUST_PROJECT_VERIFY_ENV, "").lower() not in ("1", "true", "yes"):
         return {}
@@ -1512,7 +1819,7 @@ def read_project_verify_options(project_root: Path) -> dict[str, Any]:
                     PROJECT_VERIFY_FILE,
                     ", ".join(fixloop.PROBE_GUARDS),
                 )
-        for key in ("discover_tests", "reproduce", "repo_search"):
+        for key in ("discover_tests", "reproduce", "repo_search", "offline", "read_offer"):
             if key in data:
                 if isinstance(data[key], bool):
                     out[key] = data[key]
@@ -1532,6 +1839,22 @@ def read_project_verify_options(project_root: Path) -> dict[str, Any]:
                     "ignoring test_timeout=%r in %s (must be an integer 10..3600 seconds)",
                     tt,
                     PROJECT_VERIFY_FILE,
+                )
+        if "read_rounds" in data:
+            rr = data["read_rounds"]
+            if (
+                isinstance(rr, int)
+                and not isinstance(rr, bool)
+                and 0 <= rr <= read_requests.MAX_READ_ROUNDS
+            ):
+                out["read_rounds"] = rr
+            else:
+                logger.warning(
+                    "ignoring read_rounds=%r in %s (must be an integer 0..%d); the read step "
+                    "stays OFF",
+                    rr,
+                    PROJECT_VERIFY_FILE,
+                    read_requests.MAX_READ_ROUNDS,
                 )
         if "probe_rounds" in data:
             pr = data["probe_rounds"]
@@ -2038,6 +2361,8 @@ class ContextFirstSolver:
         self.test_triage = TestTriage()
         #: Per solve: what each of the solver's own check commands is (syntax, import, tests).
         self._check_kinds: dict[str, str] = {}
+        #: Per solve: bytes the read step may still add to the prompt.
+        self._read_budget = 0
         self.consistency_reviewer = ConsistencyReviewer()
         self.verifier = Verifier(self.project_root)
 
@@ -2216,6 +2541,10 @@ class ContextFirstSolver:
         t_gather = time.monotonic()
         opts = read_project_verify_options(self.project_root)
         use_search = bool(opts.get("repo_search", self.config.repo_search))
+        read_rounds = int(opts.get("read_rounds", self.config.read_rounds))
+        offline = bool(opts.get("offline", self.config.offline))
+        if offline and category == "web":
+            category = ""  # no web step in this run: an ordinary task
         self.gatherer.focus_terms = []
         self._dashboard(
             "task.published",
@@ -2263,8 +2592,24 @@ class ContextFirstSolver:
                 query=query,
                 file_manifest=manifest_str,
                 project_summary=project_summary,
+                **({"offline": True} if offline else {}),
             )
             files_to_read = list(plan.files_to_read)
+            if plan.unparsed:
+                # Not the end of the solve: the files the answer names, else the search's.
+                files_to_read = salvage_planned_files(plan.unparsed, all_files)
+                logger.warning(
+                    "The planner's answer could not be parsed; %d file(s) taken from its text",
+                    len(files_to_read),
+                )
+                if not files_to_read:
+                    fallback = ranked or await asyncio.to_thread(
+                        repo_search.rank_files,
+                        self.project_root,
+                        all_files,
+                        repo_search.issue_terms(raw_query or query),
+                    )
+                    files_to_read = [h.path for h in fallback[:PLAN_FALLBACK_FILES]]
             grep_block = ""
             if use_search:
                 hits, counts = await asyncio.to_thread(
@@ -2284,7 +2629,7 @@ class ContextFirstSolver:
                 files=files_to_read,
                 project_root=self.project_root,
                 search_patterns=None if use_search else plan.search_patterns or None,
-                web_searches=plan.web_searches or None,
+                web_searches=None if offline else plan.web_searches or None,
             )
             full_context += grep_block + extra_context
             method = "context_first_planned"
@@ -2378,10 +2723,25 @@ class ContextFirstSolver:
         )
         self._status("Solving in single shot...")
         solver_query = raw_query or query
-        solve_result = await self.solver.asolve(
-            query=solver_query,
-            full_context=full_context,
-        )
+        if read_rounds > 0:
+            # The read step (opt-in): the solver may ask to see more before it edits.
+            self._read_budget = max(
+                read_requests.ROUND_BYTES,
+                min(read_requests.ROUND_BYTES * read_rounds, (cap or 160_000) // 2),
+            )
+            offer = bool(opts.get("read_offer", self.config.read_offer))
+            solve_result = await self.solver.asolve(
+                query=solver_query,
+                full_context=full_context
+                + (READ_OFFER.format(rounds=read_rounds) if offer else ""),
+                reader=self._answer_reads,
+                read_rounds=read_rounds,
+            )
+        else:
+            solve_result = await self.solver.asolve(
+                query=solver_query,
+                full_context=full_context,
+            )
         self._dashboard(
             "task.completed",
             task_id=solve_id,
@@ -2543,6 +2903,14 @@ class ContextFirstSolver:
                 executor.attempted,
             )
             success = False
+        elif (self._log_checks or read_rounds > 0) and not executor.files_created:
+            # A run that is there to change code (its own checks or the read step are on)
+            # and edited no file has failed, whatever commands it ran: reported as its own
+            # class, never as a success with nothing to show.
+            logger.warning("No file was edited — reported as the failure class no_edits")
+            self._check_log({"kind": "no_edits", "read_rounds": solve_result.read_rounds})
+            success = False
+            method = NO_EDITS_METHOD
 
         return ContextFirstResult(
             answer=solve_result.answer,
@@ -2552,6 +2920,38 @@ class ContextFirstSolver:
             success=success,
             method=method,
             total_tokens=total_tokens,
+        )
+
+    async def _answer_reads(
+        self, operations: list[dict[str, Any]], round_no: int, rounds_left: int
+    ) -> str:
+        """The read step: answer the read requests of one solver reply (memfun's own code,
+        confined to the project, nothing executed) and return the text for the context."""
+        items = read_requests.requests_of(operations)
+        served = await asyncio.to_thread(
+            read_requests.serve,
+            self.project_root,
+            items,
+            budget=max(0, min(read_requests.ROUND_BYTES, self._read_budget)),
+        )
+        used = sum(len(s.output.encode("utf-8", "replace")) for s in served if s.ok)
+        self._read_budget -= used
+        read_requests.log_reads(self.project_root, round_no, served)
+        n_ok = sum(1 for s in served if s.ok)
+        logger.info(
+            "Read step, round %d: %d of %d requests served (%d bytes)",
+            round_no,
+            n_ok,
+            len(served),
+            used,
+        )
+        self._status(f"Reading what the solver asked for ({n_ok} of {len(served)} requests)...")
+        tail = READ_MORE.format(left=rounds_left) if rounds_left > 0 else READ_LAST
+        return (
+            f"\n\n=== WHAT YOU ASKED TO READ (round {round_no}) ===\n"
+            + (read_requests.format_served(served) or "(the reply asked for nothing readable)")
+            + "\n\n"
+            + tail
         )
 
     def _planner_manifest(

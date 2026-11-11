@@ -109,6 +109,25 @@ def test_select_by_name_by_import_and_by_symbol(tmp_path: Path) -> None:
     assert len(rt.select_tests(tmp_path, ["src/shop/cart.py"], setup, max_files=1)) == 1
 
 
+def test_tests_in_a_directory_named_after_the_module_are_selected(tmp_path: Path) -> None:
+    """Tests that reach a module through another entry point (a command-line run) neither
+    import it nor are named exactly after it; a change to the module broke one unseen."""
+    make(tmp_path, {
+        "src/gen/parser/graphql.py": "def parse():\n    return 1\n",
+        "tests/parser/test_graphql.py": "def test_unit():\n    assert True\n",
+        "tests/main/graphql/test_main_graphql.py": "def test_cli():\n    assert True\n",
+        "tests/main/jsonschema/test_main_jsonschema.py": "def test_far():\n    assert True\n",
+        "tests/main/test_main_graphql_help.py": "def test_weak():\n    assert True\n",
+    })  # fmt: skip
+    setup = rt.discover(tmp_path, python=sys.executable)
+    got = rt.select_tests(tmp_path, ["src/gen/parser/graphql.py"], setup)
+    assert [s.path for s in got] == [
+        "tests/parser/test_graphql.py",
+        "tests/main/graphql/test_main_graphql.py",
+    ]
+    assert got[1].reasons == ("name mentions graphql", "is in a directory named graphql")
+
+
 def test_nothing_is_selected_without_a_signal(tmp_path: Path) -> None:
     make(tmp_path, {"lib/alone.py": "X = 1\n", "tests/test_far.py": "def test_x():\n    pass\n"})
     setup = rt.discover(tmp_path, python=sys.executable)
