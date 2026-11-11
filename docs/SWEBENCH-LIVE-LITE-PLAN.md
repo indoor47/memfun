@@ -169,6 +169,9 @@ python3 $R/submission.py merge --run-dir $B/runs/lite-1 --run-dir $B/runs/lite-2
     --run-dir $B/runs/lite-3 --run-dir $B/runs/lite-4 --run-dir $B/runs/lite-5 --out $B/runs/lite
 python3 $R/sealed.py unseal --dir $B/eval --run-dir $B/runs/lite --sealed $B/sealed/lite --split lite
 python3 $R/submission.py audit --run-dir $B/runs/lite --dataset $B/data/lite.jsonl > $B/audit.json
+# alarms about lines of the test patch or reference patch in a prompt: look them up in the image
+python3 $R/submission.py repo-text --run-dir $B/runs/lite --dataset $B/data/lite.jsonl
+python3 $R/submission.py audit --run-dir $B/runs/lite --dataset $B/data/lite.jsonl > $B/audit.json
 python3 $R/submission.py build --run-dir $B/runs/lite --dataset $B/data/lite.jsonl \
     --out $B/submissions/lite/memfun/Qwen3.8-27B --model-label Qwen3.8-27B
 ```
@@ -244,6 +247,16 @@ every instance:
 Things that are not violations but should be read by a person are listed as notes: a command
 the agent ran that wanted the network (a test that fetches a URL), or the name of a target test
 appearing in a prompt.
+
+One alarm needs evidence the audit does not have. A hidden test patch often repeats lines of
+tests that are already in the repository, and the agent reads existing tests. The audit sees
+those lines in a prompt and cannot know where they came from. On 97 finished dev runs this
+raised a violation for 2 distinct tasks (about 4%). `submission.py repo-text` settles each
+case: it searches the instance's image, as it was before the rollout and without network, for
+every distinctive line of the forbidden fields and records the lines it finds in
+`in-repo.json`. The audit does not count those and says so in a note; a line the image does
+not hold stays a violation. On the two dev cases every flagged line was in the image (3 and 9
+lines). It needs the images of the flagged instances again: about a dozen pulls for 300.
 
 ## Order of work on the day
 

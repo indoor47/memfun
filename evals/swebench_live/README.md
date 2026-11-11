@@ -96,6 +96,7 @@ python3 evals/swebench_live/runner.py finalize --run-dir runs/lite-1
 python3 evals/swebench_live/submission.py merge --run-dir runs/lite-1 --run-dir runs/lite-2 --out runs/lite
 python3 evals/swebench_live/sealed.py unseal --dir /root/memfun-live/eval --run-dir runs/lite --sealed sealed/lite --split lite
 python3 evals/swebench_live/submission.py audit --run-dir runs/lite --dataset data/lite.jsonl
+python3 evals/swebench_live/submission.py repo-text --run-dir runs/lite --dataset data/lite.jsonl
 python3 evals/swebench_live/submission.py build --run-dir runs/lite --dataset data/lite.jsonl \
     --out submissions/lite/memfun/MODEL --model-label MODEL
 ```
@@ -108,7 +109,10 @@ tokens per minute has to carry, and grading needs no model.
 out again), writes everything the evaluator says, its exit code included, under the sealed
 directory (mode 0700, outside the run directory) and records in the run directory only that the
 evaluation ran. With `--gold-check` the reference patch is evaluated on the same image before
-it is deleted, sealed the same way. `unseal` refuses a run that is not finalized. `build`
+it is deleted, sealed the same way. `unseal` refuses a run that is not finalized. `repo-text`
+looks up, in the image of each instance the audit flagged, whether the flagged lines of the
+test patch or reference patch were already in the repository, and records them as evidence
+(`in-repo.json`) that the audit then honours. `build`
 refuses a run whose self-audit has a violation (a forbidden dataset field or the instance id in
 a prompt, an attempted network access, a credential, an instance that is not final, an attempt
 set aside without a documented infrastructure reason).
