@@ -19,6 +19,7 @@
 #             in their rollout; the others are being graded.  ROLLOUT_SLOTS times the number
 #             of boxes is what the model path must carry: an endpoint limited to 150,000
 #             tokens per minute carries about five rollouts with waiting, not fifteen
+#   GOLD_CHECK (1)  0 = no evaluation of the reference patch during the run
 #   PRICE_IN, PRICE_OUT  dollars per million tokens, for the cost column only (0.99, 1.49)
 #
 # The time limit per instance is 3600 s: no practice rollout needed more than 800 s, but with
@@ -36,6 +37,12 @@ BASE=${1:?usage: box_run.sh BASE NAME IDS_FILE DATASET SPLIT}
 NAME=${2:?}; IDS=${3:?}; DATASET=${4:?}; SPLIT=${5:?}
 R="$BASE/repo/evals/swebench_live"
 PASSES=${PASSES:-8}
+# The reference patch is evaluated on the same image (sealed too) unless GOLD_CHECK=0: it tells
+# which tasks nobody could resolve on this box, and about doubles the grading time.  With few
+# boxes it is left out of the run and done afterwards (grade.py gold), so that the evaluation
+# of the agent's patches does not compete for the CPUs.
+GOLD=--gold-check
+[ "${GOLD_CHECK:-1}" = 0 ] && GOLD=
 mkdir -p "$BASE/runs" "$BASE/sealed"
 n=0
 while :; do
@@ -50,7 +57,7 @@ while :; do
     --host-firewall --iptables-record "$BASE/iptables-added-$NAME.txt" --network "mfl-$NAME" \
     --workers "${WORKERS:-3}" --rollout-slots "${ROLLOUT_SLOTS:-1}" \
     --retry-infra --outage-wait 10800 \
-    --sealed "$BASE/sealed/$NAME" --evaluator "$BASE/eval" --split "$SPLIT" --gold-check \
+    --sealed "$BASE/sealed/$NAME" --evaluator "$BASE/eval" --split "$SPLIT" $GOLD \
     --agent-option discover_tests=true --agent-option reproduce=true \
     --agent-option repo_search=true --agent-option probe_guard=off \
     --agent-option fix_detail=true --agent-option probe_rounds=2 \
