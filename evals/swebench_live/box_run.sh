@@ -19,7 +19,13 @@
 #             in their rollout; the others are being graded.  ROLLOUT_SLOTS times the number
 #             of boxes is what the model path must carry: an endpoint limited to 150,000
 #             tokens per minute carries about five rollouts with waiting, not fifteen
+#   GOLD_CHECK (1)  0 = no evaluation of the reference patch during the run
 #   PRICE_IN, PRICE_OUT  dollars per million tokens, for the cost column only (0.99, 1.49)
+#
+# The time limit per instance is 3600 s: no practice rollout needed more than 800 s, but with
+# several rollouts sharing a limit on tokens per minute a rollout waits for the model, and a
+# rollout cut off by the clock would be a loss caused by the queue, not by the agent.  What
+# bounds the work is the token stop.
 #
 # An instance that ends as an infrastructure error (a failed pull, a step of the runner that
 # timed out, a model path that stayed down) is run again from scratch by the next pass; the
@@ -31,6 +37,12 @@ BASE=${1:?usage: box_run.sh BASE NAME IDS_FILE DATASET SPLIT}
 NAME=${2:?}; IDS=${3:?}; DATASET=${4:?}; SPLIT=${5:?}
 R="$BASE/repo/evals/swebench_live"
 PASSES=${PASSES:-8}
+# The reference patch is evaluated on the same image (sealed too) unless GOLD_CHECK=0: it tells
+# which tasks nobody could resolve on this box, and about doubles the grading time.  With few
+# boxes it is left out of the run and done afterwards (grade.py gold), so that the evaluation
+# of the agent's patches does not compete for the CPUs.
+GOLD=--gold-check
+[ "${GOLD_CHECK:-1}" = 0 ] && GOLD=
 mkdir -p "$BASE/runs" "$BASE/sealed"
 n=0
 while :; do
@@ -40,12 +52,12 @@ while :; do
     --upstream "${UPSTREAM:-http://127.0.0.1:18431/e/live/v1}" --model "${MODEL:-qwen-3.8-27b}" \
     --bundle "$BASE/bundle" --solver context-first --temperature 0.7 --reasoning-effort none \
     --llm-max-tokens 32768 --context-window 131072 \
-    --instance-timeout 1800 --max-tokens-per-instance 520000 --cpus 2 --memory 8g \
+    --instance-timeout 3600 --max-tokens-per-instance 520000 --cpus 2 --memory 8g \
     --price-in "${PRICE_IN:-0.99}" --price-out "${PRICE_OUT:-1.49}" \
     --host-firewall --iptables-record "$BASE/iptables-added-$NAME.txt" --network "mfl-$NAME" \
     --workers "${WORKERS:-3}" --rollout-slots "${ROLLOUT_SLOTS:-1}" \
     --retry-infra --outage-wait 10800 \
-    --sealed "$BASE/sealed/$NAME" --evaluator "$BASE/eval" --split "$SPLIT" --gold-check \
+    --sealed "$BASE/sealed/$NAME" --evaluator "$BASE/eval" --split "$SPLIT" $GOLD \
     --agent-option discover_tests=true --agent-option reproduce=true \
     --agent-option repo_search=true --agent-option probe_guard=off \
     --agent-option fix_detail=true --agent-option probe_rounds=2 \

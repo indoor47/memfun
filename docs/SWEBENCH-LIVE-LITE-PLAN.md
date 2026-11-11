@@ -27,7 +27,9 @@ frozen commit names them and every box runs the same ones:
 - agent options `discover_tests=true reproduce=true repo_search=true probe_guard=off
   fix_detail=true probe_rounds=2 max_fix_attempts=4 read_rounds=2 read_offer=false
   offline=true`;
-- per instance: stop at 520,000 tokens, 1,800 s, 2 CPUs, 8 GB.
+- per instance: stop at 520,000 tokens, 3,600 s, 2 CPUs, 8 GB. (The practice runs had
+  1,800 s and none needed more than 800 s. The limit is doubled because rollouts now wait
+  for a shared limit on tokens per minute; the token stop is what bounds the work.)
 
 These are the options of the pilot with the read step answering requests without inviting them
 (`read_offer=false`) and two rounds instead of three. That pair was checked on the 12 pilot
@@ -90,27 +92,32 @@ Measured on the pilot (30 dev instances, a 16-CPU box, three instances at a time
   rollout that is not waiting uses about 100,000 uncached tokens per minute, and a task uses
   about 130,000 in total. So
   300 tasks need at least 5.5 hours of that limit however many boxes there are, and fifteen
-  rollouts at once would each crawl at a fifteenth of their speed towards the 30-minute time
-  limit. The run therefore has ONE rollout in flight per box (`ROLLOUT_SLOTS=1` in
-  `box_run.sh`, five in all) while the box's other two workers grade: a typical rollout then
+  rollouts at once would each crawl at a fifteenth of their speed towards the time
+  limit. The run therefore has five rollouts in flight in all (`ROLLOUT_SLOTS` in
+  `box_run.sh`: one per box with five boxes) while the other workers grade: a typical rollout then
   takes 3 to 5 minutes and a task at its token stop about 20. Expected wall time: 6 to 7
   hours. An endpoint without such a limit (a rented GPU serving the same model) can carry
   three rollouts per box and finish in about 3 hours; it is a different serving path and has
   to pass the dev check first.
 - **Disk**: three images at once at up to 19 GB each, plus the evaluator and the bundle (about
   2 GB): 80 GB is enough, 160 GB is comfortable. Images are deleted as the run goes.
-- **Image pulls**: Docker Hub allows about 100 unauthenticated pulls per 6 hours per address.
-  The plan is 5 boxes with 60 instances each, so that no box comes near the limit and a few
-  repeated pulls (a restart from scratch, a missing report at the end) have room. With a
-  logged-in Docker Hub account 3 boxes of 100 would do.
-- **Size**: 16 shared CPUs, 32 GB of memory and 360 GB of disk per box (Hetzner `cpx51`, about
-  EUR 0.14 per hour; the pilot box was that size with a larger disk). Three instances at a time
-  use 6 CPUs and 24 GB for the rollouts; the evaluations use the rest.
+- **Image pulls**: Docker Hub's limit for unauthenticated pulls, read from its own
+  `ratelimit-limit` header on the boxes on the day of the run, is 100 per hour per address.
+  It does not bound a run of 300.
+- **What was available on the day (2026-11-11)**: the cloud account's core limits allowed two
+  boxes, not five: one with 16 shared CPUs (Hetzner `cpx62`, 32 GB, 640 GB disk) and one with
+  8 dedicated cores (`ccx33`, 32 GB, 240 GB disk), the pair the practice runs used. The run is
+  therefore two shards: 180 instances on the first box with three rollouts in flight and four
+  workers, 120 on the second with two rollouts and three workers. That is the same five
+  rollouts in flight that the model path carries. To keep the evaluation of the agent's
+  patches from competing for CPUs, the reference patches are NOT evaluated during the run
+  (`GOLD_CHECK=0`); that check is done afterwards with `grade.py gold`.
 - **Model path**: one key-holding proxy with one spend counter on one box; every other box
   reaches it through an SSH forward (`tunnel.sh`). The key is on that one box only. The runner
   waits when the endpoint stops answering (`--outage-wait`) instead of failing instances.
 - The shards are fixed before the run: the 300 ids in the dataset's order, dealt out in turn
-  to five files of 60 (the split has 70 repositories and the largest has 30 instances; dealing
+  to five files of 60 (with two boxes: the first three files to the first box, the last two to
+  the second) (the split has 70 repositories and the largest has 30 instances; dealing
   in turn spreads a repository with large images or a slow test suite over the boxes). A box
   runs only its own file.
 
@@ -190,8 +197,8 @@ That is about $0.16 per task and about $50 for 300. The stop of 520,000 tokens b
 at about $0.52, so the hard ceiling is $156; the proxy's spend cap is set to $65, and when it is
 reached the run waits instead of failing instances.
 
-Boxes: five at about EUR 0.14 per hour for 6 to 7 hours of run plus setup and the final
-steps, and the key-holding box: under EUR 10.
+Boxes: two at about EUR 0.25 per hour for 6 to 8 hours of run plus setup, the final steps
+and the reference-patch check afterwards: under EUR 10.
 
 ## What the practice runs say
 
