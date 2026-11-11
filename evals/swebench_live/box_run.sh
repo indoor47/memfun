@@ -21,6 +21,11 @@
 #             tokens per minute carries about five rollouts with waiting, not fifteen
 #   PRICE_IN, PRICE_OUT  dollars per million tokens, for the cost column only (0.99, 1.49)
 #
+# The time limit per instance is 3600 s: no practice rollout needed more than 800 s, but with
+# several rollouts sharing a limit on tokens per minute a rollout waits for the model, and a
+# rollout cut off by the clock would be a loss caused by the queue, not by the agent.  What
+# bounds the work is the token stop.
+#
 # An instance that ends as an infrastructure error (a failed pull, a step of the runner that
 # timed out, a model path that stayed down) is run again from scratch by the next pass; the
 # earlier attempt is kept and logged by the runner.  A final instance is never run again.
@@ -40,7 +45,7 @@ while :; do
     --upstream "${UPSTREAM:-http://127.0.0.1:18431/e/live/v1}" --model "${MODEL:-qwen-3.8-27b}" \
     --bundle "$BASE/bundle" --solver context-first --temperature 0.7 --reasoning-effort none \
     --llm-max-tokens 32768 --context-window 131072 \
-    --instance-timeout 1800 --max-tokens-per-instance 520000 --cpus 2 --memory 8g \
+    --instance-timeout 3600 --max-tokens-per-instance 520000 --cpus 2 --memory 8g \
     --price-in "${PRICE_IN:-0.99}" --price-out "${PRICE_OUT:-1.49}" \
     --host-firewall --iptables-record "$BASE/iptables-added-$NAME.txt" --network "mfl-$NAME" \
     --workers "${WORKERS:-3}" --rollout-slots "${ROLLOUT_SLOTS:-1}" \

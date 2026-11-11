@@ -27,7 +27,9 @@ frozen commit names them and every box runs the same ones:
 - agent options `discover_tests=true reproduce=true repo_search=true probe_guard=off
   fix_detail=true probe_rounds=2 max_fix_attempts=4 read_rounds=2 read_offer=false
   offline=true`;
-- per instance: stop at 520,000 tokens, 1,800 s, 2 CPUs, 8 GB.
+- per instance: stop at 520,000 tokens, 3,600 s, 2 CPUs, 8 GB. (The practice runs had
+  1,800 s and none needed more than 800 s. The limit is doubled because rollouts now wait
+  for a shared limit on tokens per minute; the token stop is what bounds the work.)
 
 These are the options of the pilot with the read step answering requests without inviting them
 (`read_offer=false`) and two rounds instead of three. That pair was checked on the 12 pilot
@@ -90,7 +92,7 @@ Measured on the pilot (30 dev instances, a 16-CPU box, three instances at a time
   rollout that is not waiting uses about 100,000 uncached tokens per minute, and a task uses
   about 130,000 in total. So
   300 tasks need at least 5.5 hours of that limit however many boxes there are, and fifteen
-  rollouts at once would each crawl at a fifteenth of their speed towards the 30-minute time
+  rollouts at once would each crawl at a fifteenth of their speed towards the time
   limit. The run therefore has ONE rollout in flight per box (`ROLLOUT_SLOTS=1` in
   `box_run.sh`, five in all) while the box's other two workers grade: a typical rollout then
   takes 3 to 5 minutes and a task at its token stop about 20. Expected wall time: 6 to 7
