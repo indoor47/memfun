@@ -37,8 +37,10 @@ import contextlib
 import dataclasses
 import json
 import os
+import posixpath
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -92,6 +94,9 @@ PATCH_JUNK = (
 )
 #: A patch over this size is flagged (never cut): it probably carries generated files.
 PATCH_LARGE_BYTES = 1_000_000
+#: More files than this in the agent's own list of what it edited: the patch is not limited to
+#: them (the list would not fit a command line), the whole change of the tree is taken.
+OWN_FILES_MAX = 1000
 FINAL = "done"
 INFRA = "infra_error"
 #: An agent that exits with an error before its first model call, the same way this many
@@ -456,12 +461,16 @@ def baseline(box: Box, repo: str) -> tuple[str, list[str]]:
     return out[0].strip(), [ln for ln in out[1:] if ln.strip()]
 
 
-def collect_patch(box: Box, repo: str, base_tree: str) -> tuple[str, bool]:
+def collect_patch(
+    box: Box, repo: str, base_tree: str, only: list[str] | None = None
+) -> tuple[str, bool]:
     """The agent's change as one diff against the image's initial tree, checked to apply
-    cleanly to a copy of that tree.  ``("", True)`` when nothing changed."""
+    cleanly to a copy of that tree.  ``("", True)`` when nothing changed.  With *only* (paths
+    relative to the repository, taken literally) the diff holds those files and no others."""
+    what = " ".join(shlex.quote(f":(literal){p}") for p in only) if only else "."
     script = (
         f"t=$({_snapshot('final')}) && "
-        f"git --no-pager diff --text --no-color {base_tree} $t -- . {_pathspec()} "
+        f"git --no-pager diff --text --no-color {base_tree} $t -- {what} {_pathspec()} "
         f"> {HOME_IN}/patch.diff && cat {HOME_IN}/patch.diff"
     )
     res = box.exec("collect", ["sh", "-c", script], workdir=repo, timeout=600)
@@ -542,6 +551,42 @@ def submitted_patch(box: Box, repo: str, base_tree: str, patch: str) -> bool:
         f"git apply --check --whitespace=nowarn {HOME_IN}/patch.diff"
     )
     return box.exec("patchcheck", ["sh", "-c", check], workdir=repo, timeout=900).returncode == 0
+
+
+def patch_paths(patch: str) -> list[str]:
+    """The files a diff touches (the ``b/`` side of each header), in order."""
+    return [m.group(1) for m in re.finditer(r"(?m)^diff --git a/.+? b/(.+)$", patch)]
+
+
+def own_files(result_json: bytes, repo: str) -> list[str]:
+    """The files the agent itself reported writing or editing (``files_created`` in its result
+    file, which lists every file one of its write or edit operations touched), relative to the
+    repository.  Empty when it reported none, or too many to pass on a command line."""
+    try:
+        doc = json.loads(result_json)
+    except ValueError:
+        return []
+    if not isinstance(doc, dict):
+        return []
+    names: list[Any] = list(doc.get("files_created") or [])
+    subs = doc.get("sub_tasks")
+    for sub in subs.values() if isinstance(subs, dict) else []:
+        if isinstance(sub, dict):
+            names += list(sub.get("files_created") or [])
+    root = posixpath.normpath(repo)
+    out: dict[str, None] = {}
+    for name in names:
+        if not isinstance(name, str) or not name.strip() or "\n" in name or "\0" in name:
+            continue
+        rel = posixpath.normpath(name)
+        if posixpath.isabs(rel):
+            if not rel.startswith(root.rstrip("/") + "/"):
+                continue  # outside the repository: never part of a patch
+            rel = rel[len(root.rstrip("/")) + 1 :]
+        if rel in (".", "..") or rel.startswith("../"):
+            continue
+        out[rel] = None
+    return list(out) if len(out) <= OWN_FILES_MAX else []
 
 
 #: The agent's own record of what it checked (which tests it ran and what they said, its
@@ -691,6 +736,17 @@ def run_instance(task: ds.Task, inp: ds.EpisodeInput, ctx: Context) -> dict[str,
             )
         rec["agent_state"] = collect_agent_state(box, repo, idir)
         patch, applies = collect_patch(box, repo, base_tree)
+        own = own_files(result.stdout, repo) if s.arm != "mini" else []
+        if own and set(patch_paths(patch)) & set(own) and set(patch_paths(patch)) - set(own):
+            # The tree also changed in files the agent never edited: what the project's own
+            # tests wrote while the agent ran them (certificates, databases, snapshots).  The
+            # patch is the agent's change, so it holds the files the agent edited; the whole
+            # change of the tree is kept next to it.  (When none of the files it reported is
+            # among the changed ones the lists cannot be matched and nothing is left out.)
+            (idir / "worktree.diff").write_text(patch, "utf-8")
+            rec["left_out_of_patch"] = sorted(set(patch_paths(patch)) - set(own))[:200]
+            rec["flags"].append("patch_limited_to_agent_edits")
+            patch, applies = collect_patch(box, repo, base_tree, only=own)
         if s.arm == "mini":
             # The standard result of mini-swe-agent is the patch the agent SUBMITS; what else
             # it left in the working tree (scratch files, its patch file) is kept for reference.

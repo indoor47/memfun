@@ -19,9 +19,19 @@ differ:
 | the per-task stop (tokens) and the time limit | `settings.max_tokens_per_instance`, `settings.instance_timeout` |
 | the prompt template (the same text for every instance) | `settings.prompt_template` |
 
-The agent options of the run are the ones of the pilot:
-`discover_tests=true reproduce=true repo_search=true probe_guard=off fix_detail=true
-probe_rounds=2 max_fix_attempts=4 read_rounds=3 offline=true`.
+The settings of the run are written in one place, `evals/swebench_live/box_run.sh`, so that the
+frozen commit names them and every box runs the same ones:
+
+- solver `context-first`, model `qwen-3.8-27b`, temperature 0.7, reasoning effort `none`,
+  at most 32,768 output tokens per call, context window 131,072;
+- agent options `discover_tests=true reproduce=true repo_search=true probe_guard=off
+  fix_detail=true probe_rounds=2 max_fix_attempts=4 read_rounds=2 read_offer=false
+  offline=true`;
+- per instance: stop at 520,000 tokens, 1,800 s, 2 CPUs, 8 GB.
+
+These are the options of the pilot with the read step answering requests without inviting them
+(`read_offer=false`) and two rounds instead of three. That pair was checked on the 12 pilot
+tasks that had used the read step (see "What the practice runs say").
 
 The same bundle directory is copied to every box (not rebuilt per box) and
 `bundle_check.py BUNDLE` is run on each: every box must print the same digest.
@@ -36,7 +46,9 @@ The same bundle directory is copied to every box (not rebuilt per box) and
    template with `problem_statement` and nothing else. Every model request and response is
    recorded by the proxy on the host (`llm.jsonl`).
 4. **Patch**: the diff of the working tree against the base tree, without the agent's own
-   files; checked to apply to a clean checkout.
+   files; checked to apply to a clean checkout. When the tree also changed in files the agent
+   never edited (the project's tests wrote them while the agent ran them), the patch holds the
+   files the agent edited and the whole difference is kept next to it (`worktree.diff`).
 5. **Final**: `instance.json` gets `status: done`. A final instance is never rolled out again.
    An instance whose agent made no model call (the endpoint did not answer, or the process died
    before its first call) is not final: it is set aside with its log, listed in
@@ -77,15 +89,115 @@ Measured on the pilot (30 dev instances, a 16-CPU box, three instances at a time
   The plan is 5 boxes with 60 instances each, so that no box comes near the limit and a few
   repeated pulls (a restart from scratch, a missing report at the end) have room. With a
   logged-in Docker Hub account 3 boxes of 100 would do.
+- **Size**: 16 shared CPUs, 32 GB of memory and 360 GB of disk per box (Hetzner `cpx51`, about
+  EUR 0.14 per hour; the pilot box was that size with a larger disk). Three instances at a time
+  use 6 CPUs and 24 GB for the rollouts; the evaluations use the rest.
 - **Model path**: one key-holding proxy with one spend counter on one box; every other box
   reaches it through an SSH forward (`tunnel.sh`). The key is on that one box only. The runner
   waits when the endpoint stops answering (`--outage-wait`) instead of failing instances.
-- The shards are fixed before the run: the 300 ids in the dataset's order, cut into five files
-  of 60. A box runs only its own file.
+- The shards are fixed before the run: the 300 ids in the dataset's order, dealt out in turn
+  to five files of 60 (the split has 70 repositories and the largest has 30 instances; dealing
+  in turn spreads a repository with large images or a slow test suite over the boxes). A box
+  runs only its own file.
+
+### The commands
+
+`B=/root/memfun-live` on every box. `COMMIT` is the frozen commit of this repository.
+
+Once, on the box that holds the key (box 1):
+
+```bash
+# the key-holding proxy with the spend cap of the run (listens on 127.0.0.1 only)
+python3 $B/repo/evals/swarm/cerebras_proxy.py --port 18431 --reasoning-effort none \
+    --key-file $B/secrets/cerebras.key --max-cost-usd CAP
+# the bundle is built ONCE, here, and copied to the other boxes as a directory
+git -C $B/repo fetch -q origin && git -C $B/repo checkout -q --detach COMMIT
+bash $B/repo/evals/swebench_live/provision.sh up $B $B/repo
+python3 $B/repo/evals/swebench_live/dataset.py fetch --split lite --out $B/data/lite.jsonl
+python3 - <<'PY'   # five shard files, dealt out in turn in the dataset's order
+import json
+ids = [json.loads(line)["instance_id"] for line in open("/root/memfun-live/data/lite.jsonl")]
+for k in range(5):
+    open(f"/root/memfun-live/data/shard-{k + 1}.txt", "w").write("\n".join(ids[k::5]) + "\n")
+PY
+```
+
+On every box (docker, git and uv installed; the other boxes get `bundle/`, `data/lite.jsonl`
+and their shard file copied from box 1, and keep an SSH forward of port 18431 to box 1 open):
+
+```bash
+git -C $B/repo fetch -q origin && git -C $B/repo checkout -q --detach COMMIT
+python3 $B/repo/evals/swebench_live/bundle_check.py $B/bundle      # the same digest everywhere
+python3 $B/repo/evals/swebench_live/grade.py setup --dir $B/eval --uv "$(command -v uv)"
+# the last check: two DEV instances through the whole pipeline, then that run is deleted
+$B/repo/evals/swebench_live/box_run.sh $B check $B/data/check-ids.txt $B/data/full.jsonl full
+rm -rf $B/runs/check $B/sealed/check
+# the run (detached; N is the number of the box's shard)
+setsid nohup $B/repo/evals/swebench_live/box_run.sh $B lite-N $B/data/shard-N.txt \
+    $B/data/lite.jsonl lite > $B/lite-N.out 2>&1 < /dev/null &
+```
+
+`box_run.sh` runs passes until every instance of the shard is final and prints `BOXDONE`. What
+may be looked at while it runs: the lines it prints (instance, status, time, calls, tokens,
+dollars, patch size, flags), the proxy's spend counter, `df`. Nothing else: the sealed
+directories are not opened.
+
+When every box has printed `BOXDONE`:
+
+```bash
+python3 $B/repo/evals/swebench_live/runner.py finalize --run-dir $B/runs/lite-N   # on each box
+# copy runs/lite-N and sealed/lite-N of every box to box 1, then on box 1:
+mkdir -p $B/sealed/lite && for n in 1 2 3 4 5; do cp -a $B/sealed/lite-$n/. $B/sealed/lite/; done
+R=$B/repo/evals/swebench_live
+python3 $R/submission.py merge --run-dir $B/runs/lite-1 --run-dir $B/runs/lite-2 \
+    --run-dir $B/runs/lite-3 --run-dir $B/runs/lite-4 --run-dir $B/runs/lite-5 --out $B/runs/lite
+python3 $R/sealed.py unseal --dir $B/eval --run-dir $B/runs/lite --sealed $B/sealed/lite --split lite
+python3 $R/submission.py audit --run-dir $B/runs/lite --dataset $B/data/lite.jsonl > $B/audit.json
+python3 $R/submission.py build --run-dir $B/runs/lite --dataset $B/data/lite.jsonl \
+    --out $B/submissions/lite/memfun/Qwen3.8-27B --model-label Qwen3.8-27B
+```
 
 ## Budget
 
-PILOT_COST_PLACEHOLDER
+Model (Cerebras list price for `qwen-3.8-27b`: $0.99 per million input tokens, $1.49 per
+million output tokens), measured with the run's settings on dev tasks:
+
+| Kind of task | share in the pilot | cost per task |
+|---|---|---|
+| never asks to read | 18 of 30 | $0.11 |
+| reads, or is one of the tasks that read when invited | 12 of 30 | $0.24 |
+
+That is about $0.16 per task and about $50 for 300. The stop of 520,000 tokens bounds one task
+at about $0.52, so the hard ceiling is $156; the proxy's spend cap is set to $65, and when it is
+reached the run waits instead of failing instances.
+
+Boxes: five at about EUR 0.14 per hour for about 3 hours of run plus setup and the final
+steps, and the key-holding box: under EUR 5.
+
+## What the practice runs say
+
+All on dev tasks (never Lite), official grading, one rollout per task at temperature 0.7,
+model `qwen-3.8-27b`.
+
+| Set | Agent | Resolved | Cost |
+|---|---|---|---|
+| 30 random dev tasks whose reference patch passes | mini-swe-agent, stopped at $0.75 per task | 7 (8 when a cut-off run's edits are graded) | $13.51 |
+| the same 30 | memfun before the fixes for runs that ended without a patch | 7, and 7 runs without a patch | $3.69 |
+| the same 30 | memfun with those fixes, read step invited, 3 rounds | 8, and 1 run without a patch | $5.80 |
+| the 12 of those 30 that had used the read step | memfun with the run's settings (2 rounds, not invited) | 4 (2 in the row above on the same 12), no run without a patch | $2.90 ($3.85) |
+| 15 dev tasks that older published agents mostly solved | memfun, three runs across these versions | 12, 14, 13 | $1.56 to about $3 |
+| the same 15 | mini-swe-agent | 13 | $4.81 |
+
+**How much these numbers can carry.** One rollout per task at temperature 0.7 moves the count
+by several tasks from run to run: the two memfun runs on the 30 tasks (7 and 8 resolved) have
+only 4 resolved tasks in common, and 11 tasks were resolved by one run or the other. So 8
+against 7 is not an improvement, and neither is 4 against 2 on 12 tasks. What the fixes changed
+for certain is the number of runs that hand in nothing (7, then 1, then 0 on the 12). The
+resolve rate on this pool is somewhere around a quarter, with a wide margin on 30 tasks.
+
+**What it says about Lite.** The dev pool is `full` minus `lite` minus `verified`. Older
+published agents resolve about 10% of it and 16 to 18% of Lite, so Lite is the easier set, by
+an amount these runs cannot pin down. No estimate of the Lite score is made here.
 
 ## Submission folder
 
@@ -119,8 +231,9 @@ appearing in a prompt.
 
 ## Order of work on the day
 
-1. Merge the agent PR; choose the commit; build the bundle once; copy it to the boxes; compare
-   digests.
+The commands are under "Boxes".
+
+1. Choose the commit; build the bundle once; copy it to the boxes; compare digests.
 2. `grade.py setup` on every box (the pinned evaluator); fetch the `lite` split to a file;
    write the five shard files.
 3. A last check on two dev instances per box with the frozen settings (`--split full`), then

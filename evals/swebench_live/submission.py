@@ -55,7 +55,7 @@ NETWORK_NOISE = (
 #: Copied into trajs/<instance>/ when present.
 TRAJ_FILES = (
     "llm.jsonl", "agent.log", "patch.diff", "instance.json", "swarm-result.json",
-    "checks.jsonl", "reads.jsonl", "probes.jsonl", "issue_repro.py",
+    "checks.jsonl", "reads.jsonl", "probes.jsonl", "issue_repro.py", "worktree.diff",
 )  # fmt: skip
 
 
@@ -194,7 +194,10 @@ def audit_instance(idir: Path, row: dict[str, Any], prompt_template: str) -> dic
         for pat in KEY_PATTERNS:
             m = re.search(pat, text)
             if m:
-                bad.append(f"{name}: text that looks like a credential ({pat[:12]}...)")
+                # worktree.diff is what the project's own tests wrote (left out of the patch):
+                # a key in it is a test fixture to look at, not something the run leaked
+                where = review if name == "worktree.diff" else bad
+                where.append(f"{name}: text that looks like a credential ({pat[:12]}...)")
     return {"violations": bad, "review": review}
 
 
@@ -332,7 +335,9 @@ patch), the instance id, credentials and attempted network access:
 `preds.json`, `results.json`, `run.json`, `attempts.jsonl`, `audit.json`, and per instance in
 `trajs/<instance>/`: `llm.jsonl` (every request and response as sent and received, with
 timestamps and usage), `agent.log`, `patch.diff`, `instance.json` and the agent's own check
-logs.
+logs. The patch holds the files the agent edited; where the project's own tests also changed
+files while the agent ran them, the whole change of the tree is `worktree.diff` and
+`instance.json` lists what was left out.
 """
 
 

@@ -333,3 +333,26 @@ def test_the_folder_is_built_only_from_a_clean_graded_run(
     text = (out / "README.md").read_text()
     assert "# memfun + Model-27B" in text and "One rollout per instance (1 instances)" in text
     assert gr.EVALUATOR_COMMIT in text and '"success": 1' in text and "0 violations" in text
+
+
+def test_what_the_projects_tests_wrote_is_kept_and_a_key_in_it_is_a_note(tmp_path: Path) -> None:
+    """``worktree.diff`` (the tree's whole change, where the patch was limited to the agent's
+    edits) goes into the folder; a test key in it is for review, not a leak of the run."""
+    iid = ROW["instance_id"]
+    run = make_run(tmp_path / "run", [iid])
+    pem = "+-----BEGIN RSA PRIVATE KEY-----\n+MIIB\n"
+    (run / "instances" / iid / "worktree.diff").write_text(
+        "diff --git a/ca/k.pem b/ca/k.pem\n" + pem
+    )
+    report = sub.audit(run, {iid: ROW})
+    assert report["n_violations"] == 0 and report["n_review"] == 1
+    assert (
+        "worktree.diff: text that looks like a credential" in report["instances"][iid]["review"][0]
+    )
+    (run / "results.json").write_text(json.dumps({"submitted": 1, "success": 0}))
+    out = tmp_path / "out"
+    assert sub.build(run, {iid: ROW}, out, "memfun", "Model") == 0
+    assert (out / "trajs" / iid / "worktree.diff").is_file()
+    # the same text in the patch itself stays a violation
+    (run / "instances" / iid / "patch.diff").write_text("diff --git a/k.pem b/k.pem\n" + pem)
+    assert any("patch.diff: text that looks like" in v for v in violations(run))
