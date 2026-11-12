@@ -410,3 +410,23 @@ def test_a_line_the_repository_already_held_is_settled_with_evidence(
     open_run = make_run(tmp_path / "open", [iid], calls=leak, finalized=False)
     with pytest.raises(SystemExit, match="not finalized"):
         sub.repo_text(open_run, rows, str(docker))
+
+
+def test_what_the_agent_wrote_inside_a_json_string_is_its_own_words(tmp_path: Path) -> None:
+    """The agent answers with JSON operations, so a line with quotes leaves it escaped.  When
+    the edited file comes back in the next prompt the line is the agent's own, although the
+    reference patch has the very same line (a one-line fix leaves little choice)."""
+    iid = ROW["instance_id"]
+    fix = 'raise WidgetError(f"the value {value!r} cannot be frobnicated: {self.name}")'
+    fix_2 = 'raise WidgetError(f"the widget {self.name} has no frobnicate helper")'
+    row = {**ROW, "patch": f"diff --git a/w.py b/w.py\n+    {fix}\n+    {fix_2}\n"}
+    prompt = TEMPLATE.format(problem_statement=ROW["problem_statement"])
+    ops = json.dumps([{"op": "edit", "path": "w.py", "new": f"    {fix}\n    {fix_2}\n"}])
+    assert fix not in ops  # escaped: the raw line is not in what the model sent
+    own = [call(1, prompt, ops), call(2, f"{prompt}\n=== w.py ===\n    {fix}\n    {fix_2}", "")]
+    run = make_run(tmp_path / "own", [iid], calls=own)
+    assert sub.audit(run, {iid: row})["n_violations"] == 0
+    leak = [call(1, prompt, "ok"), call(2, f"{prompt}\n    {fix}\n    {fix_2}", "")]
+    run = make_run(tmp_path / "leak", [iid], calls=leak)
+    assert sub.audit(run, {iid: row})["n_violations"] == 1  # never written by the agent
+    assert sub._unescaped(r"a \"b\" \\n c\nd") == 'a "b" \\n c\nd'

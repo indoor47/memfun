@@ -126,6 +126,20 @@ def _content(message: dict[str, Any]) -> str:
     return c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
 
 
+def _unescaped(text: str) -> str:
+    """*text* with the escapes of a JSON string resolved.  A model that answers with JSON
+    operations writes code as string literals (``\\"`` for a quote, ``\\n`` for a new line);
+    when the file it edited comes back in a prompt, those lines are its own words."""
+    return (
+        text.replace("\\\\", "\x00")
+        .replace('\\"', '"')
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\/", "/")
+        .replace("\x00", "\\")
+    )
+
+
 def audit_instance(
     idir: Path,
     row: dict[str, Any],
@@ -206,7 +220,8 @@ def audit_instance(
             if seen and test not in _text(row.get("problem_statement")):
                 review.append(f"call {seq}: the name of a target test is in a prompt: {test}")
         with contextlib.suppress(KeyError, IndexError, TypeError):
-            answered += "\n" + _content(call["response"]["choices"][0]["message"])
+            said = _content(call["response"]["choices"][0]["message"])
+            answered += "\n" + said + "\n" + _unescaped(said)
     if calls and expected not in first_user:
         bad.append("the first prompt is not the prompt template with the problem statement")
     log = ""
@@ -395,6 +410,18 @@ def merge(shards: list[Path], out: Path) -> dict[str, Any]:
     return doc
 
 
+def _this_commit() -> str:
+    """The commit of the checkout this file runs from (the audit can be newer than the run)."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
+            capture_output=True, check=False, timeout=30,
+        )  # fmt: skip
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    return res.stdout.decode().strip() or "unknown"
+
+
 def readme(run_dir: Path, report: dict[str, Any], name: str, model_label: str) -> str:
     meta = read_json(run_dir / "run.json") or {}
     s = meta.get("settings") or {}
@@ -438,8 +465,9 @@ under `trajs/_attempts/`. The evaluation was run by the official script
 instance), ${cost:.2f} at the endpoint's list price.
 
 ## Self-audit
-Every trajectory was scanned for the dataset's forbidden fields (hints, test patch, reference
-patch), the instance id, credentials and attempted network access:
+Every trajectory was scanned (`evals/swebench_live/submission.py` at commit `{_this_commit()}`)
+for the dataset's forbidden fields (hints, test patch, reference patch), the instance id,
+credentials and attempted network access:
 {report.get("n_violations", 0)} violations, {report.get("n_review", 0)} notes for review
 (`audit.json`). Where a line of the test patch or the reference patch was in a prompt because
 the repository already held the same line (an existing test, an existing fixture), the line
